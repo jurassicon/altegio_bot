@@ -20,6 +20,7 @@ contract. Everything else is a mismatch, and a mismatch still fails closed.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 import pytest
@@ -34,6 +35,7 @@ from altegio_bot.easyweek_migration.classify import (
     READY,
     LedgerView,
     classify_record,
+    fingerprint_matches_decision,
     legacy_source_fingerprint,
 )
 from altegio_bot.easyweek_migration.cutover import parse_cutover
@@ -43,6 +45,7 @@ from altegio_bot.tests.test_easyweek_migration_planning import (
     CUSTOMER_UUID,
     KA_SERVICE_ID,
     KA_SERVICE_UUID,
+    KA_STAFF_ID,
     KA_STAFF_UUID,
     directory_with,
     manifest_text,
@@ -350,3 +353,105 @@ def test_no_reason_code_on_this_path_carries_pii():
 
     assert CUSTOMER_PHONE not in blob
     assert "Testkundin" not in blob
+
+
+# ---------------------------------------------------------------------------
+# The legacy hash is about the SOURCE slot, not the catalogue total
+# ---------------------------------------------------------------------------
+
+
+def _normalizing_manifest():
+    """The manifest with the owner-approved duration policy for this master."""
+    payload = json.loads(manifest_text())
+    payload["branches"][str(KARLSRUHE_COMPANY_ID)]["normalize_duration_to_catalog_for_staff_ids"] = [KA_STAFF_ID]
+    parsed = parse_manifest(json.dumps(payload))
+    assert parsed.valid, parsed.reason
+    return parsed
+
+
+def _classify_with(payload: dict[str, Any], manifest_obj):
+    return classify_record(
+        payload,
+        company_id=KARLSRUHE_COMPANY_ID,
+        manifest=manifest_obj,
+        directory=directory_with(),
+        cutover=parse_cutover(CUTOVER),
+        ledger=None,
+    )
+
+
+def test_a_stretched_booking_never_matches_its_legacy_hash_under_normalization():
+    """The regression: two paths must not disagree about the same booking.
+
+    `classify_record` recomputes the legacy hash from the source slot, while
+    `fingerprint_matches_decision` used the catalogue total. With the
+    staff-scoped duration policy those differ, so a booking stretched from 60 to
+    90 minutes read as CHANGED in a dry-run and as UNCHANGED in every path that
+    asks the second question — rollback, resolve-created, the previous-wave
+    context and the final reconciliation. A confirmed rollback would then cancel
+    the EasyWeek appointment of a booking somebody had deliberately edited.
+    """
+    normalizing = _normalizing_manifest()
+    unchanged = _classify_with(record(), normalizing)
+    legacy_60 = legacy_source_fingerprint(
+        company_id=KARLSRUHE_COMPANY_ID,
+        record_id=900001,
+        starts_at_utc=unchanged.starts_at_utc,
+        staff_uuid=KA_STAFF_UUID,
+        service_uuid=KA_SERVICE_UUID,
+        duration_minutes=60,
+        customer_uuid=CUSTOMER_UUID,
+    )
+
+    stretched = _classify_with(
+        record(
+            seance_length=5400,
+            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 5400, "amount": 1}],
+        ),
+        normalizing,
+    )
+    assert stretched.outcome == READY, "the policy still allows the booking to migrate"
+    assert stretched.source_booked_duration_minutes == 90
+    assert stretched.duration_minutes == 60
+
+    assert fingerprint_matches_decision(legacy_60, unchanged) is True
+    assert fingerprint_matches_decision(legacy_60, stretched) is False
+
+    # And the classifier's own answer agrees, which is the point.
+    blocked = classify_record(
+        record(
+            seance_length=5400,
+            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 90.0, "seance_length": 5400, "amount": 1}],
+        ),
+        company_id=KARLSRUHE_COMPANY_ID,
+        manifest=normalizing,
+        directory=directory_with(),
+        cutover=parse_cutover(CUTOVER),
+        ledger=LedgerView(status="created", target_booking_uuid=TARGET_UUID, source_fingerprint=legacy_60),
+    )
+    assert blocked.outcome == BLOCKED
+    assert blocked.reason == BLOCK_SOURCE_CHANGED
+
+
+def test_an_unchanged_normalized_booking_is_still_recognised():
+    """The compatibility this must not break while fixing the disagreement."""
+    normalizing = _normalizing_manifest()
+    decision = _classify_with(record(), normalizing)
+    legacy = legacy_source_fingerprint(
+        company_id=KARLSRUHE_COMPANY_ID,
+        record_id=900001,
+        starts_at_utc=decision.starts_at_utc,
+        staff_uuid=KA_STAFF_UUID,
+        service_uuid=KA_SERVICE_UUID,
+        duration_minutes=60,
+        customer_uuid=CUSTOMER_UUID,
+    )
+    again = classify_record(
+        record(),
+        company_id=KARLSRUHE_COMPANY_ID,
+        manifest=normalizing,
+        directory=directory_with(),
+        cutover=parse_cutover(CUTOVER),
+        ledger=LedgerView(status="created", target_booking_uuid=TARGET_UUID, source_fingerprint=legacy),
+    )
+    assert again.outcome == ALREADY_MIGRATED

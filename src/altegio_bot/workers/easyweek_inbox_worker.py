@@ -87,10 +87,13 @@ from ..easyweek_retention import (
     repeat_job_payload,
 )
 from ..easyweek_review import (
+    VISIT_COUNTER_DISABLED,
+    VISIT_LIMIT_ELIGIBLE,
     google_review_url_for_company,
     plan_review,
     review_job_payload,
     review_moment_passed,
+    visit_limit_verdict,
 )
 from ..easyweek_service_category import (
     evaluate_service_category,
@@ -99,6 +102,7 @@ from ..easyweek_service_category import (
     record_raw_with_services_count,
     services_count_from_record_raw,
 )
+from ..message_planner import MAX_VISITS_FOR_REVIEW
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
 
@@ -1200,6 +1204,77 @@ async def plan_review_job(
         # Marketing, and this customer said no. Nothing else needs checking.
         return
 
+    # -- the visit limit (plan §31.11) ------------------------------------
+    # A review is for a customer who is still new here: `MAX_VISITS_FOR_REVIEW`
+    # visits or fewer, the finished one included. The number comes from the
+    # snapshot `record_visit_counter` wrote from THIS delivery moments ago, in
+    # this same transaction — never from an Altegio API call, a count of local
+    # records or the payload of the job.
+    if not visit_counter_enabled():
+        # Configuration, not a decision — the same reading as a broken category
+        # allowlist or a missing review link, and handled by the same bounded
+        # mechanism. Terminalising here would spend a real finished visit on a
+        # flag somebody flipped, and that customer could never be asked again.
+        # The bound is the moment the review itself stops being possible.
+        if not review_moment_passed(record.starts_at, utcnow()):
+            raise RecoverableCategoryConfigurationError(VISIT_COUNTER_DISABLED)
+        logger.info(
+            "easyweek review skipped event=%s record_id=%s reason=%s_deadline_passed",
+            event.id,
+            record.id,
+            VISIT_COUNTER_DISABLED,
+        )
+        return
+
+    try:
+        visit = normalize_succeeded_visit_event(
+            event_hint=event.event_hint,
+            payload=event.payload,
+            body_truncated=bool(event.body_truncated),
+            location_registry=registry.locations if registry.ready else {},
+        )
+    except NormalizationError as exc:
+        # The delivery is a valid succeeded event whose visit evidence cannot be
+        # read: no usable `visits_total`, or no `customer_id` to attach it to.
+        # The payload is immutable, so waiting changes nothing — this is
+        # terminal, and terminal here means NO job.
+        logger.info(
+            "easyweek review refused event=%s record_id=%s reason=%s",
+            event.id,
+            record.id,
+            exc.code,
+        )
+        return
+
+    if int(client.altegio_client_id) != visit.customer_id:
+        # The counter attached this visit to a customer; the review must go to
+        # the same one, proven the same way, or not at all.
+        logger.warning(
+            "easyweek review refused event=%s record_id=%s client_id=%s reason=visit_client_mismatch",
+            event.id,
+            record.id,
+            client.id,
+        )
+        return
+
+    verdict = visit_limit_verdict(
+        max_visits=MAX_VISITS_FOR_REVIEW,
+        visits_total=client.easyweek_visits_total,
+        updated_at=client.easyweek_visits_total_updated_at,
+        # The counter ran first in this transaction, so a snapshot smaller than
+        # the total this delivery carried means it did not store this visit.
+        at_least=visit.visits_total,
+    )
+    if verdict != VISIT_LIMIT_ELIGIBLE:
+        logger.info(
+            "easyweek review refused event=%s record_id=%s client_id=%s reason=%s",
+            event.id,
+            record.id,
+            client.id,
+            verdict,
+        )
+        return
+
     eligibility = evaluate_service_category(
         record_raw=record.raw,
         allowed_categories_raw=settings.easyweek_allowed_service_categories,
@@ -2269,6 +2344,15 @@ async def recover_deferred_reviews(*, limit: int | None = None) -> int:
                     # instead would follow a `booking-updated` that reassigned
                     # the booking and earn the review for the wrong person.
                     expected_customer_id = normalize_succeeded_customer_id(event.payload)
+                    # The same order as the live path, and for the same reason
+                    # (plan §31.11): the visit limit is answered from the stored
+                    # snapshot, so the snapshot this delivery carries has to be
+                    # placed BEFORE the review is decided. A row deferred while
+                    # the counter was off never got one, and refusing it here as
+                    # "unproven" would quietly destroy a review that was earned.
+                    # The write is a monotonic, provider- and company-scoped
+                    # snapshot, so repeating it is a no-op.
+                    await record_visit_counter(session, event=event, registry=registry)
                     await plan_review_job(
                         session,
                         event=event,

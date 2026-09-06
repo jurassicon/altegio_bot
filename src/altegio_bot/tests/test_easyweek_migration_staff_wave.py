@@ -57,33 +57,36 @@ DEFERRED_STAFF_UUID = "aaaaaaaa-0000-4000-8000-00000000dddd"
 UNLISTED_STAFF_ID = 5999
 
 
-def wave_manifest(*, selected, deferred, staff=None) -> str:
+def wave_manifest(*, selected, deferred, staff=None, normalize_duration=None) -> str:
     """One Karlsruhe branch with an explicitly stated wave selector."""
     staff_map = staff if staff is not None else {str(KA_STAFF_ID): KA_STAFF_UUID}
-    return json.dumps(
-        {
-            "manifest_id": "wave-test",
-            "branches": {
-                str(KARLSRUHE_COMPANY_ID): {
-                    "altegio_company_id": KARLSRUHE_COMPANY_ID,
-                    "easyweek_location_id": 308001,
-                    "easyweek_location_uuid": KA_LOCATION_UUID,
-                    "selected_altegio_staff_ids": selected,
-                    "deferred_altegio_staff_ids": deferred,
-                    "staff": staff_map,
-                    "services": {
-                        str(KA_SERVICE_ID): {
-                            "easyweek_service_uuid": KA_SERVICE_UUID,
-                            "catalog_duration_minutes": 60,
-                            "catalog_price": "90.00",
-                            "catalog_service_name": "Mascara Effekt",
-                            "catalog_currency": "EUR",
-                        }
-                    },
-                }
-            },
-        }
-    )
+    payload = {
+        "manifest_id": "wave-test",
+        "branches": {
+            str(KARLSRUHE_COMPANY_ID): {
+                "altegio_company_id": KARLSRUHE_COMPANY_ID,
+                "easyweek_location_id": 308001,
+                "easyweek_location_uuid": KA_LOCATION_UUID,
+                "selected_altegio_staff_ids": selected,
+                "deferred_altegio_staff_ids": deferred,
+                "staff": staff_map,
+                "services": {
+                    str(KA_SERVICE_ID): {
+                        "easyweek_service_uuid": KA_SERVICE_UUID,
+                        "catalog_duration_minutes": 60,
+                        "catalog_price": "90.00",
+                        "catalog_service_name": "Mascara Effekt",
+                        "catalog_currency": "EUR",
+                    }
+                },
+            }
+        },
+    }
+    if normalize_duration is not None:
+        payload["branches"][str(KARLSRUHE_COMPANY_ID)]["normalize_duration_to_catalog_for_staff_ids"] = (
+            normalize_duration
+        )
+    return json.dumps(payload)
 
 
 @pytest.fixture
@@ -166,11 +169,27 @@ def test_the_selector_is_part_of_the_manifest_digest():
     assert base.digest != moved.digest
 
 
+def test_duration_normalization_is_explicit_staff_scoped_and_digest_bound():
+    exact = parse_manifest(wave_manifest(selected=[KA_STAFF_ID], deferred=[]))
+    normalized = parse_manifest(wave_manifest(selected=[KA_STAFF_ID], deferred=[], normalize_duration=[KA_STAFF_ID]))
+    assert exact.valid and normalized.valid
+    assert not exact.branch(KARLSRUHE_COMPANY_ID).normalizes_duration_to_catalog(KA_STAFF_ID)
+    assert normalized.branch(KARLSRUHE_COMPANY_ID).normalizes_duration_to_catalog(KA_STAFF_ID)
+    assert normalized.digest != exact.digest
+
+
+@pytest.mark.parametrize("bad", [[UNLISTED_STAFF_ID], [True], [0], "5001"])
+def test_duration_normalization_rejects_unclassified_or_malformed_staff_ids(bad):
+    parsed = parse_manifest(wave_manifest(selected=[KA_STAFF_ID], deferred=[], normalize_duration=bad))
+    assert not parsed.valid
+
+
 def test_the_manifest_summary_states_both_sets_without_names():
     manifest = parse_manifest(wave_manifest(selected=[KA_STAFF_ID], deferred=[KA_DEFERRED_STAFF_ID]))
     entry = manifest.as_safe_dict()["branches"][0]
     assert entry["selected_staff_ids"] == [KA_STAFF_ID]
     assert entry["deferred_staff_ids"] == [KA_DEFERRED_STAFF_ID]
+    assert entry["normalize_duration_to_catalog_for_staff_ids"] == []
 
 
 @pytest.mark.parametrize(

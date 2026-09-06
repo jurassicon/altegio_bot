@@ -1285,3 +1285,55 @@ async def test_recovery_logs_carry_no_payload_or_pii(bound_session_local, monkey
     # only the stable reason code may name what was wrong with it.
     assert "not-a-uuid" not in blob
     assert "invalid_booking_uuid" in blob, "the stable code IS reported"
+
+
+async def test_a_deferred_review_without_a_stored_count_is_still_planned(bound_session_local, monkeypatch) -> None:
+    """Recovery re-proves the visit from the row's own payload.
+
+    Plan §31.11 answers the limit from the stored snapshot, and a review can
+    wait days for its moment. A row that reaches recovery without one — deferred
+    before the counter existed, or while it was switched off — is a delivery
+    that genuinely earned a review, so refusing it as "unproven" would destroy
+    it silently. Recovery therefore keeps the live path's order: place the
+    snapshot this delivery carries, then decide.
+    """
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    _fence_open(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    (deferred_id,) = await _seed_deferred_rows(bound_session_local, count=1, malformed=False)
+
+    client = await _client_row(bound_session_local)
+    assert client.easyweek_visits_total is None, "the fixture never stored one"
+
+    decided = await worker.recover_deferred_reviews()
+
+    assert decided == 1
+    client = await _client_row(bound_session_local)
+    assert client.easyweek_visits_total == 2, "placed from the deferred row's own payload"
+    assert client.easyweek_visits_total_updated_at is not None
+    assert len(await _review_jobs(bound_session_local)) == 1
+
+    async with bound_session_local() as session:
+        row = await session.get(EasyWeekEvent, deferred_id)
+    assert row.review_deferred_at is None
+
+
+async def test_recovery_still_refuses_a_deferred_review_over_the_limit(bound_session_local, monkeypatch) -> None:
+    """Re-proving is not a way around the limit."""
+    _counter_on(monkeypatch)
+    _reviews_wanted(monkeypatch)
+    _fence_open(monkeypatch)
+    await _seed_future_booking(bound_session_local)
+    await _seed_deferred_rows(bound_session_local, count=1, malformed=False)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+            client.easyweek_visits_total = 7
+            client.easyweek_visits_total_updated_at = datetime.now(timezone.utc)
+
+    await worker.recover_deferred_reviews()
+
+    assert await _review_jobs(bound_session_local) == []
+    assert (await _client_row(bound_session_local)).easyweek_visits_total == 7, "monotonic, never lowered"

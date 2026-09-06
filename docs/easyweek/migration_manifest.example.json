@@ -11,6 +11,7 @@
       "deferred_altegio_staff_ids": [
         1000002
       ],
+      "normalize_duration_to_catalog_for_staff_ids": [],
       "staff": {
         "1000001": "00000000-0000-4000-8000-000000000011",
         "1000002": "00000000-0000-4000-8000-000000000012"
@@ -40,6 +41,7 @@
       "deferred_altegio_staff_ids": [
         1100001
       ],
+      "normalize_duration_to_catalog_for_staff_ids": [],
       "staff": {
         "1100001": "00000000-0000-4000-8000-000000000031"
       },

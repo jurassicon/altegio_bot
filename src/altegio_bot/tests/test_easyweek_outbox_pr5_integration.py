@@ -339,6 +339,13 @@ async def _seed_easyweek_client(db: AsyncSession, *, company_id: int = COLLIDING
         display_name="Anna Müller",
         email=CLIENT_EMAIL,
         raw={},
+        # Plan §31.11: a review may only be sent to a customer with a PROVEN
+        # count of at most `MAX_VISITS_FOR_REVIEW`. This fixture states a first
+        # visit explicitly — the tests below are about links, templates and
+        # retries, and each of them is a customer who is genuinely eligible.
+        # The limit itself has its own tests.
+        easyweek_visits_total=1,
+        easyweek_visits_total_updated_at=datetime(2026, 2, 10, 12, 0, tzinfo=timezone.utc),
     )
     db.add(client)
     await db.flush()
@@ -3259,6 +3266,7 @@ async def test_a_review_sends_even_when_the_price_was_never_proven(
 ) -> None:
     """The regression: an unknown price must not destroy an earned review."""
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
 
     await _run_job(db, job)
@@ -3278,6 +3286,7 @@ async def test_a_review_never_carries_a_maps_manage_or_storefront_link(
     db: AsyncSession, capture: CaptureProvider, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
 
     await _run_job(db, job)
@@ -3307,6 +3316,7 @@ async def test_a_review_makes_no_altegio_api_call(db: AsyncSession, capture: Cap
     altegio_api = AsyncMock(side_effect=AssertionError("no Altegio API call for an EasyWeek review"))
     monkeypatch.setattr(ow, "count_attended_client_visits", altegio_api)
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
 
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
@@ -3369,6 +3379,7 @@ async def test_a_disallowed_category_still_blocks_the_review(
     db: AsyncSession, capture: CaptureProvider, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps(["Something Else"]), raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
 
@@ -3383,6 +3394,7 @@ async def test_an_unprovable_review_url_still_blocks_the_review(
     db: AsyncSession, capture: CaptureProvider, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(
         db,
         services=((11, None, None),),
@@ -3421,6 +3433,7 @@ async def test_a_failed_review_delivery_produces_one_retry_with_root_identity(
     db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
     assert job.status == "done", job.last_error
@@ -3455,6 +3468,7 @@ async def test_a_duplicate_review_callback_does_not_create_a_second_retry(
     db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
     rows = await _outbox_rows(db, job)
@@ -3477,6 +3491,7 @@ async def test_an_unprovable_review_root_creates_no_retry(
     db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch, label: str, mutate: dict
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
     rows = await _outbox_rows(db, job)
@@ -3498,6 +3513,7 @@ async def test_a_review_retry_is_refused_when_the_booking_moved(
     db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
     rows = await _outbox_rows(db, job)
@@ -3521,6 +3537,7 @@ async def test_a_review_retry_stays_queued_behind_a_closed_fence(
     db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     await _run_job(db, job)
     rows = await _outbox_rows(db, job)
@@ -3544,6 +3561,7 @@ async def test_an_expired_review_backlog_is_cancelled_instead_of_sent(
 ) -> None:
     """The rollout hazard: reviews pile up behind a closed fence and go stale."""
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     # Older than the existing 24h marketing transient cap.
     job.run_at = utcnow() - timedelta(hours=30)
@@ -3560,6 +3578,7 @@ async def test_an_expired_review_backlog_is_cancelled_instead_of_sent(
 
 async def test_a_review_inside_the_cap_still_sends(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
     job.run_at = utcnow() - timedelta(hours=2)
     await db.flush()
@@ -4373,6 +4392,11 @@ async def test_easyweek_retry_refused_when_the_client_is_not_easyweek(
     async def _flip(job: MessageJob, outbox: OutboxMessage) -> None:
         client = await db.get(Client, job.client_id)
         client.provider = PROVIDER_ALTEGIO
+        # The EasyWeek visit snapshot goes with the provider: a CHECK forbids
+        # an Altegio row from carrying one, which is the same cross-provider
+        # rule this test is about.
+        client.easyweek_visits_total = None
+        client.easyweek_visits_total_updated_at = None
 
     outbox = await _outbox_without_a_usable_job(db, capture, _flip)
 
@@ -7197,6 +7221,7 @@ async def test_the_processing_fence_does_not_stop_the_delivery_retry_producer(
 
 async def test_a_review_send_uses_the_configured_link(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
 
     await _run_job(db, job)
@@ -7218,6 +7243,7 @@ async def test_a_review_without_a_provable_link_is_not_sent(
 ) -> None:
     """Fail-closed at send time, not just at planning time."""
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
     monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
 
@@ -7236,6 +7262,7 @@ async def test_a_changed_link_is_refused_rather_than_swapped(
     deadline instead.
     """
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
     monkeypatch.setattr(
         settings,
@@ -7274,6 +7301,7 @@ async def test_each_link_failure_gets_its_own_reason(
     db: AsyncSession, capture: CaptureProvider, monkeypatch, label: str, config: str, expected: str
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
     monkeypatch.setattr(settings, "easyweek_google_review_links", config, raising=False)
 
@@ -7300,6 +7328,7 @@ async def test_each_named_non_map_link_failure_reaches_last_error(
     expected: str,
 ) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
 
     if expected == REVIEW_JOB_INCOMPLETE:
@@ -7331,6 +7360,7 @@ async def test_each_named_non_map_link_failure_reaches_last_error(
 
 async def test_a_changed_link_is_named_as_changed(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
     monkeypatch.setattr(
         settings,
@@ -7347,6 +7377,7 @@ async def test_a_changed_link_is_named_as_changed(db: AsyncSession, capture: Cap
 
 async def test_no_reason_code_carries_a_link(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     job = await _seed_review_job(db)
     monkeypatch.setattr(settings, "easyweek_google_review_links", "{not json", raising=False)
 
@@ -7354,3 +7385,638 @@ async def test_no_reason_code_carries_a_link(db: AsyncSession, capture: CaptureP
 
     assert "g.page" not in (job.last_error or "")
     assert EASYWEEK_REVIEW_URL not in (job.last_error or "")
+
+
+# ---------------------------------------------------------------------------
+# Plan §31.11: the visit limit is re-proven at SEND time
+# ---------------------------------------------------------------------------
+#
+# Planning proved the count at the moment the visit finished. Days pass before
+# the job runs, and a customer can come back in between — so the fence asks the
+# Client row again, by full provider/company identity, BEFORE the template, the
+# sender, the Outbox row, Meta or an attempt. The job payload is not evidence:
+# it was written by the planner and is not re-proven by anything.
+
+
+async def _visits(db: AsyncSession, job: MessageJob, total: int | None) -> None:
+    client = await db.get(Client, job.client_id)
+    assert client is not None
+    client.easyweek_visits_total = total
+    client.easyweek_visits_total_updated_at = utcnow() if total is not None else None
+    await db.flush()
+
+
+async def test_a_review_at_the_limit_is_still_sent(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 3)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    assert len(await _outbox_rows(db, job)) == 1
+
+
+async def test_a_review_over_the_limit_is_canceled_before_anything_external(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """The customer came back after the review was planned.
+
+    Nothing external may happen: no Outbox row, no Meta call, and no attempt
+    spent — the refusal is a decision, and an attempt is a record of a delivery
+    that was tried.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 4)
+    attempts_before = job.attempts
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+    assert capture.template_calls == [], "nothing may reach Meta"
+    assert await _outbox_rows(db, job) == []
+    assert job.attempts == attempts_before
+
+
+async def test_a_job_planned_at_the_limit_is_refused_when_the_count_has_moved(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """Planned at 3, run at 4. The payload of the job proves nothing."""
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 3)
+    job.payload = {**job.payload, "visits_total": 3}
+    await db.flush()
+    await _visits(db, job, 4)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert "review_visit_limit_exceeded" in (job.last_error or "")
+    assert capture.template_calls == []
+
+
+async def test_a_legacy_job_without_any_visit_field_is_still_checked(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """Jobs queued before §31.11 carry no visit field at all, and are not exempt."""
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    assert "visits_total" not in job.payload, "the fixture is a pre-§31.11 job"
+    await _visits(db, job, 9)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert "review_visit_limit_exceeded" in (job.last_error or "")
+    assert capture.template_calls == []
+
+
+async def test_a_missing_count_blocks_the_review(db: AsyncSession, capture: CaptureProvider, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, None)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.last_error == "EasyWeek review refused: review_visit_count_unproven"
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_a_client_of_another_provider_never_reaches_the_visit_fence(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """The visit fence asks the Client row, so WHICH row it is has to be settled first.
+
+    The provider-scope guard already refuses a job whose client belongs to
+    another provider, and it runs before the visit question is even asked. This
+    pins that ordering: the row a provider-blind lookup would have accepted —
+    same company, same phone, Altegio side — never becomes the evidence a review
+    is sent on, and nothing external happens either way.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 1)
+    foreign = Client(
+        provider=PROVIDER_ALTEGIO,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_client_id=7300099,
+        phone_e164=CLIENT_PHONE,
+        display_name="Anna Müller",
+        raw={},
+    )
+    db.add(foreign)
+    await db.flush()
+    job.client_id = foreign.id
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+    assert CLIENT_PHONE not in (job.last_error or "")
+
+
+async def test_a_disabled_counter_holds_the_review_without_spending_an_attempt(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """A flag that is off is not a decision about this customer.
+
+    The job waits behind the fence exactly as it does behind a closed send
+    switch: still queued, no attempt, nothing external, and it sends normally
+    once the counter is back.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", False, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 3)
+    attempts_before = job.attempts
+
+    await _run_job(db, job)
+
+    assert job.status == "queued", job.last_error
+    assert job.attempts == attempts_before
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+    assert "review_visit_counter_disabled" in (job.last_error or "")
+
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+
+
+async def test_the_guard_runs_again_on_a_delivery_retry(
+    db: AsyncSession, capture: CaptureProvider, no_contact_rate_limit: None, monkeypatch
+) -> None:
+    """A delivery retry is another send, so it asks the same question again.
+
+    The first attempt was legitimately sent at the limit and then failed at the
+    provider. By the time the retry runs the customer has come back, and the
+    retry — planned before that, with a payload that still says otherwise — must
+    be refused rather than delivered on the strength of its own payload.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db, services=((11, None, None),), total_cost=None)
+    await _visits(db, job, 3)
+
+    await _run_job(db, job)
+    assert job.status == "done", job.last_error
+    rows = await _outbox_rows(db, job)
+    await _deliver_failed_status(db, rows[0].provider_message_id, dedupe="wa:eyw-review-visit-1")
+
+    retries = await _retry_jobs_for(db, rows[0].id)
+    assert len(retries) == 1
+    retry = retries[0]
+    retry.run_at = utcnow() - timedelta(seconds=1)
+    await db.flush()
+    await _visits(db, job, 4)
+    attempts_before = retry.attempts
+
+    await _run_job(db, retry)
+
+    assert retry.status == "canceled"
+    assert retry.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+    assert len(capture.template_calls) == 1, "the retry sent nothing"
+    assert await _outbox_rows(db, retry) == []
+    assert retry.attempts == attempts_before
+
+
+@pytest.mark.parametrize("total", [4, None])
+async def test_no_visit_refusal_carries_pii(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch, total: int | None
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, total)
+
+    await _run_job(db, job)
+
+    reason = job.last_error or ""
+    assert reason
+    for secret in (CLIENT_PHONE, CLIENT_EMAIL, "Anna Müller", EASYWEEK_REVIEW_URL):
+        assert secret not in reason
+    assert str(total) not in reason if total is not None else True
+
+
+async def test_the_visit_counter_hold_is_bounded_and_uses_its_own_budget(
+    db: AsyncSession, capture: CaptureProvider, monkeypatch
+) -> None:
+    """Waiting is not forever, and it is not the ownership question's waiting room.
+
+    A fence that never opens is a state a person has to look at, so the hold is
+    bounded and ends in `failed` — never in a send. It counts on its own payload
+    key: "who owns this booking" and "the counter is off" are different problems
+    with different fixes, and one must not spend the other's budget.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", False, raising=False)
+    job = await _seed_review_job(db)
+    await _visits(db, job, 3)
+
+    for _ in range(ow.MAX_REMINDER_OWNERSHIP_ATTEMPTS):
+        job.status = "queued"
+        await db.flush()
+        await _run_job(db, job)
+
+    assert job.status == "failed"
+    assert job.attempts == 0, "no delivery was ever attempted"
+    assert capture.template_calls == []
+    assert await _outbox_rows(db, job) == []
+    assert job.payload[ow._EASYWEEK_REVIEW_VISIT_HOLD_KEY] == ow.MAX_REMINDER_OWNERSHIP_ATTEMPTS
+    assert ow._POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY not in job.payload
+
+
+# ---------------------------------------------------------------------------
+# §31.11: the send-time count is read under a lock, not from memory
+# ---------------------------------------------------------------------------
+#
+# The guard answers a question the inbox worker can change at any moment, so
+# reading "again" is only worth something if the read (a) comes from PostgreSQL
+# rather than from the ORM instance already sitting in the session, and (b) holds
+# the row until the send decision is final. Both halves are pinned here against a
+# real database and a real `record_visit_counter`.
+
+_COUNTER_LOCATION_UUID = "cccccccc-dddd-4eee-8fff-000000000001"
+
+
+def _succeeded_visit_payload(*, booking_uuid: uuid.UUID, booking_id: int, visits_total: int) -> dict[str, Any]:
+    """A `booking-succeeded` delivery for one of this file's EasyWeek bookings."""
+    payload = booking_created()
+    payload["booking_status"] = "Succeeded appointment"
+    payload["uid"] = str(booking_uuid)
+    payload["id"] = booking_id
+    payload["customer_id"] = 7300002
+    payload["location_id"] = COLLIDING_COMPANY_ID
+    payload["location_uuid"] = _COUNTER_LOCATION_UUID
+    payload["visits_total"] = visits_total
+    return payload
+
+
+async def _record_visit_counter(session: AsyncSession, payload: dict[str, Any]) -> None:
+    """Run the real counter, with its own `Record -> Client` lock order."""
+    event = EasyWeekEvent(
+        id=987654,
+        status="processing",
+        event_hint=eyw_worker.SUCCEEDED_EVENT_HINT,
+        auth_via="query",
+        payload_hash="visit-counter-concurrency",
+        payload=payload,
+        body_truncated=False,
+    )
+    await eyw_worker.record_visit_counter(
+        session,
+        event=event,
+        registry=eyw_worker.configured_easyweek_locations(),
+    )
+
+
+async def _seed_second_booking_of_the_same_client(db: AsyncSession, job: MessageJob) -> Record:
+    """A SECOND EasyWeek booking of the customer whose review is queued."""
+    client = await db.get(Client, job.client_id)
+    assert client is not None
+    # Its own booking uuid AND its own numeric id: the natural key is
+    # (provider, company_id, altegio_record_id), and a second appointment is a
+    # different booking, not another row for the same one.
+    second = Record(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_record_id=4200002,
+        easyweek_booking_uuid=uuid.UUID("22222222-3333-4444-8555-666666666666"),
+        easyweek_booking_hash_id="90000002",
+        client_id=client.id,
+        staff_name="Tanja",
+        starts_at=utcnow() - timedelta(days=3),
+        raw=record_raw_with_services_count(record_raw_with_service_category({}, "Wimpernverlängerung"), 1),
+    )
+    db.add(second)
+    await db.flush()
+    return second
+
+
+async def test_a_client_already_in_the_session_is_re_read_from_postgresql(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The identity-map regression.
+
+    `_load_client` reaches the customer through `session.get`, so by the time the
+    visit guard runs the row is already in the session at its OLD value. A plain
+    SELECT hands that same instance back unchanged, and the review would be sent
+    against a count another transaction has already moved. The guard has to read
+    the committed value, not the remembered one.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    await db.commit()
+
+    async with session_maker() as outbox_session:
+        async with outbox_session.begin():
+            cached = await outbox_session.get(Client, client_id)
+            assert cached is not None and cached.easyweek_visits_total == 3
+
+            # Another transaction — the inbox worker's — commits the fourth visit
+            # while this session still remembers three.
+            async with session_maker() as inbox_session:
+                async with inbox_session.begin():
+                    row = (
+                        await inbox_session.execute(select(Client).where(Client.id == client_id).with_for_update())
+                    ).scalar_one()
+                    row.easyweek_visits_total = 4
+                    row.easyweek_visits_total_updated_at = utcnow()
+
+            await ow.process_job_in_session(outbox_session, job_id, object())  # type: ignore[arg-type]
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        assert persisted is not None
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert (
+            await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))
+        ).scalars().all() == []
+    assert capture.template_calls == []
+
+
+async def test_a_visit_committed_before_the_lock_cancels_the_waiting_review(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 1: counter locks and commits -> outbox waits, then refuses.
+
+    Two different bookings of ONE customer. The inbox worker records the second
+    visit while the outbox is already working on the review earned by the first.
+    The outbox must not step over the open transaction: it waits for the row, and
+    what it finds afterwards is four visits, so nothing is sent.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    outbox_reached_guard = asyncio.Event()
+    original_guard = ow._easyweek_review_visit_limit_error
+
+    async def _observed_guard(session: AsyncSession, candidate: MessageJob, record, client):
+        if candidate.id == job_id:
+            outbox_reached_guard.set()
+        return await original_guard(session, candidate, record, client)
+
+    monkeypatch.setattr(ow, "_easyweek_review_visit_limit_error", _observed_guard)
+
+    async with session_maker() as inbox_session:
+        async with inbox_session.begin():
+            await _record_visit_counter(
+                inbox_session,
+                _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+            )
+            outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+            await asyncio.wait_for(outbox_reached_guard.wait(), timeout=5)
+            # The counter still holds the row, so the guard cannot answer yet.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(outbox_task), timeout=0.2)
+
+    await asyncio.wait_for(outbox_task, timeout=5)
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        assert client is not None and client.easyweek_visits_total == 4
+        assert persisted is not None
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert (
+            await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))
+        ).scalars().all() == []
+    assert capture.template_calls == []
+
+
+async def test_a_review_already_authorised_makes_the_next_visit_wait(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 2: outbox locks, decides, sends and commits -> counter proceeds.
+
+    The mirror image, and the reason the lock is held to the end of the job's
+    transaction rather than released after the check: while the message is being
+    handed to the provider, "three visits" must still be true. The second visit
+    is not lost — it waits, and is recorded once the send is durable.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    provider_barrier = asyncio.Event()
+    release_provider = asyncio.Event()
+    counter_started = asyncio.Event()
+    counter_finished = asyncio.Event()
+    order: list[str] = []
+
+    async def _barrier_send_template(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        order.append("provider_attempt")
+        provider_barrier.set()
+        await release_provider.wait()
+        order.append("provider_return")
+        return "eyw-review-serialized-1", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _barrier_send_template)
+
+    async def _count_the_second_visit() -> None:
+        counter_started.set()
+        async with session_maker() as inbox_session:
+            async with inbox_session.begin():
+                await _record_visit_counter(
+                    inbox_session,
+                    _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+                )
+                order.append("counter_wrote")
+                # The row was only handed over when the outbox transaction
+                # committed, so by now the send it authorised is durable. This
+                # is the ordering proof: data, not task scheduling.
+                committed_send = (
+                    (await inbox_session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(committed_send) == 1
+                order.append("committed_send_visible")
+                counter_finished.set()
+            order.append("counter_commit")
+
+    outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id, order=order))
+    await asyncio.wait_for(provider_barrier.wait(), timeout=5)
+
+    counter_task = asyncio.create_task(_count_the_second_visit())
+    await asyncio.wait_for(counter_started.wait(), timeout=5)
+    # The outbox holds the client row through the provider attempt.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(counter_finished.wait(), timeout=0.2)
+
+    release_provider.set()
+    await asyncio.wait_for(outbox_task, timeout=5)
+    await asyncio.wait_for(counter_task, timeout=5)
+
+    assert order.index("provider_attempt") < order.index("provider_return")
+    assert order.index("provider_return") < order.index("counter_wrote"), (
+        "the counter waited through the whole provider attempt"
+    )
+    assert order.index("counter_wrote") < order.index("committed_send_visible") < order.index("counter_commit")
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        rows = (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))).scalars().all()
+        assert persisted is not None and persisted.status == "done", persisted.last_error
+        assert len(rows) == 1, "the review that was authorised at three visits was sent exactly once"
+        assert client is not None and client.easyweek_visits_total == 4, "and the fourth visit was not lost"
+
+
+@pytest.mark.parametrize("warmed_up", ["counter", "outbox"])
+async def test_the_two_paths_serialise_instead_of_deadlocking(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    warmed_up: str,
+) -> None:
+    """Both take `Record` then `Client`, so neither can hold what the other wants.
+
+    The two transactions race for one customer row and the test does NOT decide
+    who wins — it decides what each outcome has to look like. The evidence is
+    read where it is unambiguous: inside the counter's own transaction, right
+    after it takes the customer row, it asks whether this job's `OutboxMessage`
+    already exists. That single fact orders the two events for us:
+
+    * visible — the send was authorised AND made durable before the fourth visit
+      was recorded, which is the only way a review may go out here;
+    * not visible — the fourth visit landed first, so the review must be refused
+      rather than sent on a count that had already moved.
+
+    Asserting the equivalence in both directions is what makes this a proof: a
+    guard that no longer reads the count under a lock produces a sent review
+    whose Outbox row the counter never saw, and that combination fails here.
+
+    Bounded by a timeout throughout, so a lock-order inversion surfaces as a
+    PostgreSQL deadlock or a failed wait rather than as a silently wrong count.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_pk = int(second.id)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    counter_holds_its_record = asyncio.Event()
+    send_was_durable_first: list[bool] = []
+
+    async def _count_the_second_visit() -> None:
+        async with session_maker() as inbox_session:
+            async with inbox_session.begin():
+                # The counter's OWN first lock, taken here so the race for the
+                # shared customer row starts from a known point for both sides.
+                # It is the same row `record_visit_counter` locks a moment later,
+                # in the same transaction, so nothing about its behaviour changes.
+                await inbox_session.execute(select(Record).where(Record.id == second_pk).with_for_update())
+                counter_holds_its_record.set()
+
+                await _record_visit_counter(
+                    inbox_session,
+                    _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+                )
+                # The customer row is ours now. Anything the outbox committed
+                # for this job happened strictly before this moment; anything it
+                # has not committed cannot be visible yet.
+                rows = (
+                    (await inbox_session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                    .scalars()
+                    .all()
+                )
+                send_was_durable_first.append(len(rows) == 1)
+
+    # Which side gets a head start is a parameter, not an outcome: the assertions
+    # below are the same either way, and each run states only that whatever
+    # happened is one of the two orders that may happen. Running both is what
+    # exercises both branches instead of leaving one of them theoretical.
+    outbox_reached_guard = asyncio.Event()
+    original_guard = ow._easyweek_review_visit_limit_error
+
+    async def _observed_guard(session: AsyncSession, candidate: MessageJob, record, client):
+        if candidate.id == job_id:
+            outbox_reached_guard.set()
+        return await original_guard(session, candidate, record, client)
+
+    monkeypatch.setattr(ow, "_easyweek_review_visit_limit_error", _observed_guard)
+
+    if warmed_up == "counter":
+        counter_task = asyncio.create_task(_count_the_second_visit())
+        await asyncio.wait_for(counter_holds_its_record.wait(), timeout=5)
+        outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+    else:
+        outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+        await asyncio.wait_for(outbox_reached_guard.wait(), timeout=5)
+        counter_task = asyncio.create_task(_count_the_second_visit())
+
+    await asyncio.wait_for(asyncio.gather(counter_task, outbox_task), timeout=15)
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        rows = (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))).scalars().all()
+    assert client is not None and client.easyweek_visits_total == 4, "the visit is recorded either way"
+    assert persisted is not None
+    assert len(send_was_durable_first) == 1, "the counter finished exactly once"
+
+    # The equivalence, both ways: a review exists if and only if it was already
+    # durable when the fourth visit was recorded.
+    assert (persisted.status == "done") == send_was_durable_first[0], (
+        f"{warmed_up} first: status={persisted.status} but the counter "
+        f"{'saw' if send_was_durable_first[0] else 'did not see'} a committed send"
+    )
+
+    if send_was_durable_first[0]:
+        assert len(rows) == 1
+        assert len(capture.template_calls) == 1
+    else:
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert rows == []
+        assert capture.template_calls == []

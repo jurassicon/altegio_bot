@@ -66,6 +66,11 @@ class FakeJob:
 class FakeRecord:
     id: int
     company_id: int
+    # A real Altegio record always carries its source id, and both
+    # post-migration fences look the booking up by it. Without it the identity
+    # cannot be stated at all, which is UNKNOWN — fail closed in production, and
+    # here it would hide the visit-limit guard these tests are about.
+    altegio_record_id: int | None = 777001
     client_id: int | None = CLIENT_ID
     attendance: int = 1
     visit_attendance: int = 0
@@ -83,6 +88,35 @@ class FakeClient:
     altegio_client_id: int | None = ALTEGIO_CLIENT_ID
 
 
+class _EmptyResult:
+    """What a SELECT over an empty table returns."""
+
+    def all(self) -> list[Any]:
+        return []
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+
+class _FakeSavepoint:
+    """What `session.begin_nested()` returns for a fake session.
+
+    The ownership lookup runs inside its own SAVEPOINT so a failed statement
+    cannot poison the caller's transaction. These fakes hold no transaction at
+    all, so the savepoint has nothing to undo — but it has to EXIST, or the
+    fixture would answer a question production never asks.
+    """
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[Any] = []
@@ -90,10 +124,24 @@ class FakeSession:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
-# ─────────────────────────────────────────────────────────────────────
-# Backfill script tests (no real DB; SessionLocal + API are patched)
-# ─────────────────────────────────────────────────────────────────────
+    async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """Answer the ownership lookups the worker now performs.
+
+        These fixtures are UNMIGRATED Altegio bookings, so "no ledger row" is
+        the truthful answer, and both post-migration fences (§30 reminders and
+        §31 marketing jobs) correctly conclude the ordinary Altegio path owns
+        them. A session that cannot answer at all would make the fences fail
+        closed — which is right in production and would hide the guard this
+        file is actually about.
+        """
+        return _EmptyResult()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Backfill script tests (no real DB; SessionLocal + API are patched)
+    # ─────────────────────────────────────────────────────────────────────
 
 
 class _FakeSessionCtx:
@@ -121,6 +169,9 @@ class _FakeWriteSession:
 
     def begin(self) -> _FakeBeginCtx:
         return _FakeBeginCtx()
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, stmt: Any) -> None:
         self.executed.append(stmt)
@@ -152,6 +203,9 @@ class _Phase1Session:
         rows: list[tuple[int, int | None, int | None, int | None]],
     ) -> None:
         self._rows = rows
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, _stmt: Any) -> _FakeResult:
         return _FakeResult(self._rows)
@@ -586,6 +640,19 @@ FUTURE_STARTS_AT = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
 
 class _PlannerFakeSession:
     """Minimal async session for planner tests."""
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
+
+    async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """The post-migration ownership lookups the planner now performs.
+
+        Unmigrated fixtures, so "no ledger row" is the truthful answer and the
+        ordinary Altegio planning continues — which is what these tests are
+        about. A session that could not answer would fail closed instead, and
+        the visit-limit guard under test would never be reached.
+        """
+        return _EmptyResult()
 
     async def get(self, model: Any, pk: Any) -> Any:
         if getattr(model, "__tablename__", None) == "records":

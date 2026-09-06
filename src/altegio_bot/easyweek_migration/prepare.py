@@ -365,7 +365,12 @@ def handling_class(block_reason: str | None) -> str:
     return CLASS_FULLY_MANUAL
 
 
-def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> dict[str, Any]:
+def operator_record_row(
+    record: dict[str, Any],
+    *,
+    branch: BranchMapping,
+    block_reason: str | None,
+) -> dict[str, Any]:
     """One booking as the operator has to check it against Altegio.
 
     Local wall-clock in Europe/Berlin — the only clock the salon and the customer
@@ -385,6 +390,26 @@ def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> 
     # only here, and reading the line would show the standard hour.
     minutes = whole_minutes(record.get("seance_length"))
     service_minutes = whole_minutes(service.get("seance_length"))
+    target_minutes = 0
+    target_duration_proven = isinstance(services, list) and bool(services)
+    if isinstance(services, list):
+        for source_service in services:
+            if not isinstance(source_service, dict):
+                target_duration_proven = False
+                break
+            mapping = branch.service(source_service.get("id"))
+            if mapping is None or mapping.catalog_duration.minutes is None:
+                target_duration_proven = False
+                break
+            target_minutes += mapping.catalog_duration.minutes
+    target_duration = target_minutes if target_duration_proven else None
+    staff_id = _staff_id_of_record(record)
+    normalized = (
+        branch.normalizes_duration_to_catalog(staff_id)
+        and minutes is not None
+        and target_duration is not None
+        and minutes != target_duration
+    )
 
     starts_local: str | None = None
     ends_local: str | None = None
@@ -409,6 +434,8 @@ def operator_record_row(record: dict[str, Any], *, block_reason: str | None) -> 
         # a disagreement between them IS the per-booking override.
         "duration_minutes": minutes,
         "service_line_duration_minutes": service_minutes,
+        "target_catalog_duration_minutes": target_duration,
+        "duration_normalized_to_catalog": normalized,
         "handling": handling_class(block_reason),
         "altegio_service_id": service.get("id"),
         "altegio_service_name": _text(service.get("title")),
@@ -720,7 +747,11 @@ async def build_preparation_snapshot(
         raise PrepareError(f"branch identity unproven ({', '.join(identity.failures)})")
 
     window = build_window(inputs.cutover.at, horizon_days=inputs.horizon_days)
-    records = await fetch_company_records(inputs.altegio_company_id, window, http_client=http_client)
+    records = await fetch_company_records(
+        company_id=inputs.altegio_company_id,
+        window=window,
+        client=http_client,
+    )
 
     # The classifier decides scope. An empty-but-valid directory is passed on
     # purpose: customers are this stage's job, so their absence must not change
@@ -744,11 +775,11 @@ async def build_preparation_snapshot(
         if decision.outcome == BLOCKED and decision.reason not in PREPARABLE_BLOCKS:
             # A per-booking difference this stage must not paper over.
             manual[decision.reason or "unknown"] += 1
-            operator_records.append(operator_record_row(record, block_reason=decision.reason))
+            operator_records.append(operator_record_row(record, branch=branch, block_reason=decision.reason))
             continue
         if decision.outcome == READY:
             ready_now += 1
-        operator_records.append(operator_record_row(record, block_reason=decision.reason))
+        operator_records.append(operator_record_row(record, branch=branch, block_reason=decision.reason))
         in_scope.append(record)
 
     # -- services -----------------------------------------------------------

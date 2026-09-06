@@ -46,6 +46,58 @@ from urllib.parse import urlsplit
 
 from altegio_bot.easyweek_normalizer import MAX_BOOKING_HASH_ID_LEN, normalize_booking_hash_id
 
+# ---------------------------------------------------------------------------
+# The visit limit (plan §31.11)
+# ---------------------------------------------------------------------------
+# One rule, three places: the planner earns a review, the outbox sends one and
+# the preflight audits the backlog. Written here so all three ask exactly the
+# same question of exactly the same stored fact.
+#
+# The source of truth is never guessed. EasyWeek states the customer's full
+# historical total in the root `booking-succeeded.visits_total`; PR-11
+# normalises it strictly, proves the customer id and stores a monotonic
+# snapshot on `Client` with the instant it changed. No Altegio API call, no
+# counting of local records, no invented field on `GET /customers/{uuid}` and
+# no payload value: a job's payload records what was true when it was planned,
+# which is precisely what a send-time guard must not trust.
+
+# Stable, PII-free verdicts. They reach `job.last_error`, the preflight report
+# and the handover report.
+VISIT_LIMIT_ELIGIBLE: Final = "review_visit_count_eligible"
+VISIT_LIMIT_EXCEEDED: Final = "review_visit_limit_exceeded"
+VISIT_COUNT_UNPROVEN: Final = "review_visit_count_unproven"
+VISIT_COUNTER_DISABLED: Final = "review_visit_counter_disabled"
+
+
+def visit_limit_verdict(
+    *,
+    max_visits: int,
+    visits_total: object,
+    updated_at: object,
+    at_least: int | None = None,
+) -> str:
+    """Is this customer still eligible for a review request?
+
+    ``visits_total == max`` is still eligible and ``> max`` is not: the number
+    includes the visit that just finished, because the counter processes the
+    same `booking-succeeded` before the review is planned.
+
+    Everything unproven refuses. A missing count, a count that is not an exact
+    integer (``True`` is not 1 here), a count with no paired instant — the two
+    columns are one fact — or a snapshot that cannot even account for the total
+    the delivery in hand carried. `at_least` is that last check: the counter ran
+    first in the same transaction, so a smaller snapshot means it did not store
+    this visit and the number in front of us is stale.
+    """
+    if type(visits_total) is not int or visits_total < 0:
+        return VISIT_COUNT_UNPROVEN
+    if updated_at is None:
+        return VISIT_COUNT_UNPROVEN
+    if at_least is not None and visits_total < at_least:
+        return VISIT_COUNT_UNPROVEN
+    return VISIT_LIMIT_ELIGIBLE if visits_total <= max_visits else VISIT_LIMIT_EXCEEDED
+
+
 # How long after the appointment we ask. Three days is the product decision the
 # Altegio path already uses; PR-9 keeps it rather than inventing a second one.
 REVIEW_DELAY: Final = timedelta(days=3)

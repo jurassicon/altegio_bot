@@ -500,6 +500,56 @@ def test_a_hand_stretched_slot_is_blocked_not_rounded(manifest, directory, cutov
     assert decision.reason == BLOCK_CUSTOM_DURATION
 
 
+def test_an_explicit_staff_policy_normalizes_duration_to_the_catalogue(directory, cutover):
+    payload = json.loads(manifest_text())
+    payload["branches"][str(KARLSRUHE_COMPANY_ID)]["normalize_duration_to_catalog_for_staff_ids"] = [KA_STAFF_ID]
+    manifest = parse_manifest(json.dumps(payload))
+    assert manifest.valid
+
+    decision = classify(
+        record(
+            seance_length=5400,
+            services=[
+                {
+                    "id": KA_SERVICE_ID,
+                    "cost": 90.0,
+                    "cost_to_pay": 90.0,
+                    "seance_length": 5400,
+                    "amount": 1,
+                }
+            ],
+        ),
+        manifest=manifest,
+        directory=directory,
+        cutover=cutover,
+    )
+
+    assert decision.outcome == READY
+    assert decision.source_booked_duration_minutes == 90
+    assert decision.duration_minutes == 60
+    assert decision.duration_normalized_to_catalog is True
+    assert decision.as_safe_dict()["target_duration_minutes"] == 60
+
+
+def test_duration_normalization_does_not_normalize_custom_price(directory, cutover):
+    payload = json.loads(manifest_text())
+    payload["branches"][str(KARLSRUHE_COMPANY_ID)]["normalize_duration_to_catalog_for_staff_ids"] = [KA_STAFF_ID]
+    manifest = parse_manifest(json.dumps(payload))
+    assert manifest.valid
+
+    decision = classify(
+        record(
+            seance_length=5400,
+            services=[{"id": KA_SERVICE_ID, "cost": 90.0, "cost_to_pay": 70.0, "amount": 1}],
+        ),
+        manifest=manifest,
+        directory=directory,
+        cutover=cutover,
+    )
+    assert decision.outcome == BLOCKED
+    assert decision.reason == BLOCK_CUSTOM_PRICE
+
+
 def test_a_non_whole_minute_duration_is_blocked(manifest, directory, cutover):
     decision = classify(record(seance_length=3630), manifest=manifest, directory=directory, cutover=cutover)
     assert decision.outcome == BLOCKED

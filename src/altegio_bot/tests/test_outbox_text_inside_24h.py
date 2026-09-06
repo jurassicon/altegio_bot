@@ -103,6 +103,22 @@ class _EmptyResult:
         return None
 
 
+class _FakeSavepoint:
+    """What `session.begin_nested()` returns for a fake session.
+
+    The ownership lookup runs inside its own SAVEPOINT so a failed statement
+    cannot poison the caller's transaction. These fakes hold no transaction at
+    all, so the savepoint has nothing to undo — but it has to EXIST, or the
+    fixture would answer a question production never asks.
+    """
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[Any] = []
@@ -113,6 +129,9 @@ class FakeSession:
             self._pk += 1
             setattr(obj, "id", self._pk)
         self.added.append(obj)
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, *args: Any, **kwargs: Any) -> Any:
         """No ledger rows: this record was never migrated to EasyWeek.

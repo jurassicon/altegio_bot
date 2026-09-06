@@ -434,6 +434,7 @@ def _reviews_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     monkeypatch.setattr(
         settings,
         "easyweek_google_review_links",
@@ -741,12 +742,26 @@ async def test_the_reminder_payload_stays_minimal_and_carries_the_planned_start(
 REVIEW_URL = "https://g.page/r/CaV0vSmrSYkdEAE/review"
 
 
-def _succeeded(*, review_url: object = REVIEW_URL, **overrides) -> dict:
-    """A booking-succeeded delivery for the fixture booking."""
+def _succeeded(*, review_url: object = REVIEW_URL, visits_total: object = 1, **overrides) -> dict:
+    """A booking-succeeded delivery for the fixture booking.
+
+    `visits_total` is explicit, and it is the customer's FIRST visit by default.
+    Plan §31.11 makes a review conditional on a proven count of at most
+    `MAX_VISITS_FOR_REVIEW`, so a positive review test has to state a count it
+    is allowed to earn a review with rather than inherit one. A test about the
+    limit passes its own number; one about a missing count passes ``None``.
+    """
     payload = booking_created()
     payload["booking_status"] = "Succeeded appointment"
     if review_url is not _UNSET_REVIEW:
         payload["review_url"] = review_url
+    if visits_total is not None:
+        payload["visits_total"] = visits_total
+    else:
+        # The base fixture states a first visit, so "no count at all" has to be
+        # written by REMOVING the field — leaving the fixture's own number would
+        # test the opposite of what the caller asked for.
+        payload.pop("visits_total", None)
     payload.update(overrides)
     return payload
 
@@ -1081,6 +1096,7 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
     """Never destroyed by a configuration state, only deferred."""
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     monkeypatch.setattr(
         settings, "easyweek_google_review_links", json.dumps({str(TEST_LOCATION_ID): REVIEW_URL}), raising=False
     )
@@ -1088,6 +1104,11 @@ async def test_a_succeeded_delivery_waits_until_both_switches_are_on(
 
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", notifications, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", reviews, raising=False)
+    # This test is about the two REVIEW switches, so the delivery carries no
+    # visit evidence: the visit counter is deliberately not under the
+    # notifications switch (PR-11) and would otherwise claim and terminalize the
+    # event on its own, which is a different contract with its own tests.
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", False, raising=False)
 
     async with bound_session_local() as session:
         async with session.begin():
@@ -1119,6 +1140,7 @@ async def test_turning_both_switches_on_processes_the_waiting_delivery_once(boun
     assert await _review_jobs(bound_session_local) == []
 
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     await _run_until_idle()
 
     assert len(await _review_jobs(bound_session_local)) == 1
@@ -5210,3 +5232,252 @@ async def test_a_category_config_race_gets_the_same_deferral(bound_session_local
     assert blocked.next_retry_at is not None, "categories get the same starvation guard as the link map"
     assert blocked.processing_attempts == 0
     assert later.status == "processed"
+
+
+# --- the visit limit, plan §31.11 -------------------------------------------
+#
+# A review is asked for once, while the customer is still new here: at most
+# `MAX_VISITS_FOR_REVIEW` visits, the finished one included. The number is the
+# snapshot PR-11 stored from THIS delivery's root `visits_total` — never an
+# Altegio call, never a count of local records, never a payload of the job.
+
+
+async def _client_snapshot(session_maker) -> tuple:
+    async with session_maker() as session:
+        client = (
+            (
+                await session.execute(
+                    select(Client).where(Client.provider == "easyweek").where(Client.company_id == TEST_LOCATION_ID)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        return (client.easyweek_visits_total, client.easyweek_visits_total_updated_at)
+
+
+async def test_the_third_visit_still_earns_exactly_one_review(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session,
+                _at(_succeeded(visits_total=3), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash="h-v3",
+            )
+    await _run_until_idle()
+
+    total, updated_at = await _client_snapshot(bound_session_local)
+    assert (total, updated_at is not None) == (3, True), "the counter ran before the review was planned"
+
+    jobs = await _review_jobs(bound_session_local)
+    assert len(jobs) == 1
+    assert jobs[0].status == "queued"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+
+
+async def test_the_fourth_visit_earns_no_review_and_the_delivery_is_still_finished(
+    bound_session_local, _reviews_on
+) -> None:
+    """Over the limit is a DECISION, not a failure: nothing to retry, nothing to send."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session,
+                _at(_succeeded(visits_total=4), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash="h-v4",
+            )
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == []
+    assert (await _client_snapshot(bound_session_local))[0] == 4, "the counter still recorded the visit"
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"
+        assert event.error_code is None
+        assert event.next_retry_at is None
+
+
+@pytest.mark.parametrize(
+    ("label", "visits_total"),
+    [
+        ("boolean", True),
+        ("string", "3"),
+        ("float", 3.0),
+        ("missing", None),
+        ("zero", 0),
+        ("negative", -1),
+    ],
+)
+async def test_an_unusable_visit_count_earns_no_review(
+    bound_session_local, _reviews_on, label: str, visits_total: object
+) -> None:
+    """The count is evidence. Anything that is not a plain positive int is none.
+
+    The payload is immutable, so this is terminal: no job now and no job on a
+    redrive, and the snapshot stays unwritten rather than guessing a number.
+    """
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session,
+                _at(_succeeded(visits_total=visits_total), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash=f"h-bad-{label}",
+            )
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == [], label
+    assert await _client_snapshot(bound_session_local) == (None, None), label
+
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed", label
+
+
+async def test_a_resend_at_the_limit_earns_no_second_review(bound_session_local, _reviews_on) -> None:
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    for payload_hash in ("h-v3", "h-v3-resend"):
+        async with bound_session_local() as session:
+            async with session.begin():
+                await _capture(
+                    session,
+                    _at(_succeeded(visits_total=3), starts_at),
+                    event_hint="booking-succeeded",
+                    payload_hash=payload_hash,
+                )
+        await _run_until_idle()
+
+    assert len(await _review_jobs(bound_session_local)) == 1
+    assert (await _client_snapshot(bound_session_local))[0] == 3, "a resend is not a fourth visit"
+
+
+async def test_a_snapshot_smaller_than_this_delivery_is_not_proof(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """The stored count must cover THIS visit, or it proves nothing about it.
+
+    The counter is suppressed here to reproduce the only state that can produce
+    it in production — a snapshot written by an earlier delivery while this one's
+    own visit was never stored. One below the limit is still not permission when
+    the delivery itself says the customer is further along.
+    """
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            client = (await session.execute(select(Client).where(Client.provider == "easyweek"))).scalars().one()
+            client.easyweek_visits_total = 1
+            client.easyweek_visits_total_updated_at = utcnow()
+
+    async def _counter_did_not_store(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(worker, "record_visit_counter", _counter_did_not_store)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _at(_succeeded(visits_total=3), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash="h-stale",
+            )
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == []
+    assert (await _client_snapshot(bound_session_local))[0] == 1, "nothing rewrote the stale snapshot"
+
+
+async def test_another_branchs_client_count_is_never_consulted(bound_session_local, _reviews_on) -> None:
+    """The count is provider- and company-scoped like every other identity here."""
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    provider="easyweek",
+                    company_id=FOREIGN_LOCATION_ID,
+                    altegio_client_id=TEST_CUSTOMER_ID,
+                    display_name="Foreign namesake",
+                    easyweek_visits_total=1,
+                    easyweek_visits_total_updated_at=utcnow(),
+                )
+            )
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _at(_succeeded(visits_total=4), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash="h-foreign",
+            )
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == [], "a foreign row cannot vouch for this customer"
+
+    async with bound_session_local() as session:
+        foreign = (
+            (await session.execute(select(Client).where(Client.company_id == FOREIGN_LOCATION_ID))).scalars().one()
+        )
+        assert foreign.easyweek_visits_total == 1, "and this delivery cannot move it either"
+
+
+async def test_a_disabled_visit_counter_defers_the_delivery_instead_of_spending_it(
+    bound_session_local, _reviews_on, monkeypatch
+) -> None:
+    """A flag somebody turned off must not consume a real finished visit.
+
+    The customer's third visit happens once. Terminalising on a configuration
+    state would mean they can never be asked, so the delivery waits — bounded by
+    the moment the review itself stops being possible — and is planned in full
+    as soon as the counter is back.
+    """
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", False, raising=False)
+    starts_at = await _seed_lifecycle(bound_session_local)
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            event_id = await _capture(
+                session,
+                _at(_succeeded(visits_total=3), starts_at),
+                event_hint="booking-succeeded",
+                payload_hash="h-counter-off",
+            )
+    await _run_until_idle()
+
+    assert await _review_jobs(bound_session_local) == []
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "captured", "deferred, not lost"
+        assert event.processed_at is None
+        assert event.next_retry_at is not None, "bounded retry, never a busy loop"
+
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    # The deferral carries a retry delay, so a fixed configuration is picked up
+    # at the next attempt rather than in a busy loop. The test skips the wait
+    # instead of sleeping through it.
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(update(EasyWeekEvent).where(EasyWeekEvent.id == event_id).values(next_retry_at=None))
+    await _run_until_idle()
+
+    assert len(await _review_jobs(bound_session_local)) == 1
+    assert (await _client_snapshot(bound_session_local))[0] == 3
+    async with bound_session_local() as session:
+        event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
+        assert event.status == "processed"

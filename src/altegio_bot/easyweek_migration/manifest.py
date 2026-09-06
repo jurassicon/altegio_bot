@@ -122,6 +122,7 @@ _BRANCH_FIELDS: Final = frozenset(
         "services",
     }
 )
+_BRANCH_OPTIONAL_FIELDS: Final = frozenset({"normalize_duration_to_catalog_for_staff_ids"})
 
 _TOP_LEVEL_FIELDS: Final = frozenset({"manifest_id", "branches"})
 
@@ -224,6 +225,11 @@ class BranchMapping:
     # parser refuses a manifest where they overlap.
     selected_staff_ids: frozenset[int]
     deferred_staff_ids: frozenset[int]
+    # Explicit, durable operator policy. Only these staff ids may have a source
+    # booking duration replaced by the sum of the reviewed EasyWeek catalogue
+    # durations. Omitted in every legacy manifest, which preserves fail-closed
+    # exact-duration behaviour by default.
+    normalize_duration_to_catalog_for_staff_ids: frozenset[int]
     # Altegio staff id → EasyWeek staff uuid, scoped to THIS company.
     staff: dict[int, str]
     # Altegio service id → its EasyWeek target and catalogue baseline, scoped to
@@ -249,6 +255,10 @@ class BranchMapping:
         if altegio_staff_id in self.deferred_staff_ids:
             return STAFF_DEFERRED
         return STAFF_UNKNOWN
+
+    def normalizes_duration_to_catalog(self, altegio_staff_id: object) -> bool:
+        """Whether this exact staff id has an operator-approved normalization."""
+        return type(altegio_staff_id) is int and altegio_staff_id in self.normalize_duration_to_catalog_for_staff_ids
 
     def service(self, altegio_service_id: object) -> ServiceMapping | None:
         """Exact lookup only. An unmapped or non-integer id resolves to nothing."""
@@ -324,6 +334,9 @@ class MigrationManifest:
                     ),
                     "selected_staff_ids": sorted(branch.selected_staff_ids),
                     "deferred_staff_ids": sorted(branch.deferred_staff_ids),
+                    "normalize_duration_to_catalog_for_staff_ids": sorted(
+                        branch.normalize_duration_to_catalog_for_staff_ids
+                    ),
                 }
                 for _company_id, branch in sorted(self.branches.items())
             ],
@@ -534,6 +547,9 @@ def _canonical_digest(manifest_id: str, branches: dict[int, BranchMapping]) -> s
                 # reviewed plan and the canary proof along with it.
                 "selected_staff": sorted(branch.selected_staff_ids),
                 "deferred_staff": sorted(branch.deferred_staff_ids),
+                "normalize_duration_to_catalog_for_staff_ids": sorted(
+                    branch.normalize_duration_to_catalog_for_staff_ids
+                ),
                 "staff": sorted(branch.staff.items()),
                 # Name and currency are in here for the same reason the
                 # selector is: they are part of WHAT the operator approved. A
@@ -629,7 +645,11 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         if str(keyed_company_id) != key:
             return _invalid(INVALID_SHAPE)
 
-        if not isinstance(entry, dict) or frozenset(entry) != _BRANCH_FIELDS:
+        if (
+            not isinstance(entry, dict)
+            or not _BRANCH_FIELDS <= frozenset(entry)
+            or frozenset(entry) - _BRANCH_FIELDS - _BRANCH_OPTIONAL_FIELDS
+        ):
             return _invalid(INVALID_SHAPE)
 
         company_id = _positive_id(entry.get("altegio_company_id"), maximum=PG_BIGINT_MAX)
@@ -667,7 +687,8 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
 
         selected = _parse_staff_id_list(entry.get("selected_altegio_staff_ids"))
         deferred = _parse_staff_id_list(entry.get("deferred_altegio_staff_ids"))
-        if selected is None or deferred is None:
+        normalize_duration = _parse_staff_id_list(entry.get("normalize_duration_to_catalog_for_staff_ids", []))
+        if selected is None or deferred is None or normalize_duration is None:
             return _invalid(INVALID_SHAPE)
 
         # A master cannot be both migrating now and deliberately postponed. The
@@ -681,6 +702,8 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
         # you meant to leave her out, say so in `deferred_altegio_staff_ids`.
         if selected - set(staff):
             return _invalid(INVALID_SELECTED_STAFF_UNMAPPED)
+        if normalize_duration - set(staff) or normalize_duration - (selected | deferred):
+            return _invalid(INVALID_SHAPE)
 
         branches[company_id] = BranchMapping(
             altegio_company_id=company_id,
@@ -688,6 +711,7 @@ def _parse(raw: object, *, allow_empty_mappings: bool) -> MigrationManifest:
             easyweek_location_uuid=location_uuid,
             selected_staff_ids=selected,
             deferred_staff_ids=deferred,
+            normalize_duration_to_catalog_for_staff_ids=normalize_duration,
             staff=staff,
             services=services,
         )

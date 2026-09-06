@@ -11,6 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.altegio_records import count_attended_client_visits
 from altegio_bot.db import SessionLocal  # noqa: F401 – re-exported
 from altegio_bot.models.models import Client, MessageJob, Record
+from altegio_bot.post_booking_ownership import (
+    PostBookingOwner,
+    PostBookingOwnershipUnproven,
+    altegio_post_booking_jobs_are_suppressed,
+)
 from altegio_bot.reminder_ownership import altegio_reminders_are_suppressed
 from altegio_bot.utils import utcnow
 
@@ -327,6 +332,42 @@ async def plan_jobs_for_record_event(
                 reminder_owner_state.value,
             )
 
+    # Post-booking marketing ownership fence (plan §31.7). A second, separate
+    # question from the one above, and asked for a different reason: §30 proves
+    # the EasyWeek reminders exist, while this proves the Altegio marketing
+    # obligations were given up with nothing created in their place.
+    #
+    # It guards the `review_3d`, `repeat_10d` and `comeback_3d` calls below and
+    # nothing else. `add_job` resurrects a `canceled` job on conflict, so
+    # without this a late `create` re-opens exactly what the handover withdrew,
+    # and a late `delete` plans a fresh `comeback_3d` for a booking that lives
+    # in EasyWeek now. A migrated booking that never had such a job can acquire
+    # its first one here — which is why the marker covers every eligible row.
+    #
+    # `UNKNOWN` suppresses too. Lifecycle jobs, reminders, campaigns and every
+    # unmigrated record are planned exactly as before.
+    post_booking_suppressed = False
+    if norm_status in ("create", "update", "delete"):
+        post_booking_suppressed, post_booking_owner_state = await altegio_post_booking_jobs_are_suppressed(
+            session,
+            company_id=cid,
+            altegio_record_id=_exact_int(getattr(record_obj, "altegio_record_id", None)),
+        )
+        if post_booking_owner_state is PostBookingOwner.UNKNOWN:
+            # Not an answer, and here it must not become a silent skip. This
+            # planner runs once per delivery and the caller acks the event, so
+            # returning quietly would drop the follow-up for good. Raising
+            # leaves the event `failed` with a stable reason a person can
+            # re-drive; nothing is created either way.
+            raise PostBookingOwnershipUnproven()
+        if post_booking_suppressed:
+            logger.info(
+                "altegio post-booking jobs suppressed company_id=%s record_id=%s owner=%s",
+                cid,
+                record_obj.id,
+                post_booking_owner_state.value,
+            )
+
     if norm_status in ("create", "update") and starts_at is not None and not reminders_suppressed:
         run_at_24h = starts_at - timedelta(hours=24)
         if run_at_24h > now:
@@ -362,7 +403,7 @@ async def plan_jobs_for_record_event(
 
     opted_out = bool(getattr(client_obj, "wa_opted_out", False))
 
-    if norm_status in ("create", "update") and not opted_out:
+    if norm_status in ("create", "update") and not opted_out and not post_booking_suppressed:
         if starts_at is not None:
             review_at = starts_at + timedelta(days=3)
             if review_at > now:
@@ -412,7 +453,7 @@ async def plan_jobs_for_record_event(
                     payload={"kind": REPEAT_10D},
                 )
 
-    if norm_status == "delete" and not opted_out:
+    if norm_status == "delete" and not opted_out and not post_booking_suppressed:
         already_queued = False
 
         if record_obj.client_id is not None:

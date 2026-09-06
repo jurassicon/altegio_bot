@@ -265,6 +265,11 @@ class _FakeClient:
 @dataclass
 class _FakeRecord:
     id: int = 10
+    company_id: int = 758285
+    # A real Altegio record carries its source id; the post-migration fences
+    # look the booking up by it, and an identity that cannot be stated is
+    # UNKNOWN rather than permission.
+    altegio_record_id: int | None = 777020
     client_id: int | None = 1
     starts_at: datetime | None = field(default_factory=lambda: NOW - timedelta(days=4))
     is_deleted: bool = False
@@ -275,6 +280,33 @@ class _FakeScalarResult:
     def scalar_one_or_none(self) -> None:
         return None
 
+    def all(self) -> list[Any]:
+        """No rows — including for the post-migration ownership lookups.
+
+        These fixtures are unmigrated bookings, so "no ledger row" is the
+        truthful answer and the ordinary Altegio path keeps owning them.
+        """
+        return []
+
+    def scalars(self) -> "_FakeScalarResult":
+        return self
+
+
+class _FakeSavepoint:
+    """What `session.begin_nested()` returns for a fake session.
+
+    The ownership lookup runs inside its own SAVEPOINT so a failed statement
+    cannot poison the caller's transaction. These fakes hold no transaction at
+    all, so the savepoint has nothing to undo — but it has to EXIST, or the
+    fixture would answer a question production never asks.
+    """
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
 
 class _FakeSession:
     def __init__(self) -> None:
@@ -282,6 +314,9 @@ class _FakeSession:
 
     def add(self, obj: Any) -> None:
         self.added.append(obj)
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, stmt: Any) -> _FakeScalarResult:
         return _FakeScalarResult()
