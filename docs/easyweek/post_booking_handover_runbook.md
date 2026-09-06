@@ -24,7 +24,7 @@
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-post-booking-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v1.json
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-post-booking-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v2.json
 ```
 
 Plan открывает PostgreSQL-транзакцию `SET TRANSACTION READ ONLY`, ничего не
@@ -41,7 +41,16 @@ Plan открывает PostgreSQL-транзакцию `SET TRANSACTION READ ON
 | `rows_without_source_job` | строки без job'ов; marker им нужен так же |
 | `rows_already_marked` | уже обработанные предыдущим apply |
 | `rows_with_source_target_overlap` | одна запись держит открытыми обе стороны |
+| `target_review_visit_buckets` | аудит открытых EasyWeek `review_3d` по визитному вердикту §31.11 |
 | `blockers` | стабильные STOP-коды; при непустом списке apply невозможен |
+
+`target_review_visit_buckets` — только наблюдение, PII-free и без имён клиентов:
+`review_visit_count_eligible` (доказанный счётчик в пределах лимита),
+`review_visit_limit_exceeded` (клиент уже пришёл больше раз, чем разрешает
+§31.11), `review_visit_count_unproven` (снимка нет или он непарный),
+`review_visit_counter_disabled` (счётчик выключен, вопрос сейчас не задаётся).
+Инструмент по этим числам **ничего не делает**: лишние review останавливает
+runtime send guard перед шаблоном, sender'ом, Outbox и Meta, а не handover.
 
 `apply_ready=false` → exit code 1, и CLI **не печатает** команду apply. Snapshot
 всё равно записывается как приватный диагностический артефакт (0600, каталог
@@ -62,7 +71,7 @@ cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
 trap 'dc start altegio-outbox-worker' EXIT INT TERM HUP
 dc stop altegio-outbox-worker
-EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY=true dc --profile ops run --rm --build --no-deps -T -e EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY=true easyweek-migration-post-booking-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v1.json --apply-report /migration/state/post_booking-apply.json --apply --plan-digest PLAN_DIGEST_ИЗ_ОТЧЁТА --confirm 'ФРАЗА_ИЗ_ОТЧЁТА'
+EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY=true dc --profile ops run --rm --build --no-deps -T -e EASYWEEK_POST_BOOKING_HANDOVER_ALLOW_APPLY=true easyweek-migration-post-booking-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v2.json --apply-report /migration/state/post_booking-apply.json --apply --plan-digest PLAN_DIGEST_ИЗ_ОТЧЁТА --confirm 'ФРАЗА_ИЗ_ОТЧЁТА'
 ```
 
 Проверить состояние worker'а независимо от trap:
@@ -93,12 +102,34 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-post-booking-handover verify --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v1.json --apply-report /migration/state/post_booking-apply.json
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-post-booking-handover verify --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/post_booking.v2.json --apply-report /migration/state/post_booking-apply.json
 ```
 
+Verify выполняется **после** возврата worker'а — так предписан порядок выше, и
+это означает, что EasyWeek jobs к моменту проверки живут своей обычной жизнью.
+Поэтому verify различает две разные вещи:
+
+| Что видит verify | Как трактуется |
+|---|---|
+| target job исчез или появился новый (набор ID изменился) | нарушение инварианта, `passed=false`, `target_job_set_changed` |
+| у target job изменился только статус (`queued` → `processing`/`done`/`canceled`) | штатная работа outbox worker'а; `passed` не меняется, изменение печатается в `target_job_transitions` |
+
 `passed=true` требует: marker у всех строк scope, живой §30-marker и closure,
-ноль открытых source jobs трёх типов, неизменные target jobs и scoped Outbox,
-совпадение counts с apply report.
+ноль открытых source jobs трёх типов, отсутствие source-side дрейфа, неизменный
+**набор** target jobs и scoped Outbox, совпадение counts с apply report.
+
+`passed=false` ставится только за реальное нарушение инварианта handover:
+отсутствующие identity или marker, открытый source job, source-side дрейф,
+несогласованный apply report или доказанная мутация target job самим
+инструментом. Сам apply доказывает точный набор и статусы target jobs **внутри
+своей транзакции** и не выполняет по ним ни одного UPDATE: его UPDATE ограничен
+`provider='altegio'`, source record и тремя типами.
+
+Ничего не скрывается: отчёт печатает и замороженное, и текущее состояние target
+jobs — `target_job_transitions` показывает переходы построчно
+(`ledger_id`, `job_id`, `frozen_status`, `current_status`), чтобы обычная работа
+EasyWeek outbox не выдавалась ни за действие оператора, ни за отсутствие
+изменений.
 
 ## 4. Повтор и новый plan
 
@@ -125,7 +156,8 @@ dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEG
 | `source_job_processing` | worker держит job; дождаться и повторить plan |
 | `source_job_outbox_non_terminal` | сообщение может быть в полёте; дождаться терминального статуса |
 | `source_job_set_changed` | появился job, которого plan не видел; новый plan |
-| `target_job_set_changed` | EasyWeek jobs изменились; новый plan |
+| `target_job_set_changed` | набор EasyWeek jobs изменился (исчез или появился); новый plan |
+| `source_job_outbox_set_changed` | Outbox source job'ов изменился между plan и apply; новый plan |
 | `post_booking_marker_conflict` | строку уже закрыл другой plan; разобрать вручную |
 | `snapshot_invalidated` | разрешение уничтожено новым plan; выполнить plan заново |
 | `database_lock_timeout` / `database_statement_timeout` | повторить в спокойный момент |

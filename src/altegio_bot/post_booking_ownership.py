@@ -128,17 +128,35 @@ async def post_booking_owner(
         .where(EasyWeekMigrationLedger.source_company_id == company_id)
         .where(EasyWeekMigrationLedger.source_record_id == altegio_record_id)
     )
+    # The read runs inside its OWN savepoint. Swallowing a DBAPIError in the
+    # caller's transaction left that transaction aborted: every later statement
+    # failed with `InFailedSQLTransaction`, so the inbox worker could not even
+    # write the `failed` status that would have made the event visible and
+    # re-drivable — the delivery vanished into a poisoned transaction instead.
+    #
+    # The savepoint is released on success and rolled back on failure, which
+    # leaves the outer transaction usable either way. A connection that is gone
+    # cannot be rolled back at all; that error is re-raised rather than reported
+    # as an answer, because pretending otherwise would claim a status nobody
+    # could store.
+    savepoint = await session.begin_nested()
     try:
         rows = list((await session.execute(stmt)).all())
     except Exception:
-        # The question could not be put to the database at all. That is not an
-        # answer, and it is certainly not permission.
+        try:
+            await savepoint.rollback()
+        except Exception:
+            # The connection itself is unusable. Not an ownership answer, and
+            # not something this module can recover from.
+            raise
         logger.error(
             "post-booking ownership lookup failed: company_id=%s source_record_id=%s",
             company_id,
             altegio_record_id,
         )
         return PostBookingOwner.UNKNOWN
+    else:
+        await savepoint.commit()
 
     if not rows:
         # No ledger row at all, or one for a different company. Never migrated

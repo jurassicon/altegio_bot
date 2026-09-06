@@ -84,6 +84,10 @@ def _pr9_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_reviews_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_review_send_enabled", False, raising=False)
+    # §31.11: the visit-counter contract is what makes a review provable at all,
+    # so the preflight's baseline has it on. "send on, counter off" has its own
+    # case below and is a red configuration, not a supported mode.
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_default_language", "de", raising=False)
     monkeypatch.setattr(settings, "easyweek_allowed_service_categories", json.dumps([CATEGORY]), raising=False)
     monkeypatch.setattr(
@@ -159,6 +163,7 @@ async def _seed_review(
     display_name: str | None = "Anna Müller",
     link_client: bool = True,
     suffix: str = "1",
+    visits_total: int | None = 1,
 ) -> MessageJob:
     """One queued review job with every surrounding row it needs."""
     start = starts_at or (utcnow() - timedelta(hours=1))
@@ -172,6 +177,14 @@ async def _seed_review(
         email="anna@example.invalid",
         wa_opted_out=opted_out,
         raw={},
+        # Plan §31.11: the preflight asks the same visit question the sender
+        # will. Stated explicitly — a first visit — so a green verdict here
+        # means a customer who is genuinely eligible, and the limit itself is
+        # exercised by its own cases below.
+        easyweek_visits_total=visits_total if provider == PROVIDER_EASYWEEK else None,
+        easyweek_visits_total_updated_at=(
+            utcnow() if provider == PROVIDER_EASYWEEK and visits_total is not None else None
+        ),
     )
     session.add(client)
     await session.flush()
@@ -1205,3 +1218,76 @@ async def test_an_unusable_location_registry_stops_before_the_queue(
     assert report.ready is False
     assert report.reasons == {}, "the queue must not be read at all"
     assert report.candidate_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Plan §31.11: the preflight sizes the backlog by visit verdict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "visits_total", "bucket", "green"),
+    [
+        ("at-the-limit", 3, "review_visit_count_eligible", True),
+        ("over-the-limit", 4, "review_visit_limit_exceeded", False),
+        ("no-snapshot", None, "review_visit_count_unproven", False),
+    ],
+)
+async def test_the_preflight_buckets_every_review_by_visit_verdict(
+    session_maker, label: str, visits_total: int | None, bucket: str, green: bool
+) -> None:
+    """The same question the sender asks, answered before the fence is opened."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, visits_total=visits_total)
+
+    report = await _run(session_maker)
+
+    assert report.visit_buckets == {bucket: 1}, label
+    assert report.as_safe_dict()["review_visit_buckets"] == {bucket: 1}
+    assert (report.reasons == {PROVEN: 1}) is green, label
+    assert report.ready is green, label
+    if not green:
+        assert report.reasons == {bucket: 1}, "the blocking reason names the visit verdict"
+
+
+async def test_a_review_blocked_for_another_reason_still_gets_a_visit_verdict(session_maker) -> None:
+    """The audit covers the whole backlog, not only the jobs that got that far.
+
+    `reasons` records what stopped a job FIRST. An operator sizing the queue
+    needs the visit answer for every job in it, including one already blocked by
+    a missing template.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, with_template=False, visits_total=4)
+
+    report = await _run(session_maker)
+
+    assert report.reasons == {REASON_TEMPLATE_MISSING: 1}
+    assert report.visit_buckets == {"review_visit_limit_exceeded": 1}
+
+
+async def test_a_switched_off_counter_is_red_for_every_review(session_maker, monkeypatch) -> None:
+    """ "Send on, counter off" is a red configuration: the send guard holds them all."""
+    monkeypatch.setattr(preflight.settings, "easyweek_visit_counter_enabled", False, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, visits_total=1)
+
+    report = await _run(session_maker)
+
+    assert report.visit_buckets == {"review_visit_counter_disabled": 1}
+    assert report.reasons == {"review_visit_counter_disabled": 1}
+    assert report.ready is False
+
+
+async def test_no_visit_bucket_carries_anything_but_a_count(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_review(session, visits_total=4)
+
+    payload = json.dumps((await _run(session_maker)).as_safe_dict()["review_visit_buckets"])
+
+    for leaked in ("phone", "@", "+49", "http", "uuid"):
+        assert leaked not in payload

@@ -101,12 +101,31 @@ class _EmptyResult:
         return None
 
 
+class _FakeSavepoint:
+    """What `session.begin_nested()` returns for a fake session.
+
+    The ownership lookup runs inside its own SAVEPOINT so a failed statement
+    cannot poison the caller's transaction. These fakes hold no transaction at
+    all, so the savepoint has nothing to undo — but it has to EXIST, or the
+    fixture would answer a question production never asks.
+    """
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[Any] = []
 
     def add(self, obj: Any) -> None:
         self.added.append(obj)
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
         """Answer the ownership lookups the worker now performs.
@@ -120,10 +139,9 @@ class FakeSession:
         """
         return _EmptyResult()
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Backfill script tests (no real DB; SessionLocal + API are patched)
-# ─────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # Backfill script tests (no real DB; SessionLocal + API are patched)
+    # ─────────────────────────────────────────────────────────────────────
 
 
 class _FakeSessionCtx:
@@ -151,6 +169,9 @@ class _FakeWriteSession:
 
     def begin(self) -> _FakeBeginCtx:
         return _FakeBeginCtx()
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, stmt: Any) -> None:
         self.executed.append(stmt)
@@ -182,6 +203,9 @@ class _Phase1Session:
         rows: list[tuple[int, int | None, int | None, int | None]],
     ) -> None:
         self._rows = rows
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, _stmt: Any) -> _FakeResult:
         return _FakeResult(self._rows)
@@ -616,6 +640,9 @@ FUTURE_STARTS_AT = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
 
 class _PlannerFakeSession:
     """Minimal async session for planner tests."""
+
+    async def begin_nested(self) -> "_FakeSavepoint":
+        return _FakeSavepoint()
 
     async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
         """The post-migration ownership lookups the planner now performs.

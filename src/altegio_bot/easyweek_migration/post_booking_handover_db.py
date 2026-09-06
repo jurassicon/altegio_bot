@@ -37,12 +37,14 @@ from altegio_bot.easyweek_migration.manifest import MigrationManifest
 from altegio_bot.easyweek_migration.post_booking_handover import (
     DEFAULT_MAX_SNAPSHOT_AGE_SEC,
     NON_TERMINAL_OUTBOX_STATUSES,
+    OPEN_JOB_STATUSES,
     POST_BOOKING_JOB_TYPES,
     STOP_CONFIGURATION_CHANGED,
     STOP_LEDGER_SCOPE_CHANGED,
     STOP_MANIFEST_SCOPE,
     STOP_MARKER_CONFLICT,
     STOP_NON_TERMINAL_OUTBOX,
+    STOP_OUTBOX_SET_CHANGED,
     STOP_PLAN_TRANSACTION,
     STOP_REMINDER_HANDOVER_INCOMPLETE,
     STOP_SNAPSHOT_EMPTY,
@@ -56,20 +58,30 @@ from altegio_bot.easyweek_migration.post_booking_handover import (
     STOP_WAVE_UNRESOLVED,
     FrozenPostBookingPlan,
     JobRef,
+    OutboxRef,
     PostBookingApplyReport,
     PostBookingPlan,
     ScopeRow,
 )
 from altegio_bot.easyweek_migration.reminder_handover import canonical_uuid, validate_run_ids
+from altegio_bot.easyweek_policy import REVIEW_3D
+from altegio_bot.easyweek_review import (
+    VISIT_COUNT_UNPROVEN,
+    VISIT_COUNTER_DISABLED,
+    visit_limit_verdict,
+)
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    Client,
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
     Record,
 )
 from altegio_bot.post_booking_ownership import REASON_HANDED_OVER
+from altegio_bot.settings import settings
 
 logger = logging.getLogger("easyweek_migration.post_booking_handover")
 
@@ -122,23 +134,27 @@ async def _jobs_for(session: AsyncSession, *, provider: str, record_pk: int) -> 
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def _non_terminal_outbox_ids(session: AsyncSession, job_ids: list[int]) -> tuple[int, ...]:
-    """Outbox rows of those jobs that may still be in flight.
+async def _outbox_rows(session: AsyncSession, job_ids: list[int]) -> tuple[OutboxRef, ...]:
+    """EVERY Outbox row of those jobs, with its status.
 
     Keyed on `job_id`, not on the record: this asks about the messages these
-    exact jobs produced. A terminal row — sent, delivered, read, failed,
-    canceled — is history and is deliberately not returned; the handover never
-    rewrites it and never pretends to recall a message.
+    exact jobs produced. Freezing only the non-terminal ones made a send that
+    happened between the plan and the moment the worker was stopped invisible —
+    it lands as a terminal row the plan never saw, and the wave would then be
+    withdrawn as if nothing had been delivered. The handover still never
+    rewrites a terminal row; it has to be able to SEE one appear.
     """
     if not job_ids:
         return ()
     stmt = (
-        select(OutboxMessage.id)
+        select(OutboxMessage.id, OutboxMessage.job_id, OutboxMessage.status)
         .where(OutboxMessage.job_id.in_(job_ids))
-        .where(OutboxMessage.status.in_(NON_TERMINAL_OUTBOX_STATUSES))
         .order_by(OutboxMessage.id.asc())
     )
-    return tuple(int(value) for (value,) in (await session.execute(stmt)).all())
+    return tuple(
+        OutboxRef(outbox_id=int(outbox_id), job_id=int(job_id), status=str(status))
+        for outbox_id, job_id, status in (await session.execute(stmt)).all()
+    )
 
 
 def _job_refs(jobs: list[MessageJob]) -> tuple[JobRef, ...]:
@@ -146,6 +162,47 @@ def _job_refs(jobs: list[MessageJob]) -> tuple[JobRef, ...]:
         JobRef(job_id=int(job.id), job_type=str(job.job_type), status=str(job.status))
         for job in sorted(jobs, key=lambda item: int(item.id))
     )
+
+
+async def _review_visit_verdicts(
+    session: AsyncSession,
+    *,
+    target: Record,
+    target_jobs: list[MessageJob],
+) -> list[str]:
+    """The visit verdict of every OPEN target `review_3d` of this booking.
+
+    Read-only and advisory. It answers the same question the send guard asks —
+    from the same stored snapshot, never from a payload or an Altegio call — so
+    the operator's report and the runtime agree about what the backlog holds.
+    """
+    open_reviews = [job for job in target_jobs if job.job_type == REVIEW_3D and job.status in OPEN_JOB_STATUSES]
+    if not open_reviews:
+        return []
+    if not settings.easyweek_visit_counter_enabled:
+        return [VISIT_COUNTER_DISABLED] * len(open_reviews)
+    client = None
+    if target.client_id is not None:
+        client = (
+            (
+                await session.execute(
+                    select(Client)
+                    .where(Client.id == target.client_id)
+                    .where(Client.provider == PROVIDER_EASYWEEK)
+                    .where(Client.company_id == target.company_id)
+                )
+            )
+            .scalars()
+            .one_or_none()
+        )
+    if client is None:
+        return [VISIT_COUNT_UNPROVEN] * len(open_reviews)
+    verdict = visit_limit_verdict(
+        max_visits=MAX_VISITS_FOR_REVIEW,
+        visits_total=client.easyweek_visits_total,
+        updated_at=client.easyweek_visits_total_updated_at,
+    )
+    return [verdict] * len(open_reviews)
 
 
 async def build_plan(
@@ -196,6 +253,7 @@ async def build_plan(
                 wave_closed = False
 
     rows: list[ScopeRow] = []
+    review_buckets: dict[str, int] = {}
     for entry in created:
         booking_uuid = canonical_uuid(entry.target_booking_uuid)
         if booking_uuid is None:
@@ -251,7 +309,16 @@ async def build_plan(
 
         source_jobs = await _jobs_for(session, provider=PROVIDER_ALTEGIO, record_pk=int(source.id))
         target_jobs = await _jobs_for(session, provider=PROVIDER_EASYWEEK, record_pk=int(target.id))
-        outbox = await _non_terminal_outbox_ids(session, [int(job.id) for job in source_jobs])
+        outbox = await _outbox_rows(session, [int(job.id) for job in source_jobs])
+
+        # Audit only (plan §31.11). The open target `review_3d` of this booking
+        # is bucketed by the SAME visit question the sender will ask, so an
+        # operator can see how much of the EasyWeek backlog is provably
+        # eligible before the send fence is opened. The handover changes none
+        # of them: whatever is over the limit is stopped by the runtime send
+        # guard, not by this tool.
+        for verdict in await _review_visit_verdicts(session, target=target, target_jobs=target_jobs):
+            review_buckets[verdict] = review_buckets.get(verdict, 0) + 1
 
         rows.append(
             ScopeRow(
@@ -267,7 +334,7 @@ async def build_plan(
                 post_booking_digest=entry.post_booking_handover_plan_digest,
                 source_jobs=_job_refs(source_jobs),
                 target_jobs=_job_refs(target_jobs),
-                non_terminal_outbox_ids=outbox,
+                outbox_rows=outbox,
             )
         )
 
@@ -283,6 +350,7 @@ async def build_plan(
         eligible_created_rows=len(created),
         unresolved_rows=unresolved,
         wave_closed=wave_closed,
+        target_review_visit_buckets=review_buckets,
     )
 
 
@@ -458,10 +526,38 @@ async def _apply_inner(
         ):
             return PostBookingApplyResult(halted=STOP_TARGET_RECORD)
 
-        # -- 2. the COMPLETE current job sets, not the frozen ids ----------
+        # -- 2. the COMPLETE current job set, by id AND status -------------
+        # Comparing only for ADDED ids was not enough. A job that went
+        # `queued -> done` between the plan and the apply had been sent; one
+        # that vanished cannot be re-proven at all; one cancelled by somebody
+        # else with another reason is not this handover's work. Each of those
+        # left the operator a report claiming a withdrawal that never described
+        # what happened, so the whole set is compared exactly.
+        #
+        # One difference is allowed, and only one: the exact repeat of a digest
+        # that has already been applied, where a job this snapshot froze as
+        # `queued` is now `canceled` by THIS handover's own reason and the row
+        # already carries THIS digest. That is what makes a re-run idempotent
+        # rather than a permanent refusal.
         source_jobs = await _jobs_for(session, provider=PROVIDER_ALTEGIO, record_pk=int(row["source_record_pk"]))
         frozen_source = {int(item["job_id"]): str(item["status"]) for item in row["source_jobs"]}
         current_source = {int(job.id): str(job.status) for job in source_jobs}
+        by_id = {int(job.id): job for job in source_jobs}
+        repeat_of_this_digest = entry.post_booking_handover_plan_digest == frozen.digest
+
+        for job_id, frozen_status in frozen_source.items():
+            current_status = current_source.get(job_id)
+            if current_status == frozen_status:
+                continue
+            withdrawn_by_us = (
+                repeat_of_this_digest
+                and frozen_status == "queued"
+                and current_status == "canceled"
+                and by_id[job_id].last_error == CANCEL_REASON
+            )
+            if not withdrawn_by_us:
+                # Gone, moved on, or cancelled by somebody else.
+                return PostBookingApplyResult(halted=STOP_SOURCE_JOB_SET_CHANGED)
         if set(current_source) - set(frozen_source):
             # A job the plan never saw. It is exactly the one that would survive
             # this handover, so the wave stops instead.
@@ -472,8 +568,16 @@ async def _apply_inner(
             # let this tool claim it withdrew a message somebody has been sent.
             return PostBookingApplyResult(halted=STOP_SOURCE_PROCESSING)
 
-        live_outbox = await _non_terminal_outbox_ids(session, list(current_source))
-        if live_outbox:
+        # The Outbox, compared the same way. A row that appeared after the plan
+        # is a message that went out in between — terminal by the time we look,
+        # and invisible to a check that only asked whether anything was still in
+        # flight. Both directions stop the wave: a new row, a vanished row, or
+        # one whose status moved.
+        live_outbox = await _outbox_rows(session, list(current_source))
+        frozen_outbox = {int(item["outbox_id"]): str(item["status"]) for item in row["outbox_rows"]}
+        if {item.outbox_id: item.status for item in live_outbox} != frozen_outbox:
+            return PostBookingApplyResult(halted=STOP_OUTBOX_SET_CHANGED)
+        if any(item.status in NON_TERMINAL_OUTBOX_STATUSES for item in live_outbox):
             return PostBookingApplyResult(halted=STOP_NON_TERMINAL_OUTBOX)
 
         target_jobs = await _jobs_for(session, provider=PROVIDER_EASYWEEK, record_pk=int(row["target_record_pk"]))
@@ -514,16 +618,7 @@ async def _apply_inner(
                 return PostBookingApplyResult(halted=STOP_SOURCE_JOB_SET_CHANGED)
             canceled.extend(changed)
 
-        outbox_ids.extend(
-            int(value)
-            for (value,) in (
-                await session.execute(
-                    select(OutboxMessage.id)
-                    .where(OutboxMessage.job_id.in_(list(current_source) or [0]))
-                    .order_by(OutboxMessage.id.asc())
-                )
-            ).all()
-        )
+        outbox_ids.extend(item.outbox_id for item in live_outbox)
 
         # -- 4. the durable marker, for every row of the scope -------------
         # Including rows with no job at all: without it a late Altegio delivery
@@ -622,19 +717,41 @@ async def verify_handover(
     open_source: list[int] = []
     target_now: list[int] = []
     target_changed: list[int] = []
+    target_transitions: list[dict[str, Any]] = []
     outbox_now: list[int] = []
     for row in frozen.rows:
         source_jobs = await _jobs_for(session, provider=PROVIDER_ALTEGIO, record_pk=int(row["source_record_pk"]))
         open_source.extend(int(job.id) for job in source_jobs if job.status in {"queued", "processing"})
         target_jobs = await _jobs_for(session, provider=PROVIDER_EASYWEEK, record_pk=int(row["target_record_pk"]))
         target_now.extend(int(job.id) for job in target_jobs)
-        # Ids AND statuses. Comparing ids alone let a target `review_3d` be
-        # cancelled after the apply and still pass the check whose whole job is
-        # to prove the EasyWeek side was left exactly as it was reviewed.
-        if {int(job.id): str(job.status) for job in target_jobs} != {
-            int(item["job_id"]): str(item["status"]) for item in row["target_jobs"]
-        }:
+        # Two different questions, and only one of them is a failure.
+        #
+        # The rollout restarts the outbox worker BEFORE verify, deliberately, so
+        # a target `review_3d` may legitimately move `queued -> processing ->
+        # done` or be cancelled by its own send guard between the apply and this
+        # read. That is the EasyWeek side doing its job, not this tool touching
+        # it, and failing on it would make the documented rollout report a
+        # violation every time.
+        #
+        # What the handover must never do is change the SET: it issues no
+        # UPDATE against an EasyWeek job and creates none, so an id that
+        # appeared or vanished is the only thing that could implicate it. The
+        # apply proves the statuses inside its own transaction, where nothing
+        # else can be running; here they are reported, not judged.
+        current_target = {int(job.id): str(job.status) for job in target_jobs}
+        frozen_target = {int(item["job_id"]): str(item["status"]) for item in row["target_jobs"]}
+        if set(current_target) != set(frozen_target):
             target_changed.append(int(row["ledger_id"]))
+        for job_id, status in sorted(current_target.items()):
+            if frozen_target.get(job_id) != status:
+                target_transitions.append(
+                    {
+                        "ledger_id": int(row["ledger_id"]),
+                        "job_id": job_id,
+                        "frozen_status": frozen_target.get(job_id),
+                        "current_status": status,
+                    }
+                )
         outbox_now.extend(
             int(value)
             for (value,) in (
@@ -660,7 +777,10 @@ async def verify_handover(
             "rows_missing_reminder_marker": sorted(set(lost_reminder_marker)),
             "open_source_job_ids": sorted(set(open_source)),
             "target_job_ids": sorted(set(target_now)),
+            # A CHANGED SET is a violation; a changed status is ordinary
+            # EasyWeek work and is reported separately so nothing is hidden.
             "rows_with_changed_target_jobs": sorted(set(target_changed)),
+            "target_job_transitions": target_transitions,
             "scoped_outbox_ids": sorted(set(outbox_now)),
             "wave_closed": wave_closed,
             "report_marked": sorted(set(report.marked_ledger_ids) | set(report.already_marked_ledger_ids)),

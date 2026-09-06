@@ -52,11 +52,17 @@ from altegio_bot.easyweek_review import (
     REVIEW_LINK_MISSING,
     REVIEW_LINKS_INVALID,
     REVIEW_LINKS_UNCONFIGURED,
+    VISIT_COUNT_UNPROVEN,
+    VISIT_COUNTER_DISABLED,
+    VISIT_LIMIT_ELIGIBLE,
+    VISIT_LIMIT_EXCEEDED,
     google_review_url_for_company,
     parse_google_review_links,
     validate_google_review_url,
+    visit_limit_verdict,
 )
 from altegio_bot.easyweek_service_category import evaluate_service_category
+from altegio_bot.message_planner import MAX_VISITS_FOR_REVIEW
 from altegio_bot.meta_templates import build_lifecycle_template_params
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
@@ -99,6 +105,14 @@ REASON_REVIEW_LINKS_INCOMPLETE: Final = "review_links_incomplete"
 REASON_LOCATION_REGISTRY_UNCONFIGURED: Final = "location_registry_unconfigured"
 REASON_LOCATION_REGISTRY_INVALID: Final = "location_registry_invalid"
 REASON_CATEGORY: Final = "category_not_allowed"
+# Plan §31.11. The three buckets an operator needs before opening the send
+# fence: how much of the backlog is provably eligible, how much is over the
+# limit and will be cancelled by the send guard, and how much cannot be proven
+# either way. Imported rather than re-spelled so the preflight, the planner and
+# the sender cannot drift apart.
+REASON_VISIT_LIMIT_EXCEEDED: Final = VISIT_LIMIT_EXCEEDED
+REASON_VISIT_COUNT_UNPROVEN: Final = VISIT_COUNT_UNPROVEN
+REASON_VISIT_COUNTER_DISABLED: Final = VISIT_COUNTER_DISABLED
 REASON_CATEGORY_CONFIG: Final = "category_configuration_unavailable"
 REASON_DEADLINE: Final = "deadline_expired"
 REASON_TEMPLATE_MISSING: Final = "template_row_missing"
@@ -129,6 +143,11 @@ class ReviewPreflightReport:
     # world that no longer exists.
     config_error: str | None = None
     reasons: Counter = field(default_factory=Counter)
+    # Plan §31.11, counts only. Kept apart from `reasons` because the visit
+    # question has an answer for EVERY checked job, including the ones blocked
+    # for an unrelated reason: an operator sizing the backlog needs to know how
+    # much of it is provably eligible, not only which job failed first.
+    visit_buckets: Counter = field(default_factory=Counter)
     blocked_job_ids: list[int] = field(default_factory=list)
     blocked_record_ids: list[int] = field(default_factory=list)
     company_ids: set[int] = field(default_factory=set)
@@ -170,6 +189,7 @@ class ReviewPreflightReport:
             "blocked_count": self.blocked_count,
             "truncated": self.truncated,
             "reasons": dict(sorted(self.reasons.items())),
+            "review_visit_buckets": dict(sorted(self.visit_buckets.items())),
             "blocked_job_ids": sorted(self.blocked_job_ids)[:MAX_REPORTED_IDS],
             "blocked_record_ids": sorted(self.blocked_record_ids)[:MAX_REPORTED_IDS],
             "company_ids": sorted(self.company_ids)[:MAX_REPORTED_IDS],
@@ -364,6 +384,19 @@ def _send_prerequisites_reason(client: Client, review_url: str) -> str | None:
     return None
 
 
+def review_visit_bucket(client: Client | None) -> str:
+    """The visit verdict for one job's client, exactly as the sender asks it."""
+    if not settings.easyweek_visit_counter_enabled:
+        return VISIT_COUNTER_DISABLED
+    if client is None:
+        return VISIT_COUNT_UNPROVEN
+    return visit_limit_verdict(
+        max_visits=MAX_VISITS_FOR_REVIEW,
+        visits_total=client.easyweek_visits_total,
+        updated_at=client.easyweek_visits_total_updated_at,
+    )
+
+
 async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
     """One job's verdict as a stable reason code. ``PROVEN`` means sendable."""
     # Imported here rather than at module scope: the outbox worker is a heavy
@@ -441,6 +474,14 @@ async def check_review_job(session: AsyncSession, job: MessageJob) -> str:
         return sender_reason
 
     assert client is not None  # proven by the domain guard above
+
+    # The visit limit, asked exactly as the sender will ask it (§31.11).
+    # `review send on, visit counter off` is a red configuration, not a
+    # supported mode: the send guard would hold every one of these jobs.
+    visit_verdict = review_visit_bucket(client)
+    if visit_verdict != VISIT_LIMIT_ELIGIBLE:
+        return visit_verdict
+
     review_url = easyweek_review_url_for_send(job, record)
     if review_url is None:  # pragma: no cover - the domain guard proves it
         return REASON_DOMAIN
@@ -477,6 +518,11 @@ async def run_review_preflight(
 
         report.checked_count += 1
         report.reasons[reason] += 1
+        try:
+            client = await session.get(Client, job.client_id) if job.client_id is not None else None
+            report.visit_buckets[review_visit_bucket(client)] += 1
+        except Exception:  # noqa: BLE001 — an audit line must not fail the audit
+            report.visit_buckets[VISIT_COUNT_UNPROVEN] += 1
         if job.company_id is not None:
             report.company_ids.add(job.company_id)
         if reason != PROVEN:

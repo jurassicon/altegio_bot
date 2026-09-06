@@ -101,8 +101,12 @@ from altegio_bot.easyweek_review import (
     REVIEW_LINK_CHANGED,
     REVIEW_LINK_MISSING,
     REVIEW_PLANNED_LINK_UNPROVABLE,
+    VISIT_COUNT_UNPROVEN,
+    VISIT_COUNTER_DISABLED,
+    VISIT_LIMIT_ELIGIBLE,
     google_review_url_for_company,
     validate_google_review_url,
+    visit_limit_verdict,
 )
 from altegio_bot.easyweek_service_category import evaluate_service_category, services_count_from_record_raw
 from altegio_bot.message_planner import (
@@ -255,6 +259,11 @@ _REMINDER_OWNERSHIP_ATTEMPTS_KEY = "_reminder_ownership_attempts"
 # The same idea for the PR-12.1 fence, under its own key: the two questions are
 # different and their bounded retries must not share a counter.
 _POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY = "_post_booking_ownership_attempts"
+# The visit-limit hold counts on its OWN key (plan §31.11). "Nobody can answer
+# who owns this booking" and "the visit counter is switched off" are different
+# questions with different fixes, and sharing one budget would let a job spend
+# its waiting room on the wrong one.
+_EASYWEEK_REVIEW_VISIT_HOLD_KEY = "_easyweek_review_visit_hold_attempts"
 
 # Separate counter for the follow-up live Altegio guard stored in job.payload.
 # Independent from _api_guard_attempts (which serves review_3d / repeat_10d / comeback_3d)
@@ -448,6 +457,33 @@ def _handle_reminder_ownership_unproven(job: MessageJob) -> None:
     job.locked_at = None
     job.updated_at = utcnow()
     job.last_error = REASON_UNKNOWN
+
+    if count >= MAX_REMINDER_OWNERSHIP_ATTEMPTS:
+        job.status = "failed"
+        return
+
+    job.status = "queued"
+    job.run_at = utcnow() + timedelta(seconds=_retry_delay_seconds(count))
+
+
+def _hold_easyweek_review_for_visit_counter(job: MessageJob) -> None:
+    """Hold a review whose visit count cannot be obtained right now (§31.11).
+
+    The counter contract being off is configuration, not a decision about this
+    customer, so the job waits instead of being cancelled — and the wait costs
+    no delivery attempt, because nothing was delivered.
+
+    Bounded like every other hold here: after the same number of tries the job
+    FAILS rather than sending. A fence that can never be opened is a state a
+    person has to look at, and the outcome that must not follow from it is a
+    review sent to somebody it was never proven to belong to.
+    """
+    payload = dict(getattr(job, "payload", None) or {})
+    count = int(payload.get(_EASYWEEK_REVIEW_VISIT_HOLD_KEY, 0)) + 1
+    payload[_EASYWEEK_REVIEW_VISIT_HOLD_KEY] = count
+    job.payload = payload
+    job.locked_at = None
+    job.updated_at = utcnow()
 
     if count >= MAX_REMINDER_OWNERSHIP_ATTEMPTS:
         job.status = "failed"
@@ -1270,6 +1306,60 @@ def _easyweek_review_presend_error(
         return f"EasyWeek review refused: {link_reason}"
 
     return None
+
+
+async def _easyweek_review_visit_limit_error(
+    session: AsyncSession,
+    job: MessageJob,
+    record: Record | None,
+    client: Client | None,
+) -> str | None:
+    """Re-prove the visit count immediately before Meta, or refuse (§31.11).
+
+    A review is earned three days ahead of the send. In between the customer can
+    come back — twice — and the request would then go to somebody who is no
+    longer new here. So the count is read again, from the database, right now.
+
+    The job's payload is deliberately NOT evidence: it records what was true
+    when the review was planned, and jobs queued before this guard existed
+    carry no such field at all. The Client row is re-read by full identity
+    rather than trusted from the caller's instance, because that instance may
+    have been loaded before a `booking-succeeded` in another transaction moved
+    the number.
+
+    Nothing here calls Altegio: EasyWeek states the total itself, and the
+    Altegio helper would answer for a different company id space entirely.
+    """
+    if not settings.easyweek_visit_counter_enabled:
+        # The proof cannot be obtained at all. Held behind the fence rather than
+        # cancelled: the flag is configuration, and a review that could still be
+        # legitimate must not be destroyed by it.
+        return VISIT_COUNTER_DISABLED
+    if record is None or client is None or job.client_id is None:
+        return VISIT_COUNT_UNPROVEN
+
+    fresh = (
+        (
+            await session.execute(
+                select(Client)
+                .where(Client.id == job.client_id)
+                .where(Client.provider == PROVIDER_EASYWEEK)
+                .where(Client.company_id == job.company_id)
+            )
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if fresh is None or fresh.id != client.id or record.client_id != fresh.id:
+        # Provider, company and the exact client, or no answer at all.
+        return VISIT_COUNT_UNPROVEN
+
+    verdict = visit_limit_verdict(
+        max_visits=MAX_VISITS_FOR_REVIEW,
+        visits_total=fresh.easyweek_visits_total,
+        updated_at=fresh.easyweek_visits_total_updated_at,
+    )
+    return None if verdict == VISIT_LIMIT_ELIGIBLE else verdict
 
 
 async def _easyweek_retention_presend_error(
@@ -3573,6 +3663,39 @@ async def _run_job_logic(
     # silently answer for another salon.
     is_easyweek_review = job_provider == PROVIDER_EASYWEEK and job.job_type == REVIEW_3D
     if is_easyweek_review:
+        # The visit limit first, and before anything external: no template, no
+        # sender, no Outbox row, no Meta request and no attempt is spent on a
+        # customer who is no longer eligible. A count that cannot be proven — or
+        # a counter contract that is switched off — holds the job instead of
+        # sending it.
+        visit_error = await _easyweek_review_visit_limit_error(session, job, record, client)
+        if visit_error == VISIT_COUNTER_DISABLED:
+            # Configuration, not a verdict about this customer. Requeued on its
+            # own counter so the wait costs no delivery attempt, exactly like an
+            # unprovable ownership question.
+            _hold_easyweek_review_for_visit_counter(job)
+            job.last_error = f"EasyWeek review held: {visit_error}"
+            logger.info(
+                "EasyWeek review held before send job_id=%s company_id=%s reason=%s",
+                job.id,
+                job.company_id,
+                visit_error,
+            )
+            return
+        if visit_error is not None:
+            job.status = "canceled"
+            job.locked_at = None
+            job.updated_at = utcnow()
+            job.last_error = f"EasyWeek review refused: {visit_error}"
+            logger.info(
+                "EasyWeek review refused before send job_id=%s company_id=%s record_id=%s reason=%s",
+                job.id,
+                job.company_id,
+                getattr(record, "id", None),
+                visit_error,
+            )
+            return
+
         review_error = _easyweek_review_presend_error(job, record, client)
         if review_error is not None:
             job.status = "canceled"

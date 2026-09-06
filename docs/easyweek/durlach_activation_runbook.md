@@ -2724,6 +2724,15 @@ read-only: ни одного вызова Meta, Chatwoot или EasyWeek API.
 **9. Открывать fence только при `ready=true` и exit code 0.** Пустая очередь,
 `truncated=true`, любой blocked кандидат или `config_error` — это STOP.
 
+Отчёт дополнительно печатает `review_visit_buckets` (plan §31.11) — тот же
+визитный вопрос, который задаст sender, посчитанный по **каждому** кандидату,
+включая заблокированных по другой причине: `review_visit_count_eligible`,
+`review_visit_limit_exceeded`, `review_visit_count_unproven`,
+`review_visit_counter_disabled`. Только счётчики, без PII. Отправка при
+включённом `EASYWEEK_REVIEW_SEND_ENABLED` и выключенном
+`EASYWEEK_VISIT_COUNTER_ENABLED` — красная конфигурация: send guard удержит
+такие job'ы за fence, поэтому preflight в этом состоянии зелёным не бывает.
+
 **10. Открыть send fence.** `EASYWEEK_REVIEW_SEND_ENABLED=true`, затем
 пересоздать **только** outbox worker:
 

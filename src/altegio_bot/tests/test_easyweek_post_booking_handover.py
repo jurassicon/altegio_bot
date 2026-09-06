@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -31,6 +31,7 @@ from altegio_bot.easyweek_migration.post_booking_handover import (
     STOP_LEDGER_SCOPE_CHANGED,
     STOP_MARKER_CONFLICT,
     STOP_NON_TERMINAL_OUTBOX,
+    STOP_OUTBOX_SET_CHANGED,
     STOP_REMINDER_HANDOVER_INCOMPLETE,
     STOP_SOURCE_JOB_SET_CHANGED,
     STOP_SOURCE_PROCESSING,
@@ -49,6 +50,7 @@ from altegio_bot.easyweek_migration.post_booking_handover import (
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    Client,
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
@@ -59,6 +61,7 @@ from altegio_bot.post_booking_ownership import (
     post_booking_owner,
 )
 from altegio_bot.scripts import easyweek_post_booking_handover as cli
+from altegio_bot.settings import settings
 from altegio_bot.tests import test_easyweek_reminder_handover_db as h
 
 registry = h.registry
@@ -941,12 +944,15 @@ def test_the_apply_report_shape_is_stable(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_verify_fails_when_a_target_job_status_changed(session_maker, prepared):
-    """Ids alone were not proof: a cancelled target keeps its id.
+@pytest.mark.parametrize("landed", ["done", "canceled"])
+async def test_a_normal_target_transition_after_apply_is_diagnostic_not_a_failure(session_maker, prepared, landed):
+    """The documented rollout restarts the outbox worker BEFORE verify.
 
-    The EasyWeek job is exactly what a proven `booking-succeeded` created and
-    what this phase must leave standing, so a verify that only counted ids
-    reported success for a wave whose target obligation had been withdrawn.
+    So a target `review_3d` may legitimately move `queued -> done`, or be
+    cancelled by its own send guard, between the apply and the verification.
+    That is the EasyWeek side doing its work; treating it as proof that the
+    handover mutated a target would make the prescribed rollout report a
+    violation every time. It is reported, and it does not fail.
     """
     target = await add_target_job(session_maker, prepared, job_type=REVIEW)
     planned = await plan(session_maker)
@@ -955,20 +961,69 @@ async def test_verify_fails_when_a_target_job_status_changed(session_maker, prep
     assert result.halted is None
     report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
 
+    # The worker is back, and the target job finishes its ordinary life: either
+    # it is delivered, or its own send guard withdraws it (the §31.11 visit
+    # limit does exactly that). Neither is the handover's doing.
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.id == target).values(status=landed))
+
     async with session_maker() as session:
         findings = await db.verify_handover(session, frozen, report)
-    assert findings["passed"] is True
+
+    assert findings["passed"] is True, landed
+    assert findings["rows_with_changed_target_jobs"] == []
+    assert findings["target_job_transitions"] == [
+        {
+            "ledger_id": (await ledger_row(session_maker)).id,
+            "job_id": target,
+            "frozen_status": "queued",
+            "current_status": landed,
+        }
+    ], "the change is shown, never hidden"
+
+    # And the handover itself still issued no UPDATE against an EasyWeek job.
+    async with session_maker() as session:
+        job = await session.get(MessageJob, target)
+    assert job.last_error is None
+
+
+async def test_verify_fails_when_a_target_job_disappears(session_maker, prepared):
+    """A changed SET is the thing the handover could be responsible for.
+
+    It creates no EasyWeek job and updates none, so an id that vanished or
+    appeared is the only target-side change that could implicate it.
+    """
+    target = await add_target_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+    frozen = freeze_plan(planned)
+    result = await apply(session_maker, planned)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
 
     async with session_maker() as session:
         async with session.begin():
-            await session.execute(update(MessageJob).where(MessageJob.id == target).values(status="canceled"))
+            await session.execute(delete(MessageJob).where(MessageJob.id == target))
 
     async with session_maker() as session:
         findings = await db.verify_handover(session, frozen, report)
+
     assert findings["passed"] is False
     assert findings["rows_with_changed_target_jobs"] == [(await ledger_row(session_maker)).id]
-    # The id set is unchanged, which is exactly why it was not enough.
-    assert findings["target_job_ids"] == [target]
+
+
+async def test_the_apply_proves_target_statuses_inside_its_own_transaction(session_maker, prepared):
+    """Where a status DOES have to be exact: under the locks, before the write."""
+    target = await add_target_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.id == target).values(status="done"))
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted == STOP_TARGET_JOB_SET_CHANGED
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
 
 
 async def test_a_target_in_another_branch_is_refused_by_the_plan(session_maker, prepared):
@@ -992,3 +1047,268 @@ async def test_a_target_in_another_branch_is_refused_by_the_plan(session_maker, 
     assert planned.apply_ready is False
     # And nothing was written by asking.
     assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
+
+
+# ---------------------------------------------------------------------------
+# Drift between plan and apply: the whole set, by id and status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param({"status": "done"}, id="queued-to-done"),
+        pytest.param({"status": "failed"}, id="queued-to-failed"),
+        pytest.param({"status": "canceled", "last_error": "cancelled by somebody else"}, id="foreign-cancel"),
+        pytest.param({"status": "processing"}, id="queued-to-processing"),
+    ],
+)
+async def test_a_source_job_that_moved_after_the_plan_stops_the_wave(session_maker, prepared, mutate):
+    """Only asking for ADDED ids was not enough.
+
+    `queued -> done` means the message was sent; `queued -> failed` means it was
+    attempted; a cancel carrying somebody else's reason is not this handover's
+    work. Each of those left the operator a report describing a withdrawal that
+    never happened.
+    """
+    job_id = await add_source_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.id == job_id).values(**mutate))
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted in {STOP_SOURCE_JOB_SET_CHANGED, STOP_SOURCE_PROCESSING}
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
+    async with session_maker() as session:
+        job = await session.get(MessageJob, job_id)
+    assert job.status == mutate["status"], "nothing was cancelled on a picture that had moved"
+
+
+async def test_a_source_job_deleted_after_the_plan_stops_the_wave(session_maker, prepared):
+    job_id = await add_source_job(session_maker, prepared, job_type=REPEAT)
+    planned = await plan(session_maker)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(delete(MessageJob).where(MessageJob.id == job_id))
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted == STOP_SOURCE_JOB_SET_CHANGED
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
+
+
+async def test_a_terminal_outbox_row_created_after_the_plan_stops_the_wave(session_maker, prepared):
+    """A send that happened between the plan and the stop must not be invisible.
+
+    The row is terminal by the time the apply looks, so a check that only asked
+    whether anything was still in flight saw nothing — and the wave would have
+    been withdrawn as if that customer had never been messaged.
+    """
+    job_id = await add_source_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+    assert planned.apply_ready is True
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=h.COMPANY,
+                    record_id=prepared["source_pk"],
+                    job_id=job_id,
+                    phone_e164="+490000000000",
+                    template_code="t",
+                    body="b",
+                    status="sent",
+                    scheduled_at=datetime.now(timezone.utc),
+                )
+            )
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted == STOP_OUTBOX_SET_CHANGED
+    async with session_maker() as session:
+        job = await session.get(MessageJob, job_id)
+    assert job.status == "queued"
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
+
+
+async def test_an_outbox_row_that_changed_status_after_the_plan_stops_the_wave(session_maker, prepared):
+    job_id = await add_source_job(session_maker, prepared, job_type=REVIEW, status="done")
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                OutboxMessage(
+                    company_id=h.COMPANY,
+                    record_id=prepared["source_pk"],
+                    job_id=job_id,
+                    phone_e164="+490000000000",
+                    template_code="t",
+                    body="b",
+                    status="sent",
+                    scheduled_at=datetime.now(timezone.utc),
+                )
+            )
+    planned = await plan(session_maker)
+    assert planned.apply_ready is True
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(OutboxMessage).values(status="read"))
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted == STOP_OUTBOX_SET_CHANGED
+    assert (await ledger_row(session_maker)).post_booking_jobs_handed_over_at is None
+
+
+async def test_the_exact_repeat_after_our_own_cancellation_still_applies(session_maker, prepared):
+    """The one allowed difference: our own withdrawal, under our own digest."""
+    job_id = await add_source_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+
+    first = await apply(session_maker, planned)
+    assert first.canceled_job_ids == (job_id,)
+    second = await apply(session_maker, planned)
+
+    assert second.halted is None
+    assert second.canceled_job_ids == ()
+    assert second.already_canceled_job_ids == (job_id,)
+    assert second.marked_ledger_ids == ()
+
+
+async def test_a_repeat_under_a_foreign_digest_is_refused(session_maker, prepared):
+    """A cancelled job is only forgiven when THIS digest already owns the row."""
+    job_id = await add_source_job(session_maker, prepared, job_type=REVIEW)
+    planned = await plan(session_maker)
+    assert (await apply(session_maker, planned)).halted is None
+
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(update(EasyWeekMigrationLedger).values(post_booking_handover_plan_digest="f" * 64))
+
+    result = await apply(session_maker, planned)
+
+    assert result.halted in {STOP_MARKER_CONFLICT, STOP_SOURCE_JOB_SET_CHANGED}
+    async with session_maker() as session:
+        job = await session.get(MessageJob, job_id)
+    assert job.status == "canceled", "the first withdrawal stands"
+
+
+def test_the_snapshot_version_was_raised_and_the_old_one_is_refused(tmp_path):
+    """v1 froze only the non-terminal Outbox ids; v2 freezes every row.
+
+    Reading a v1 file under v2 rules would silently mean "no Outbox row existed"
+    for rows the old plan never recorded, so it is refused rather than
+    reinterpreted.
+    """
+    from altegio_bot.easyweek_migration.post_booking_handover import SNAPSHOT_VERSION
+
+    assert SNAPSHOT_VERSION == 2
+    legacy = tmp_path / "v1.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "post_booking_handover",
+                "mode": "read-only",
+                "created_at": "2026-09-05T00:00:00Z",
+                "company_ids": [h.COMPANY],
+                "wave": {},
+                "ledger_rows_seen": 1,
+                "eligible_created_rows": 1,
+                "refusals": {},
+                "rows": [],
+                "plan_digest": "a" * 64,
+            }
+        )
+    )
+    with pytest.raises(PostBookingSnapshotError):
+        read_snapshot(legacy)
+
+
+# ---------------------------------------------------------------------------
+# §31.11: the plan reports what the send guard will decide — and decides nothing
+# ---------------------------------------------------------------------------
+
+
+async def _set_visits(session_maker, total: int | None) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client = await session.get(Client, 1)
+            client.easyweek_visits_total = total
+            client.easyweek_visits_total_updated_at = datetime.now(timezone.utc) if total is not None else None
+
+
+@pytest.mark.parametrize(
+    ("label", "total", "expected"),
+    [
+        ("at-the-limit", 3, "review_visit_count_eligible"),
+        ("over-the-limit", 4, "review_visit_limit_exceeded"),
+        ("no-snapshot", None, "review_visit_count_unproven"),
+    ],
+)
+async def test_the_plan_buckets_open_target_reviews_by_visit_verdict(
+    session_maker, prepared, monkeypatch, label: str, total: int | None, expected: str
+):
+    """An operator sees how much of the EasyWeek backlog is provably eligible.
+
+    The same question the sender asks, answered from the same stored snapshot —
+    never a payload, never an Altegio call. Counts only: no names, phones or ids
+    of customers.
+    """
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    await add_target_job(session_maker, prepared, job_type=REVIEW)
+    await _set_visits(session_maker, total)
+
+    planned = await plan(session_maker)
+
+    assert planned.target_review_visit_buckets == {expected: 1}, label
+    payload = planned.as_safe_dict()
+    assert payload["target_review_visit_buckets"] == {expected: 1}
+    for leaked in ("phone", "@", "+49", "http", "name"):
+        assert leaked not in json.dumps(payload["target_review_visit_buckets"]), leaked
+
+
+async def test_a_disabled_counter_is_reported_as_its_own_bucket(session_maker, prepared, monkeypatch):
+    """ "Nobody is asking the question right now" is not "the customer is eligible"."""
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", False, raising=False)
+    await add_target_job(session_maker, prepared, job_type=REVIEW)
+    await _set_visits(session_maker, 1)
+
+    planned = await plan(session_maker)
+
+    assert planned.target_review_visit_buckets == {"review_visit_counter_disabled": 1}
+
+
+async def test_a_terminal_target_review_is_not_bucketed(session_maker, prepared, monkeypatch):
+    """The buckets describe what is still ABOUT to be sent."""
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    await add_target_job(session_maker, prepared, job_type=REVIEW, status="done")
+    await _set_visits(session_maker, 9)
+
+    planned = await plan(session_maker)
+
+    assert planned.target_review_visit_buckets == {}
+
+
+async def test_the_buckets_change_nothing_about_the_target_jobs(session_maker, prepared, monkeypatch):
+    """Reporting is not acting. An over-limit review is stopped by the runtime."""
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    target = await add_target_job(session_maker, prepared, job_type=REVIEW)
+    await _set_visits(session_maker, 4)
+    await add_source_job(session_maker, prepared, job_type=REVIEW)
+
+    planned = await plan(session_maker)
+    assert planned.target_review_visit_buckets == {"review_visit_limit_exceeded": 1}
+    result = await apply(session_maker, planned)
+    assert result.halted is None
+
+    async with session_maker() as session:
+        job = await session.get(MessageJob, target)
+    assert job.status == "queued"
+    assert job.last_error is None
+    assert job.attempts == 0

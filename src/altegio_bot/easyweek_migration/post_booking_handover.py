@@ -43,7 +43,11 @@ from typing import Any, Final
 
 # Its own version line. A §30 snapshot can never be read as this one and the
 # other way round: the top-level key set differs and both readers are exact.
-SNAPSHOT_VERSION: Final = 1
+# v2: the frozen Outbox rows carry their status, and the apply compares the
+# COMPLETE source job set by id AND status. A v1 file cannot be read under those
+# rules — it froze only the non-terminal Outbox ids — so it is refused rather
+# than reinterpreted.
+SNAPSHOT_VERSION: Final = 2
 SNAPSHOT_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
 # One hour, same reasoning as §30: a plan describes a set of open jobs, and a
@@ -80,6 +84,9 @@ STOP_TARGET_RECORD: Final = "target_record_unproven"
 STOP_TARGET_BRANCH_MISMATCH: Final = "target_branch_mismatch"
 STOP_SOURCE_PROCESSING: Final = "source_job_processing"
 STOP_NON_TERMINAL_OUTBOX: Final = "source_job_outbox_non_terminal"
+# An Outbox row appeared, vanished or changed status since the plan. A row that
+# appeared is a message that went out between the plan and the apply.
+STOP_OUTBOX_SET_CHANGED: Final = "source_job_outbox_set_changed"
 STOP_SOURCE_JOB_SET_CHANGED: Final = "source_job_set_changed"
 STOP_TARGET_JOB_SET_CHANGED: Final = "target_job_set_changed"
 STOP_MARKER_CONFLICT: Final = "post_booking_marker_conflict"
@@ -130,6 +137,18 @@ class JobRef:
 
 
 @dataclass(frozen=True)
+class OutboxRef:
+    """One Outbox row of a source job, by identity and state. Never its body."""
+
+    outbox_id: int
+    job_id: int
+    status: str
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {"outbox_id": self.outbox_id, "job_id": self.job_id, "status": self.status}
+
+
+@dataclass(frozen=True)
 class ScopeRow:
     """One ledger row this handover would act on."""
 
@@ -148,7 +167,16 @@ class ScopeRow:
     post_booking_digest: str | None
     source_jobs: tuple[JobRef, ...]
     target_jobs: tuple[JobRef, ...]
-    non_terminal_outbox_ids: tuple[int, ...]
+    # EVERY Outbox row of those jobs, with its status — not only the ones that
+    # were non-terminal at plan time. A send that happened between the plan and
+    # the moment the worker was stopped is a terminal row the plan never saw,
+    # and freezing only the non-terminal ids made it invisible: the wave would
+    # be withdrawn as if nothing had been delivered.
+    outbox_rows: tuple[OutboxRef, ...]
+
+    @property
+    def non_terminal_outbox_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(row.outbox_id for row in self.outbox_rows if row.status in NON_TERMINAL_OUTBOX_STATUSES))
 
     @property
     def queued_source_job_ids(self) -> tuple[int, ...]:
@@ -184,7 +212,7 @@ class ScopeRow:
             "post_booking_digest": self.post_booking_digest,
             "source_jobs": [job.as_safe_dict() for job in sorted(self.source_jobs, key=lambda j: j.job_id)],
             "target_jobs": [job.as_safe_dict() for job in sorted(self.target_jobs, key=lambda j: j.job_id)],
-            "non_terminal_outbox_ids": list(self.non_terminal_outbox_ids),
+            "outbox_rows": [row.as_safe_dict() for row in sorted(self.outbox_rows, key=lambda r: r.outbox_id)],
         }
 
 
@@ -207,6 +235,11 @@ class PostBookingPlan:
     # `created` after this handover would carry no marker at all.
     unresolved_rows: dict[str, int] = field(default_factory=dict)
     wave_closed: bool = False
+    # Audit of the OPEN target `review_3d` of this wave, bucketed by the visit
+    # verdict the send guard will reach (plan §31.11). Reported, never acted on:
+    # the handover changes no EasyWeek job, and a review over the limit is
+    # stopped by the runtime guard.
+    target_review_visit_buckets: dict[str, int] = field(default_factory=dict)
 
     @property
     def source_queued(self) -> int:
@@ -317,6 +350,7 @@ class PostBookingPlan:
             "rows_without_source_job": self.rows_without_source_job,
             "rows_already_marked": self.rows_already_marked,
             "rows_with_source_target_overlap": self.overlapping_rows,
+            "target_review_visit_buckets": dict(sorted(self.target_review_visit_buckets.items())),
             "blockers": list(self.blockers),
             "apply_ready": self.apply_ready,
         }
@@ -439,6 +473,18 @@ def _validate_job(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def _validate_outbox(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise PostBookingSnapshotError("an outbox entry is not an object")
+    _exact_keys(payload, {"outbox_id", "job_id", "status"}, "outbox entry")
+    for key in ("outbox_id", "job_id"):
+        if type(payload[key]) is not int or payload[key] <= 0:
+            raise PostBookingSnapshotError(f"{key} is not a positive integer")
+    if not isinstance(payload["status"], str) or not payload["status"]:
+        raise PostBookingSnapshotError("an outbox status is not a string")
+    return payload
+
+
 def _validate_row(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise PostBookingSnapshotError("a row is not an object")
@@ -457,7 +503,7 @@ def _validate_row(payload: Any) -> dict[str, Any]:
             "post_booking_digest",
             "source_jobs",
             "target_jobs",
-            "non_terminal_outbox_ids",
+            "outbox_rows",
         },
         "row",
     )
@@ -488,9 +534,11 @@ def _validate_row(payload: Any) -> dict[str, Any]:
             raise PostBookingSnapshotError(f"{key} is not an array")
         for item in payload[key]:
             _validate_job(item)
-    outbox = payload["non_terminal_outbox_ids"]
-    if not isinstance(outbox, list) or any(type(item) is not int for item in outbox):
-        raise PostBookingSnapshotError("non_terminal_outbox_ids is not an array of integers")
+    outbox = payload["outbox_rows"]
+    if not isinstance(outbox, list):
+        raise PostBookingSnapshotError("outbox_rows is not an array")
+    for item in outbox:
+        _validate_outbox(item)
     return payload
 
 

@@ -20,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot import message_planner as planner_mod
 from altegio_bot.message_planner import (
@@ -464,3 +465,119 @@ def test_the_unproven_error_carries_no_pii():
     assert message == REASON_UNKNOWN
     for leaked in ("+49", "@", "http"):
         assert leaked not in message
+
+
+# ---------------------------------------------------------------------------
+# A real statement failure must leave the transaction usable
+# ---------------------------------------------------------------------------
+
+
+async def test_a_real_sql_failure_in_the_lookup_leaves_the_transaction_usable(session_maker, monkeypatch):
+    """Not a stubbed UNKNOWN — an actual aborted statement inside the caller's transaction.
+
+    Swallowing a DBAPIError in the caller's transaction left that transaction
+    aborted: every later statement failed with `InFailedSQLTransaction`, so the
+    inbox worker could not write the `failed` status that makes the delivery
+    visible and re-drivable. The event would have stayed invisible instead.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    from altegio_bot.post_booking_ownership import PostBookingOwner, post_booking_owner
+
+    record_pk = await _seed_record(session_maker, migrated=True, handed_over=False)
+
+    async with session_maker() as session:
+        async with session.begin():
+            # A statement that really fails in PostgreSQL, inside this
+            # transaction, immediately before the ownership question.
+            with pytest.raises(DBAPIError):
+                async with session.begin_nested():
+                    await session.execute(text("SELECT * FROM a_table_that_does_not_exist"))
+
+            owner = await post_booking_owner(session, company_id=COMPANY, altegio_record_id=SOURCE_RECORD_ID)
+            assert owner is PostBookingOwner.ALTEGIO, "the transaction is still usable"
+
+            # And the transaction can still write — which is what the inbox
+            # worker needs in order to record a failed event at all.
+            await session.execute(update(Record).where(Record.id == record_pk).values(staff_name="after the failure"))
+
+    async with session_maker() as session:
+        record = await session.get(Record, record_pk)
+    assert record.staff_name == "after the failure"
+
+
+async def test_a_failing_ownership_read_does_not_poison_the_caller(session_maker, monkeypatch):
+    """The lookup's own statement fails: UNKNOWN, and the transaction survives."""
+    from altegio_bot import post_booking_ownership as ownership
+
+    record_pk = await _seed_record(session_maker, migrated=True, handed_over=False)
+    real_execute = AsyncSession.execute
+    exploded: list[bool] = []
+
+    async def explode_once(self, statement, *args, **kwargs):
+        # Only the ownership SELECT is broken, and only the first time.
+        if not exploded and "post_booking_jobs_handed_over_at" in str(statement):
+            exploded.append(True)
+            return await real_execute(self, text("SELECT * FROM a_table_that_does_not_exist"))
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", explode_once)
+
+    async with session_maker() as session:
+        async with session.begin():
+            owner = await ownership.post_booking_owner(session, company_id=COMPANY, altegio_record_id=SOURCE_RECORD_ID)
+            assert owner is ownership.PostBookingOwner.UNKNOWN
+            # The caller can still write its own verdict in the same transaction.
+            await session.execute(update(Record).where(Record.id == record_pk).values(staff_name="verdict recorded"))
+    monkeypatch.undo()
+
+    assert exploded == [True], "the lookup really did fail at the SQL level"
+    async with session_maker() as session:
+        record = await session.get(Record, record_pk)
+    assert record.staff_name == "verdict recorded"
+
+
+async def test_the_planner_refuses_and_stays_recoverable_after_a_real_sql_failure(session_maker, monkeypatch):
+    """End to end: no job created, a stable PII-free reason, and a re-drivable event."""
+    from altegio_bot import post_booking_ownership as ownership
+
+    record_pk = await _seed_record(session_maker, migrated=True, handed_over=False)
+    real_execute = AsyncSession.execute
+    exploded: list[bool] = []
+
+    async def explode_once(self, statement, *args, **kwargs):
+        if not exploded and "post_booking_jobs_handed_over_at" in str(statement):
+            exploded.append(True)
+            return await real_execute(self, text("SELECT * FROM a_table_that_does_not_exist"))
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", explode_once)
+    async with session_maker() as session:
+        async with session.begin():
+            with pytest.raises(ownership.PostBookingOwnershipUnproven) as refused:
+                await plan_jobs_for_record_event(
+                    session,
+                    company_id=COMPANY,
+                    record_id=record_pk,
+                    event_status="create",
+                )
+            # The same transaction can still record the outcome.
+            await session.execute(
+                update(Record).where(Record.id == record_pk).values(staff_name=str(refused.value)[:32])
+            )
+    monkeypatch.undo()
+
+    assert str(refused.value) == ownership.REASON_UNKNOWN
+    for leaked in ("+49", "@", "http"):
+        assert leaked not in str(refused.value)
+    planned = await _jobs(session_maker, record_pk)
+    # None of the three types this fence owns. The ordinary lifecycle job of the
+    # same delivery is untouched — in production the worker rolls the whole
+    # event back anyway; here the transaction was committed deliberately to
+    # prove it still COULD commit.
+    assert not (POST_BOOKING_JOB_TYPES & set(planned)), planned
+
+    # A later, healthy redrive of the same delivery plans normally.
+    await _plan_event(session_maker, record_pk, status="create")
+    planned = await _jobs(session_maker, record_pk)
+    assert planned[REVIEW_3D] == "queued"
