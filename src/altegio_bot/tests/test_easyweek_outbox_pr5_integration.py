@@ -7640,3 +7640,323 @@ async def test_the_visit_counter_hold_is_bounded_and_uses_its_own_budget(
     assert await _outbox_rows(db, job) == []
     assert job.payload[ow._EASYWEEK_REVIEW_VISIT_HOLD_KEY] == ow.MAX_REMINDER_OWNERSHIP_ATTEMPTS
     assert ow._POST_BOOKING_OWNERSHIP_ATTEMPTS_KEY not in job.payload
+
+
+# ---------------------------------------------------------------------------
+# §31.11: the send-time count is read under a lock, not from memory
+# ---------------------------------------------------------------------------
+#
+# The guard answers a question the inbox worker can change at any moment, so
+# reading "again" is only worth something if the read (a) comes from PostgreSQL
+# rather than from the ORM instance already sitting in the session, and (b) holds
+# the row until the send decision is final. Both halves are pinned here against a
+# real database and a real `record_visit_counter`.
+
+_COUNTER_LOCATION_UUID = "cccccccc-dddd-4eee-8fff-000000000001"
+
+
+def _succeeded_visit_payload(*, booking_uuid: uuid.UUID, booking_id: int, visits_total: int) -> dict[str, Any]:
+    """A `booking-succeeded` delivery for one of this file's EasyWeek bookings."""
+    payload = booking_created()
+    payload["booking_status"] = "Succeeded appointment"
+    payload["uid"] = str(booking_uuid)
+    payload["id"] = booking_id
+    payload["customer_id"] = 7300002
+    payload["location_id"] = COLLIDING_COMPANY_ID
+    payload["location_uuid"] = _COUNTER_LOCATION_UUID
+    payload["visits_total"] = visits_total
+    return payload
+
+
+async def _record_visit_counter(session: AsyncSession, payload: dict[str, Any]) -> None:
+    """Run the real counter, with its own `Record -> Client` lock order."""
+    event = EasyWeekEvent(
+        id=987654,
+        status="processing",
+        event_hint=eyw_worker.SUCCEEDED_EVENT_HINT,
+        auth_via="query",
+        payload_hash="visit-counter-concurrency",
+        payload=payload,
+        body_truncated=False,
+    )
+    await eyw_worker.record_visit_counter(
+        session,
+        event=event,
+        registry=eyw_worker.configured_easyweek_locations(),
+    )
+
+
+async def _seed_second_booking_of_the_same_client(db: AsyncSession, job: MessageJob) -> Record:
+    """A SECOND EasyWeek booking of the customer whose review is queued."""
+    client = await db.get(Client, job.client_id)
+    assert client is not None
+    # Its own booking uuid AND its own numeric id: the natural key is
+    # (provider, company_id, altegio_record_id), and a second appointment is a
+    # different booking, not another row for the same one.
+    second = Record(
+        provider=PROVIDER_EASYWEEK,
+        company_id=COLLIDING_COMPANY_ID,
+        altegio_record_id=4200002,
+        easyweek_booking_uuid=uuid.UUID("22222222-3333-4444-8555-666666666666"),
+        easyweek_booking_hash_id="90000002",
+        client_id=client.id,
+        staff_name="Tanja",
+        starts_at=utcnow() - timedelta(days=3),
+        raw=record_raw_with_services_count(record_raw_with_service_category({}, "Wimpernverlängerung"), 1),
+    )
+    db.add(second)
+    await db.flush()
+    return second
+
+
+async def test_a_client_already_in_the_session_is_re_read_from_postgresql(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The identity-map regression.
+
+    `_load_client` reaches the customer through `session.get`, so by the time the
+    visit guard runs the row is already in the session at its OLD value. A plain
+    SELECT hands that same instance back unchanged, and the review would be sent
+    against a count another transaction has already moved. The guard has to read
+    the committed value, not the remembered one.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    await db.commit()
+
+    async with session_maker() as outbox_session:
+        async with outbox_session.begin():
+            cached = await outbox_session.get(Client, client_id)
+            assert cached is not None and cached.easyweek_visits_total == 3
+
+            # Another transaction — the inbox worker's — commits the fourth visit
+            # while this session still remembers three.
+            async with session_maker() as inbox_session:
+                async with inbox_session.begin():
+                    row = (
+                        await inbox_session.execute(select(Client).where(Client.id == client_id).with_for_update())
+                    ).scalar_one()
+                    row.easyweek_visits_total = 4
+                    row.easyweek_visits_total_updated_at = utcnow()
+
+            await ow.process_job_in_session(outbox_session, job_id, object())  # type: ignore[arg-type]
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        assert persisted is not None
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert (
+            await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))
+        ).scalars().all() == []
+    assert capture.template_calls == []
+
+
+async def test_a_visit_committed_before_the_lock_cancels_the_waiting_review(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 1: counter locks and commits -> outbox waits, then refuses.
+
+    Two different bookings of ONE customer. The inbox worker records the second
+    visit while the outbox is already working on the review earned by the first.
+    The outbox must not step over the open transaction: it waits for the row, and
+    what it finds afterwards is four visits, so nothing is sent.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    outbox_reached_guard = asyncio.Event()
+    original_guard = ow._easyweek_review_visit_limit_error
+
+    async def _observed_guard(session: AsyncSession, candidate: MessageJob, record, client):
+        if candidate.id == job_id:
+            outbox_reached_guard.set()
+        return await original_guard(session, candidate, record, client)
+
+    monkeypatch.setattr(ow, "_easyweek_review_visit_limit_error", _observed_guard)
+
+    async with session_maker() as inbox_session:
+        async with inbox_session.begin():
+            await _record_visit_counter(
+                inbox_session,
+                _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+            )
+            outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id))
+            await asyncio.wait_for(outbox_reached_guard.wait(), timeout=5)
+            # The counter still holds the row, so the guard cannot answer yet.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(outbox_task), timeout=0.2)
+
+    await asyncio.wait_for(outbox_task, timeout=5)
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        assert client is not None and client.easyweek_visits_total == 4
+        assert persisted is not None
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert (
+            await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))
+        ).scalars().all() == []
+    assert capture.template_calls == []
+
+
+async def test_a_review_already_authorised_makes_the_next_visit_wait(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order 2: outbox locks, decides, sends and commits -> counter proceeds.
+
+    The mirror image, and the reason the lock is held to the end of the job's
+    transaction rather than released after the check: while the message is being
+    handed to the provider, "three visits" must still be true. The second visit
+    is not lost — it waits, and is recorded once the send is durable.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    provider_barrier = asyncio.Event()
+    release_provider = asyncio.Event()
+    counter_started = asyncio.Event()
+    counter_finished = asyncio.Event()
+    order: list[str] = []
+
+    async def _barrier_send_template(*args: Any, **kwargs: Any) -> tuple[str, None]:
+        order.append("provider_attempt")
+        provider_barrier.set()
+        await release_provider.wait()
+        order.append("provider_return")
+        return "eyw-review-serialized-1", None
+
+    monkeypatch.setattr(ow, "safe_send_template", _barrier_send_template)
+
+    async def _count_the_second_visit() -> None:
+        counter_started.set()
+        async with session_maker() as inbox_session:
+            async with inbox_session.begin():
+                await _record_visit_counter(
+                    inbox_session,
+                    _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+                )
+                order.append("counter_wrote")
+                # The row was only handed over when the outbox transaction
+                # committed, so by now the send it authorised is durable. This
+                # is the ordering proof: data, not task scheduling.
+                committed_send = (
+                    (await inbox_session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(committed_send) == 1
+                order.append("committed_send_visible")
+                counter_finished.set()
+            order.append("counter_commit")
+
+    outbox_task = asyncio.create_task(_process_job_in_new_transaction(session_maker, job_id, order=order))
+    await asyncio.wait_for(provider_barrier.wait(), timeout=5)
+
+    counter_task = asyncio.create_task(_count_the_second_visit())
+    await asyncio.wait_for(counter_started.wait(), timeout=5)
+    # The outbox holds the client row through the provider attempt.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(counter_finished.wait(), timeout=0.2)
+
+    release_provider.set()
+    await asyncio.wait_for(outbox_task, timeout=5)
+    await asyncio.wait_for(counter_task, timeout=5)
+
+    assert order.index("provider_attempt") < order.index("provider_return")
+    assert order.index("provider_return") < order.index("counter_wrote"), (
+        "the counter waited through the whole provider attempt"
+    )
+    assert order.index("counter_wrote") < order.index("committed_send_visible") < order.index("counter_commit")
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        rows = (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))).scalars().all()
+        assert persisted is not None and persisted.status == "done", persisted.last_error
+        assert len(rows) == 1, "the review that was authorised at three visits was sent exactly once"
+        assert client is not None and client.easyweek_visits_total == 4, "and the fourth visit was not lost"
+
+
+async def test_the_two_paths_serialise_instead_of_deadlocking(
+    db: AsyncSession,
+    session_maker: async_sessionmaker[AsyncSession],
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both take `Record` then `Client`, so neither can hold what the other wants.
+
+    Started together and bounded by a timeout: a lock-order inversion would show
+    up here as a PostgreSQL deadlock or as a test that never finishes, not as a
+    silently wrong count.
+    """
+    monkeypatch.setattr(settings, "easyweek_review_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_visit_counter_enabled", True, raising=False)
+    job = await _seed_review_job(db)
+    job_id, client_id = int(job.id), int(job.client_id)
+    await _visits(db, job, 3)
+    second = await _seed_second_booking_of_the_same_client(db, job)
+    second_uuid, second_id = second.easyweek_booking_uuid, int(second.altegio_record_id)
+    await db.commit()
+
+    async def _count_the_second_visit() -> None:
+        async with session_maker() as inbox_session:
+            async with inbox_session.begin():
+                await _record_visit_counter(
+                    inbox_session,
+                    _succeeded_visit_payload(booking_uuid=second_uuid, booking_id=second_id, visits_total=4),
+                )
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            _process_job_in_new_transaction(session_maker, job_id),
+            _count_the_second_visit(),
+        ),
+        timeout=15,
+    )
+
+    async with session_maker() as verification:
+        persisted = await verification.get(MessageJob, job_id)
+        client = await verification.get(Client, client_id)
+        rows = (await verification.execute(select(OutboxMessage).where(OutboxMessage.job_id == job_id))).scalars().all()
+    assert client is not None and client.easyweek_visits_total == 4, "the visit is recorded either way"
+    assert persisted is not None
+    # Whichever order the two transactions took, the outcome is one of exactly
+    # two correct ones — never a send decided on a count that had already moved.
+    if persisted.status == "done":
+        assert len(rows) == 1
+        assert len(capture.template_calls) == 1
+    else:
+        assert persisted.status == "canceled"
+        assert persisted.last_error == "EasyWeek review refused: review_visit_limit_exceeded"
+        assert persisted.attempts == 0
+        assert rows == []
+        assert capture.template_calls == []

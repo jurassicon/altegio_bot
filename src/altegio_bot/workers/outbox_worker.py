@@ -1322,10 +1322,28 @@ async def _easyweek_review_visit_limit_error(
 
     The job's payload is deliberately NOT evidence: it records what was true
     when the review was planned, and jobs queued before this guard existed
-    carry no such field at all. The Client row is re-read by full identity
-    rather than trusted from the caller's instance, because that instance may
-    have been loaded before a `booking-succeeded` in another transaction moved
-    the number.
+    carry no such field at all.
+
+    Reading the row again is not enough on its own, and both halves of that
+    matter:
+
+    * ``populate_existing`` — ``_load_client`` reaches this customer through
+      ``session.get``, so the row is already in the identity map. Without it a
+      plain SELECT returns the ORM instance as it was loaded, and a
+      ``visits_total`` another transaction has since committed would never be
+      seen. The value has to come from PostgreSQL, not from memory.
+    * ``FOR UPDATE`` — without the lock the answer is only true for the instant
+      it was read. `record_visit_counter` could commit a fourth visit in the gap
+      between this check and the Meta call, and the review would go out against
+      a count that no longer holds. The lock makes the decision linear with the
+      counter: whoever takes the row first finishes first.
+
+    The lock is held for the rest of the job's transaction — through the send
+    decision, the provider attempt and the Outbox audit row — so "eligible" stays
+    true until the message actually exists. Order is ``Record`` then ``Client``,
+    the same order `record_visit_counter` takes them in (the EasyWeek Record is
+    already locked by ``_load_easyweek_record_for_update`` before this runs), so
+    the two paths queue behind each other instead of deadlocking.
 
     Nothing here calls Altegio: EasyWeek states the total itself, and the
     Altegio helper would answer for a different company id space entirely.
@@ -1345,6 +1363,8 @@ async def _easyweek_review_visit_limit_error(
                 .where(Client.id == job.client_id)
                 .where(Client.provider == PROVIDER_EASYWEEK)
                 .where(Client.company_id == job.company_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
