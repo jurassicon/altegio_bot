@@ -506,7 +506,7 @@ async def test_a_real_sql_failure_in_the_lookup_leaves_the_transaction_usable(se
     assert record.staff_name == "after the failure"
 
 
-async def test_a_failing_ownership_read_does_not_poison_the_caller(session_maker, monkeypatch):
+async def test_a_failing_ownership_read_does_not_poison_the_caller(session_maker):
     """The lookup's own statement fails: UNKNOWN, and the transaction survives."""
     from altegio_bot import post_booking_ownership as ownership
 
@@ -521,15 +521,22 @@ async def test_a_failing_ownership_read_does_not_poison_the_caller(session_maker
             return await real_execute(self, text("SELECT * FROM a_table_that_does_not_exist"))
         return await real_execute(self, statement, *args, **kwargs)
 
-    monkeypatch.setattr(AsyncSession, "execute", explode_once)
+    # Its OWN patch scope. `monkeypatch.undo()` would revert every patch made
+    # through the shared function-scoped fixture — including the autouse Altegio
+    # API stub above — and the rest of the test would then talk to the real CRM.
+    with pytest.MonkeyPatch.context() as broken_execute:
+        broken_execute.setattr(AsyncSession, "execute", explode_once)
 
-    async with session_maker() as session:
-        async with session.begin():
-            owner = await ownership.post_booking_owner(session, company_id=COMPANY, altegio_record_id=SOURCE_RECORD_ID)
-            assert owner is ownership.PostBookingOwner.UNKNOWN
-            # The caller can still write its own verdict in the same transaction.
-            await session.execute(update(Record).where(Record.id == record_pk).values(staff_name="verdict recorded"))
-    monkeypatch.undo()
+        async with session_maker() as session:
+            async with session.begin():
+                owner = await ownership.post_booking_owner(
+                    session, company_id=COMPANY, altegio_record_id=SOURCE_RECORD_ID
+                )
+                assert owner is ownership.PostBookingOwner.UNKNOWN
+                # The caller can still write its own verdict in the same transaction.
+                await session.execute(
+                    update(Record).where(Record.id == record_pk).values(staff_name="verdict recorded")
+                )
 
     assert exploded == [True], "the lookup really did fail at the SQL level"
     async with session_maker() as session:
@@ -537,7 +544,7 @@ async def test_a_failing_ownership_read_does_not_poison_the_caller(session_maker
     assert record.staff_name == "verdict recorded"
 
 
-async def test_the_planner_refuses_and_stays_recoverable_after_a_real_sql_failure(session_maker, monkeypatch):
+async def test_the_planner_refuses_and_stays_recoverable_after_a_real_sql_failure(session_maker):
     """End to end: no job created, a stable PII-free reason, and a re-drivable event."""
     from altegio_bot import post_booking_ownership as ownership
 
@@ -551,21 +558,27 @@ async def test_the_planner_refuses_and_stays_recoverable_after_a_real_sql_failur
             return await real_execute(self, text("SELECT * FROM a_table_that_does_not_exist"))
         return await real_execute(self, statement, *args, **kwargs)
 
-    monkeypatch.setattr(AsyncSession, "execute", explode_once)
-    async with session_maker() as session:
-        async with session.begin():
-            with pytest.raises(ownership.PostBookingOwnershipUnproven) as refused:
-                await plan_jobs_for_record_event(
-                    session,
-                    company_id=COMPANY,
-                    record_id=record_pk,
-                    event_status="create",
+    # Scoped exactly to the broken statement, for the reason spelled out in the
+    # sibling test: a blanket `monkeypatch.undo()` also removes the autouse
+    # Altegio API stub, and the healthy redrive below would then reach out to
+    # api.alteg.io for real — green on a laptop that happens to hold a token,
+    # red in CI, and an unwanted request to a live CRM either way.
+    with pytest.MonkeyPatch.context() as broken_execute:
+        broken_execute.setattr(AsyncSession, "execute", explode_once)
+
+        async with session_maker() as session:
+            async with session.begin():
+                with pytest.raises(ownership.PostBookingOwnershipUnproven) as refused:
+                    await plan_jobs_for_record_event(
+                        session,
+                        company_id=COMPANY,
+                        record_id=record_pk,
+                        event_status="create",
+                    )
+                # The same transaction can still record the outcome.
+                await session.execute(
+                    update(Record).where(Record.id == record_pk).values(staff_name=str(refused.value)[:32])
                 )
-            # The same transaction can still record the outcome.
-            await session.execute(
-                update(Record).where(Record.id == record_pk).values(staff_name=str(refused.value)[:32])
-            )
-    monkeypatch.undo()
 
     assert str(refused.value) == ownership.REASON_UNKNOWN
     for leaked in ("+49", "@", "http"):
@@ -581,3 +594,8 @@ async def test_the_planner_refuses_and_stays_recoverable_after_a_real_sql_failur
     await _plan_event(session_maker, record_pk, status="create")
     planned = await _jobs(session_maker, record_pk)
     assert planned[REVIEW_3D] == "queued"
+    # And it was answered by the stub, not by the real Altegio API: this file
+    # must never depend on a token, a network, or somebody else's live data.
+    assert planner_mod.count_attended_client_visits.await_count >= 1, (
+        "review eligibility was resolved without the stubbed Altegio call"
+    )
