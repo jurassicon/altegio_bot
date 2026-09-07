@@ -23,6 +23,9 @@ SERVICES_COUNT_SNAPSHOT_KEY: Final = "services_count"
 ALLOWED: Final = "allowed"
 CATEGORY_MISSING: Final = "category_missing"
 CATEGORY_NOT_ALLOWED: Final = "category_not_allowed"
+# Durable ledger code used when §30 intentionally disables this bot's reminder
+# automation for an otherwise fully proven migrated booking.
+REMINDER_SUPPRESSION_REASON_CODE: Final = "service_category_not_allowed"
 CATEGORY_AMBIGUOUS_MULTI_SERVICE: Final = "category_ambiguous_multi_service"
 SERVICE_COUNT_UNPROVEN: Final = "service_count_unproven"
 ALLOWED_CATEGORIES_UNCONFIGURED: Final = "allowed_categories_unconfigured"
@@ -235,6 +238,7 @@ __all__ = [
     "CATEGORY_AMBIGUOUS_MULTI_SERVICE",
     "CATEGORY_MISSING",
     "CATEGORY_NOT_ALLOWED",
+    "REMINDER_SUPPRESSION_REASON_CODE",
     "EASYWEEK_RAW_NAMESPACE",
     "MAX_ALLOWED_SERVICE_CATEGORIES",
     "MAX_SERVICE_CATEGORY_LENGTH",

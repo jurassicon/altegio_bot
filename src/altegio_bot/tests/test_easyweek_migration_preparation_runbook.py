@@ -623,3 +623,48 @@ def test_the_prose_describes_the_marker_evidence_in_the_report(handover: str) ->
 
     assert "ownership markers" in text
     assert "проставленных и уже" in text
+
+
+def test_the_runbook_freezes_the_two_approved_production_scopes(handover: str) -> None:
+    for value in (
+        "/migration/input/manifest.karlsruhe.api-contract.20260831.json",
+        "27d8b9b5c59a446c",
+        "887cfbbe881149ad",
+        "90b183e121294f49",
+        "9f895ed02dc64073",
+        "f6897b60b99b4860",
+        "/migration/input/manifest.handover.hanna.json",
+        "55be3c0a62164e06",
+        "f61323dc49384c62",
+    ):
+        assert value in handover
+    for excluded in (
+        "b4ca41ac1ad54591",
+        "c52bb4f62fb64a35",
+        "02d514703aec466f",
+        "de193299b9974859",
+    ):
+        assert excluded in handover
+
+
+def test_the_runbook_explains_typed_terminal_and_suppression_outcomes(handover: str) -> None:
+    text = prose(handover)
+    for disposition in (
+        "handover_active",
+        "handover_terminal_completed",
+        "handover_terminal_canceled",
+        "suppressed_unsupported_category",
+        "unproven",
+    ):
+        assert disposition in text
+    assert "service_category_not_allowed" in text
+    assert "ownership и suppression markers" in text.casefold()
+
+
+def test_the_runbook_sql_audits_suppression_without_mutating_production(handover: str) -> None:
+    sql = [line for block in bash_blocks(handover) for line in block.splitlines() if "psql " in line]
+    [query] = [line for line in sql if "reminders_suppressed_at" in line]
+    assert "reminder_suppression_reason_code" in query
+    assert "service_category_not_allowed" in query
+    assert "target_reminders_on_suppressed" in query
+    assert "BEGIN TRANSACTION READ ONLY" in query

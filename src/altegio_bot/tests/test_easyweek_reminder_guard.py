@@ -318,7 +318,7 @@ def test_a_missing_flag_is_refused_rather_than_assumed_false(flag: str) -> None:
     assert _check(payload).outcome is GuardOutcome.MALFORMED_RESPONSE
 
 
-@pytest.mark.parametrize("status_type", ["canceled", "cancelled", "COMPLETED", "succeeded", "finished"])
+@pytest.mark.parametrize("status_type", ["canceled", "cancelled", "COMPLETED", "succeeded", "finished", "successful"])
 def test_a_status_type_contradicting_the_booleans_fails_closed(status_type: str) -> None:
     """Two halves of one response disagree; neither is trusted."""
     result = _check(_api(status={"type": status_type}))

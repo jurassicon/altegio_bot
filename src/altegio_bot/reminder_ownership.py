@@ -27,9 +27,11 @@ immediately before Meta.
 
 Fail-closed, and what that means on each side
 ---------------------------------------------
-Three answers, never two:
+Four answers, never two:
 
-* ``TRANSFERRED`` — a marker proves EasyWeek owns these reminders.
+* ``EASYWEEK`` — a marker proves EasyWeek owns these reminders.
+* ``SUPPRESSED`` — the bot intentionally owns no reminder obligation for the
+  proven unsupported category.
 * ``ALTEGIO`` — the ledger has no marker for this exact source identity, so
   nothing has moved and the ordinary path continues untouched.
 * ``UNKNOWN`` — the question could not be answered. Contradictory rows, a
@@ -49,13 +51,19 @@ untouched, and every EasyWeek job is untouched.
 from __future__ import annotations
 
 import logging
+import uuid
 from enum import Enum
 from typing import Final
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import PROVIDER_ALTEGIO, EasyWeekMigrationLedger
+from altegio_bot.easyweek_service_category import REMINDER_SUPPRESSION_REASON_CODE
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    EasyWeekMigrationLedger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +74,7 @@ HANDOVER_JOB_TYPES: Final[frozenset[str]] = frozenset({"reminder_24h", "reminder
 # Stable, PII-free reasons. They reach `message_jobs.last_error`, which an
 # operator reads and a report may quote.
 REASON_HANDED_OVER: Final = "Canceled: reminder ownership handed over to EasyWeek"
+REASON_SUPPRESSED: Final = "Canceled: reminders suppressed for unsupported EasyWeek service category"
 REASON_UNKNOWN: Final = "reminder ownership could not be proven"
 
 
@@ -74,7 +83,21 @@ class ReminderOwner(str, Enum):
 
     ALTEGIO = "altegio"
     EASYWEEK = "easyweek"
+    SUPPRESSED = "suppressed"
     UNKNOWN = "unknown"
+
+
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _valid_target_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 async def reminder_owner(
@@ -102,8 +125,14 @@ async def reminder_owner(
 
     stmt = (
         select(
+            EasyWeekMigrationLedger.target_provider,
+            EasyWeekMigrationLedger.status,
+            EasyWeekMigrationLedger.target_booking_uuid,
             EasyWeekMigrationLedger.reminders_handed_over_at,
             EasyWeekMigrationLedger.reminder_handover_plan_digest,
+            EasyWeekMigrationLedger.reminders_suppressed_at,
+            EasyWeekMigrationLedger.reminder_suppression_plan_digest,
+            EasyWeekMigrationLedger.reminder_suppression_reason_code,
         )
         .where(EasyWeekMigrationLedger.source_provider == PROVIDER_ALTEGIO)
         .where(EasyWeekMigrationLedger.source_company_id == company_id)
@@ -135,23 +164,50 @@ async def reminder_owner(
         )
         return ReminderOwner.UNKNOWN
 
-    handed_over_at, digest = rows[0]
-    if handed_over_at is None and digest is None:
+    (
+        target_provider,
+        status,
+        target_booking_uuid,
+        handed_over_at,
+        handover_digest,
+        suppressed_at,
+        suppression_digest,
+        suppression_reason,
+    ) = rows[0]
+    ownership_empty = handed_over_at is None and handover_digest is None
+    suppression_empty = suppressed_at is None and suppression_digest is None and suppression_reason is None
+
+    if ownership_empty and suppression_empty:
         # A migrated booking whose reminders were never handed over. This is the
         # ordinary state for every wave that has not run the handover yet, and
         # it must NOT suppress anything.
         return ReminderOwner.ALTEGIO
-    if handed_over_at is None or not digest:
-        # Half a marker. The database CHECK makes this unreachable through any
-        # supported path, so seeing it means something wrote the row directly.
-        # Refusing is the only safe reading.
-        logger.error(
-            "reminder ownership marker is incomplete: company_id=%s source_record_id=%s",
-            company_id,
-            altegio_record_id,
-        )
-        return ReminderOwner.UNKNOWN
-    return ReminderOwner.EASYWEEK
+
+    identity_proven = (
+        target_provider == PROVIDER_EASYWEEK and status == "created" and _valid_target_uuid(target_booking_uuid)
+    )
+    ownership_complete = handed_over_at is not None and _valid_digest(handover_digest)
+    suppression_complete = (
+        suppressed_at is not None
+        and _valid_digest(suppression_digest)
+        and suppression_reason == REMINDER_SUPPRESSION_REASON_CODE
+    )
+
+    if identity_proven and ownership_complete and suppression_empty:
+        return ReminderOwner.EASYWEEK
+    if identity_proven and ownership_empty and suppression_complete:
+        return ReminderOwner.SUPPRESSED
+
+    # Half/dual/corrupt markers or a marker on an unproven migration identity.
+    # The database constraints make most of these states unreachable through a
+    # supported write, but direct SQL or a partially applied external migration
+    # must still fail closed rather than becoming permission to send.
+    logger.error(
+        "reminder ownership marker is invalid: company_id=%s source_record_id=%s",
+        company_id,
+        altegio_record_id,
+    )
+    return ReminderOwner.UNKNOWN
 
 
 async def altegio_reminders_are_suppressed(
@@ -162,9 +218,9 @@ async def altegio_reminders_are_suppressed(
 ) -> tuple[bool, ReminderOwner]:
     """Should the Altegio path refrain from creating a reminder here?
 
-    ``True`` for both ``EASYWEEK`` and ``UNKNOWN``: an unanswerable question is
-    not a licence. Returned with the owner so the caller can log and act on the
-    difference — one is a normal, expected outcome after a handover, the other
+    ``True`` for ``EASYWEEK``, ``SUPPRESSED`` and ``UNKNOWN``: an unanswerable
+    question is not a licence. Returned with the owner so the caller can log and
+    act on the difference — two are normal outcomes after a handover, the other
     is something a person needs to look at.
     """
     owner = await reminder_owner(session, company_id=company_id, altegio_record_id=altegio_record_id)

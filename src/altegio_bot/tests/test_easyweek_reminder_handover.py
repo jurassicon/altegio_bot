@@ -24,9 +24,15 @@ from typing import Any
 import pytest
 
 from altegio_bot.easyweek_migration.reminder_handover import (
+    ACTIONABLE_DISPOSITIONS,
     APPLY_REPORT_VERSION,
     CANCEL_REASON,
+    DISPOSITION_ACTIVE,
+    DISPOSITION_SUPPRESSED_CATEGORY,
+    DISPOSITION_TERMINAL_COMPLETED,
+    DISPOSITION_UNPROVEN,
     MARKER_ALREADY,
+    MARKER_SUPPRESSION,
     OBLIGATION_DONE,
     OBLIGATION_MISSING,
     OBLIGATION_OCCUPIED_CANCELED,
@@ -53,6 +59,7 @@ from altegio_bot.easyweek_migration.reminder_handover import (
 )
 from altegio_bot.easyweek_policy import REMINDER_2H, REMINDER_24H
 from altegio_bot.easyweek_reminders import easyweek_reminder_dedupe_key
+from altegio_bot.easyweek_service_category import CATEGORY_NOT_ALLOWED, REMINDER_SUPPRESSION_REASON_CODE
 from altegio_bot.models.models import PROVIDER_EASYWEEK
 
 BOOKING = uuid_module.UUID("aaaaaaaa-0000-4000-8000-000000000001")
@@ -250,10 +257,10 @@ def test_a_blocker_fails_the_guard_question() -> None:
 
 
 def test_a_processing_source_job_fails_only_the_cutover_question() -> None:
-    """The queue is fine; this is simply not the moment to switch ownership."""
+    """A claimed source job is an explicit wave-wide guard blocker."""
     plan = plan_with(handover_row(obligations=owed(48), processing_source_job_ids=(9,)))
 
-    assert plan.guard_ready is True
+    assert plan.guard_ready is False
     assert plan.cutover_ready is False
 
 
@@ -347,6 +354,32 @@ def test_a_damaged_snapshot_authorises_nothing(content: str, tmp_path: Path) -> 
 
 def frozen_for(tmp_path: Path, plan: HandoverPlan):
     return read_snapshot(write_snapshot(plan, tmp_path / "plan.json"))
+
+
+def apply_report_for(frozen: Any, **overrides: Any) -> ApplyReport:
+    disposition_counts = {item: 0 for item in sorted(ACTIONABLE_DISPOSITIONS | {DISPOSITION_UNPROVEN})}
+    disposition_counts[DISPOSITION_ACTIVE] = 1
+    base: dict[str, Any] = {
+        "snapshot_version": SNAPSHOT_VERSION,
+        "snapshot_digest": frozen.digest,
+        "company_ids": frozen.company_ids,
+        "applied_at": NOW,
+        "eligible_created_rows": 1,
+        "rows_in_scope": 1,
+        "created_job_ids": (10, 11),
+        "canceled_job_ids": (),
+        "already_present_count": 0,
+        "halted": None,
+        "disposition_counts": disposition_counts,
+        "marked_ledger_ids": (1,),
+        "already_marked_ledger_ids": (),
+        "suppression_marked_ledger_ids": (),
+        "suppression_already_marked_ledger_ids": (),
+        "scoped_outbox_ids_before": (),
+        "scoped_outbox_ids_after": (),
+    }
+    base.update(overrides)
+    return ApplyReport(**base)
 
 
 def test_the_right_digest_and_phrase_together_authorise(tmp_path: Path) -> None:
@@ -480,21 +513,7 @@ def test_snapshot_schema_changes_never_authorise_apply(change: str, tmp_path: Pa
 
 def test_apply_report_round_trips_and_is_bound_to_the_snapshot(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(1,),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen)
     path = write_apply_report(report, tmp_path / "report.json")
 
     assert read_apply_report(path, frozen=frozen) == report
@@ -504,21 +523,7 @@ def test_apply_report_round_trips_and_is_bound_to_the_snapshot(tmp_path: Path) -
 
 def test_a_tampered_apply_report_is_refused(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(1,),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen)
     path = write_apply_report(report, tmp_path / "report.json")
     payload = json.loads(path.read_text())
     payload["created_job_ids"] = [10]
@@ -530,21 +535,7 @@ def test_a_tampered_apply_report_is_refused(tmp_path: Path) -> None:
 
 def test_an_internally_inconsistent_apply_report_is_refused_even_with_a_new_digest(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(1,),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen)
     path = write_apply_report(report, tmp_path / "report.json")
     payload = json.loads(path.read_text())
     payload["created_job_count"] = 1
@@ -699,8 +690,9 @@ def test_the_handover_reader_reports_the_booking_as_it_is() -> None:
     [
         ({"is_canceled": True, "status": {"type": "canceled"}}, "canceled"),
         ({"is_completed": True, "status": {"type": "completed"}}, "completed"),
+        ({"is_completed": True, "status": {"type": "SUCCESSFUL"}}, "completed"),
     ],
-    ids=["canceled", "completed"],
+    ids=["canceled", "completed", "successful"],
 )
 def test_the_handover_reader_reports_a_dead_booking_as_inactive(override: dict[str, Any], outcome: str) -> None:
     from altegio_bot.easyweek_reminder_guard import ObservedBooking, read_booking_state
@@ -720,6 +712,8 @@ def test_the_handover_reader_reports_a_dead_booking_as_inactive(override: dict[s
         {"is_completed": True, "status": {"type": "canceled"}},
         {"status": {"type": "canceled"}},
         {"status": {"type": "completed"}},
+        {"status": {"type": "successful"}},
+        {"is_canceled": True, "is_completed": True},
     ],
     ids=[
         "canceled_flag_active_status",
@@ -727,6 +721,8 @@ def test_the_handover_reader_reports_a_dead_booking_as_inactive(override: dict[s
         "completed_flag_canceled_status",
         "false_flags_canceled_status",
         "false_flags_completed_status",
+        "false_flags_successful_status",
+        "both_terminal_flags",
     ],
 )
 def test_the_handover_reader_refuses_contradictory_status_evidence(override: dict[str, Any]) -> None:
@@ -797,9 +793,21 @@ def marked_row(**overrides: Any) -> HandoverRow:
     return handover_row(**base)
 
 
+def suppressed_row(**overrides: Any) -> HandoverRow:
+    base: dict[str, Any] = {
+        "disposition": DISPOSITION_SUPPRESSED_CATEGORY,
+        "category_reason_code": CATEGORY_NOT_ALLOWED,
+        "marker_kind": MARKER_SUPPRESSION,
+        "marker_reason_code": REMINDER_SUPPRESSION_REASON_CODE,
+        "obligations": (),
+    }
+    base.update(overrides)
+    return handover_row(**base)
+
+
 def test_the_snapshot_version_moved_for_the_marker() -> None:
-    """v2 described a snapshot that authorised a write with no marker at all."""
-    assert SNAPSHOT_VERSION == 4
+    """v4 cannot distinguish terminal and intentionally suppressed rows."""
+    assert SNAPSHOT_VERSION == 5
 
 
 def test_a_v2_snapshot_authorises_nothing(tmp_path: Path) -> None:
@@ -810,6 +818,47 @@ def test_a_v2_snapshot_authorises_nothing(tmp_path: Path) -> None:
 
     with pytest.raises(SnapshotError):
         read_snapshot(path)
+
+
+def test_a_v4_snapshot_authorises_nothing(tmp_path: Path) -> None:
+    path = write_snapshot(plan_with(suppressed_row()), tmp_path / "plan.json")
+    payload = json.loads(path.read_text())
+    payload["version"] = 4
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+def test_a_suppression_disposition_round_trips_with_its_distinct_marker(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(suppressed_row()))
+
+    [row] = frozen.rows
+    assert row["disposition"] == DISPOSITION_SUPPRESSED_CATEGORY
+    assert row["category_reason_code"] == CATEGORY_NOT_ALLOWED
+    assert row["marker"] == {
+        "kind": MARKER_SUPPRESSION,
+        "action": "set",
+        "reason_code": REMINDER_SUPPRESSION_REASON_CODE,
+        "existing_digest": None,
+        "handed_over_at": None,
+    }
+    assert row["obligations"] == []
+
+
+def test_a_terminal_disposition_is_not_indistinguishable_from_an_active_short_window(tmp_path: Path) -> None:
+    terminal = handover_row(
+        disposition=DISPOSITION_TERMINAL_COMPLETED,
+        target_is_completed=True,
+        target_status_type="successful",
+        obligations=(),
+    )
+    active = handover_row(target_starts_at=NOW + timedelta(hours=1), obligations=())
+
+    assert plan_with(terminal).digest() != plan_with(active).digest()
+    frozen = frozen_for(tmp_path, plan_with(terminal))
+    assert frozen.rows[0]["disposition"] == DISPOSITION_TERMINAL_COMPLETED
+    assert frozen.rows[0]["identity"]["target_status_type"] == "successful"
 
 
 def test_a_row_without_a_marker_block_is_refused(tmp_path: Path) -> None:
@@ -885,27 +934,47 @@ def test_an_edited_marker_expectation_breaks_the_snapshot_digest(tmp_path: Path)
 
 
 def test_the_apply_report_version_moved_with_the_marker_evidence() -> None:
-    assert APPLY_REPORT_VERSION == 2
+    assert APPLY_REPORT_VERSION == 3
+
+
+def test_a_v2_apply_report_is_rejected(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    path = write_apply_report(apply_report_for(frozen), tmp_path / "report.json")
+    payload = json.loads(path.read_text())
+    payload["version"] = 2
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(path, frozen=frozen)
+
+
+def test_a_suppression_apply_report_accounts_for_the_distinct_marker(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(suppressed_row()))
+    disposition_counts = {item: 0 for item in sorted(ACTIONABLE_DISPOSITIONS | {DISPOSITION_UNPROVEN})}
+    disposition_counts[DISPOSITION_SUPPRESSED_CATEGORY] = 1
+    report = apply_report_for(
+        frozen,
+        created_job_ids=(),
+        disposition_counts=disposition_counts,
+        marked_ledger_ids=(),
+        suppression_marked_ledger_ids=(1,),
+    )
+
+    assert read_apply_report(write_apply_report(report, tmp_path / "suppressed.json"), frozen=frozen) == report
+
+
+def test_a_halted_result_cannot_masquerade_as_a_committed_apply_report(tmp_path: Path) -> None:
+    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
+    report = apply_report_for(frozen, halted="source_reminder_processing")
+
+    with pytest.raises(SnapshotError):
+        read_apply_report(write_apply_report(report, tmp_path / "halted.json"), frozen=frozen)
 
 
 def test_an_apply_report_that_marks_no_row_is_refused(tmp_path: Path) -> None:
     """A wave that withdrew reminders without recording ownership is not proven."""
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen, marked_ledger_ids=())
     path = write_apply_report(report, tmp_path / "report.json")
 
     with pytest.raises(SnapshotError):
@@ -914,21 +983,7 @@ def test_an_apply_report_that_marks_no_row_is_refused(tmp_path: Path) -> None:
 
 def test_an_apply_report_whose_marker_lists_overlap_is_refused(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(1,),
-        already_marked_ledger_ids=(1,),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen, already_marked_ledger_ids=(1,))
     path = write_apply_report(report, tmp_path / "report.json")
 
     with pytest.raises(SnapshotError):
@@ -937,21 +992,7 @@ def test_an_apply_report_whose_marker_lists_overlap_is_refused(tmp_path: Path) -
 
 def test_an_apply_report_marking_the_wrong_row_is_refused(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(999,),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen, marked_ledger_ids=(999,))
     path = write_apply_report(report, tmp_path / "report.json")
 
     with pytest.raises(SnapshotError):
@@ -959,23 +1000,9 @@ def test_an_apply_report_marking_the_wrong_row_is_refused(tmp_path: Path) -> Non
 
 
 def test_an_apply_report_disagreeing_with_the_snapshot_action_is_refused(tmp_path: Path) -> None:
-    """The plan said this row would be marked; the report says it already was."""
-    frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(),
-        already_marked_ledger_ids=(1,),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    """A marker that existed at plan time cannot be reported as newly written."""
+    frozen = frozen_for(tmp_path, plan_with(marked_row()))
+    report = apply_report_for(frozen)
     path = write_apply_report(report, tmp_path / "report.json")
 
     with pytest.raises(SnapshotError):
@@ -984,21 +1011,7 @@ def test_an_apply_report_disagreeing_with_the_snapshot_action_is_refused(tmp_pat
 
 def test_a_marked_row_counts_as_a_mutation_in_the_report(tmp_path: Path) -> None:
     frozen = frozen_for(tmp_path, plan_with(handover_row(obligations=owed(48))))
-    report = ApplyReport(
-        snapshot_version=SNAPSHOT_VERSION,
-        snapshot_digest=frozen.digest,
-        company_ids=frozen.company_ids,
-        applied_at=NOW,
-        eligible_created_rows=1,
-        rows_in_scope=1,
-        created_job_ids=(10, 11),
-        canceled_job_ids=(),
-        already_present_count=0,
-        marked_ledger_ids=(1,),
-        already_marked_ledger_ids=(),
-        scoped_outbox_ids_before=(),
-        scoped_outbox_ids_after=(),
-    )
+    report = apply_report_for(frozen)
 
     assert report.mutation_count == 3
     assert read_apply_report(write_apply_report(report, tmp_path / "r.json"), frozen=frozen) == report
