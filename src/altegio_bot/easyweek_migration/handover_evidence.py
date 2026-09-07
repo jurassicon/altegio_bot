@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,7 +15,11 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.manifest import MigrationManifest
 from altegio_bot.easyweek_migration.reminder_handover import CANCEL_REASON
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
-from altegio_bot.easyweek_service_category import evaluate_service_category
+from altegio_bot.easyweek_service_category import (
+    ALLOWED,
+    CATEGORY_NOT_ALLOWED,
+    evaluate_service_category,
+)
 from altegio_bot.models.models import Client, EasyWeekMigrationLedger, MessageJob, Record
 from altegio_bot.settings import settings
 
@@ -148,7 +153,17 @@ async def row_evidence(session: AsyncSession, entry: Any, source: Record, target
     # prove the same frozen facts after its own successful cancellation.
     return {
         "ledger": digest(
-            columns(entry, exclude=("reminders_handed_over_at", "reminder_handover_plan_digest", "updated_at"))
+            columns(
+                entry,
+                exclude=(
+                    "reminders_handed_over_at",
+                    "reminder_handover_plan_digest",
+                    "reminders_suppressed_at",
+                    "reminder_suppression_plan_digest",
+                    "reminder_suppression_reason_code",
+                    "updated_at",
+                ),
+            )
         ),
         "source": digest(columns(source)),
         "target": digest(columns(target)),
@@ -159,23 +174,35 @@ async def row_evidence(session: AsyncSession, entry: Any, source: Record, target
     }
 
 
-async def local_refusal(
+@dataclass(frozen=True)
+class LocalHandoverProof:
+    """Exact local eligibility evidence without collapsing business reasons."""
+
+    refusal: str | None
+    category_reason_code: str | None
+
+
+async def local_handover_proof(
     session: AsyncSession, entry: Any, source: Record, target: Record, manifest: MigrationManifest | None = None
-) -> str | None:
+) -> LocalHandoverProof:
     if entry.source_provider != "altegio" or entry.target_provider != "easyweek":
-        return "provider_mismatch"
+        return LocalHandoverProof("provider_mismatch", None)
     if manifest is not None:
         branch = manifest.branch(entry.source_company_id)
         if branch is None or branch.staff_scope(source.staff_id) != "selected":
-            return "staff_scope_unproven"
+            return LocalHandoverProof("staff_scope_unproven", None)
     eligibility = evaluate_service_category(
         record_raw=target.raw, allowed_categories_raw=settings.easyweek_allowed_service_categories
     )
-    if not eligibility.allowed:
-        return "ownership_unproven"
+    category_reason = eligibility.reason
+    # Only the exact business exclusion may proceed to a live target proof and
+    # become a durable suppression disposition. Missing/ambiguous evidence and
+    # unusable configuration remain genuinely unproven.
+    if category_reason not in (ALLOWED, CATEGORY_NOT_ALLOWED):
+        return LocalHandoverProof(category_reason, category_reason)
     client = await session.get(Client, target.client_id) if target.client_id is not None else None
     if client is None or client.provider != "easyweek" or client.company_id != target.company_id:
-        return "target_client_unproven"
+        return LocalHandoverProof("target_client_unproven", category_reason)
     duplicates = list(
         (
             await session.scalars(
@@ -187,7 +214,7 @@ async def local_refusal(
         ).all()
     )
     if duplicates:
-        return "ledger_duplicate_target"
+        return LocalHandoverProof("ledger_duplicate_target", category_reason)
     for record in (source, target):
         jobs = list(
             (
@@ -200,13 +227,21 @@ async def local_refusal(
         )
         for job in jobs:
             if job.provider != record.provider:
-                return "provider_mismatch"
+                return LocalHandoverProof("provider_mismatch", category_reason)
             if job.company_id != record.company_id:
-                return "company_mismatch"
+                return LocalHandoverProof("company_mismatch", category_reason)
             if job.client_id != record.client_id:
-                return "target_client_unproven" if record is target else "source_client_mismatch"
+                reason = "target_client_unproven" if record is target else "source_client_mismatch"
+                return LocalHandoverProof(reason, category_reason)
             if record is source and job.status == "canceled" and job.last_error == CANCEL_REASON:
                 continue
             if job.run_at is None or not job.dedupe_key or not isinstance(job.payload, dict):
-                return "reminder_identity_mismatch"
-    return None
+                return LocalHandoverProof("reminder_identity_mismatch", category_reason)
+    return LocalHandoverProof(None, category_reason)
+
+
+async def local_refusal(
+    session: AsyncSession, entry: Any, source: Record, target: Record, manifest: MigrationManifest | None = None
+) -> str | None:
+    """Compatibility projection for callers that only need a STOP reason."""
+    return (await local_handover_proof(session, entry, source, target, manifest)).refusal

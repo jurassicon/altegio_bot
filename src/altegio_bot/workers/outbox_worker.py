@@ -157,6 +157,7 @@ from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.reminder_ownership import (
     HANDOVER_JOB_TYPES,
     REASON_HANDED_OVER,
+    REASON_SUPPRESSED,
     REASON_UNKNOWN,
     ReminderOwner,
     altegio_reminders_are_suppressed,
@@ -3323,20 +3324,21 @@ async def _run_job_logic(
             company_id=job.company_id,
             altegio_record_id=getattr(record, "altegio_record_id", None),
         )
-        if suppressed and owner is ReminderOwner.EASYWEEK:
-            # Proven: EasyWeek owns this booking's reminders. Terminal, and NOT
-            # a failed send — `attempts` is untouched because nothing was
-            # attempted, and burning one would push an unrelated future retry
-            # closer to `Max attempts reached`.
+        if suppressed and owner in (ReminderOwner.EASYWEEK, ReminderOwner.SUPPRESSED):
+            # Proven: either EasyWeek owns the reminders or the bot
+            # intentionally owns no reminder obligation for this unsupported
+            # category. Both are terminal and neither is a failed send:
+            # `attempts` stays untouched because no external call was made.
             job.status = "canceled"
             job.locked_at = None
             job.updated_at = utcnow()
-            job.last_error = REASON_HANDED_OVER
+            job.last_error = REASON_HANDED_OVER if owner is ReminderOwner.EASYWEEK else REASON_SUPPRESSED
             logger.info(
-                "Altegio reminder suppressed: job_id=%s company=%s job_type=%s owner=easyweek",
+                "Altegio reminder suppressed: job_id=%s company=%s job_type=%s owner=%s",
                 job.id,
                 job.company_id,
                 job.job_type,
+                owner.value,
             )
             return
         if suppressed:

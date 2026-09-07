@@ -30,6 +30,13 @@ from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, parse_manifest
 from altegio_bot.easyweek_migration.reminder_handover import (
     CANCEL_REASON,
+    DISPOSITION_ACTIVE,
+    DISPOSITION_SUPPRESSED_CATEGORY,
+    DISPOSITION_TERMINAL_CANCELED,
+    DISPOSITION_TERMINAL_COMPLETED,
+    DISPOSITION_UNPROVEN,
+    MARKER_ALREADY,
+    MARKER_SUPPRESSION,
     HandoverPlan,
     freeze_plan,
     write_snapshot,
@@ -45,6 +52,12 @@ from altegio_bot.easyweek_reminders import (
     easyweek_reminder_dedupe_key,
     reminder_job_payload,
 )
+from altegio_bot.easyweek_service_category import (
+    CATEGORY_AMBIGUOUS_MULTI_SERVICE,
+    CATEGORY_MISSING,
+    CATEGORY_NOT_ALLOWED,
+    SERVICE_COUNT_UNPROVEN,
+)
 from altegio_bot.message_planner import make_dedupe_key
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
@@ -55,7 +68,13 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
 )
-from altegio_bot.reminder_ownership import REASON_HANDED_OVER, REASON_UNKNOWN, ReminderOwner
+from altegio_bot.reminder_ownership import (
+    REASON_HANDED_OVER,
+    REASON_SUPPRESSED,
+    REASON_UNKNOWN,
+    ReminderOwner,
+    reminder_owner,
+)
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_migration_harness import (
     KA_LOCATION_ID,
@@ -96,14 +115,18 @@ def booking_body(
     booking_uuid: uuid_module.UUID = BOOKING,
     canceled: bool = False,
     completed: bool = False,
+    status_type: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "uuid": str(booking_uuid),
         "location_uuid": KA_LOCATION_UUID,
         "start_time": starts_at.isoformat().replace("+00:00", "Z"),
         "is_canceled": canceled,
         "is_completed": completed,
     }
+    if status_type is not None:
+        body["status"] = {"type": status_type}
+    return body
 
 
 class FakeBookings:
@@ -347,6 +370,35 @@ async def run_apply(
             return await apply_plan(session, frozen, now=now)
 
 
+async def set_target_category(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    target_pk: int,
+    category: object = "Nagelservice",
+    services_count: object = 1,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            target = await session.get(Record, target_pk)
+            assert target is not None
+            target.raw = {
+                "easyweek": {
+                    "service_category": category,
+                    "services_count": services_count,
+                }
+            }
+
+
+async def suppression_marker(session_maker: async_sessionmaker[AsyncSession]) -> tuple[Any, Any, Any]:
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+        return (
+            row.reminders_suppressed_at,
+            row.reminder_suppression_plan_digest,
+            row.reminder_suppression_reason_code,
+        )
+
+
 # ---------------------------------------------------------------------------
 # plan writes nothing
 # ---------------------------------------------------------------------------
@@ -504,6 +556,8 @@ async def test_one_failed_live_proof_blocks_the_entire_two_row_scope(session_mak
     assert len(plan.scoped) == 1
     assert len(plan.eligible_refusals) == 1
     assert plan.eligible_created_rows == 2
+    assert sum(plan.disposition_counts.values()) == 2
+    assert plan.disposition_counts[DISPOSITION_UNPROVEN] == 1
     assert plan.cutover_ready is False
     assert result.halted == "snapshot_incomplete_scope"
     assert await jobs(session_maker) == []
@@ -538,17 +592,158 @@ async def test_zero_created_rows_is_information_not_cutover_permission(session_m
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_target_owes_nothing_but_stays_in_scope(session_maker, seeded) -> None:
+@pytest.mark.parametrize("status_type", ["canceled", "cancelled"])
+async def test_a_cancelled_target_owes_nothing_but_stays_in_scope(status_type: str, session_maker, seeded) -> None:
     """Its stale Altegio reminders still have to be withdrawn."""
     async with session_maker() as session:
         async with session.begin():
             tgt = (await session.execute(select(Record).where(Record.id == seeded["target_pk"]))).scalars().one()
             tgt.is_deleted = True
 
-    plan = await plan_for(session_maker, answer=booking_body(seeded["starts"], canceled=True))
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], canceled=True, status_type=status_type),
+    )
 
     assert len(plan.scoped) == 1
     assert plan.to_create == 0
+    assert plan.scoped[0].disposition == DISPOSITION_TERMINAL_CANCELED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_present", "status"),
+    [
+        (False, None),
+        (True, "completed"),
+        (True, {}),
+        (True, {"type": 1}),
+        (True, {"type": ""}),
+        (True, {"type": "   "}),
+        (True, {"type": "unknown"}),
+    ],
+    ids=["missing", "non_object", "missing_type", "non_string", "empty", "whitespace", "unknown"],
+)
+@pytest.mark.parametrize("terminal_flag", ["is_canceled", "is_completed"], ids=["canceled", "completed"])
+async def test_unproven_terminal_status_blocks_the_entire_plan(
+    status_present: bool,
+    status: object,
+    terminal_flag: str,
+    session_maker,
+    seeded,
+) -> None:
+    answer = booking_body(
+        seeded["starts"],
+        canceled=terminal_flag == "is_canceled",
+        completed=terminal_flag == "is_completed",
+    )
+    if status_present:
+        answer["status"] = status
+
+    plan = await plan_for(session_maker, answer=answer)
+    result = await run_apply(session_maker, plan)
+
+    assert plan.scoped == ()
+    assert plan.refused == {"target_unproven": 1}
+    assert plan.disposition_counts[DISPOSITION_UNPROVEN] == 1
+    assert plan.cutover_ready is False
+    assert result.halted == "snapshot_incomplete_scope"
+    assert await ledger_marker(session_maker) == (None, None)
+    assert await suppression_marker(session_maker) == (None, None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_type", ["completed", "succeeded", "finished", "successful"])
+async def test_a_completed_target_is_a_typed_terminal_handover(status_type: str, session_maker, seeded) -> None:
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], completed=True, status_type=status_type),
+    )
+
+    assert len(plan.scoped) == 1
+    assert plan.scoped[0].disposition == DISPOSITION_TERMINAL_COMPLETED
+    assert plan.scoped[0].target_status_type == status_type
+    assert plan.scoped[0].obligations == ()
+    assert plan.cutover_ready is True
+
+
+@pytest.mark.asyncio
+async def test_an_active_target_is_a_typed_active_handover(session_maker, seeded) -> None:
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], status_type="active"),
+    )
+
+    assert plan.scoped[0].disposition == DISPOSITION_ACTIVE
+    assert plan.scoped[0].target_status_type == "active"
+    assert plan.to_create == 2
+
+
+@pytest.mark.asyncio
+async def test_only_exact_category_not_allowed_becomes_intentional_suppression(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    [row] = plan.scoped
+    assert row.disposition == DISPOSITION_SUPPRESSED_CATEGORY
+    assert row.category_reason_code == CATEGORY_NOT_ALLOWED
+    assert row.marker_kind == MARKER_SUPPRESSION
+    assert row.obligations == ()
+    assert plan.cutover_ready is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("category", "services_count", "reason"),
+    [
+        (None, 1, CATEGORY_MISSING),
+        ("Wimpernverlängerung", None, SERVICE_COUNT_UNPROVEN),
+        ("Wimpernverlängerung", 2, CATEGORY_AMBIGUOUS_MULTI_SERVICE),
+    ],
+)
+async def test_ambiguous_category_evidence_remains_unproven(
+    category: object,
+    services_count: object,
+    reason: str,
+    session_maker,
+    seeded,
+) -> None:
+    await set_target_category(
+        session_maker,
+        target_pk=seeded["target_pk"],
+        category=category,
+        services_count=services_count,
+    )
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    assert plan.scoped == ()
+    assert plan.eligible_refusals[0].reason == reason
+    assert plan.eligible_refusals[0].category_reason_code == reason
+    assert plan.cutover_ready is False
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_category_policy_remains_unproven(session_maker, seeded, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "")
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    assert plan.scoped == ()
+    assert plan.eligible_refusals[0].reason == "allowed_categories_unconfigured"
+    assert plan.cutover_ready is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_category_policy_remains_unproven(session_maker, seeded, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", "not-json")
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    assert plan.scoped == ()
+    assert plan.eligible_refusals[0].reason == "allowed_categories_invalid"
+    assert plan.cutover_ready is False
 
 
 # ---------------------------------------------------------------------------
@@ -1388,6 +1583,252 @@ async def test_neither_the_report_nor_the_logs_carry_personal_data(session_maker
 
 
 # ---------------------------------------------------------------------------
+# Typed terminal and intentional-suppression dispositions (plan §30.13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("canceled", "completed", "status_type", "expected"),
+    [
+        (True, False, "canceled", DISPOSITION_TERMINAL_CANCELED),
+        (False, True, "successful", DISPOSITION_TERMINAL_COMPLETED),
+    ],
+)
+async def test_a_terminal_handover_cancels_source_jobs_without_creating_target_jobs(
+    canceled: bool,
+    completed: bool,
+    status_type: str,
+    expected: str,
+    session_maker,
+    seeded,
+) -> None:
+    if canceled:
+        async with session_maker() as session:
+            async with session.begin():
+                target = await session.get(Record, seeded["target_pk"])
+                assert target is not None
+                target.is_deleted = True
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key=f"altegio:terminal:{status_type}",
+    )
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(
+            seeded["starts"],
+            canceled=canceled,
+            completed=completed,
+            status_type=status_type,
+        ),
+    )
+
+    result = await run_apply(session_maker, plan)
+
+    assert plan.scoped[0].disposition == expected
+    assert result.halted is None
+    assert result.created_job_ids == ()
+    assert result.canceled_job_ids == (stale,)
+    assert result.marked_ledger_ids
+    assert result.suppression_marked_ledger_ids == ()
+    assert not [job for job in await jobs(session_maker) if job.provider == PROVIDER_EASYWEEK]
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_handover_with_no_source_jobs_is_still_ownership_marked(session_maker, seeded) -> None:
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], completed=True, status_type="successful"),
+    )
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.created_job_ids == result.canceled_job_ids == ()
+    assert result.marked_ledger_ids
+    assert await suppression_marker(session_maker) == (None, None, None)
+    assert (await ledger_marker(session_maker))[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_processing_source_job_blocks_a_terminal_handover(session_maker, seeded) -> None:
+    claimed = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="processing",
+        dedupe_key="altegio:terminal:processing",
+    )
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], completed=True, status_type="successful"),
+    )
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted == "source_reminder_processing"
+    assert await ledger_marker(session_maker) == (None, None)
+    rows = {job.id: job for job in await jobs(session_maker)}
+    assert rows[claimed].status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_intentional_suppression_with_no_source_jobs_writes_only_its_marker(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.halted is None
+    assert result.created_job_ids == result.canceled_job_ids == ()
+    assert result.marked_ledger_ids == ()
+    assert result.suppression_marked_ledger_ids
+    suppressed_at, digest, reason = await suppression_marker(session_maker)
+    assert suppressed_at is not None
+    assert digest == plan.digest()
+    assert reason == "service_category_not_allowed"
+    assert await ledger_marker(session_maker) == (None, None)
+    async with session_maker() as session:
+        assert (
+            await reminder_owner(
+                session,
+                company_id=COMPANY,
+                altegio_record_id=SOURCE_RECORD_ID,
+            )
+            is ReminderOwner.SUPPRESSED
+        )
+
+
+@pytest.mark.asyncio
+async def test_intentional_suppression_cancels_exact_queued_source_jobs(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    stale = tuple(
+        sorted(
+            [
+                await add_job(
+                    session_maker,
+                    provider=PROVIDER_ALTEGIO,
+                    record_pk=seeded["source_pk"],
+                    job_type=job_type,
+                    status="queued",
+                    dedupe_key=f"altegio:suppressed:{job_type}",
+                )
+                for job_type in (REMINDER_24H, REMINDER_2H)
+            ]
+        )
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    result = await run_apply(session_maker, plan)
+
+    assert result.created_job_ids == ()
+    assert result.canceled_job_ids == stale
+    rows = {job.id: job for job in await jobs(session_maker)}
+    assert all(rows[job_id].status == "canceled" for job_id in stale)
+    assert all(rows[job_id].last_error == CANCEL_REASON for job_id in stale)
+
+
+@pytest.mark.asyncio
+async def test_a_processing_source_job_blocks_intentional_suppression(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    claimed = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_2H,
+        status="processing",
+        dedupe_key="altegio:suppressed:processing",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    result = await run_apply(session_maker, plan)
+
+    assert plan.guard_ready is False
+    assert result.halted == "source_reminder_processing"
+    assert await suppression_marker(session_maker) == (None, None, None)
+    assert (await jobs(session_maker))[0].id == claimed
+    assert (await jobs(session_maker))[0].status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_a_suppression_marker_rolls_back_with_the_whole_wave(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key="altegio:suppressed:rollback",
+    )
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    async with session_maker() as session:
+        with pytest.raises(RuntimeError):
+            async with session.begin():
+                result = await apply_plan(session, freeze_plan(plan))
+                assert result.halted is None
+                raise RuntimeError("rollback after suppression marker")
+
+    assert await suppression_marker(session_maker) == (None, None, None)
+    rows = {job.id: job for job in await jobs(session_maker)}
+    assert rows[stale].status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_repeating_the_same_suppression_apply_has_zero_mutations(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    marker_before = await suppression_marker(session_maker)
+
+    repeated = await run_apply(session_maker, plan)
+
+    assert repeated.halted is None
+    assert repeated.as_safe_dict()["mutations"] == 0
+    assert repeated.suppression_already_marked_ledger_ids
+    assert await suppression_marker(session_maker) == marker_before
+
+
+@pytest.mark.asyncio
+async def test_a_new_plan_cannot_overwrite_an_existing_suppression_digest(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    first = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, first)
+    marker_before = await suppression_marker(session_maker)
+    second = await plan_for(session_maker, starts=seeded["starts"])
+    assert second.digest() != first.digest()
+
+    result = await run_apply(session_maker, second)
+
+    assert result.halted == "reminder_marker_conflict"
+    assert await suppression_marker(session_maker) == marker_before
+
+
+@pytest.mark.asyncio
+async def test_an_easyweek_reminder_on_a_suppressed_target_blocks_the_plan(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    await add_job(
+        session_maker,
+        provider=PROVIDER_EASYWEEK,
+        record_pk=seeded["target_pk"],
+        job_type=REMINDER_24H,
+        status="done",
+        dedupe_key="easyweek:suppressed:must-not-exist",
+    )
+
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+
+    assert plan.scoped == ()
+    assert plan.eligible_refusals[0].reason == "stale_target_reminder"
+    assert plan.cutover_ready is False
+
+
+# ---------------------------------------------------------------------------
 # The durable ownership marker (plan §30.11)
 # ---------------------------------------------------------------------------
 
@@ -1605,6 +2046,50 @@ async def test_the_database_refuses_half_an_ownership_marker(session_maker, seed
 
 
 @pytest.mark.asyncio
+async def test_the_database_refuses_partial_or_unknown_suppression_markers(session_maker, seeded) -> None:
+    statements = (
+        "UPDATE easyweek_migration_ledger SET reminders_suppressed_at = now()",
+        "UPDATE easyweek_migration_ledger SET reminder_suppression_plan_digest = repeat('a', 64)",
+        "UPDATE easyweek_migration_ledger SET reminder_suppression_reason_code = 'service_category_not_allowed'",
+        (
+            "UPDATE easyweek_migration_ledger SET reminders_suppressed_at = now(), "
+            "reminder_suppression_plan_digest = repeat('a', 64), "
+            "reminder_suppression_reason_code = 'invented_reason'"
+        ),
+    )
+    for statement in statements:
+        async with session_maker() as session:
+            with pytest.raises(IntegrityError):
+                async with session.begin():
+                    await session.execute(text(statement))
+
+    assert await suppression_marker(session_maker) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_the_database_refuses_dual_ownership_and_suppression_markers(session_maker, seeded) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekMigrationLedger))).scalars().one()
+            row.reminders_handed_over_at = datetime.now(timezone.utc)
+            row.reminder_handover_plan_digest = "a" * 64
+
+    async with session_maker() as session:
+        with pytest.raises(IntegrityError):
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "UPDATE easyweek_migration_ledger SET reminders_suppressed_at = now(), "
+                        "reminder_suppression_plan_digest = repeat('b', 64), "
+                        "reminder_suppression_reason_code = 'service_category_not_allowed'"
+                    )
+                )
+
+    assert (await ledger_marker(session_maker))[0] is not None
+    assert await suppression_marker(session_maker) == (None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_a_fresh_plan_after_the_handover_shows_ownership_has_moved(session_maker, seeded) -> None:
     plan = await plan_for(session_maker, starts=seeded["starts"])
     await run_apply(session_maker, plan)
@@ -1612,7 +2097,7 @@ async def test_a_fresh_plan_after_the_handover_shows_ownership_has_moved(session
     again = await plan_for(session_maker, starts=seeded["starts"])
     [row] = [item for item in again.scoped]
 
-    assert row.marker_action == "already_handed_over"
+    assert row.marker_action == MARKER_ALREADY
     assert row.marker_existing_digest == plan.digest()
     assert again.to_create == 0
     assert again.coverage_ready is True
@@ -1693,7 +2178,24 @@ async def test_verify_passes_after_a_clean_marked_apply(session_maker, seeded) -
         verdict = await verify_handover(session, frozen, report)
 
     assert verdict["passed"] is True
-    assert verdict["ledger_rows_marked"] == 1
+    assert verdict["ledger_rows_ownership_marked"] == 1
+    assert verdict["marker_matches_apply_report"] is True
+
+
+@pytest.mark.asyncio
+async def test_verify_passes_for_a_clean_intentional_suppression(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    frozen = freeze_plan(plan)
+    result = await run_apply(session_maker, plan)
+    report = result.apply_report(frozen, applied_at=datetime.now(timezone.utc))
+
+    async with session_maker() as session:
+        verdict = await verify_handover(session, frozen, report)
+
+    assert verdict["passed"] is True
+    assert verdict["ledger_rows_ownership_marked"] == 0
+    assert verdict["ledger_rows_suppression_marked"] == 1
     assert verdict["marker_matches_apply_report"] is True
 
 
@@ -1792,6 +2294,50 @@ async def test_a_late_reschedule_creates_no_reminder_under_a_new_key(session_mak
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_status", "move_days"),
+    [("create", 0), ("update", 0), ("update", 2)],
+    ids=["late_create", "late_update", "late_reschedule"],
+)
+async def test_intentional_suppression_blocks_every_late_altegio_reminder_plan(
+    event_status: str,
+    move_days: int,
+    session_maker,
+    seeded,
+) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(
+        session_maker,
+        record_pk=seeded["source_pk"],
+        status=event_status,
+        starts_at=seeded["starts"] + timedelta(days=move_days),
+    )
+
+    assert await altegio_reminders(session_maker, seeded["source_pk"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_altegio_event_cannot_reopen_a_terminal_handover(session_maker, seeded) -> None:
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], completed=True, status_type="successful"),
+    )
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(
+        session_maker,
+        record_pk=seeded["source_pk"],
+        status="update",
+        starts_at=seeded["starts"] + timedelta(days=2),
+    )
+
+    assert await altegio_reminders(session_maker, seeded["source_pk"]) == []
+
+
+@pytest.mark.asyncio
 async def test_a_delivery_blocked_behind_the_apply_sees_the_marker_afterwards(session_maker, seeded) -> None:
     """The post-commit half of the race, in the order production produces it."""
     plan = await plan_for(session_maker, starts=seeded["starts"])
@@ -1819,6 +2365,23 @@ async def test_a_migrated_record_still_gets_its_other_jobs(session_maker, seeded
         and job.job_type not in EASYWEEK_REMINDER_JOB_TYPES
     ]
     assert other, "the record_* job is still planned"
+
+
+@pytest.mark.asyncio
+async def test_intentional_suppression_does_not_suppress_non_reminder_jobs(session_maker, seeded) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+
+    await plan_altegio_event(session_maker, record_pk=seeded["source_pk"], status="create")
+
+    planned = [
+        job
+        for job in await jobs(session_maker)
+        if job.provider == PROVIDER_ALTEGIO and job.record_id == seeded["source_pk"]
+    ]
+    assert planned
+    assert all(job.job_type not in EASYWEEK_REMINDER_JOB_TYPES for job in planned)
 
 
 @pytest.mark.asyncio
@@ -1944,6 +2507,34 @@ async def test_a_queued_altegio_reminder_for_a_marked_record_is_terminalised(ses
     assert before.attempts == 0, "nothing was attempted, so nothing was spent"
     no_meta.assert_not_awaited()
 
+    async with session_maker() as session:
+        assert (await session.execute(select(OutboxMessage))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_queued_altegio_reminder_for_a_suppressed_record_is_terminalised(
+    session_maker, seeded, no_meta
+) -> None:
+    await set_target_category(session_maker, target_pk=seeded["target_pk"])
+    plan = await plan_for(session_maker, starts=seeded["starts"])
+    await run_apply(session_maker, plan)
+    job_id = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_2H,
+        status="queued",
+        dedupe_key="altegio:reminder_2h:suppressed-slipped-through",
+        run_at=seeded["starts"] - timedelta(hours=2),
+    )
+
+    job = await process(session_maker, job_id)
+
+    assert job.status == "canceled"
+    assert job.last_error == REASON_SUPPRESSED
+    assert job.locked_at is None
+    assert job.attempts == 0
+    no_meta.assert_not_awaited()
     async with session_maker() as session:
         assert (await session.execute(select(OutboxMessage))).scalars().all() == []
 

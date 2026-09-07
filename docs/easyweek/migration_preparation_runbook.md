@@ -325,6 +325,13 @@ digest плана, под которым это произошло. Отметк
 последней — волна, откатившаяся по любой причине, отметки не оставляет, а
 существующая отметка всегда означает, что отмена закоммичена.
 
+Для доказанного `category_not_allowed` используется другая durable отметка —
+reminder suppression marker с закрытым reason
+`service_category_not_allowed`. Она означает, что этот бот намеренно не создаёт
+reminder obligation ни на одной стороне. Ownership и suppression markers
+взаимоисключающие; missing/invalid category, недоказанное число услуг и
+невалидный allowlist suppression не разрешают и останавливают всю волну.
+
 Дальше отметку читают два места. Обычный планировщик Altegio — перед созданием
 напоминания, внутри своей транзакции, так что доставка, ждавшая блокировки во
 время apply, увидит отметку сразу после commit. И сам outbox — непосредственно
@@ -334,10 +341,27 @@ digest плана, под которым это произошло. Отметк
 
 ### 6b.1 Dry-run со снимком
 
-Выберите точный manifest миграции и `run_id` из сохранённого отчёта её canary/apply.
-Это исходный `run_id` ledger, а не `last_resolution_run_id` последующего reconcile.
-В командах ниже замените `MIGRATION_RUN_ID` на это значение; если волна включает
-несколько запусков, повторите `--run-id` для каждого во **всех** трёх режимах.
+Для текущего production handover допустимы только два заранее зафиксированных
+scope. Не добавляйте к ним run IDs Ирины и Алёны
+(`b4ca41ac1ad54591`, `c52bb4f62fb64a35`, `02d514703aec466f`,
+`de193299b9974859`): они не входят в эту операцию.
+
+```bash
+# CORE
+HANDOVER_SCOPE=(--manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860)
+
+# HANNA — запускать отдельно от CORE, со своим snapshot/report
+HANDOVER_SCOPE=(--manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62)
+```
+
+Команды ниже полностью выписаны для CORE. Для отдельного запуска HANNA замените
+в каждой команде только непрерывный фрагмент от `--manifest` до последнего
+`--run-id` на точный HANNA-фрагмент выше и используйте отдельные пути
+snapshot/report. Не объединяйте два manifest в один snapshot.
+
+Точные manifest и исходные ledger `run_id` текущих волн уже перечислены выше.
+Это не `last_resolution_run_id` последующего reconcile. Один и тот же выбранный
+`HANDOVER_SCOPE` используется без изменений во **всех** трёх режимах.
 Список проверяется вместе с canonical digest manifest; филиал без выбранных
 мастеров и записи других запусков в handover не входят.
 
@@ -350,8 +374,9 @@ dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.cha
 dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT source_company_id, run_id, status, count(*) FROM easyweek_migration_ledger WHERE source_provider = 'altegio' AND target_provider = 'easyweek' AND source_company_id = 758285 GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
 ```
 
-Snapshot v4 включает выбранные run IDs, digest manifest и конфигурации, client
-identity и fingerprints локальных данных. Старые v3 снимки не применяются.
+Snapshot v5 включает выбранные run IDs, digest manifest и конфигурации, client
+identity, typed disposition, category/terminal facts, marker kind и fingerprints
+локальных данных. Снимки v1–v4 не применяются.
 Plan использует `SET TRANSACTION READ ONLY`, повторно читает данные после API
 обхода и при `candidate_set_changed=true` запрещает apply. Один booking GET
 выполняется без автоматического retry, пауза между запросами — минимум 1 секунда.
@@ -396,7 +421,7 @@ snapshot фиксирует их текущие значения; API guard/pref
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.v5.json
 ```
 
 Команда читает ledger, доказывает каждую перенесённую запись живым
@@ -423,13 +448,16 @@ apply воркер останавливается лишь на время од�
 
 Смотреть также `rows_with_blockers` (канонический ключ занят
 canceled/failed-заданием — решает человек, автоматически не переоткрывается) и
-`rows_with_processing_source_jobs`. Snapshot **v4** содержит и защищает digest-ом
-весь eligible `status=created` scope выбранных run IDs, отказы доказательства, readiness, identity
-строк, каждое obligation, полный список старых job ID и ожидаемое состояние
-ownership marker каждой ledger-строки. Любой snapshot более ранней версии — v1
-v2 или v3, — повреждённый JSON, неизвестное поле или изменение `created_at` write
-не разрешают. Нулевая или частично доказанная волна никогда не бывает
-`cutover_ready`.
+`rows_with_processing_source_jobs` и `disposition_counts`. Snapshot **v5**
+содержит и защищает digest-ом весь eligible `status=created` scope выбранных run
+IDs, отказы доказательства, readiness, identity строк, category reason,
+terminal facts, каждое obligation, полный список старых job ID и ожидаемые kind
+и состояние marker каждой ledger-строки. `handover_active` может иметь target
+obligations; `handover_terminal_completed`, `handover_terminal_canceled` и
+`suppressed_unsupported_category` не могут. `unproven` блокирует всю волну.
+Любой snapshot более ранней версии (v1–v4), повреждённый JSON, неизвестное поле
+или изменение `created_at` write не разрешают. Нулевая или частично доказанная
+волна никогда не бывает `cutover_ready`.
 
 ### 6b.3 Apply
 
@@ -472,7 +500,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.v5.json --apply-report /migration/state/reminder_handover.apply-report.v3.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -490,18 +518,24 @@ dc ps altegio-outbox-worker
 test "$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')" -eq 1
 ```
 
-Транзакция одна: сначала создаются все недостающие EasyWeek-напоминания, и
-только после этого отменяются старые `queued` Altegio-напоминания тех же
-записей. Порядок — это и есть гарантия: если создание не прошло, откат
-оставляет клиенту то напоминание, которое у него уже было.
+Транзакция одна: только для `handover_active` сначала создаются все недостающие
+EasyWeek-напоминания. Для active, terminal и intentionally suppressed строк
+после проверки coverage отменяются старые exact `queued` Altegio-напоминания.
+Затем active/terminal получают ownership marker, а exact
+`category_not_allowed` — отдельный suppression marker. Порядок — это и есть
+гарантия: если любой шаг не прошёл, откат оставляет всю волну в исходном
+состоянии и оставляет клиенту то напоминание, которое у него уже было.
 
 Если хотя бы одно относящееся к scope старое задание оказалось в
 `status=processing`, apply останавливается целиком и не меняет ничего.
 
-Успешный apply после commit атомарно пишет приватный PII-free apply report **v2**.
-В нём находятся snapshot version/digest, company scope, created/canceled job
-IDs и counts, already-present count, ID и счётчики проставленных и уже
-существовавших ownership markers, и scoped Outbox before/after evidence.
+Успешный apply после commit атомарно пишет приватный PII-free apply report **v3**.
+В нём находятся snapshot version/digest, company scope, disposition counts,
+created/canceled job IDs и counts, already-present count, раздельные ID и
+счётчики проставленных и уже существовавших ownership markers, а также
+проставленных и уже существовавших suppression markers, и scoped Outbox
+before/after evidence. Поле `halted` у committed report всегда `null`;
+при STOP report не создаётся, а стабильный reason печатается в apply-результате.
 Verify не принимает отчёт от другого snapshot или отредактированный отчёт.
 
 ### 6b.4 Verify
@@ -509,11 +543,12 @@ Verify не принимает отчёт от другого snapshot или о
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.apply-report.v2.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.v5.json --apply-report /migration/state/reminder_handover.apply-report.v3.json
 ```
 
-PASS требует не только ownership markers каждой созданной ledger-строки, но и
-durable closure каждой заявленной пары company/run. Проверить в JSON-отчёте:
+PASS требует ownership marker для active/terminal rows, suppression marker для
+`category_not_allowed` rows и durable closure каждой заявленной пары
+company/run. Проверить в JSON-отчёте:
 `wave_closures_expected == wave_closures_verified`,
 `wave_closures_missing == []` и
 `wave_closures_with_foreign_digest == []`. Это отдельная гарантия для пустых и
@@ -545,7 +580,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 dc stop altegio-outbox-worker
-dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.v4.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v2.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.v5.json --apply-report /migration/state/reminder_handover.repeat-apply-report.v3.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_6B1 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_6B1'
 )
 ```
 
@@ -555,7 +590,7 @@ dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.json --company-id 758285 --run-id MIGRATION_RUN_ID --snapshot /migration/state/reminder_handover.after.v4.json
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.after.v5.json
 ```
 
 Отдельно запускается существующий API preflight. Он повторно читает актуальные
@@ -577,18 +612,18 @@ dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.cha
 dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
 ```
 
-Отметки владения и отсутствие открытых Altegio-напоминаний у переданных записей
-— одним read-only запросом:
+Оба marker-вида, отсутствие открытых Altegio-напоминаний и отсутствие любых
+EasyWeek-reminders у suppressed rows — одним read-only запросом:
 
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT l.source_company_id, count(*) AS handed_over, count(DISTINCT l.reminder_handover_plan_digest) AS plans, count(j.id) AS still_open_altegio_reminders FROM easyweek_migration_ledger l LEFT JOIN records r ON r.provider = l.source_provider AND r.company_id = l.source_company_id AND r.altegio_record_id = l.source_record_id LEFT JOIN message_jobs j ON j.provider = 'altegio' AND j.record_id = r.id AND j.job_type IN ('reminder_24h','reminder_2h') AND j.status IN ('queued','processing') WHERE l.reminders_handed_over_at IS NOT NULL GROUP BY 1 ORDER BY 1; COMMIT;"
+dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT l.source_company_id, count(*) FILTER (WHERE l.reminders_handed_over_at IS NOT NULL) AS ownership_marked, count(DISTINCT l.reminder_handover_plan_digest) FILTER (WHERE l.reminders_handed_over_at IS NOT NULL) AS ownership_plans, count(*) FILTER (WHERE l.reminders_suppressed_at IS NOT NULL) AS suppression_marked, count(*) FILTER (WHERE l.reminders_handed_over_at IS NOT NULL AND l.reminders_suppressed_at IS NOT NULL) AS invalid_dual_markers, count(*) FILTER (WHERE l.reminders_suppressed_at IS NOT NULL AND l.reminder_suppression_reason_code <> 'service_category_not_allowed') AS invalid_suppression_reasons, sum((SELECT count(*) FROM records sr JOIN message_jobs sj ON sj.record_id = sr.id AND sj.provider = 'altegio' AND sj.job_type IN ('reminder_24h','reminder_2h') AND sj.status IN ('queued','processing') WHERE sr.provider = l.source_provider AND sr.company_id = l.source_company_id AND sr.altegio_record_id = l.source_record_id)) AS still_open_altegio_reminders, sum((SELECT count(*) FROM records tr JOIN message_jobs tj ON tj.record_id = tr.id AND tj.provider = 'easyweek' AND tj.job_type IN ('reminder_24h','reminder_2h') WHERE l.reminders_suppressed_at IS NOT NULL AND tr.provider = 'easyweek' AND tr.easyweek_booking_uuid::text = l.target_booking_uuid)) AS target_reminders_on_suppressed FROM easyweek_migration_ledger l WHERE l.reminders_handed_over_at IS NOT NULL OR l.reminders_suppressed_at IS NOT NULL GROUP BY 1 ORDER BY 1; COMMIT;"
 ```
 
-`still_open_altegio_reminders` обязан быть `0`. `plans` больше единицы означает,
-что записи филиала передавались разными планами — само по себе не ошибка, но
-повод свериться с историей apply-отчётов.
+`invalid_dual_markers`, `invalid_suppression_reasons`,
+`still_open_altegio_reminders` и `target_reminders_on_suppressed` обязаны быть
+`0`: каждый такой счётчик обязан быть `0`.
 
 ### 6b.5 Если что-то пошло не так
 
@@ -598,6 +633,9 @@ dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEG
 `reminder_boundary_passed` — STOP. Любой `*_changed` в apply также означает
 откат всей волны. При `database_lock_timeout`/`database_statement_timeout`
 откат обязателен; повторите свежий plan после устранения конкурирующей операции.
+`category_missing`, `service_count_unproven`, ambiguous multi-service и invalid
+или unconfigured allowlist также STOP; только точный `category_not_allowed`
+является разрешённым intentionally suppressed исходом.
 Outbox восстанавливается через trap при EXIT, INT, TERM и HUP. При потере SSH
 проверьте его состояние после переподключения; SIGKILL/выключение хоста trap
 обработать не может.

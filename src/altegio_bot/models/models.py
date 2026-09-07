@@ -1605,6 +1605,29 @@ class EasyWeekMigrationLedger(Base):
             "(reminders_handed_over_at IS NULL) = (reminder_handover_plan_digest IS NULL)",
             name="ck_easyweek_migration_ledger_reminder_handover_complete",
         ),
+        # Intentionally unsupported service categories do not transfer reminder
+        # ownership to EasyWeek. They carry a separate three-column marker:
+        # when automation was suppressed, which plan authorised it, and the
+        # closed business reason. All three fields are one fact.
+        CheckConstraint(
+            "((reminders_suppressed_at IS NULL) = "
+            "(reminder_suppression_plan_digest IS NULL)) AND "
+            "((reminders_suppressed_at IS NULL) = "
+            "(reminder_suppression_reason_code IS NULL))",
+            name="ck_easyweek_migration_ledger_reminder_suppression_complete",
+        ),
+        CheckConstraint(
+            "reminder_suppression_reason_code IS NULL OR "
+            "reminder_suppression_reason_code = 'service_category_not_allowed'",
+            name="ck_easyweek_migration_ledger_reminder_suppression_reason",
+        ),
+        # Ownership and intentional suppression are opposite dispositions. A
+        # row carrying both would let different runtime readers reach different
+        # answers, so the database makes the state impossible.
+        CheckConstraint(
+            "NOT (reminders_handed_over_at IS NOT NULL AND reminders_suppressed_at IS NOT NULL)",
+            name="ck_easyweek_migration_ledger_reminder_marker_exclusive",
+        ),
         # A rollback attempt is one fact in two columns, for the same reason the
         # handover marker is: half of it would be an attempt with no run to
         # attribute it to, or a run id claiming an attempt that never happened.
@@ -1642,6 +1665,13 @@ class EasyWeekMigrationLedger(Base):
             "source_company_id",
             "source_record_id",
             postgresql_where=text("reminders_handed_over_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_easyweek_migration_ledger_reminder_suppression",
+            "source_provider",
+            "source_company_id",
+            "source_record_id",
+            postgresql_where=text("reminders_suppressed_at IS NOT NULL"),
         ),
     )
 
@@ -1720,6 +1750,18 @@ class EasyWeekMigrationLedger(Base):
     # repeat of the SAME snapshot is recognised as idempotent, and a different
     # one is refused rather than silently re-marking the row.
     reminder_handover_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- intentional reminder suppression (PR-11.2, plan §30.13) ----------
+    # A category_not_allowed row does not transfer reminder ownership to
+    # EasyWeek: this bot intentionally owns no reminder obligation for it. The
+    # marker is still durable so late Altegio events cannot recreate or requeue
+    # a source reminder after the operator cancelled the frozen source set.
+    reminders_suppressed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    reminder_suppression_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reminder_suppression_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # -- post-booking marketing ownership (PR-12.1, plan §31.6) ------------
     # When this booking's `review_3d` / `repeat_10d` / `comeback_3d` stopped

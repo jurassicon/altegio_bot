@@ -98,14 +98,12 @@ async def test_other_run_is_neither_read_from_api_nor_locked(session_maker, seed
         assert other.reminders_handed_over_at is None
 
 
-@pytest.mark.parametrize("change", ["category", "client", "staff", "provider"])
+@pytest.mark.parametrize("change", ["client", "staff", "provider"])
 async def test_local_refusals_spend_no_api_request(change, session_maker, seeded):
     async with session_maker() as session, session.begin():
         target = await session.get(Record, seeded["target_pk"])
         source = await session.get(Record, seeded["source_pk"])
-        if change == "category":
-            target.raw = {"easyweek": {"service_category": "Nagelservice", "services_count": 1}}
-        elif change == "client":
+        if change == "client":
             target.client_id = 10
         elif change == "staff":
             source.staff_id = 5003
@@ -116,6 +114,17 @@ async def test_local_refusals_spend_no_api_request(change, session_maker, seeded
     result = await plan(session_maker, seeded, client=client)
     assert not result.cutover_ready and result.eligible_refusals
     assert client.calls == []
+
+
+async def test_exact_category_exclusion_still_requires_live_target_proof(session_maker, seeded):
+    await h.set_target_category(session_maker, target_pk=seeded["target_pk"])
+    client = h.FakeBookings(h.booking_body(seeded["starts"]))
+
+    result = await plan(session_maker, seeded, client=client)
+
+    assert result.cutover_ready
+    assert result.scoped[0].disposition == "suppressed_unsupported_category"
+    assert client.calls == [str(h.BOOKING)]
 
 
 async def test_plan_detects_changes_during_live_walk(session_maker, seeded):

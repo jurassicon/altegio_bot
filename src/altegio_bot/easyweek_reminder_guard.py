@@ -49,7 +49,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
@@ -62,6 +62,12 @@ from altegio_bot.easyweek_client import (
 from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageJob, Record
+
+# EasyWeek uses both result nouns and adjectives across API surfaces. Keeping
+# this vocabulary in one immutable place prevents the live handover reader and
+# the runtime contradiction check from drifting apart.
+COMPLETED_STATUS_TYPES: Final[frozenset[str]] = frozenset({"completed", "succeeded", "finished", "successful"})
+CANCELED_STATUS_TYPES: Final[frozenset[str]] = frozenset({"canceled", "cancelled"})
 
 
 class BookingReader(Protocol):
@@ -194,44 +200,39 @@ def _status_type_contradicts(payload: dict[str, Any]) -> str | None:
     if not isinstance(status_type, str):
         return None
     normalized = status_type.strip().casefold()
-    if normalized in {"canceled", "cancelled"}:
+    if normalized in CANCELED_STATUS_TYPES:
         return "status_type_canceled"
-    if normalized in {"completed", "succeeded", "finished"}:
+    if normalized in COMPLETED_STATUS_TYPES:
         return "status_type_completed"
     return None
 
 
 def _observed_status_contradiction(
-    payload: dict[str, Any],
     *,
     is_canceled: bool,
     is_completed: bool,
+    normalized_status_type: str | None,
 ) -> str | None:
-    """Judge optional status prose against status facts for handover reads.
+    """Judge status type against status facts for handover reads.
 
     The runtime send guard deliberately keeps its established ordering and
     reason codes in :func:`_status_type_contradicts`.  The handover has a
     different job: it must be able to *read* a consistently terminal booking so
     it can retire the obsolete Altegio reminder without planning a replacement.
+    A terminal boolean therefore needs matching status vocabulary; an absent,
+    malformed, blank or unknown type proves nothing and fails closed.
     """
     if is_canceled and is_completed:
         return "status_flags_both_terminal"
-    status = payload.get("status")
-    if not isinstance(status, dict):
-        return None
-    status_type = status.get("type")
-    if not isinstance(status_type, str):
-        return None
-    normalized = status_type.strip().casefold()
-    canceled_types = {"canceled", "cancelled"}
-    completed_types = {"completed", "succeeded", "finished"}
     if is_canceled:
-        return None if normalized in canceled_types else "status_type_vs_canceled"
+        return None if normalized_status_type in CANCELED_STATUS_TYPES else "canceled_status_type_unproven"
     if is_completed:
-        return None if normalized in completed_types else "status_type_vs_completed"
-    if normalized in canceled_types:
+        return None if normalized_status_type in COMPLETED_STATUS_TYPES else "completed_status_type_unproven"
+    if normalized_status_type is None:
+        return None
+    if normalized_status_type in CANCELED_STATUS_TYPES:
         return "status_type_canceled"
-    if normalized in completed_types:
+    if normalized_status_type in COMPLETED_STATUS_TYPES:
         return "status_type_completed"
     return None
 
@@ -326,6 +327,7 @@ class ObservedBooking:
     starts_at: datetime
     is_canceled: bool
     is_completed: bool
+    normalized_status_type: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -344,7 +346,9 @@ def read_booking_state(
     asked for and the branch the caller claims, or nothing is read out of it.
     Only after that are the start and the two status flags taken at face value —
     and a flag that is neither ``true`` nor ``false`` is malformed, never
-    optimistically read as "not cancelled".
+    optimistically read as "not cancelled". A true terminal flag additionally
+    requires a matching normalized ``status.type``; the flag alone cannot
+    authorise reminder cancellation or an ownership marker.
     """
     if not isinstance(payload, dict):
         return _refuse(GuardOutcome.MALFORMED_RESPONSE, "not_an_object")
@@ -374,10 +378,15 @@ def read_booking_state(
 
     is_canceled = not canceled_ok
     is_completed = not completed_ok
+    normalized_status_type = (
+        payload["status"]["type"].strip().casefold() or None
+        if isinstance(payload.get("status"), dict) and isinstance(payload["status"].get("type"), str)
+        else None
+    )
     contradiction = _observed_status_contradiction(
-        payload,
         is_canceled=is_canceled,
         is_completed=is_completed,
+        normalized_status_type=normalized_status_type,
     )
     if contradiction is not None:
         return _refuse(GuardOutcome.MALFORMED_RESPONSE, contradiction)
@@ -390,6 +399,7 @@ def read_booking_state(
         # these read inverted: "the flag was cleanly false" means "not that".
         is_canceled=is_canceled,
         is_completed=is_completed,
+        normalized_status_type=normalized_status_type,
     )
 
 

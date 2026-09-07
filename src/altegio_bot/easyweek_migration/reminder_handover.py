@@ -64,6 +64,7 @@ from typing import Any, Final
 
 from altegio_bot.easyweek_migration.manifest import canonical_uuid as manifest_canonical_uuid
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
+from altegio_bot.easyweek_reminder_guard import CANCELED_STATUS_TYPES, COMPLETED_STATUS_TYPES
 from altegio_bot.easyweek_reminders import (
     REMINDER_OFFSETS,
     PlannedReminder,
@@ -71,16 +72,21 @@ from altegio_bot.easyweek_reminders import (
     plan_reminders,
     reminder_job_payload,
 )
+from altegio_bot.easyweek_service_category import (
+    ALLOWED,
+    CATEGORY_NOT_ALLOWED,
+    REMINDER_SUPPRESSION_REASON_CODE,
+)
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK
 
-SNAPSHOT_VERSION: Final = 4
+SNAPSHOT_VERSION: Final = 5
 
 # Ledger statuses that may still turn into `created`. Named here because the
 # plan's readiness depends on them and this module must not import the runner.
 UNRESOLVED_LEDGER_STATUSES: Final = ("pending", "uncertain")
 # The blocker an operator sees for them, in both the plan report and the apply.
 WAVE_UNRESOLVED: Final = "migration_wave_unresolved"
-APPLY_REPORT_VERSION: Final = 2
+APPLY_REPORT_VERSION: Final = 3
 SNAPSHOT_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
 
@@ -104,7 +110,26 @@ CANCEL_REASON: Final = "superseded by migrated EasyWeek booking (reminder handov
 # `add_job` — which re-queues a cancelled job on conflict — re-opened the very
 # reminder the handover had just withdrawn.
 MARKER_SET: Final = "set"
-MARKER_ALREADY: Final = "already_handed_over"
+MARKER_ALREADY: Final = "already"
+MARKER_OWNERSHIP: Final = "ownership"
+MARKER_SUPPRESSION: Final = "suppression"
+
+# Every fully proved created ledger row has exactly one of these dispositions.
+# A fifth state, `unproven`, is represented explicitly by EligibleRefusal and
+# blocks the whole wave.
+DISPOSITION_ACTIVE: Final = "handover_active"
+DISPOSITION_TERMINAL_COMPLETED: Final = "handover_terminal_completed"
+DISPOSITION_TERMINAL_CANCELED: Final = "handover_terminal_canceled"
+DISPOSITION_SUPPRESSED_CATEGORY: Final = "suppressed_unsupported_category"
+DISPOSITION_UNPROVEN: Final = "unproven"
+ACTIONABLE_DISPOSITIONS: Final[frozenset[str]] = frozenset(
+    {
+        DISPOSITION_ACTIVE,
+        DISPOSITION_TERMINAL_COMPLETED,
+        DISPOSITION_TERMINAL_CANCELED,
+        DISPOSITION_SUPPRESSED_CATEGORY,
+    }
+)
 
 # Per-obligation outcomes. Only MISSING leads to an insert.
 OBLIGATION_MISSING: Final = "missing"
@@ -130,6 +155,7 @@ ROW_NO_FUTURE_OBLIGATION: Final = "no_future_obligation"
 # a row in this state was written outside every supported path and is not
 # something to reason about.
 ROW_MARKER_INCOMPLETE: Final = "marker_incomplete"
+ROW_MARKER_CONFLICT: Final = "marker_conflict"
 
 # Statuses an open reminder can hold. `processing` counts as open: a job the
 # worker claimed a second ago is still going to fire.
@@ -260,6 +286,9 @@ class HandoverRow:
     target_starts_at: datetime
     target_is_canceled: bool = False
     target_is_completed: bool = False
+    target_status_type: str | None = None
+    disposition: str = DISPOSITION_ACTIVE
+    category_reason_code: str = ALLOWED
     obligations: tuple[Obligation, ...] = ()
     # Altegio reminder job ids that are still queued for the source booking.
     stale_source_job_ids: tuple[int, ...] = ()
@@ -270,7 +299,9 @@ class HandoverRow:
     # apply would do to it. `MARKER_SET` means there is none yet; `MARKER_ALREADY`
     # means this exact handover already ran and carries the digest it ran under,
     # so a repeat of the same snapshot is recognised instead of re-marking.
+    marker_kind: str = MARKER_OWNERSHIP
     marker_action: str = MARKER_SET
+    marker_reason_code: str | None = None
     marker_existing_digest: str | None = None
     marker_handed_over_at: str | None = None
     refusal: str | None = None
@@ -302,6 +333,7 @@ class HandoverRow:
             "target_starts_at": _as_utc(self.target_starts_at).isoformat().replace("+00:00", "Z"),
             "target_is_canceled": self.target_is_canceled,
             "target_is_completed": self.target_is_completed,
+            "target_status_type": self.target_status_type,
             "target_client_id": self.target_client_id,
         }
 
@@ -315,6 +347,8 @@ class HandoverRow:
         """
         return {
             "identity": self.identity(),
+            "disposition": self.disposition,
+            "category_reason_code": self.category_reason_code,
             "obligations": [item.as_safe_dict() for item in self.obligations],
             "stale_source_job_ids": list(self.stale_source_job_ids),
             "processing_source_job_ids": list(self.processing_source_job_ids),
@@ -322,7 +356,9 @@ class HandoverRow:
             # a row switched from "set" to "already handed over", a swapped
             # digest — invalidates the snapshot rather than authorising a write.
             "marker": {
+                "kind": self.marker_kind,
                 "action": self.marker_action,
+                "reason_code": self.marker_reason_code,
                 "existing_digest": self.marker_existing_digest,
                 "handed_over_at": self.marker_handed_over_at,
             },
@@ -435,13 +471,16 @@ class EligibleRefusal:
     source_company_id: int
     source_record_id: int
     reason: str
+    category_reason_code: str | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "ledger_id": self.ledger_id,
             "source_company_id": self.source_company_id,
             "source_record_id": self.source_record_id,
+            "disposition": DISPOSITION_UNPROVEN,
             "reason": self.reason,
+            "category_reason_code": self.category_reason_code,
         }
 
 
@@ -489,6 +528,14 @@ class HandoverPlan:
         return sum(len(row.stale_source_job_ids) for row in self.scoped)
 
     @property
+    def disposition_counts(self) -> dict[str, int]:
+        counts = {item: 0 for item in sorted(ACTIONABLE_DISPOSITIONS | {DISPOSITION_UNPROVEN})}
+        for row in self.scoped:
+            counts[row.disposition] = counts.get(row.disposition, 0) + 1
+        counts[DISPOSITION_UNPROVEN] = len(self.eligible_refusals)
+        return counts
+
+    @property
     def blocked_rows(self) -> tuple[HandoverRow, ...]:
         return tuple(row for row in self.scoped if row.blockers)
 
@@ -529,6 +576,7 @@ class HandoverPlan:
         return (
             not self.blocked_rows
             and not self.eligible_refusals
+            and not self.processing_rows
             and not self.candidate_set_changed
             and not self.unresolved_rows
         )
@@ -541,12 +589,7 @@ class HandoverPlan:
     @property
     def cutover_ready(self) -> bool:
         """May ownership be switched atomically right now?"""
-        return (
-            bool(self.eligible_created_rows)
-            and self.eligible_created_rows == len(self.scoped)
-            and self.guard_ready
-            and not self.processing_rows
-        )
+        return bool(self.eligible_created_rows) and self.eligible_created_rows == len(self.scoped) and self.guard_ready
 
     def _snapshot_material(self) -> dict[str, Any]:
         outcomes: dict[str, int] = {}
@@ -572,6 +615,7 @@ class HandoverPlan:
                 item.as_safe_dict() for item in sorted(self.eligible_refusals, key=lambda item: item.ledger_id)
             ],
             "rows": [row.as_safe_dict() for row in sorted(self.scoped, key=lambda item: item.ledger_id)],
+            "disposition_counts": self.disposition_counts,
             "obligation_outcomes": dict(sorted(outcomes.items())),
             "readiness": {
                 "guard_ready": self.guard_ready,
@@ -608,6 +652,7 @@ class HandoverPlan:
             "eligible_created_rows": self.eligible_created_rows,
             "rows_in_scope": len(self.scoped),
             "rows_refused": dict(sorted(self.refused.items())),
+            "disposition_counts": self.disposition_counts,
             "historical_rows": dict(sorted(self.historical_rows.items())),
             "eligible_refusals": [item.as_safe_dict() for item in self.eligible_refusals],
             "obligation_outcomes": dict(sorted(outcomes.items())),
@@ -745,18 +790,27 @@ class ApplyReport:
     created_job_ids: tuple[int, ...]
     canceled_job_ids: tuple[int, ...]
     already_present_count: int
+    halted: str | None
+    disposition_counts: dict[str, int]
     # The durable evidence half. `marked` are the rows this apply stamped;
     # `already_marked` are the rows that already carried THIS plan's marker, so
     # an idempotent repeat reports zero mutations without losing the fact that
     # the scope is fully covered.
     marked_ledger_ids: tuple[int, ...]
     already_marked_ledger_ids: tuple[int, ...]
+    suppression_marked_ledger_ids: tuple[int, ...]
+    suppression_already_marked_ledger_ids: tuple[int, ...]
     scoped_outbox_ids_before: tuple[int, ...]
     scoped_outbox_ids_after: tuple[int, ...]
 
     @property
     def mutation_count(self) -> int:
-        return len(self.created_job_ids) + len(self.canceled_job_ids) + len(self.marked_ledger_ids)
+        return (
+            len(self.created_job_ids)
+            + len(self.canceled_job_ids)
+            + len(self.marked_ledger_ids)
+            + len(self.suppression_marked_ledger_ids)
+        )
 
     @property
     def marked_ledger_count(self) -> int:
@@ -785,10 +839,16 @@ class ApplyReport:
             "canceled_job_ids": list(self.canceled_job_ids),
             "canceled_job_count": self.canceled_job_count,
             "already_present_count": self.already_present_count,
-            "marked_ledger_ids": list(self.marked_ledger_ids),
-            "marked_ledger_count": self.marked_ledger_count,
-            "already_marked_ledger_ids": list(self.already_marked_ledger_ids),
-            "already_marked_ledger_count": len(self.already_marked_ledger_ids),
+            "halted": self.halted,
+            "disposition_counts": dict(sorted(self.disposition_counts.items())),
+            "ownership_marked_ledger_ids": list(self.marked_ledger_ids),
+            "ownership_marked_ledger_count": self.marked_ledger_count,
+            "ownership_already_marked_ledger_ids": list(self.already_marked_ledger_ids),
+            "ownership_already_marked_ledger_count": len(self.already_marked_ledger_ids),
+            "suppression_marked_ledger_ids": list(self.suppression_marked_ledger_ids),
+            "suppression_marked_ledger_count": len(self.suppression_marked_ledger_ids),
+            "suppression_already_marked_ledger_ids": list(self.suppression_already_marked_ledger_ids),
+            "suppression_already_marked_ledger_count": len(self.suppression_already_marked_ledger_ids),
             "scoped_outbox_ids_before": list(self.scoped_outbox_ids_before),
             "scoped_outbox_ids_after": list(self.scoped_outbox_ids_after),
             "mutation_count": self.mutation_count,
@@ -842,10 +902,16 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         "canceled_job_ids",
         "canceled_job_count",
         "already_present_count",
-        "marked_ledger_ids",
-        "marked_ledger_count",
-        "already_marked_ledger_ids",
-        "already_marked_ledger_count",
+        "halted",
+        "disposition_counts",
+        "ownership_marked_ledger_ids",
+        "ownership_marked_ledger_count",
+        "ownership_already_marked_ledger_ids",
+        "ownership_already_marked_ledger_count",
+        "suppression_marked_ledger_ids",
+        "suppression_marked_ledger_count",
+        "suppression_already_marked_ledger_ids",
+        "suppression_already_marked_ledger_count",
         "scoped_outbox_ids_before",
         "scoped_outbox_ids_after",
         "mutation_count",
@@ -874,22 +940,45 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
     eligible = _non_negative_int(payload["eligible_created_rows"], "apply report eligible_created_rows")
     rows = _non_negative_int(payload["rows_in_scope"], "apply report rows_in_scope")
     already = _non_negative_int(payload["already_present_count"], "already_present_count")
+    if payload["halted"] is not None:
+        raise SnapshotError("a committed apply report cannot be halted")
     mutations = _non_negative_int(payload["mutation_count"], "mutation_count")
     created_count = _non_negative_int(payload["created_job_count"], "created_job_count")
     canceled_count = _non_negative_int(payload["canceled_job_count"], "canceled_job_count")
-    marked = _canonical_ids(payload["marked_ledger_ids"], "marked_ledger_ids")
-    already_marked = _canonical_ids(payload["already_marked_ledger_ids"], "already_marked_ledger_ids")
-    marked_count = _non_negative_int(payload["marked_ledger_count"], "marked_ledger_count")
-    already_marked_count = _non_negative_int(payload["already_marked_ledger_count"], "already_marked_ledger_count")
+    disposition_counts = _validate_disposition_counts(payload["disposition_counts"])
+    marked = _canonical_ids(payload["ownership_marked_ledger_ids"], "ownership_marked_ledger_ids")
+    already_marked = _canonical_ids(
+        payload["ownership_already_marked_ledger_ids"], "ownership_already_marked_ledger_ids"
+    )
+    suppression_marked = _canonical_ids(payload["suppression_marked_ledger_ids"], "suppression_marked_ledger_ids")
+    suppression_already_marked = _canonical_ids(
+        payload["suppression_already_marked_ledger_ids"], "suppression_already_marked_ledger_ids"
+    )
+    marked_count = _non_negative_int(payload["ownership_marked_ledger_count"], "ownership_marked_ledger_count")
+    already_marked_count = _non_negative_int(
+        payload["ownership_already_marked_ledger_count"], "ownership_already_marked_ledger_count"
+    )
+    suppression_marked_count = _non_negative_int(
+        payload["suppression_marked_ledger_count"], "suppression_marked_ledger_count"
+    )
+    suppression_already_marked_count = _non_negative_int(
+        payload["suppression_already_marked_ledger_count"], "suppression_already_marked_ledger_count"
+    )
     if created_count != len(created) or canceled_count != len(canceled):
         raise SnapshotError("apply report job counts are inconsistent")
-    if marked_count != len(marked) or already_marked_count != len(already_marked):
+    if (
+        marked_count != len(marked)
+        or already_marked_count != len(already_marked)
+        or suppression_marked_count != len(suppression_marked)
+        or suppression_already_marked_count != len(suppression_already_marked)
+    ):
         raise SnapshotError("apply report marker counts are inconsistent")
-    if set(marked) & set(already_marked):
+    marker_sets = (set(marked), set(already_marked), set(suppression_marked), set(suppression_already_marked))
+    if any(left & right for index, left in enumerate(marker_sets) for right in marker_sets[index + 1 :]):
         # A row cannot both have been stamped now and have carried the marker
         # already; one of the two lists has been edited.
         raise SnapshotError("apply report marker sets overlap")
-    if mutations != created_count + canceled_count + marked_count:
+    if mutations != created_count + canceled_count + marked_count + suppression_marked_count:
         raise SnapshotError("apply report mutation count is inconsistent")
     report = ApplyReport(
         snapshot_version=payload["snapshot_version"],
@@ -901,8 +990,12 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         created_job_ids=created,
         canceled_job_ids=canceled,
         already_present_count=already,
+        halted=None,
+        disposition_counts=disposition_counts,
         marked_ledger_ids=marked,
         already_marked_ledger_ids=already_marked,
+        suppression_marked_ledger_ids=suppression_marked,
+        suppression_already_marked_ledger_ids=suppression_already_marked,
         scoped_outbox_ids_before=before,
         scoped_outbox_ids_after=after,
     )
@@ -912,25 +1005,38 @@ def read_apply_report(path: str | Path, *, frozen: FrozenPlan | None = None) -> 
         or report.company_ids != frozen.company_ids
         or report.eligible_created_rows != frozen.eligible_created_rows
         or report.rows_in_scope != len(frozen.rows)
+        or report.disposition_counts != _disposition_counts(frozen.rows, frozen.eligible_refusals)
     ):
         raise SnapshotError("the apply report belongs to a different snapshot")
     if frozen is not None:
         obligations = sum(len(row["obligations"]) for row in frozen.rows)
         if len(report.created_job_ids) + report.already_present_count != obligations:
             raise SnapshotError("the apply report does not account for every obligation")
-        # Every frozen row must appear in exactly one of the two marker lists.
-        # A partial marker apply is the state that would leave some bookings
-        # protected against a late Altegio delivery and others not.
-        frozen_ledger_ids = {int(row["identity"]["ledger_id"]) for row in frozen.rows}
-        if set(report.marked_ledger_ids) | set(report.already_marked_ledger_ids) != frozen_ledger_ids:
-            raise SnapshotError("the apply report does not mark every frozen ledger row")
-        expected_already = {
-            int(row["identity"]["ledger_id"]) for row in frozen.rows if row["marker"]["action"] == MARKER_ALREADY
+        expected_ownership = {
+            int(row["identity"]["ledger_id"]) for row in frozen.rows if row["marker"]["kind"] == MARKER_OWNERSHIP
         }
-        if not expected_already.issubset(report.already_marked_ledger_ids):
-            raise SnapshotError("the apply report marker actions disagree with the snapshot")
-        replayed = set(report.already_marked_ledger_ids) - expected_already
-        if replayed and (report.mutation_count or set(report.already_marked_ledger_ids) != frozen_ledger_ids):
+        expected_suppression = {
+            int(row["identity"]["ledger_id"]) for row in frozen.rows if row["marker"]["kind"] == MARKER_SUPPRESSION
+        }
+        reported_ownership = set(report.marked_ledger_ids) | set(report.already_marked_ledger_ids)
+        reported_suppression = set(report.suppression_marked_ledger_ids) | set(
+            report.suppression_already_marked_ledger_ids
+        )
+        if reported_ownership != expected_ownership or reported_suppression != expected_suppression:
+            raise SnapshotError("the apply report does not mark every frozen ledger row with its disposition")
+        expected_already_ownership = {
+            int(row["identity"]["ledger_id"])
+            for row in frozen.rows
+            if row["marker"]["kind"] == MARKER_OWNERSHIP and row["marker"]["action"] == MARKER_ALREADY
+        }
+        expected_already_suppression = {
+            int(row["identity"]["ledger_id"])
+            for row in frozen.rows
+            if row["marker"]["kind"] == MARKER_SUPPRESSION and row["marker"]["action"] == MARKER_ALREADY
+        }
+        if not expected_already_ownership.issubset(report.already_marked_ledger_ids) or not (
+            expected_already_suppression.issubset(report.suppression_already_marked_ledger_ids)
+        ):
             raise SnapshotError("the apply report marker actions disagree with the snapshot")
     return report
 
@@ -1013,6 +1119,7 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
         "historical_rows",
         "eligible_refusals",
         "rows",
+        "disposition_counts",
         "obligation_outcomes",
         "readiness",
         "plan_digest",
@@ -1075,7 +1182,7 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
             booking_uuid=canonical_uuid(identity["target_booking_uuid"]),
             starts_at=_parse_timestamp(identity["target_starts_at"], "target_starts_at"),
             now=created_at,
-            is_deleted=identity["target_is_canceled"] or identity["target_is_completed"],
+            is_deleted=row["disposition"] != DISPOSITION_ACTIVE,
         )
         if {item.dedupe_key for item in planned} != {item["dedupe_key"] for item in row["obligations"]}:
             raise SnapshotError("snapshot_obligations_incomplete")
@@ -1088,6 +1195,10 @@ def read_snapshot(path: str | Path) -> FrozenPlan:
         raise SnapshotError("eligible_created_rows does not match the frozen scope")
     if ledger_rows_seen != eligible_count + sum(historical.values()):
         raise SnapshotError("ledger_rows_seen does not match eligible and historical rows")
+
+    disposition_counts = _disposition_counts(rows, refusals)
+    if _validate_disposition_counts(payload["disposition_counts"]) != disposition_counts:
+        raise SnapshotError("disposition_counts does not match the frozen rows")
 
     outcomes = _obligation_counts(rows)
     if payload["obligation_outcomes"] != outcomes:
@@ -1183,13 +1294,29 @@ def _parse_timestamp(value: object, label: str) -> datetime:
 
 
 def _validate_refusal(value: object) -> dict[str, Any]:
-    _exact_keys(value, {"ledger_id", "source_company_id", "source_record_id", "reason"}, "eligible refusal")
+    _exact_keys(
+        value,
+        {
+            "ledger_id",
+            "source_company_id",
+            "source_record_id",
+            "disposition",
+            "reason",
+            "category_reason_code",
+        },
+        "eligible refusal",
+    )
     assert isinstance(value, dict)
     for key in ("ledger_id", "source_company_id", "source_record_id"):
         if type(value[key]) is not int or value[key] <= 0:
             raise SnapshotError(f"eligible refusal {key} is invalid")
     if not isinstance(value["reason"], str) or not value["reason"]:
         raise SnapshotError("eligible refusal reason is invalid")
+    if value["disposition"] != DISPOSITION_UNPROVEN:
+        raise SnapshotError("eligible refusal disposition is invalid")
+    category_reason = value["category_reason_code"]
+    if category_reason is not None and (not isinstance(category_reason, str) or not category_reason):
+        raise SnapshotError("eligible refusal category reason is invalid")
     return dict(value)
 
 
@@ -1198,6 +1325,8 @@ def _validate_row(value: object) -> dict[str, Any]:
         value,
         {
             "identity",
+            "disposition",
+            "category_reason_code",
             "obligations",
             "stale_source_job_ids",
             "processing_source_job_ids",
@@ -1222,6 +1351,7 @@ def _validate_row(value: object) -> dict[str, Any]:
         "target_starts_at",
         "target_is_canceled",
         "target_is_completed",
+        "target_status_type",
         "target_client_id",
     }
     _exact_keys(identity, identity_keys, "row identity")
@@ -1231,6 +1361,7 @@ def _validate_row(value: object) -> dict[str, Any]:
         "target_starts_at",
         "target_is_canceled",
         "target_is_completed",
+        "target_status_type",
     }:
         if type(identity[key]) is not int or identity[key] <= 0:
             raise SnapshotError(f"row identity {key} is invalid")
@@ -1238,6 +1369,19 @@ def _validate_row(value: object) -> dict[str, Any]:
         raise SnapshotError("row target terminal flags are invalid")
     if identity["target_is_canceled"] and identity["target_is_completed"]:
         raise SnapshotError("row target terminal flags contradict each other")
+    status_type = identity["target_status_type"]
+    if status_type is not None and (
+        not isinstance(status_type, str) or not status_type or status_type != status_type.strip().casefold()
+    ):
+        raise SnapshotError("row target status type is invalid")
+    if identity["target_is_canceled"]:
+        if status_type not in CANCELED_STATUS_TYPES:
+            raise SnapshotError("row target status type does not prove canceled flag")
+    elif identity["target_is_completed"]:
+        if status_type not in COMPLETED_STATUS_TYPES:
+            raise SnapshotError("row target status type does not prove completed flag")
+    elif status_type in CANCELED_STATUS_TYPES or status_type in COMPLETED_STATUS_TYPES:
+        raise SnapshotError("row target terminal status type contradicts active flags")
     booking_uuid = canonical_uuid(identity["target_booking_uuid"])
     if booking_uuid is None or str(booking_uuid) != identity["target_booking_uuid"]:
         raise SnapshotError("row target_booking_uuid is not canonical")
@@ -1257,22 +1401,45 @@ def _validate_row(value: object) -> dict[str, Any]:
     order = [(item["run_at"], item["job_type"]) for item in obligations]
     if order != sorted(set(order)):
         raise SnapshotError("obligations are duplicate or not canonical")
+
+    disposition = value["disposition"]
+    category_reason = value["category_reason_code"]
+    if disposition not in ACTIONABLE_DISPOSITIONS:
+        raise SnapshotError("row disposition is unknown")
+    if not isinstance(category_reason, str) or not category_reason:
+        raise SnapshotError("row category reason is invalid")
+    expected_marker_kind = MARKER_SUPPRESSION if disposition == DISPOSITION_SUPPRESSED_CATEGORY else MARKER_OWNERSHIP
+    if disposition == DISPOSITION_ACTIVE:
+        if category_reason != ALLOWED or identity["target_is_canceled"] or identity["target_is_completed"]:
+            raise SnapshotError("active disposition contradicts its proofs")
+    elif disposition == DISPOSITION_TERMINAL_COMPLETED:
+        if category_reason != ALLOWED or identity["target_is_canceled"] or not identity["target_is_completed"]:
+            raise SnapshotError("completed disposition contradicts its proofs")
+    elif disposition == DISPOSITION_TERMINAL_CANCELED:
+        if category_reason != ALLOWED or not identity["target_is_canceled"] or identity["target_is_completed"]:
+            raise SnapshotError("canceled disposition contradicts its proofs")
+    elif category_reason != CATEGORY_NOT_ALLOWED or identity["target_is_canceled"] and identity["target_is_completed"]:
+        raise SnapshotError("suppressed disposition contradicts its proofs")
+    if disposition != DISPOSITION_ACTIVE and obligations:
+        raise SnapshotError("only an active disposition may carry target obligations")
     _exact_keys(value["evidence"], {"ledger", "source", "target", "clients", "source_jobs"}, "row evidence")
     for key, digest in value["evidence"].items():
         _validate_digest(digest, key)
 
     return {
         "identity": dict(identity),
+        "disposition": disposition,
+        "category_reason_code": category_reason,
         "obligations": obligations,
         "stale_source_job_ids": list(stale),
         "processing_source_job_ids": list(processing),
-        "marker": _validate_marker(value["marker"]),
+        "marker": _validate_marker(value["marker"], expected_kind=expected_marker_kind),
         "refusal": None,
         "evidence": dict(value["evidence"]),
     }
 
 
-def _validate_marker(value: object) -> dict[str, Any]:
+def _validate_marker(value: object, *, expected_kind: str) -> dict[str, Any]:
     """The row's expected ownership-marker state, or refuse the snapshot.
 
     Strict in both directions. ``set`` means the plan saw no marker and the
@@ -1281,8 +1448,16 @@ def _validate_marker(value: object) -> dict[str, Any]:
     carry both. A half-stated expectation would let an apply either re-mark a
     row somebody else had already handed over, or skip marking one that needs it.
     """
-    _exact_keys(value, {"action", "existing_digest", "handed_over_at"}, "row marker")
+    _exact_keys(value, {"kind", "action", "reason_code", "existing_digest", "handed_over_at"}, "row marker")
     assert isinstance(value, dict)
+    kind = value["kind"]
+    reason_code = value["reason_code"]
+    if kind != expected_kind or kind not in (MARKER_OWNERSHIP, MARKER_SUPPRESSION):
+        raise SnapshotError("row marker kind contradicts its disposition")
+    if kind == MARKER_OWNERSHIP and reason_code is not None:
+        raise SnapshotError("ownership marker cannot carry a suppression reason")
+    if kind == MARKER_SUPPRESSION and reason_code != REMINDER_SUPPRESSION_REASON_CODE:
+        raise SnapshotError("suppression marker reason is invalid")
     action = value["action"]
     if action not in (MARKER_SET, MARKER_ALREADY):
         raise SnapshotError("row marker action is unknown")
@@ -1292,12 +1467,24 @@ def _validate_marker(value: object) -> dict[str, Any]:
     if action == MARKER_SET:
         if digest is not None or handed_over_at is not None:
             raise SnapshotError("a row to be marked cannot already carry a marker")
-        return {"action": action, "existing_digest": None, "handed_over_at": None}
+        return {
+            "kind": kind,
+            "action": action,
+            "reason_code": reason_code,
+            "existing_digest": None,
+            "handed_over_at": None,
+        }
 
     if not isinstance(digest, str) or len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
         raise SnapshotError("row marker existing_digest is not a digest")
     _parse_timestamp(handed_over_at, "row marker handed_over_at")
-    return {"action": action, "existing_digest": digest, "handed_over_at": handed_over_at}
+    return {
+        "kind": kind,
+        "action": action,
+        "reason_code": reason_code,
+        "existing_digest": digest,
+        "handed_over_at": handed_over_at,
+    }
 
 
 def _validate_obligation(value: object, *, booking_uuid: uuid_module.UUID, starts_at: datetime) -> dict[str, Any]:
@@ -1345,6 +1532,27 @@ def _obligation_counts(rows: tuple[dict[str, Any], ...]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _disposition_counts(
+    rows: tuple[dict[str, Any], ...],
+    refusals: tuple[dict[str, Any], ...],
+) -> dict[str, int]:
+    counts = {item: 0 for item in sorted(ACTIONABLE_DISPOSITIONS | {DISPOSITION_UNPROVEN})}
+    for row in rows:
+        disposition = row["disposition"]
+        counts[disposition] = counts.get(disposition, 0) + 1
+    counts[DISPOSITION_UNPROVEN] = len(refusals)
+    return counts
+
+
+def _validate_disposition_counts(value: object) -> dict[str, int]:
+    expected = ACTIONABLE_DISPOSITIONS | {DISPOSITION_UNPROVEN}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise SnapshotError("disposition_counts has missing or unknown dispositions")
+    if any(not _is_non_negative_int(count) for count in value.values()):
+        raise SnapshotError("disposition_counts contains an invalid count")
+    return dict(sorted(value.items()))
+
+
 def _readiness(
     rows: tuple[dict[str, Any], ...],
     refusals: tuple[dict[str, Any], ...],
@@ -1360,11 +1568,11 @@ def _readiness(
     blocker = any(item["outcome"] in blocked_outcomes for item in obligations)
     processing = any(row["processing_source_job_ids"] for row in rows)
     unresolved = any(historical_rows.get(status, 0) for status in UNRESOLVED_LEDGER_STATUSES)
-    guard = not blocker and not refusals and not unresolved
+    guard = not blocker and not refusals and not unresolved and not processing
     return {
         "guard_ready": guard,
         "coverage_ready": guard and not any(item["outcome"] == OBLIGATION_MISSING for item in obligations),
-        "cutover_ready": bool(eligible_count) and eligible_count == len(rows) and guard and not processing,
+        "cutover_ready": bool(eligible_count) and eligible_count == len(rows) and guard,
     }
 
 
@@ -1433,6 +1641,7 @@ def frozen_scope_identities(rows: tuple[dict[str, Any], ...]) -> list[dict[str, 
 
 
 __all__ = [
+    "ACTIONABLE_DISPOSITIONS",
     "CANCEL_REASON",
     "CONFIRMATION_TEMPLATE",
     "DEFAULT_MAX_SNAPSHOT_AGE_SEC",
@@ -1442,12 +1651,21 @@ __all__ = [
     "PROVIDER_EASYWEEK",
     "SNAPSHOT_VERSION",
     "COVERING_STATUSES",
+    "DISPOSITION_ACTIVE",
+    "DISPOSITION_SUPPRESSED_CATEGORY",
+    "DISPOSITION_TERMINAL_CANCELED",
+    "DISPOSITION_TERMINAL_COMPLETED",
+    "DISPOSITION_UNPROVEN",
     "EligibleRefusal",
     "ApplyReport",
     "APPLY_REPORT_VERSION",
     "FrozenPlan",
     "HandoverPlan",
     "HandoverRow",
+    "MARKER_ALREADY",
+    "MARKER_OWNERSHIP",
+    "MARKER_SET",
+    "MARKER_SUPPRESSION",
     "Obligation",
     "SnapshotError",
     "boundary_still_future",
