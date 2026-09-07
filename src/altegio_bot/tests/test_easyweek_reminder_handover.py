@@ -29,6 +29,7 @@ from altegio_bot.easyweek_migration.reminder_handover import (
     CANCEL_REASON,
     DISPOSITION_ACTIVE,
     DISPOSITION_SUPPRESSED_CATEGORY,
+    DISPOSITION_TERMINAL_CANCELED,
     DISPOSITION_TERMINAL_COMPLETED,
     DISPOSITION_UNPROVEN,
     MARKER_ALREADY,
@@ -686,22 +687,74 @@ def test_the_handover_reader_reports_the_booking_as_it_is() -> None:
 
 
 @pytest.mark.parametrize(
-    ("override", "outcome"),
+    ("flag", "status_type", "normalized"),
     [
-        ({"is_canceled": True, "status": {"type": "canceled"}}, "canceled"),
-        ({"is_completed": True, "status": {"type": "completed"}}, "completed"),
-        ({"is_completed": True, "status": {"type": "SUCCESSFUL"}}, "completed"),
+        ("is_canceled", "canceled", "canceled"),
+        ("is_canceled", " CANCELLED ", "cancelled"),
+        ("is_completed", "completed", "completed"),
+        ("is_completed", "succeeded", "succeeded"),
+        ("is_completed", "finished", "finished"),
+        ("is_completed", " SUCCESSFUL ", "successful"),
     ],
-    ids=["canceled", "completed", "successful"],
+    ids=["canceled", "cancelled", "completed", "succeeded", "finished", "successful"],
 )
-def test_the_handover_reader_reports_a_dead_booking_as_inactive(override: dict[str, Any], outcome: str) -> None:
+def test_the_handover_reader_accepts_every_proven_terminal_status(
+    flag: str,
+    status_type: str,
+    normalized: str,
+) -> None:
     from altegio_bot.easyweek_reminder_guard import ObservedBooking, read_booking_state
 
-    observed = read_booking_state(guard_body(**override), booking_uuid=BOOKING, location=FakeLocation())
+    observed = read_booking_state(
+        guard_body(**{flag: True}, status={"type": status_type}),
+        booking_uuid=BOOKING,
+        location=FakeLocation(),
+    )
 
     assert isinstance(observed, ObservedBooking)
     assert observed.is_active is False
-    assert getattr(observed, f"is_{outcome}") is True
+    assert getattr(observed, flag) is True
+    assert observed.normalized_status_type == normalized
+
+
+@pytest.mark.parametrize(
+    ("status_present", "status"),
+    [
+        (False, None),
+        (True, "canceled"),
+        (True, {}),
+        (True, {"type": 1}),
+        (True, {"type": ""}),
+        (True, {"type": "   "}),
+        (True, {"type": "pending"}),
+    ],
+    ids=["missing", "non_object", "missing_type", "non_string", "empty", "whitespace", "unknown"],
+)
+@pytest.mark.parametrize(
+    ("flag", "reason_detail"),
+    [
+        ("is_canceled", "canceled_status_type_unproven"),
+        ("is_completed", "completed_status_type_unproven"),
+    ],
+    ids=["canceled", "completed"],
+)
+def test_the_handover_reader_requires_proven_status_type_for_a_terminal_flag(
+    status_present: bool,
+    status: object,
+    flag: str,
+    reason_detail: str,
+) -> None:
+    from altegio_bot.easyweek_reminder_guard import GuardOutcome, GuardResult, read_booking_state
+
+    payload = guard_body(**{flag: True})
+    if status_present:
+        payload["status"] = status
+
+    result = read_booking_state(payload, booking_uuid=BOOKING, location=FakeLocation())
+
+    assert isinstance(result, GuardResult)
+    assert result.outcome is GuardOutcome.MALFORMED_RESPONSE
+    assert result.reason == f"easyweek_reminder_guard:malformed_response:{reason_detail}"
 
 
 @pytest.mark.parametrize(
@@ -726,11 +779,25 @@ def test_the_handover_reader_reports_a_dead_booking_as_inactive(override: dict[s
     ],
 )
 def test_the_handover_reader_refuses_contradictory_status_evidence(override: dict[str, Any]) -> None:
-    from altegio_bot.easyweek_reminder_guard import GuardResult, read_booking_state
+    from altegio_bot.easyweek_reminder_guard import GuardOutcome, GuardResult, read_booking_state
 
     result = read_booking_state(guard_body(**override), booking_uuid=BOOKING, location=FakeLocation())
 
     assert isinstance(result, GuardResult)
+    assert result.outcome is GuardOutcome.MALFORMED_RESPONSE
+
+
+def test_the_handover_reader_keeps_dual_terminal_flags_as_a_contradiction() -> None:
+    from altegio_bot.easyweek_reminder_guard import GuardResult, read_booking_state
+
+    result = read_booking_state(
+        guard_body(is_canceled=True, is_completed=True, status={"type": "canceled"}),
+        booking_uuid=BOOKING,
+        location=FakeLocation(),
+    )
+
+    assert isinstance(result, GuardResult)
+    assert result.reason == "easyweek_reminder_guard:malformed_response:status_flags_both_terminal"
 
 
 @pytest.mark.parametrize(
@@ -859,6 +926,69 @@ def test_a_terminal_disposition_is_not_indistinguishable_from_an_active_short_wi
     frozen = frozen_for(tmp_path, plan_with(terminal))
     assert frozen.rows[0]["disposition"] == DISPOSITION_TERMINAL_COMPLETED
     assert frozen.rows[0]["identity"]["target_status_type"] == "successful"
+
+
+@pytest.mark.parametrize(
+    ("disposition", "is_canceled", "is_completed", "status_type"),
+    [
+        (DISPOSITION_TERMINAL_CANCELED, True, False, None),
+        (DISPOSITION_TERMINAL_CANCELED, True, False, ""),
+        (DISPOSITION_TERMINAL_CANCELED, True, False, "unknown"),
+        (DISPOSITION_TERMINAL_CANCELED, True, False, "completed"),
+        (DISPOSITION_TERMINAL_COMPLETED, False, True, None),
+        (DISPOSITION_TERMINAL_COMPLETED, False, True, "   "),
+        (DISPOSITION_TERMINAL_COMPLETED, False, True, "unknown"),
+        (DISPOSITION_TERMINAL_COMPLETED, False, True, "canceled"),
+    ],
+    ids=[
+        "canceled_none",
+        "canceled_blank",
+        "canceled_unknown",
+        "canceled_mismatched",
+        "completed_none",
+        "completed_blank",
+        "completed_unknown",
+        "completed_mismatched",
+    ],
+)
+def test_a_digest_consistent_terminal_snapshot_requires_matching_status_proof(
+    disposition: str,
+    is_canceled: bool,
+    is_completed: bool,
+    status_type: str | None,
+    tmp_path: Path,
+) -> None:
+    row = handover_row(
+        disposition=disposition,
+        target_is_canceled=is_canceled,
+        target_is_completed=is_completed,
+        target_status_type=status_type,
+        obligations=(),
+    )
+    path = write_snapshot(plan_with(row), tmp_path / "terminal.json")
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+def test_a_digest_consistent_suppressed_snapshot_still_requires_terminal_status_proof(tmp_path: Path) -> None:
+    row = suppressed_row(target_is_completed=True, target_status_type=None)
+    path = write_snapshot(plan_with(row), tmp_path / "suppressed-terminal.json")
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
+
+
+@pytest.mark.parametrize("status_type", ["canceled", "cancelled", "completed", "succeeded", "finished", "successful"])
+def test_a_digest_consistent_active_snapshot_rejects_terminal_status_vocabulary(
+    status_type: str,
+    tmp_path: Path,
+) -> None:
+    row = handover_row(target_status_type=status_type, obligations=owed(48))
+    path = write_snapshot(plan_with(row), tmp_path / "active-terminal-status.json")
+
+    with pytest.raises(SnapshotError):
+        read_snapshot(path)
 
 
 def test_a_row_without_a_marker_block_is_refused(tmp_path: Path) -> None:

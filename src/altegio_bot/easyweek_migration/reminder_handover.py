@@ -1374,17 +1374,14 @@ def _validate_row(value: object) -> dict[str, Any]:
         not isinstance(status_type, str) or not status_type or status_type != status_type.strip().casefold()
     ):
         raise SnapshotError("row target status type is invalid")
-    if status_type is not None:
-        if identity["target_is_canceled"] and status_type not in CANCELED_STATUS_TYPES:
-            raise SnapshotError("row target status type contradicts canceled flag")
-        if identity["target_is_completed"] and status_type not in COMPLETED_STATUS_TYPES:
-            raise SnapshotError("row target status type contradicts completed flag")
-        if (
-            not identity["target_is_canceled"]
-            and not identity["target_is_completed"]
-            and (status_type in CANCELED_STATUS_TYPES or status_type in COMPLETED_STATUS_TYPES)
-        ):
-            raise SnapshotError("row target terminal status type contradicts active flags")
+    if identity["target_is_canceled"]:
+        if status_type not in CANCELED_STATUS_TYPES:
+            raise SnapshotError("row target status type does not prove canceled flag")
+    elif identity["target_is_completed"]:
+        if status_type not in COMPLETED_STATUS_TYPES:
+            raise SnapshotError("row target status type does not prove completed flag")
+    elif status_type in CANCELED_STATUS_TYPES or status_type in COMPLETED_STATUS_TYPES:
+        raise SnapshotError("row target terminal status type contradicts active flags")
     booking_uuid = canonical_uuid(identity["target_booking_uuid"])
     if booking_uuid is None or str(booking_uuid) != identity["target_booking_uuid"]:
         raise SnapshotError("row target_booking_uuid is not canonical")

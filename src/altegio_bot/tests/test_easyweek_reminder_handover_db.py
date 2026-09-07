@@ -592,18 +592,64 @@ async def test_zero_created_rows_is_information_not_cutover_permission(session_m
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_target_owes_nothing_but_stays_in_scope(session_maker, seeded) -> None:
+@pytest.mark.parametrize("status_type", ["canceled", "cancelled"])
+async def test_a_cancelled_target_owes_nothing_but_stays_in_scope(status_type: str, session_maker, seeded) -> None:
     """Its stale Altegio reminders still have to be withdrawn."""
     async with session_maker() as session:
         async with session.begin():
             tgt = (await session.execute(select(Record).where(Record.id == seeded["target_pk"]))).scalars().one()
             tgt.is_deleted = True
 
-    plan = await plan_for(session_maker, answer=booking_body(seeded["starts"], canceled=True))
+    plan = await plan_for(
+        session_maker,
+        answer=booking_body(seeded["starts"], canceled=True, status_type=status_type),
+    )
 
     assert len(plan.scoped) == 1
     assert plan.to_create == 0
     assert plan.scoped[0].disposition == DISPOSITION_TERMINAL_CANCELED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_present", "status"),
+    [
+        (False, None),
+        (True, "completed"),
+        (True, {}),
+        (True, {"type": 1}),
+        (True, {"type": ""}),
+        (True, {"type": "   "}),
+        (True, {"type": "unknown"}),
+    ],
+    ids=["missing", "non_object", "missing_type", "non_string", "empty", "whitespace", "unknown"],
+)
+@pytest.mark.parametrize("terminal_flag", ["is_canceled", "is_completed"], ids=["canceled", "completed"])
+async def test_unproven_terminal_status_blocks_the_entire_plan(
+    status_present: bool,
+    status: object,
+    terminal_flag: str,
+    session_maker,
+    seeded,
+) -> None:
+    answer = booking_body(
+        seeded["starts"],
+        canceled=terminal_flag == "is_canceled",
+        completed=terminal_flag == "is_completed",
+    )
+    if status_present:
+        answer["status"] = status
+
+    plan = await plan_for(session_maker, answer=answer)
+    result = await run_apply(session_maker, plan)
+
+    assert plan.scoped == ()
+    assert plan.refused == {"target_unproven": 1}
+    assert plan.disposition_counts[DISPOSITION_UNPROVEN] == 1
+    assert plan.cutover_ready is False
+    assert result.halted == "snapshot_incomplete_scope"
+    assert await ledger_marker(session_maker) == (None, None)
+    assert await suppression_marker(session_maker) == (None, None, None)
 
 
 @pytest.mark.asyncio

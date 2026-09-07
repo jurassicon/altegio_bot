@@ -213,21 +213,23 @@ def _observed_status_contradiction(
     is_completed: bool,
     normalized_status_type: str | None,
 ) -> str | None:
-    """Judge optional status prose against status facts for handover reads.
+    """Judge status type against status facts for handover reads.
 
     The runtime send guard deliberately keeps its established ordering and
     reason codes in :func:`_status_type_contradicts`.  The handover has a
     different job: it must be able to *read* a consistently terminal booking so
     it can retire the obsolete Altegio reminder without planning a replacement.
+    A terminal boolean therefore needs matching status vocabulary; an absent,
+    malformed, blank or unknown type proves nothing and fails closed.
     """
     if is_canceled and is_completed:
         return "status_flags_both_terminal"
+    if is_canceled:
+        return None if normalized_status_type in CANCELED_STATUS_TYPES else "canceled_status_type_unproven"
+    if is_completed:
+        return None if normalized_status_type in COMPLETED_STATUS_TYPES else "completed_status_type_unproven"
     if normalized_status_type is None:
         return None
-    if is_canceled:
-        return None if normalized_status_type in CANCELED_STATUS_TYPES else "status_type_vs_canceled"
-    if is_completed:
-        return None if normalized_status_type in COMPLETED_STATUS_TYPES else "status_type_vs_completed"
     if normalized_status_type in CANCELED_STATUS_TYPES:
         return "status_type_canceled"
     if normalized_status_type in COMPLETED_STATUS_TYPES:
@@ -344,7 +346,9 @@ def read_booking_state(
     asked for and the branch the caller claims, or nothing is read out of it.
     Only after that are the start and the two status flags taken at face value —
     and a flag that is neither ``true`` nor ``false`` is malformed, never
-    optimistically read as "not cancelled".
+    optimistically read as "not cancelled". A true terminal flag additionally
+    requires a matching normalized ``status.type``; the flag alone cannot
+    authorise reminder cancellation or an ownership marker.
     """
     if not isinstance(payload, dict):
         return _refuse(GuardOutcome.MALFORMED_RESPONSE, "not_an_object")
