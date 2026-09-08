@@ -17,7 +17,6 @@ from altegio_bot.campaigns.loyalty_cleanup import (
     resolve_or_issue_loyalty_card,
 )
 from altegio_bot.campaigns.provider import (
-    EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
     CampaignProviderRefusal,
     require_campaign_execution_provider,
     require_same_provider,
@@ -245,6 +244,11 @@ def _build_recipient(
         is_opted_out=client.wa_opted_out,
         status="skipped" if candidate.excluded_reason else "candidate",
         excluded_reason=candidate.excluded_reason,
+        source_easyweek_event_id=candidate.source_easyweek_event_id,
+        source_record_id=candidate.source_record_id,
+        source_booking_uuid=candidate.source_booking_uuid,
+        source_visits_total=candidate.source_visits_total,
+        source_visits_total_updated_at=candidate.source_visits_total_updated_at,
     )
     return recipient
 
@@ -318,28 +322,57 @@ async def run_preview(params: RunParams) -> CampaignRun:
             run = await _create_run(session, params, status="running")
             run_id = run.id
 
-    # PR-13 deliberately has no EasyWeek segment adapter. Persist a diagnostic
-    # preview refusal, but do not import/call Altegio discovery and do not create
-    # recipients or message jobs.
+    source_meta: dict[str, object]
     if provider == PROVIDER_EASYWEEK:
-        await _mark_run_failed(run_id, EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED)
-        async with SessionLocal() as session:
-            refused = await session.get(CampaignRun, run_id)
-            if refused is None:  # pragma: no cover - defensive race guard
-                raise RuntimeError(f"CampaignRun {run_id} disappeared after refusal")
-            return refused
-
-    # Фаза 2: CRM HTTP-запросы (без открытой транзакции БД)
-    try:
-        candidates = await _find_candidates(
-            provider=provider,
-            company_id=params.company_id,
-            period_start=params.period_start,
-            period_end=params.period_end,
+        # Separate local source: no Altegio CRM/loyalty/service API and no
+        # EasyWeek HTTP.  Only processed succeeded events plus provider-scoped
+        # domain snapshots are read.
+        from altegio_bot.campaigns.easyweek_segment import (
+            EasyWeekSegmentUnavailable,
+            build_easyweek_segment,
         )
-    except Exception as exc:
-        await _mark_run_failed(run_id, str(exc))
-        raise
+
+        try:
+            segment = await build_easyweek_segment(
+                company_id=params.company_id,
+                period_start=params.period_start,
+                period_end=params.period_end,
+            )
+        except EasyWeekSegmentUnavailable as exc:
+            await _mark_run_failed(run_id, exc.reason)
+            async with SessionLocal() as session:
+                refused = await session.get(CampaignRun, run_id)
+                if refused is None:  # pragma: no cover - defensive race guard
+                    raise RuntimeError(f"CampaignRun {run_id} disappeared after refusal")
+                return refused
+        except Exception:
+            await _mark_run_failed(run_id, "easyweek_campaign_segment_failed")
+            raise
+
+        candidates = []
+        for item in segment.candidates:
+            candidate = item.candidate
+            if item.proof is not None:
+                candidate.source_easyweek_event_id = item.proof.event_id
+                candidate.source_record_id = item.proof.record_id
+                candidate.source_booking_uuid = item.proof.booking_uuid
+                candidate.source_visits_total = item.proof.visits_total
+                candidate.source_visits_total_updated_at = item.proof.visits_total_updated_at
+            candidates.append(candidate)
+        source_meta = segment.safe_meta()
+    else:
+        # Фаза 2: Altegio CRM HTTP-запросы (без открытой транзакции БД)
+        try:
+            candidates = await _find_candidates(
+                provider=provider,
+                company_id=params.company_id,
+                period_start=params.period_start,
+                period_end=params.period_end,
+            )
+        except Exception as exc:
+            await _mark_run_failed(run_id, str(exc))
+            raise
+        source_meta = {"discovery_source": "crm_api"}
 
     # Фаза 3: сохранить результаты (короткая транзакция)
     async with SessionLocal() as session:
@@ -367,9 +400,8 @@ async def run_preview(params: RunParams) -> CampaignRun:
             for candidate in candidates:
                 session.add(_build_recipient(run_id, provider, candidate))
 
-            # Записать источник обнаружения кандидатов в meta
             meta = dict(run.meta or {})
-            meta["discovery_source"] = "crm_api"
+            meta.update(source_meta)
             run.meta = meta
 
             run.status = "completed"

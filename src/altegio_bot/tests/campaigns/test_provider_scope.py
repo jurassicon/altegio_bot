@@ -14,8 +14,10 @@ import altegio_bot.campaigns.followup as followup
 import altegio_bot.campaigns.runner as runner
 import altegio_bot.workers.campaign_worker as campaign_worker
 import altegio_bot.workers.outbox_worker as outbox_worker
-from altegio_bot.campaigns.configuration import resolve_campaign_readiness
+from altegio_bot.campaigns.configuration import CAMPAIGN_LIVE_GUARD_UNPROVEN, resolve_campaign_readiness
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
+from altegio_bot.campaigns.easyweek_eligibility import REGISTRY_UNAVAILABLE
+from altegio_bot.campaigns.easyweek_segment import SEGMENT_SOURCE
 from altegio_bot.campaigns.provider import (
     CAMPAIGN_IDENTITY_MISMATCH,
     CAMPAIGN_PROVIDER_MISMATCH,
@@ -172,7 +174,7 @@ def test_unknown_and_easyweek_execution_providers_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_easyweek_preview_persists_only_pii_free_refusal(
+async def test_easyweek_preview_with_unavailable_registry_fails_pii_free(
     session_maker,
     monkeypatch,
 ) -> None:
@@ -184,7 +186,7 @@ async def test_easyweek_preview_persists_only_pii_free_refusal(
 
     assert run.provider == "easyweek"
     assert run.status == "failed"
-    assert run.meta["last_error"] == EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED
+    assert run.meta["last_error"] == REGISTRY_UNAVAILABLE
     discover.assert_not_awaited()
     async with session_maker() as session:
         assert await session.scalar(select(func.count()).select_from(CampaignRecipient)) == 0
@@ -346,7 +348,9 @@ async def test_sender_and_template_lookup_do_not_cross_provider_on_numeric_colli
     assert readiness.template_id == easyweek_template.id
     assert readiness.meta_template_name == "easyweek_template"
     assert readiness.ready_for_send is False
-    assert EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED in readiness.reasons
+    assert readiness.segment_source == SEGMENT_SOURCE
+    assert EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED not in readiness.reasons
+    assert CAMPAIGN_LIVE_GUARD_UNPROVEN in readiness.reasons
 
 
 @pytest.mark.asyncio
