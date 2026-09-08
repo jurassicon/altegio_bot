@@ -23,6 +23,10 @@ from altegio_bot.campaigns.followup import (
     FOLLOWUP_SKIP_STATUSES,
     check_followup_final_eligibility,
 )
+from altegio_bot.campaigns.provider import (
+    CampaignProviderRefusal,
+    require_campaign_execution_provider,
+)
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob
@@ -100,8 +104,8 @@ class RepairStats:
     rows: list[_RecipientRow] = field(default_factory=list)
 
 
-def _repair_dedupe_key(run_id: int, recipient_id: int) -> str:
-    return f"campaign_followup:{run_id}:{recipient_id}"
+def _repair_dedupe_key(provider: str, run_id: int, recipient_id: int) -> str:
+    return f"{provider}:campaign_followup:{run_id}:{recipient_id}"
 
 
 def _make_row(
@@ -144,6 +148,11 @@ async def schedule_followups(
             if run is None:
                 print(f"ERROR: CampaignRun {run_id} not found", file=sys.stderr)
                 sys.exit(2)
+            try:
+                provider = require_campaign_execution_provider(run.provider)
+            except CampaignProviderRefusal as exc:
+                print(f"ERROR: {exc.reason}", file=sys.stderr)
+                sys.exit(2)
 
             errors: list[str] = []
             if run.mode != "send-real":
@@ -163,7 +172,10 @@ async def schedule_followups(
 
             delay: int = run.followup_delay_days  # type: ignore[assignment]  # validated above
 
-            stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+            stmt = select(CampaignRecipient).where(
+                CampaignRecipient.campaign_run_id == run_id,
+                CampaignRecipient.provider == provider,
+            )
             recipients = (await session.execute(stmt)).scalars().all()
 
             stats = RepairStats(campaign_run_id=run_id, dry_run=dry_run)
@@ -257,6 +269,7 @@ async def schedule_followups(
                 # --- Dedupe: check for an existing MessageJob by payload ---
                 existing_job_id = await session.scalar(
                     select(MessageJob.id)
+                    .where(MessageJob.provider == provider)
                     .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
                     .where(MessageJob.payload["campaign_run_id"].as_integer() == run_id)
                     .where(MessageJob.payload["campaign_recipient_id"].as_integer() == recipient.id)
@@ -337,9 +350,10 @@ async def schedule_followups(
                         if recipient.display_name:
                             payload["contact_name"] = recipient.display_name
 
-                    dedupe_key = _repair_dedupe_key(run.id, recipient.id)
+                    dedupe_key = _repair_dedupe_key(provider, run.id, recipient.id)
 
                     upsert = pg_insert(MessageJob).values(
+                        provider=provider,
                         company_id=recipient.company_id,
                         record_id=None,
                         client_id=recipient.client_id,

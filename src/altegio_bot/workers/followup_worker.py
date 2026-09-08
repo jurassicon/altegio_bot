@@ -53,6 +53,10 @@ from altegio_bot.campaigns.followup import (
     existing_followup_work_counts,
     plan_followup,
 )
+from altegio_bot.campaigns.provider import (
+    CampaignProviderRefusal,
+    require_campaign_execution_provider,
+)
 from altegio_bot.campaigns.runner import CAMPAIGN_CODE
 from altegio_bot.db import SessionLocal
 from altegio_bot.models.models import CampaignRun
@@ -200,6 +204,18 @@ async def process_run(run_id: int) -> None:
                     logger.warning("followup_worker: run_id=%d not found before processing", run_id)
                     return
                 meta = dict(run.meta or {})
+                try:
+                    provider = require_campaign_execution_provider(run.provider)
+                except CampaignProviderRefusal as exc:
+                    meta.update(
+                        {
+                            "followup_auto_status": "failed",
+                            "followup_auto_completed_at": now.isoformat(),
+                            "followup_auto_last_error": exc.reason,
+                        }
+                    )
+                    run.meta = meta
+                    return
                 safety_passed = meta.get("followup_auto_safety_gate_passed") is True
 
                 if not safety_passed:
@@ -307,7 +323,11 @@ async def process_run(run_id: int) -> None:
         # event), и execute-time skips. stats["skipped"] покрывает только
         # последние, поэтому считаем терминальные skip-статусы напрямую.
         async with SessionLocal() as session:
-            skipped_count = await count_followup_skipped(session, run_id)
+            skipped_count = await count_followup_skipped(
+                session,
+                run_id,
+                provider=provider,
+            )
 
         # 3. Записываем успех (сохраняем recovery-поля, если они есть)
         async with SessionLocal() as session:

@@ -64,7 +64,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
 from datetime import datetime
 
 import httpx
@@ -78,8 +77,9 @@ from altegio_bot.campaigns.altegio_crm import (
     get_client_crm_records,
     get_company_period_client_refs,
 )
+from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import Client
+from altegio_bot.models.models import PROVIDER_ALTEGIO, Client
 from altegio_bot.service_filter import LASH_CATEGORY_IDS_BY_COMPANY, ServiceLookupError, is_lash_service
 from altegio_bot.settings import settings
 
@@ -106,67 +106,6 @@ def _normalize_phone(raw: str | None) -> str | None:
     if not digits:
         return None
     return f"+{digits}"
-
-
-@dataclass(frozen=True)
-class ClientSnapshot:
-    """Immutable snapshot клиента для конкурентных CRM-задач.
-
-    Заменяет прямую передачу ORM Client объектов в конкурентные asyncio задачи.
-    ORM объекты привязаны к сессии и небезопасны для использования после её закрытия
-    (expiry при expire_on_commit=True и детачинг). ClientSnapshot — plain dataclass
-    без SQLAlchemy зависимостей, безопасен для передачи в любые задачи.
-
-    id=None означает, что клиент обнаружен только через CRM (нет записи в локальной БД).
-    Такие клиенты не имеют нормализованного phone_e164 → excluded с no_phone.
-    """
-
-    id: int | None
-    company_id: int
-    altegio_client_id: int | None
-    display_name: str | None
-    phone_e164: str | None
-    wa_opted_out: bool
-
-
-@dataclass
-class ClientCandidate:
-    """Кандидат на рассылку с метаданными сегментации."""
-
-    client: ClientSnapshot
-
-    # --- Записи в периоде (из CRM) ---
-    # Все не удалённые не-отменённые записи клиента в периоде
-    total_records_in_period: int
-    # Подтверждённые записи (confirmed == CONFIRMED_FLAG) — диагностика
-    confirmed_records_in_period: int
-
-    # --- Ресничные записи в периоде (из CRM + category lookup) ---
-    lash_records_in_period: int
-    # Посещённые lash-записи (attendance == ATTENDED_FLAG) — критерий eligible
-    confirmed_lash_records_in_period: int
-
-    # --- Услуги в периоде (для диагностики) ---
-    service_titles_in_period: list[str]
-
-    # --- История до периода (источник истины: Altegio CRM API) ---
-    records_before_period: int
-
-    # --- Записи после периода (источник истины: Altegio CRM API) ---
-    # Кол-во не удалённых записей с starts_at >= period_end.
-    # Если > 0 → excluded_reason = 'returned_after_first_visit'.
-    records_after_period: int = field(default=0)
-
-    # --- Диагностика ---
-    # True если Client найден в локальной БД
-    local_client_found: bool = field(default=True)
-
-    # Причина исключения; None — клиент eligible
-    excluded_reason: str | None = field(default=None)
-
-    @property
-    def is_eligible(self) -> bool:
-        return self.excluded_reason is None
 
 
 def compute_excluded_reason(
@@ -527,6 +466,7 @@ async def find_candidates(
 
         async with SessionLocal() as session:
             clients_stmt = select(Client).where(
+                Client.provider == PROVIDER_ALTEGIO,
                 Client.altegio_client_id.in_(altegio_ids),
                 Client.company_id == company_id,
             )
@@ -548,6 +488,7 @@ async def find_candidates(
                             display_name=local_c.display_name,
                             phone_e164=local_c.phone_e164,
                             wa_opted_out=bool(local_c.wa_opted_out),
+                            provider=PROVIDER_ALTEGIO,
                         )
                     )
                 else:
@@ -563,6 +504,7 @@ async def find_candidates(
                             display_name=ref.name,
                             phone_e164=crm_phone,
                             wa_opted_out=False,
+                            provider=PROVIDER_ALTEGIO,
                         )
                     )
         # Session closed here — snapshots are safe, ORM objects are not used further

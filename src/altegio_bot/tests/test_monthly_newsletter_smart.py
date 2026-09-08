@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import func, select
 
-from altegio_bot.models.models import Client, Record
+import altegio_bot.scripts.run_monthly_newsletter_smart as newsletter
+import altegio_bot.workers.outbox_worker as outbox_worker
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+    MessageJob,
+    OutboxMessage,
+    Record,
+)
 from altegio_bot.scripts.run_monthly_newsletter_smart import (
     CandidateInfo,
     _compute_candidates,
@@ -14,6 +27,8 @@ from altegio_bot.scripts.run_monthly_newsletter_smart import (
     _format_table,
     _parse_company_ids,
     _parse_period,
+    _resolve_all_company_ids,
+    run_monthly_newsletter_smart,
 )
 
 PERIOD_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -178,6 +193,7 @@ async def test_compute_candidates_eligible_client(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8001,
                 display_name="Smart Test Client",
@@ -189,6 +205,7 @@ async def test_compute_candidates_eligible_client(session_maker) -> None:
 
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9001,
                     client_id=client.id,
@@ -200,6 +217,7 @@ async def test_compute_candidates_eligible_client(session_maker) -> None:
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -218,6 +236,7 @@ async def test_compute_candidates_arrived_excluded(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8002,
                 display_name="Arrived Client",
@@ -229,6 +248,7 @@ async def test_compute_candidates_arrived_excluded(session_maker) -> None:
 
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9002,
                     client_id=client.id,
@@ -239,6 +259,7 @@ async def test_compute_candidates_arrived_excluded(session_maker) -> None:
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -257,6 +278,7 @@ async def test_compute_candidates_multi_record_excluded(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8003,
                 display_name="Regular Client",
@@ -269,6 +291,7 @@ async def test_compute_candidates_multi_record_excluded(session_maker) -> None:
             for i, rid in enumerate([9003, 9004]):
                 session.add(
                     Record(
+                        provider=PROVIDER_ALTEGIO,
                         company_id=COMPANY,
                         altegio_record_id=rid,
                         client_id=client.id,
@@ -279,6 +302,7 @@ async def test_compute_candidates_multi_record_excluded(session_maker) -> None:
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -297,6 +321,7 @@ async def test_compute_candidates_opted_out_excluded(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8004,
                 display_name="Opted Out",
@@ -309,6 +334,7 @@ async def test_compute_candidates_opted_out_excluded(session_maker) -> None:
 
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9005,
                     client_id=client.id,
@@ -319,6 +345,7 @@ async def test_compute_candidates_opted_out_excluded(session_maker) -> None:
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -338,6 +365,7 @@ async def test_compute_candidates_visit_attendance_excluded(
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8005,
                 display_name="Visit Attended",
@@ -349,6 +377,7 @@ async def test_compute_candidates_visit_attendance_excluded(
 
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9006,
                     client_id=client.id,
@@ -360,6 +389,7 @@ async def test_compute_candidates_visit_attendance_excluded(
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -377,6 +407,7 @@ async def test_compute_candidates_no_phone_excluded(session_maker) -> None:
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8006,
                 display_name="No Phone",
@@ -388,6 +419,7 @@ async def test_compute_candidates_no_phone_excluded(session_maker) -> None:
 
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9007,
                     client_id=client.id,
@@ -398,6 +430,7 @@ async def test_compute_candidates_no_phone_excluded(session_maker) -> None:
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -417,6 +450,7 @@ async def test_compute_candidates_outside_period_not_counted(
     async with session_maker() as session:
         async with session.begin():
             client = Client(
+                provider=PROVIDER_ALTEGIO,
                 company_id=COMPANY,
                 altegio_client_id=8007,
                 display_name="Outside Period",
@@ -429,6 +463,7 @@ async def test_compute_candidates_outside_period_not_counted(
             # One record INSIDE period
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9008,
                     client_id=client.id,
@@ -439,6 +474,7 @@ async def test_compute_candidates_outside_period_not_counted(
             # One record OUTSIDE period (before)
             session.add(
                 Record(
+                    provider=PROVIDER_ALTEGIO,
                     company_id=COMPANY,
                     altegio_record_id=9009,
                     client_id=client.id,
@@ -449,6 +485,7 @@ async def test_compute_candidates_outside_period_not_counted(
 
         result = await _compute_candidates(
             session,
+            provider=PROVIDER_ALTEGIO,
             company_id=COMPANY,
             period_start=PERIOD_START,
             period_end=PERIOD_END,
@@ -460,3 +497,526 @@ async def test_compute_candidates_outside_period_not_counted(
     assert cands[0].is_eligible is True
     assert cands[0].total_records_in_period == 1
     assert cands[0].arrived_records_in_period == 0
+
+
+# ---------------------------------------------------------------------------
+# PR-13 provider-isolation regression coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_all_companies_ignores_easyweek_only_company(session_maker) -> None:
+    altegio_company = 800001
+    easyweek_company = 800002
+    async with session_maker() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    Client(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=altegio_company,
+                        altegio_client_id=8101,
+                        raw={},
+                    ),
+                    Client(
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=easyweek_company,
+                        altegio_client_id=8102,
+                        raw={},
+                    ),
+                ]
+            )
+
+        company_ids = await _resolve_all_company_ids(
+            session,
+            provider=PROVIDER_ALTEGIO,
+        )
+
+    assert altegio_company in company_ids
+    assert easyweek_company not in company_ids
+
+
+@pytest.mark.asyncio
+async def test_candidates_ignore_easyweek_client_with_same_company_id(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            altegio_client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=COMPANY,
+                altegio_client_id=8201,
+                phone_e164="+491110000101",
+                raw={},
+            )
+            easyweek_client = Client(
+                provider=PROVIDER_EASYWEEK,
+                company_id=COMPANY,
+                altegio_client_id=8202,
+                phone_e164="+491110000102",
+                raw={},
+            )
+            session.add_all([altegio_client, easyweek_client])
+            await session.flush()
+            session.add_all(
+                [
+                    Record(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=COMPANY,
+                        altegio_record_id=9201,
+                        client_id=altegio_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                    Record(
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=COMPANY,
+                        altegio_record_id=9202,
+                        client_id=easyweek_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                ]
+            )
+
+        candidates = await _compute_candidates(
+            session,
+            provider=PROVIDER_ALTEGIO,
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    assert [candidate.client_id for candidate in candidates] == [altegio_client.id]
+    assert all(candidate.altegio_client_id != easyweek_client.altegio_client_id for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_easyweek_record_does_not_change_altegio_statistics(session_maker) -> None:
+    """Even a corrupt cross-provider client link cannot affect Altegio counts."""
+    async with session_maker() as session:
+        async with session.begin():
+            altegio_client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=COMPANY,
+                altegio_client_id=8301,
+                phone_e164="+491110000201",
+                raw={},
+            )
+            session.add(altegio_client)
+            await session.flush()
+            session.add_all(
+                [
+                    Record(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=COMPANY,
+                        altegio_record_id=9301,
+                        client_id=altegio_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                    Record(
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=COMPANY,
+                        altegio_record_id=9302,
+                        client_id=altegio_client.id,
+                        starts_at=PERIOD_START + timedelta(days=2),
+                        attendance=1,
+                    ),
+                ]
+            )
+
+        candidates = await _compute_candidates(
+            session,
+            provider=PROVIDER_ALTEGIO,
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    assert len(candidates) == 1
+    assert candidates[0].total_records_in_period == 1
+    assert candidates[0].arrived_records_in_period == 0
+    assert candidates[0].is_eligible is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_easyweek_only_company_produces_no_altegio_candidates(session_maker) -> None:
+    easyweek_company = 800003
+    async with session_maker() as session:
+        async with session.begin():
+            easyweek_client = Client(
+                provider=PROVIDER_EASYWEEK,
+                company_id=easyweek_company,
+                altegio_client_id=8401,
+                phone_e164="+491110000301",
+                raw={},
+            )
+            session.add(easyweek_client)
+            await session.flush()
+            session.add(
+                Record(
+                    provider=PROVIDER_EASYWEEK,
+                    company_id=easyweek_company,
+                    altegio_record_id=9401,
+                    client_id=easyweek_client.id,
+                    starts_at=PERIOD_START + timedelta(days=1),
+                    attendance=0,
+                )
+            )
+
+        candidates = await _compute_candidates(
+            session,
+            provider=PROVIDER_ALTEGIO,
+            company_id=easyweek_company,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_all_mode_does_not_create_foreign_campaign_work(
+    session_maker,
+    monkeypatch,
+) -> None:
+    altegio_company = 800004
+    easyweek_company = 800005
+    altegio_phone = "+491110000401"
+    easyweek_phone = "+491110000402"
+    async with session_maker() as session:
+        async with session.begin():
+            altegio_client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=altegio_company,
+                altegio_client_id=8501,
+                phone_e164=altegio_phone,
+                raw={},
+            )
+            easyweek_client = Client(
+                provider=PROVIDER_EASYWEEK,
+                company_id=easyweek_company,
+                altegio_client_id=8502,
+                phone_e164=easyweek_phone,
+                raw={},
+            )
+            session.add_all([altegio_client, easyweek_client])
+            await session.flush()
+            session.add_all(
+                [
+                    Record(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=altegio_company,
+                        altegio_record_id=9501,
+                        client_id=altegio_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                    Record(
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=easyweek_company,
+                        altegio_record_id=9502,
+                        client_id=easyweek_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                ]
+            )
+
+    class LoyaltyProbe:
+        def __init__(self) -> None:
+            self.issue_calls: list[tuple[int, int]] = []
+            self.closed = False
+
+        async def get_card_types(self, location_id: int) -> list[dict[str, object]]:
+            raise AssertionError(f"unexpected card-type API lookup for company={location_id}")
+
+        async def issue_card(
+            self,
+            location_id: int,
+            *,
+            loyalty_card_number: str,
+            loyalty_card_type_id: str,
+            phone: int,
+        ) -> dict[str, object]:
+            del loyalty_card_type_id
+            assert location_id == altegio_company
+            assert phone == int(altegio_phone.lstrip("+"))
+            self.issue_calls.append((location_id, phone))
+            return {
+                "id": "altegio-card-id",
+                "loyalty_card_number": loyalty_card_number,
+            }
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    loyalty = LoyaltyProbe()
+    monkeypatch.setattr(newsletter, "SessionLocal", session_maker)
+    monkeypatch.setattr(newsletter, "AltegioLoyaltyClient", lambda: loyalty)
+
+    exit_code = await run_monthly_newsletter_smart(
+        month="2026-01",
+        from_date=None,
+        to_date=None,
+        company_id_arg="all",
+        mode="send-real",
+        test_phone="",
+        booking_link="https://example.invalid/book",
+        template_name="test-template",
+        expect_status="sent",
+        timeout_sec=1,
+        cleanup=False,
+        force=False,
+        limit=None,
+        output_format="json",
+        out_file=None,
+        card_type_id="altegio-card-type",
+        client_name="Test",
+    )
+
+    assert exit_code == 0
+    assert loyalty.issue_calls == [(altegio_company, int(altegio_phone.lstrip("+")))]
+    assert loyalty.closed is True
+    async with session_maker() as session:
+        runs = (await session.execute(select(CampaignRun))).scalars().all()
+        recipients = (await session.execute(select(CampaignRecipient))).scalars().all()
+        jobs = (await session.execute(select(MessageJob))).scalars().all()
+        outbox_count = await session.scalar(select(func.count()).select_from(OutboxMessage))
+
+    assert len(runs) == 1
+    assert runs[0].provider == PROVIDER_ALTEGIO
+    assert altegio_company in runs[0].company_ids
+    assert easyweek_company not in runs[0].company_ids
+    assert len(recipients) == 1
+    assert recipients[0].provider == PROVIDER_ALTEGIO
+    assert recipients[0].client_id == altegio_client.id
+    assert recipients[0].client_id != easyweek_client.id
+    assert recipients[0].status == "queued"
+    assert len(jobs) == 1
+    assert jobs[0].provider == PROVIDER_ALTEGIO
+    assert jobs[0].client_id == altegio_client.id
+    assert jobs[0].client_id != easyweek_client.id
+    assert jobs[0].payload["campaign_run_id"] == runs[0].id
+    assert jobs[0].payload["campaign_recipient_id"] == recipients[0].id
+    assert recipients[0].message_job_id == jobs[0].id
+    assert recipients[0].provider == runs[0].provider == jobs[0].provider
+    assert recipients[0].company_id == jobs[0].company_id
+    assert outbox_count == 0
+
+
+@pytest.mark.asyncio
+async def test_smart_send_real_job_passes_identity_guard(
+    session_maker,
+    monkeypatch,
+) -> None:
+    company_id = 800006
+    phone = "+491110000601"
+    async with session_maker() as session:
+        async with session.begin():
+            client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=company_id,
+                altegio_client_id=8701,
+                display_name="Smart runner client",
+                phone_e164=phone,
+                raw={},
+            )
+            session.add(client)
+            await session.flush()
+            session.add(
+                Record(
+                    provider=PROVIDER_ALTEGIO,
+                    company_id=company_id,
+                    altegio_record_id=9701,
+                    client_id=client.id,
+                    starts_at=PERIOD_START + timedelta(days=1),
+                    attendance=0,
+                )
+            )
+
+    class LoyaltyProbe:
+        async def issue_card(
+            self,
+            location_id: int,
+            *,
+            loyalty_card_number: str,
+            loyalty_card_type_id: str,
+            phone: int,
+        ) -> dict[str, object]:
+            assert location_id == company_id
+            assert loyalty_card_type_id == "altegio-card-type"
+            assert phone == int("491110000601")
+            return {"id": "smart-card", "loyalty_card_number": loyalty_card_number}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(newsletter, "SessionLocal", session_maker)
+    monkeypatch.setattr(newsletter, "AltegioLoyaltyClient", LoyaltyProbe)
+
+    exit_code = await run_monthly_newsletter_smart(
+        month="2026-01",
+        from_date=None,
+        to_date=None,
+        company_id_arg=str(company_id),
+        mode="send-real",
+        test_phone="",
+        booking_link="https://example.invalid/book",
+        template_name="test-template",
+        expect_status="sent",
+        timeout_sec=1,
+        cleanup=False,
+        force=False,
+        limit=None,
+        output_format="json",
+        out_file=None,
+        card_type_id="altegio-card-type",
+        client_name="Test",
+    )
+    assert exit_code == 0
+
+    monkeypatch.setattr(outbox_worker, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(outbox_worker, "_marketing_suppression_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(outbox_worker, "_pause_for_closed_meta_circuit", AsyncMock(return_value=False))
+    monkeypatch.setattr(outbox_worker, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        outbox_worker,
+        "_render_message",
+        AsyncMock(return_value=("Smart newsletter body", None, "de", {"client_name": "Smart runner client"})),
+    )
+    send = AsyncMock(return_value=("wamid.smart-runner", None))
+    monkeypatch.setattr(outbox_worker, "safe_send", send)
+    monkeypatch.setattr(outbox_worker.settings, "whatsapp_send_mode", "text")
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await session.scalar(select(MessageJob).where(MessageJob.company_id == company_id))
+            assert job is not None
+            job.status = "processing"
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+
+        recipient = await session.scalar(select(CampaignRecipient).where(CampaignRecipient.company_id == company_id))
+        outbox_rows = (
+            (await session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalars().all()
+        )
+
+    assert job.status == "done"
+    assert job.last_error is None
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].provider_message_id == "wamid.smart-runner"
+    assert recipient is not None
+    assert recipient.message_job_id == job.id
+    assert recipient.outbox_message_id == outbox_rows[0].id
+    assert recipient.provider_message_id == "wamid.smart-runner"
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_smart_send_real_refuses_unproven_recipient_before_loyalty(
+    session_maker,
+    monkeypatch,
+) -> None:
+    candidate = CandidateInfo(
+        company_id=COMPANY,
+        client_id=1,
+        altegio_client_id=1,
+        display_name="Candidate",
+        phone_e164="+491110000701",
+        total_records_in_period=1,
+        arrived_records_in_period=0,
+        is_opted_out=False,
+        is_eligible=True,
+        excluded_reason=None,
+    )
+    complete = AsyncMock()
+    loyalty = MagicMock(side_effect=AssertionError("loyalty must not be constructed"))
+    monkeypatch.setattr(newsletter, "SessionLocal", session_maker)
+    monkeypatch.setattr(newsletter, "_create_campaign_run", AsyncMock(return_value=123))
+    monkeypatch.setattr(newsletter, "_save_recipients", AsyncMock())
+    monkeypatch.setattr(newsletter, "_complete_campaign_run", complete)
+    monkeypatch.setattr(newsletter, "AltegioLoyaltyClient", loyalty)
+
+    result = await newsletter._run_mode_send_real(
+        [candidate],
+        provider=PROVIDER_ALTEGIO,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        company_ids=[COMPANY],
+        fmt="json",
+        out_file=None,
+        booking_link="https://example.invalid/book",
+        template_name="test-template",
+        limit=None,
+        card_type_id="altegio-card-type",
+    )
+
+    assert result == 2
+    loyalty.assert_not_called()
+    complete.assert_awaited_once_with(
+        123,
+        provider=PROVIDER_ALTEGIO,
+        sent=0,
+        failed=1,
+        status="failed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_altegio_legacy_behavior_is_preserved(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            eligible_client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=COMPANY,
+                altegio_client_id=8601,
+                phone_e164="+491110000501",
+                raw={},
+            )
+            arrived_client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=COMPANY,
+                altegio_client_id=8602,
+                phone_e164="+491110000502",
+                raw={},
+            )
+            session.add_all([eligible_client, arrived_client])
+            await session.flush()
+            session.add_all(
+                [
+                    Record(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=COMPANY,
+                        altegio_record_id=9601,
+                        client_id=eligible_client.id,
+                        starts_at=PERIOD_START + timedelta(days=1),
+                        attendance=0,
+                    ),
+                    Record(
+                        provider=PROVIDER_ALTEGIO,
+                        company_id=COMPANY,
+                        altegio_record_id=9602,
+                        client_id=arrived_client.id,
+                        starts_at=PERIOD_START + timedelta(days=2),
+                        attendance=1,
+                    ),
+                ]
+            )
+
+        candidates = await _compute_candidates(
+            session,
+            provider=PROVIDER_ALTEGIO,
+            company_id=COMPANY,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+        )
+
+    summary = _compute_summary(candidates)
+    assert summary == {
+        "total_clients_seen": 2,
+        "candidates_count": 1,
+        "excluded_opted_out": 0,
+        "excluded_more_than_one_record": 0,
+        "excluded_has_arrived": 1,
+        "excluded_no_phone": 0,
+    }

@@ -43,10 +43,17 @@ from altegio_bot.campaigns.altegio_crm import (
     classify_crm_records,
     get_client_crm_records,
 )
+from altegio_bot.campaigns.configuration import resolve_campaign_readiness
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
+from altegio_bot.campaigns.gift_card_readiness import probe_gift_card_readiness
 from altegio_bot.campaigns.loyalty_cleanup import (
     bulk_delete_outstanding_cards,
     find_outstanding_campaign_cards,
+)
+from altegio_bot.campaigns.provider import (
+    CampaignProviderRefusal,
+    require_campaign_execution_provider,
+    require_same_provider,
 )
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
@@ -65,7 +72,16 @@ from altegio_bot.campaigns.runner import (
 )
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client, MessageJob, MessageTemplate, Record
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+    MessageJob,
+    MessageTemplate,
+    Record,
+)
 from altegio_bot.ops.auth import require_ops_auth
 from altegio_bot.service_filter import ServiceLookupError
 from altegio_bot.settings import settings
@@ -88,6 +104,7 @@ FollowupPolicy = Literal["unread_only", "unread_or_not_booked"]
 
 
 class CampaignBaseRequest(BaseModel):
+    provider: Literal["altegio", "easyweek"] = PROVIDER_ALTEGIO
     company_id: int
     location_id: int
     period_start: datetime
@@ -116,6 +133,65 @@ class FollowupPlanRequest(BaseModel):
     followup_template_name: str | None = None
 
 
+@router.get("/new-clients/readiness")
+async def campaign_readiness(
+    provider: Literal["altegio", "easyweek"] = Query(default=PROVIDER_ALTEGIO),
+    company_id: int = Query(...),
+    sender_code: str = Query(default="default"),
+    template_code: str = Query(default="newsletter_new_clients_monthly"),
+    language: str = Query(default="de"),
+    include_gift_card: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Return provider-scoped, read-only campaign readiness diagnostics."""
+    async with SessionLocal() as session:
+        readiness = await resolve_campaign_readiness(
+            session,
+            provider=provider,
+            company_id=company_id,
+            sender_code=sender_code,
+            template_code=template_code,
+            language=language,
+        )
+
+    result: dict[str, Any] = {
+        "provider": readiness.provider,
+        "company_id": readiness.company_id,
+        "ready_for_send": readiness.ready_for_send,
+        "reasons": list(readiness.reasons),
+        "booking_page_url": readiness.booking_page_url,
+        "sender_id": readiness.sender_id,
+        "template_id": readiness.template_id,
+        "meta_template_name": readiness.meta_template_name,
+        "language": readiness.language,
+        "segment_source": readiness.segment_source,
+        "live_guard": readiness.live_guard,
+        "supported_job_types": list(readiness.supported_job_types),
+    }
+    if include_gift_card and provider == "easyweek":
+        try:
+            async with EasyWeekClient() as client:
+                gift_card = await probe_gift_card_readiness(client)
+        except EasyWeekError:
+            result["gift_card"] = {
+                "ready": False,
+                "reasons": ["gift_card_template_unproven"],
+            }
+        else:
+            result["gift_card"] = {
+                "ready": gift_card.ready,
+                "reasons": list(gift_card.reasons),
+                "template_uuid": gift_card.template_uuid,
+                "workspace_uuid": gift_card.workspace_uuid,
+                "location_uuid": gift_card.location_uuid,
+                "currency": gift_card.currency,
+                "monetary_value": gift_card.monetary_value,
+                "validity": gift_card.validity,
+                "branch_scope": gift_card.branch_scope,
+                "customer_purchase_url": gift_card.customer_purchase_url,
+            }
+    return result
+
+
 # ==========================================================================
 # Preview
 # ==========================================================================
@@ -131,6 +207,7 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
     _validate_period(body.period_start, body.period_end)
 
     params = RunParams(
+        provider=body.provider,
         company_id=body.company_id,
         location_id=body.location_id,
         period_start=_ensure_utc(body.period_start),
@@ -185,6 +262,7 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
     if body.source_preview_run_id is not None:
         await _validate_run_matches_preview(
             preview_run_id=body.source_preview_run_id,
+            provider=body.provider,
             company_id=body.company_id,
             period_start=period_start_utc,
             period_end=period_end_utc,
@@ -197,6 +275,7 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
         )
 
     params = RunParams(
+        provider=body.provider,
         company_id=body.company_id,
         location_id=body.location_id,
         period_start=period_start_utc,
@@ -213,6 +292,8 @@ async def create_run(body: RunRequest) -> dict[str, Any]:
 
     try:
         run = await enqueue_send_real(params)
+    except CampaignProviderRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
     except Exception as exc:
         logger.exception("send-real enqueue failed: %s", exc)
         raise HTTPException(
@@ -245,6 +326,7 @@ def _normalise_nullable_str(v: str | None) -> str | None:
 async def _validate_run_matches_preview(
     *,
     preview_run_id: int,
+    provider: str,
     company_id: int,
     period_start: datetime,
     period_end: datetime,
@@ -277,6 +359,9 @@ async def _validate_run_matches_preview(
             status_code=400,
             detail=f"Preview run {preview_run_id} not found",
         )
+
+    if preview_run.provider != provider:
+        raise HTTPException(status_code=400, detail="campaign_provider_mismatch")
 
     if preview_run.mode != "preview":
         raise HTTPException(
@@ -444,7 +529,15 @@ async def debug_client_segmentation(
     # 1. Локальный клиент и его записи в периоде
     # ------------------------------------------------------------------
     async with SessionLocal() as session:
-        client_stmt = select(Client).where(Client.company_id == company_id, Client.phone_e164 == phone_e164).limit(1)
+        client_stmt = (
+            select(Client)
+            .where(
+                Client.provider == PROVIDER_ALTEGIO,
+                Client.company_id == company_id,
+                Client.phone_e164 == phone_e164,
+            )
+            .limit(1)
+        )
         local_client: Client | None = (await session.execute(client_stmt)).scalar_one_or_none()
 
         local_records_in_period: list[Record] = []
@@ -452,6 +545,7 @@ async def debug_client_segmentation(
             rec_stmt = (
                 select(Record)
                 .where(
+                    Record.provider == PROVIDER_ALTEGIO,
                     Record.company_id == company_id,
                     Record.client_id == local_client.id,
                     Record.starts_at >= period_start_utc,
@@ -691,6 +785,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
     async with SessionLocal() as session:
         if valid_phones_e164:
             cl_stmt = select(Client).where(
+                Client.provider == PROVIDER_ALTEGIO,
                 Client.company_id == body.company_id,
                 Client.phone_e164.in_(valid_phones_e164),
             )
@@ -706,6 +801,7 @@ async def debug_clients_batch(body: BatchDebugRequest) -> dict[str, Any]:
                 count_stmt = (
                     select(Record.client_id, sql_func.count().label("cnt"))
                     .where(
+                        Record.provider == PROVIDER_ALTEGIO,
                         Record.company_id == body.company_id,
                         Record.client_id.in_(found_client_ids),
                         Record.starts_at >= period_start_utc,
@@ -977,6 +1073,7 @@ def normalize_meta_template_name(template_name: str) -> str:
 async def get_template_text(
     template_name: str = Query(..., description="Meta template name"),
     company_id: int | None = Query(default=None, description="Campaign company ID"),
+    provider: Literal["altegio", "easyweek"] = Query(default=PROVIDER_ALTEGIO),
 ) -> dict[str, Any]:
     """Загрузить текст шаблона из локальной БД (message_templates).
 
@@ -996,6 +1093,7 @@ async def get_template_text(
     async with SessionLocal() as session:
         base_stmt = (
             select(MessageTemplate)
+            .where(MessageTemplate.provider == provider)
             .where(MessageTemplate.code == code)
             .where(MessageTemplate.is_active.is_(True))
             .order_by(MessageTemplate.id.asc())
@@ -1010,7 +1108,7 @@ async def get_template_text(
             match = (await session.execute(company_stmt)).scalar_one_or_none()
 
         # Fallback: берём первый активный шаблон с таким кодом (детерминированно по id ASC)
-        if match is None:
+        if match is None and provider == PROVIDER_ALTEGIO:
             match = (await session.execute(base_stmt)).scalar_one_or_none()
 
     if match is None:
@@ -1025,6 +1123,7 @@ async def get_template_text(
         "language": match.language,
         "body": match.body,
         "company_id": match.company_id,
+        "provider": match.provider,
         "is_active": match.is_active,
     }
 
@@ -1037,6 +1136,7 @@ async def get_template_text(
 @router.get("/runs")
 async def list_runs(
     company_id: int | None = Query(default=None),
+    provider: Literal["altegio", "easyweek"] | None = Query(default=None),
     mode: str | None = Query(default=None),
     status: str | None = Query(default=None),
     include_deleted: bool = Query(default=False),
@@ -1062,6 +1162,8 @@ async def list_runs(
     async with SessionLocal() as session:
         # Строим базовое условие
         conditions = [CampaignRun.campaign_code == campaign_code]
+        if provider is not None:
+            conditions.append(CampaignRun.provider == provider)
         if not include_deleted and status != "deleted":
             conditions.append(CampaignRun.status != "deleted")
         if not include_hidden:
@@ -1097,6 +1199,7 @@ async def list_runs(
         if preview_ids:
             src_stmt = select(CampaignRun.source_preview_run_id).where(
                 CampaignRun.source_preview_run_id.in_(preview_ids),
+                CampaignRun.provider.in_({r.provider for r in runs}),
                 CampaignRun.mode == "send-real",
             )
             used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
@@ -1125,8 +1228,13 @@ async def get_run(run_id: int) -> dict[str, Any]:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        execution_job = await _fetch_execution_job(session, run_id)
-        progress = await _fetch_progress(session, run_id, run.total_clients_seen or 0)
+        execution_job = await _fetch_execution_job(session, run_id, provider=run.provider)
+        progress = await _fetch_progress(
+            session,
+            run_id,
+            run.total_clients_seen or 0,
+            provider=run.provider,
+        )
         used_as_source = False
         if run.mode == "preview":
             src_count = await session.scalar(
@@ -1134,6 +1242,7 @@ async def get_run(run_id: int) -> dict[str, Any]:
                 .select_from(CampaignRun)
                 .where(
                     CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.provider == run.provider,
                     CampaignRun.mode == "send-real",
                 )
             )
@@ -1162,11 +1271,17 @@ async def get_run_progress(run_id: int) -> dict[str, Any]:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        execution_job = await _fetch_execution_job(session, run_id)
-        progress = await _fetch_progress(session, run_id, run.total_clients_seen or 0)
+        execution_job = await _fetch_execution_job(session, run_id, provider=run.provider)
+        progress = await _fetch_progress(
+            session,
+            run_id,
+            run.total_clients_seen or 0,
+            provider=run.provider,
+        )
 
     return {
         "run_id": run_id,
+        "provider": run.provider,
         "status": run.status,
         "execution_job": execution_job,
         "progress": progress,
@@ -1228,7 +1343,10 @@ async def get_recipients(
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
 
-        conditions = [CampaignRecipient.campaign_run_id == run_id]
+        conditions = [
+            CampaignRecipient.campaign_run_id == run_id,
+            CampaignRecipient.provider == run.provider,
+        ]
         if status:
             conditions.append(CampaignRecipient.status == status)
         if excluded_reason:
@@ -1279,6 +1397,7 @@ async def get_run_report(run_id: int) -> dict[str, Any]:
 async def get_monthly_dashboard(
     year: int = Query(..., ge=2020, le=2100),
     month: int = Query(..., ge=1, le=12),
+    provider: Literal["altegio", "easyweek"] = Query(default=PROVIDER_ALTEGIO),
     company_ids: str | None = Query(
         default=None,
         description="Comma-separated company IDs",
@@ -1296,7 +1415,13 @@ async def get_monthly_dashboard(
             )
 
     async with SessionLocal() as session:
-        return await monthly_dashboard(session, year=year, month=month, company_ids=cids)
+        return await monthly_dashboard(
+            session,
+            year=year,
+            month=month,
+            company_ids=cids,
+            provider=provider,
+        )
 
 
 # ==========================================================================
@@ -1319,6 +1444,11 @@ async def plan_followup_endpoint(
             run = await session.get(CampaignRun, run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
+
+            try:
+                require_campaign_execution_provider(run.provider)
+            except CampaignProviderRefusal as exc:
+                raise HTTPException(status_code=409, detail=exc.reason) from exc
 
             if run.mode != "send-real":
                 raise HTTPException(
@@ -1364,6 +1494,11 @@ async def run_followup_now(run_id: int) -> dict[str, Any]:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+
+        try:
+            require_campaign_execution_provider(run.provider)
+        except CampaignProviderRefusal as exc:
+            raise HTTPException(status_code=409, detail=exc.reason) from exc
 
         if run.mode != "send-real":
             raise HTTPException(
@@ -1546,6 +1681,11 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
 
+    try:
+        require_campaign_execution_provider(run.provider)
+    except CampaignProviderRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+
     if run.mode != "preview":
         raise HTTPException(
             status_code=400,
@@ -1562,6 +1702,7 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
             select(func.count())
             .select_from(CampaignRun)
             .where(CampaignRun.source_preview_run_id == run_id)
+            .where(CampaignRun.provider == run.provider)
             .where(CampaignRun.mode == "send-real")
         )
     if int(used or 0) > 0:
@@ -1591,7 +1732,15 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
 
     async with SessionLocal() as session:
         if phone_e164 and altegio_cid is None:
-            stmt = select(Client).where(Client.company_id == company_id, Client.phone_e164 == phone_e164).limit(1)
+            stmt = (
+                select(Client)
+                .where(
+                    Client.provider == run.provider,
+                    Client.company_id == company_id,
+                    Client.phone_e164 == phone_e164,
+                )
+                .limit(1)
+            )
             local_client = (await session.execute(stmt)).scalar_one_or_none()
             if local_client is not None:
                 altegio_cid = local_client.altegio_client_id
@@ -1599,6 +1748,7 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
             stmt = (
                 select(Client)
                 .where(
+                    Client.provider == run.provider,
                     Client.company_id == company_id,
                     Client.altegio_client_id == altegio_cid,
                 )
@@ -1628,6 +1778,7 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
                 .select_from(CampaignRecipient)
                 .where(
                     CampaignRecipient.campaign_run_id == run_id,
+                    CampaignRecipient.provider == run.provider,
                     CampaignRecipient.phone_e164 == phone_e164,
                 )
             )
@@ -1715,6 +1866,7 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
     async with SessionLocal() as session:
         async with session.begin():
             new_r = CampaignRecipient(
+                provider=run.provider,
                 campaign_run_id=run_id,
                 company_id=company_id,
                 client_id=local_client.id if local_client else None,
@@ -1834,12 +1986,18 @@ async def retry_recipient(
     возвращает 404, если recipient не принадлежит run_id.
     """
     async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
         recipient = await session.get(CampaignRecipient, recipient_id)
-        if recipient is None or recipient.campaign_run_id != run_id:
+        if run is None or recipient is None or recipient.campaign_run_id != run_id:
             raise HTTPException(
                 status_code=404,
                 detail=f"Recipient {recipient_id} not found in run {run_id}",
             )
+        try:
+            require_same_provider(run.provider, recipient.provider)
+            require_campaign_execution_provider(run.provider)
+        except CampaignProviderRefusal as exc:
+            raise HTTPException(status_code=409, detail=exc.reason) from exc
 
     result = await retry_recipient_job(recipient_id)
 
@@ -1862,6 +2020,7 @@ async def retry_recipient(
 async def get_outstanding_cards(
     campaign_code: str = Query(...),
     company_id: int = Query(...),
+    provider: Literal["altegio", "easyweek"] = Query(default=PROVIDER_ALTEGIO),
 ) -> dict[str, Any]:
     """Список loyalty-карт прошлых периодов, которые ещё не были удалены.
 
@@ -1871,16 +2030,29 @@ async def get_outstanding_cards(
     Используется UI на странице запуска кампании для предварительного просмотра
     карт, которые будут удалены перед следующим run.
     """
+    try:
+        require_campaign_execution_provider(provider)
+    except CampaignProviderRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+
     async with SessionLocal() as session:
         cards = await find_outstanding_campaign_cards(
             session,
+            provider=provider,
             campaign_code=campaign_code,
             company_id=company_id,
         )
-    return {"campaign_code": campaign_code, "company_id": company_id, "cards": cards, "total": len(cards)}
+    return {
+        "provider": provider,
+        "campaign_code": campaign_code,
+        "company_id": company_id,
+        "cards": cards,
+        "total": len(cards),
+    }
 
 
 class BulkDeleteCardsRequest(BaseModel):
+    provider: Literal["altegio", "easyweek"] = PROVIDER_ALTEGIO
     campaign_code: str
     company_id: int
     exclude_recipient_ids: list[int] = Field(default_factory=list)
@@ -1897,11 +2069,17 @@ async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
 
     Возвращает: deleted_count, failed_count, skipped_count, deleted, failed.
     """
+    try:
+        require_campaign_execution_provider(body.provider)
+    except CampaignProviderRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+
     exclude_set = set(body.exclude_recipient_ids)
 
     async with SessionLocal() as session:
         outstanding = await find_outstanding_campaign_cards(
             session,
+            provider=body.provider,
             campaign_code=body.campaign_code,
             company_id=body.company_id,
         )
@@ -1911,6 +2089,7 @@ async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
         result = await bulk_delete_outstanding_cards(
             loyalty,
             outstanding,
+            provider=body.provider,
             exclude_recipient_ids=exclude_set,
             session_factory=SessionLocal,
         )
@@ -1943,10 +2122,13 @@ async def bulk_delete_cards(body: BulkDeleteCardsRequest) -> dict[str, Any]:
 async def _fetch_execution_job(
     session: AsyncSession,
     run_id: int,
+    *,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> dict[str, Any] | None:
     """Найти последний execution MessageJob для данного run_id."""
     stmt = (
         select(MessageJob)
+        .where(MessageJob.provider == provider)
         .where(MessageJob.job_type == CAMPAIGN_EXECUTION_JOB_TYPE)
         .where(MessageJob.payload.contains({"campaign_run_id": run_id}))
         .order_by(MessageJob.id.desc())
@@ -1958,6 +2140,7 @@ async def _fetch_execution_job(
 
     return {
         "id": job.id,
+        "provider": job.provider,
         "status": job.status,
         "attempts": job.attempts,
         "max_attempts": job.max_attempts,
@@ -1973,6 +2156,8 @@ async def _fetch_progress(
     session: AsyncSession,
     run_id: int,
     total_clients_seen: int,
+    *,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> dict[str, Any]:
     """Live-счётчики получателей по статусам из CampaignRecipient.
 
@@ -1986,6 +2171,7 @@ async def _fetch_progress(
             func.count(CampaignRecipient.id).label("cnt"),
         )
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .group_by(CampaignRecipient.status, CampaignRecipient.excluded_reason)
     )
     rows = (await session.execute(stmt)).all()
@@ -2085,6 +2271,7 @@ def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str,
     """Краткая сводка по run для списков."""
     return {
         "id": run.id,
+        "provider": run.provider,
         "campaign_code": run.campaign_code,
         "mode": run.mode,
         "status": run.status,
@@ -2196,6 +2383,7 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
     """Словарь для одного CampaignRecipient."""
     return {
         "id": r.id,
+        "provider": r.provider,
         "client_id": r.client_id,
         "altegio_client_id": r.altegio_client_id,
         "phone_e164": r.phone_e164,

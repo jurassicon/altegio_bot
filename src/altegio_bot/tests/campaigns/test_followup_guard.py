@@ -344,6 +344,7 @@ async def test_outbox_worker_followup_replied_does_not_send(
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -437,6 +438,7 @@ async def test_outbox_worker_status_replied_without_replied_at_persists_skipped_
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -667,6 +669,7 @@ async def test_outbox_worker_replied_plus_booked_persists_skipped_booked_after(
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -1068,6 +1071,7 @@ async def test_outbox_worker_followup_missing_recipient_id_does_not_send(
                 include_recipient_id=False,  # <-- key: payload missing campaign_recipient_id
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -1119,6 +1123,7 @@ async def test_outbox_worker_followup_future_record_does_not_send(
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
             # Use a far-future date so the DB guard (_has_future_record uses
@@ -1205,6 +1210,7 @@ async def test_outbox_worker_create_event_after_campaign_sets_booked_after_at(
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
             _make_record(
@@ -1270,6 +1276,7 @@ async def test_outbox_worker_followup_opted_out_does_not_send(
                 client_id=client.id,
             )
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -1579,6 +1586,7 @@ async def test_live_altegio_guard_not_called_when_db_guard_fires_read(
 
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -1678,6 +1686,7 @@ async def test_live_altegio_guard_passes_when_no_future_record(
 
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     await _lock_job(session_maker, job_id)
@@ -1718,6 +1727,7 @@ async def test_live_altegio_guard_retries_on_api_error(
 
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     await _lock_job(session_maker, job_id)
@@ -1763,6 +1773,7 @@ async def test_live_altegio_guard_fails_after_max_attempts(
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             job.payload = {**job.payload, ow._FOLLOWUP_LIVE_GUARD_ATTEMPTS_KEY: pre_attempts}
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     await _lock_job(session_maker, job_id)
@@ -1881,6 +1892,7 @@ async def test_live_altegio_guard_not_called_when_db_guard_fires_booked(
 
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     provider = MagicMock()
@@ -2007,6 +2019,7 @@ async def test_live_altegio_guard_uses_client_altegio_id_fallback(
 
             job = _make_followup_job(session, run_id=run.id, recipient_id=recipient.id, client_id=client.id)
             await session.flush()
+            recipient.followup_message_job_id = job.id
             job_id = job.id
 
     await _lock_job(session_maker, job_id)

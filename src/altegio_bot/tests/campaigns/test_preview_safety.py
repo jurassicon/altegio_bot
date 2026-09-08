@@ -16,11 +16,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
 from altegio_bot.main import app
-from altegio_bot.models.models import CampaignRun
+from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
 from altegio_bot.ops.auth import require_ops_auth
 
 
@@ -90,6 +91,57 @@ async def test_run_from_preview_company_mismatch_returns_400(
     resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
     assert resp.status_code == 400
     assert "Company ID mismatch" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_run_from_preview_provider_mismatch_returns_400_before_enqueue(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """EasyWeek request cannot consume an Altegio preview snapshot."""
+    preview_run_id = await _create_preview_run(session_maker, provider="altegio")
+
+    body = {
+        "provider": "easyweek",
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",
+        "source_preview_run_id": preview_run_id,
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "campaign_provider_mismatch"
+    async with session_maker() as session:
+        assert await session.scalar(select(func.count()).select_from(CampaignRun)) == 1
+        assert await session.scalar(select(func.count()).select_from(CampaignRecipient)) == 0
+        assert await session.scalar(select(func.count()).select_from(MessageJob)) == 0
+        assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+
+@pytest.mark.asyncio
+async def test_easyweek_send_real_api_refuses_before_creating_state(
+    http_client: AsyncClient,
+    session_maker,
+) -> None:
+    """PR-13 exposes configuration, but does not authorize EasyWeek execution."""
+    body = {
+        "provider": "easyweek",
+        "company_id": COMPANY,
+        "location_id": COMPANY,
+        "period_start": "2026-01-01T00:00:00Z",
+        "period_end": "2026-01-31T23:59:59Z",
+        "card_type_id": "test-card-type",
+    }
+    resp = await http_client.post("/ops/campaigns/new-clients/run", json=body)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "easyweek_campaign_segment_not_implemented"
+    async with session_maker() as session:
+        for model in (CampaignRun, CampaignRecipient, MessageJob, OutboxMessage):
+            assert await session.scalar(select(func.count()).select_from(model)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +462,7 @@ async def test_run_preview_writes_discovery_source(session_maker) -> None:
     runner_module.SessionLocal = session_maker
 
     params = RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=COMPANY,
         period_start=PERIOD_START,
@@ -453,6 +506,7 @@ async def test_run_preview_final_state_guard(session_maker) -> None:
 
     # Запускаем preview — создаёт run со статусом 'running', потом финализирует
     params = RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=COMPANY,
         period_start=PERIOD_START,
@@ -496,6 +550,7 @@ async def test_run_preview_guard_raises_when_status_changed_externally(session_m
     runner_module.SessionLocal = session_maker
 
     params = RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=COMPANY,
         period_start=PERIOD_START,
@@ -547,6 +602,7 @@ async def test_send_real_guard_raises_when_status_changed_externally(session_mak
     runner_module.SessionLocal = session_maker
 
     params = RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=COMPANY,
         period_start=PERIOD_START,
@@ -609,6 +665,7 @@ async def test_send_real_snapshot_writes_preview_snapshot_discovery_source(sessi
     preview_run_id = await _create_preview_run(session_maker)
 
     params = RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=COMPANY,
         period_start=PERIOD_START,

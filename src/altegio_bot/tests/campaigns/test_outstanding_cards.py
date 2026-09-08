@@ -106,7 +106,9 @@ async def test_no_cards_issued(session_maker):
         async with session.begin():
             _make_run(session)
         # No recipients added → no cards issued
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
     assert cards == []
 
 
@@ -118,7 +120,9 @@ async def test_returns_card_from_send_real_run(session_maker):
             await session.flush()
             _make_recipient(session, run, loyalty_card_id="card-001")
 
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
 
     assert len(cards) == 1
     assert cards[0]["loyalty_card_id"] == "card-001"
@@ -141,7 +145,9 @@ async def test_excludes_already_deleted_card(session_maker):
                 cleanup_card_ids=["card-001"],
             )
 
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
 
     assert cards == []
 
@@ -155,7 +161,9 @@ async def test_ignores_preview_run_cards(session_maker):
             await session.flush()
             _make_recipient(session, run, loyalty_card_id="card-preview")
 
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
 
     assert cards == []
 
@@ -179,7 +187,9 @@ async def test_ignores_different_company(session_maker):
             await session.flush()
             _make_recipient(session, run, company_id=other_company, loyalty_card_id="card-other")
 
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
 
     assert cards == []
 
@@ -195,7 +205,9 @@ async def test_multiple_runs_returns_all_outstanding(session_maker):
             _make_recipient(session, run1, phone_e164="+49111", loyalty_card_id="card-march")
             _make_recipient(session, run2, phone_e164="+49222", loyalty_card_id="card-april")
 
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
 
     card_ids = {c["loyalty_card_id"] for c in cards}
     assert card_ids == {"card-march", "card-april"}
@@ -247,6 +259,7 @@ async def test_bulk_delete_calls_api_and_persists(session_maker):
     result = await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids=set(),
         session_factory=session_maker,
     )
@@ -292,6 +305,7 @@ async def test_bulk_delete_skips_excluded(session_maker):
     result = await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids={recipient_id},
         session_factory=session_maker,
     )
@@ -342,6 +356,7 @@ async def test_bulk_delete_records_failure_and_continues(session_maker):
     result = await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids=set(),
         session_factory=session_maker,
     )
@@ -393,6 +408,7 @@ async def test_bulk_delete_calls_aclose(session_maker):
     await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids=set(),
         session_factory=session_maker,
     )
@@ -475,6 +491,7 @@ async def test_bulk_delete_persist_failure_recorded_and_loop_continues(
     result = await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids=set(),
         session_factory=_BrokenSessionFactory(),
     )
@@ -528,10 +545,13 @@ async def test_find_outstanding_empty_after_bulk_delete(session_maker):
     await bulk_delete_outstanding_cards(
         loyalty,
         outstanding,
+        provider="altegio",
         exclude_recipient_ids=set(),
         session_factory=session_maker,
     )
 
     async with session_maker() as session:
-        cards = await find_outstanding_campaign_cards(session, campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID)
+        cards = await find_outstanding_campaign_cards(
+            session, provider="altegio", campaign_code=CAMPAIGN_CODE, company_id=COMPANY_ID
+        )
     assert cards == []

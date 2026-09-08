@@ -634,6 +634,9 @@ _ROLLBACK_PARENT_REVISION = "a7d1f4c82b95"
 _CLOSURE_TABLE = "easyweek_migration_wave_closure"
 _CLOSURE_UNIQUE = "uq_easyweek_migration_wave_closure_identity"
 _CLOSURE_PARENT_REVISION = "c4b7e2f1a983"
+# PR-13: provider-scoped campaign identity.
+_CAMPAIGN_PROVIDER_PARENT_REVISION = "e4b7a1d9c203"
+_CAMPAIGN_PROVIDER_FK = "fk_campaign_recipients_run_provider"
 
 
 async def _ledger_index(db_url: str, index: str) -> str | None:
@@ -1088,4 +1091,64 @@ async def test_wave_closure_migration_round_trip(temp_db_url) -> None:
     # A fresh table: no environment is told it once closed a wave it never closed.
     rows = await _fetch(temp_db_url, f"SELECT count(*) FROM {_CLOSURE_TABLE}")
     assert rows[0][0] == 0
+    assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1
+
+
+@pytest.mark.asyncio
+async def test_campaign_provider_migration_backfills_and_enforces_identity(temp_db_url) -> None:
+    """Historical rows become Altegio and recipient/run provider cannot diverge."""
+    _alembic_ok("upgrade", _CAMPAIGN_PROVIDER_PARENT_REVISION, db_url=temp_db_url)
+    await _exec(
+        temp_db_url,
+        "INSERT INTO campaign_runs "
+        "(id, campaign_code, mode, company_ids, period_start, period_end, status, meta) "
+        "VALUES (910001, 'new_clients_monthly', 'preview', '[758285]'::jsonb, "
+        "'2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', 'completed', '{}'::jsonb)",
+    )
+    await _exec(
+        temp_db_url,
+        "INSERT INTO campaign_recipients (id, campaign_run_id, company_id, status, meta) "
+        "VALUES (920001, 910001, 758285, 'candidate', '{}'::jsonb)",
+    )
+
+    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+
+    run_provider = await _fetch(temp_db_url, "SELECT provider FROM campaign_runs WHERE id = 910001")
+    recipient_provider = await _fetch(
+        temp_db_url,
+        "SELECT provider FROM campaign_recipients WHERE id = 920001",
+    )
+    assert run_provider == [("altegio",)]
+    assert recipient_provider == [("altegio",)]
+
+    for table in ("campaign_runs", "campaign_recipients"):
+        provider_column = await _column(temp_db_url, table, "provider")
+        assert provider_column is not None
+        assert provider_column[1] == "NO"
+        assert "altegio" in (provider_column[2] or "")
+
+    assert _CAMPAIGN_PROVIDER_FK in await _constraint_names(temp_db_url, "campaign_recipients")
+    with pytest.raises(IntegrityError) as mismatch:
+        await _exec(
+            temp_db_url,
+            "UPDATE campaign_recipients SET provider = 'easyweek' WHERE id = 920001",
+        )
+    assert _CAMPAIGN_PROVIDER_FK in str(mismatch.value)
+
+    await _exec(
+        temp_db_url,
+        "INSERT INTO campaign_runs "
+        "(id, provider, campaign_code, mode, company_ids, period_start, period_end, status, meta) "
+        "VALUES (910002, 'easyweek', 'new_clients_monthly', 'preview', '[758285]'::jsonb, "
+        "'2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', 'failed', '{}'::jsonb)",
+    )
+    await _exec(
+        temp_db_url,
+        "INSERT INTO campaign_recipients (id, provider, campaign_run_id, company_id, status, meta) "
+        "VALUES (920002, 'easyweek', 910002, 758285, 'skipped', '{}'::jsonb)",
+    )
+    assert await _fetch(
+        temp_db_url,
+        "SELECT provider FROM campaign_recipients WHERE id = 920002",
+    ) == [("easyweek",)]
     assert _alembic_ok("heads", db_url=temp_db_url).count("(head)") == 1

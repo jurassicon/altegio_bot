@@ -396,6 +396,7 @@ async def test_preview_saves_records_after_period(patched_db, session_maker) -> 
         with patch.object(runner_module, "find_candidates", return_value=[candidate]):
             run = await run_preview(
                 RunParams(
+                    provider="altegio",
                     company_id=COMPANY,
                     location_id=COMPANY,
                     period_start=PERIOD_START,

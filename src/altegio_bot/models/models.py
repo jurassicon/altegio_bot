@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -1088,8 +1089,18 @@ class CampaignRun(Base):
     """Один запуск кампании: preview или send-real."""
 
     __tablename__ = "campaign_runs"
+    __table_args__ = (
+        UniqueConstraint("id", "provider", name="uq_campaign_runs_id_provider"),
+        Index(
+            "ix_campaign_runs_provider_campaign_created",
+            "provider",
+            "campaign_code",
+            "created_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = _provider_column()
 
     # Код кампании, например 'new_clients_monthly'
     campaign_code: Mapped[str] = mapped_column(String(128), index=True)
@@ -1207,12 +1218,31 @@ class CampaignRecipient(Base):
     """
 
     __tablename__ = "campaign_recipients"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_run_id", "provider"],
+            ["campaign_runs.id", "campaign_runs.provider"],
+            name="fk_campaign_recipients_run_provider",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_campaign_recipients_provider_run",
+            "provider",
+            "campaign_run_id",
+        ),
+        Index(
+            "ix_campaign_recipients_provider_company_client",
+            "provider",
+            "company_id",
+            "client_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = _provider_column()
 
     campaign_run_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("campaign_runs.id", ondelete="CASCADE"),
         index=True,
     )
 

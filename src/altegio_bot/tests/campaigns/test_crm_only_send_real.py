@@ -81,6 +81,7 @@ def _crm_only_candidate(*, phone_e164: str | None = "+4915123456789") -> ClientC
 
 def _make_params(*, source_preview_run_id: int | None = None, mode: str = "send-real") -> RunParams:
     return RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=LOCATION,
         period_start=PERIOD_START,

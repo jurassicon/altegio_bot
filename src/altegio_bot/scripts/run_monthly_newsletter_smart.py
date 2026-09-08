@@ -47,12 +47,18 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
+from altegio_bot.campaigns.provider import (
+    CAMPAIGN_IDENTITY_MISMATCH,
+    require_campaign_execution_provider,
+)
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import add_job
+from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
     CampaignRecipient,
     CampaignRun,
     Client,
+    MessageJob,
     Record,
 )
 from altegio_bot.scripts.run_newsletter_new_clients_monthly import (
@@ -77,6 +83,14 @@ _LOYALTY_CARD_PREFIX = "Kundenkarte #"
 # Record.visit_attendance == 1 (visit confirmed).
 # Both fields are synced from the Altegio API record payload.
 ARRIVED_STATUSES_DOC = "attendance=1 OR visit_attendance=1 (Altegio arrived)"
+
+
+def _require_altegio_provider(provider: object) -> str:
+    """Prove this legacy runner stays on its sole supported CRM path."""
+    exact_provider = require_campaign_execution_provider(provider)
+    if exact_provider != PROVIDER_ALTEGIO:
+        raise RuntimeError("campaign_provider_mismatch")
+    return exact_provider
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +158,15 @@ def _parse_company_ids(value: str) -> list[int] | None:
     return [int(x.strip()) for x in v.split(",") if x.strip()]
 
 
-async def _resolve_all_company_ids(session: AsyncSession) -> list[int]:
-    res = await session.execute(select(Client.company_id).distinct().order_by(Client.company_id))
+async def _resolve_all_company_ids(
+    session: AsyncSession,
+    *,
+    provider: str,
+) -> list[int]:
+    exact_provider = _require_altegio_provider(provider)
+    res = await session.execute(
+        select(Client.company_id).where(Client.provider == exact_provider).distinct().order_by(Client.company_id)
+    )
     return [row[0] for row in res.all()]
 
 
@@ -157,6 +178,7 @@ async def _resolve_all_company_ids(session: AsyncSession) -> list[int]:
 async def _compute_candidates(
     session: AsyncSession,
     *,
+    provider: str,
     company_id: int,
     period_start: datetime,
     period_end: datetime,
@@ -166,8 +188,10 @@ async def _compute_candidates(
     'arrived' = attendance==1 OR visit_attendance==1.
     See ARRIVED_STATUSES_DOC for the authoritative definition.
     """
+    exact_provider = _require_altegio_provider(provider)
     logger.debug(
-        "Computing candidates company=%s period=[%s, %s)",
+        "Computing candidates provider=%s company=%s period=[%s, %s)",
+        exact_provider,
         company_id,
         period_start.date(),
         period_end.date(),
@@ -187,6 +211,7 @@ async def _compute_candidates(
             func.count(Record.id).label("total_records"),
             func.sum(arrived_expr).label("arrived_records"),
         )
+        .where(Record.provider == exact_provider)
         .where(Record.company_id == company_id)
         .where(Record.client_id.is_not(None))
         .where(Record.starts_at >= period_start)
@@ -202,6 +227,7 @@ async def _compute_candidates(
             func.coalesce(stats_subq.c.arrived_records, 0).label("arrived_records"),
         )
         .join(stats_subq, stats_subq.c.client_id == Client.id)
+        .where(Client.provider == exact_provider)
         .where(Client.company_id == company_id)
         .order_by(
             Client.phone_e164.asc().nullsfirst(),
@@ -367,6 +393,7 @@ def _print_candidates(
 
 async def _create_campaign_run(
     *,
+    provider: str,
     mode: str,
     company_ids: list[int],
     period_start: datetime,
@@ -374,10 +401,12 @@ async def _create_campaign_run(
     all_candidates: list[CandidateInfo],
 ) -> int:
     """Insert a CampaignRun and return its id."""
+    exact_provider = _require_altegio_provider(provider)
     summary = _compute_summary(all_candidates)
     async with SessionLocal() as session:
         async with session.begin():
             run = CampaignRun(
+                provider=exact_provider,
                 campaign_code=CAMPAIGN_CODE,
                 mode=mode,
                 company_ids=company_ids,
@@ -404,13 +433,17 @@ async def _create_campaign_run(
 async def _save_recipients(
     run_id: int,
     candidates: list[CandidateInfo],
+    *,
+    provider: str,
 ) -> None:
     """Bulk-insert CampaignRecipient rows."""
+    exact_provider = _require_altegio_provider(provider)
     async with SessionLocal() as session:
         async with session.begin():
             for c in candidates:
                 session.add(
                     CampaignRecipient(
+                        provider=exact_provider,
                         campaign_run_id=run_id,
                         company_id=c.company_id,
                         client_id=c.client_id,
@@ -427,16 +460,59 @@ async def _save_recipients(
                 )
 
 
+async def _resolve_eligible_recipient_ids(
+    run_id: int,
+    eligible: list[CandidateInfo],
+    *,
+    provider: str,
+) -> dict[tuple[int, int], int]:
+    """Prove a unique durable recipient identity for every eligible candidate."""
+    exact_provider = _require_altegio_provider(provider)
+    recipient_ids: dict[tuple[int, int], int] = {}
+    async with SessionLocal() as session:
+        for candidate in eligible:
+            if type(candidate.company_id) is not int or type(candidate.client_id) is not int:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            key = (candidate.company_id, candidate.client_id)
+            if key in recipient_ids:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            matches = (
+                (
+                    await session.execute(
+                        select(CampaignRecipient.id).where(
+                            CampaignRecipient.provider == exact_provider,
+                            CampaignRecipient.campaign_run_id == run_id,
+                            CampaignRecipient.company_id == candidate.company_id,
+                            CampaignRecipient.client_id == candidate.client_id,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(matches) != 1:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            recipient_ids[key] = matches[0]
+    return recipient_ids
+
+
 async def _complete_campaign_run(
     run_id: int,
     *,
+    provider: str,
     sent: int,
     failed: int,
     status: str = "done",
 ) -> None:
+    exact_provider = _require_altegio_provider(provider)
     async with SessionLocal() as session:
         async with session.begin():
-            run = await session.get(CampaignRun, run_id)
+            run = await session.scalar(
+                select(CampaignRun).where(
+                    CampaignRun.id == run_id,
+                    CampaignRun.provider == exact_provider,
+                )
+            )
             if run is not None:
                 run.status = status
                 run.sent_count = sent
@@ -584,6 +660,7 @@ async def _run_mode_send_test(
 async def _run_mode_send_real(
     all_candidates: list[CandidateInfo],
     *,
+    provider: str,
     period_start: datetime,
     period_end: datetime,
     company_ids: list[int],
@@ -594,6 +671,7 @@ async def _run_mode_send_real(
     limit: int | None,
     card_type_id: str | None,
 ) -> int:
+    exact_provider = _require_altegio_provider(provider)
     _print_candidates(
         all_candidates,
         period_start=period_start,
@@ -607,6 +685,7 @@ async def _run_mode_send_real(
         eligible = eligible[:limit]
 
     run_id = await _create_campaign_run(
+        provider=exact_provider,
         mode="send-real",
         company_ids=company_ids,
         period_start=period_start,
@@ -615,7 +694,24 @@ async def _run_mode_send_real(
     )
     logger.info("CampaignRun created id=%s", run_id)
 
-    await _save_recipients(run_id, all_candidates)
+    await _save_recipients(run_id, all_candidates, provider=exact_provider)
+
+    try:
+        recipient_ids = await _resolve_eligible_recipient_ids(
+            run_id,
+            eligible,
+            provider=exact_provider,
+        )
+    except RuntimeError as exc:
+        logger.error("Recipient identity proof failed: %s", exc)
+        await _complete_campaign_run(
+            run_id,
+            provider=exact_provider,
+            sent=0,
+            failed=len(eligible),
+            status="failed",
+        )
+        return 2
 
     sent = 0
     errors = 0
@@ -627,6 +723,7 @@ async def _run_mode_send_real(
 
         for candidate in eligible:
             cid = candidate.company_id
+            recipient_id = recipient_ids[(cid, candidate.client_id)]
             phone_e164 = candidate.phone_e164 or ""
             phone_int = int(phone_e164.lstrip("+"))
 
@@ -666,6 +763,14 @@ async def _run_mode_send_real(
             loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{issued_num}"
 
             try:
+                job_run_at = utcnow()
+                dedupe_key = make_dedupe_key(
+                    job_type=NEWSLETTER_JOB_TYPE,
+                    company_id=cid,
+                    record_id=None,
+                    run_at=job_run_at,
+                    provider=exact_provider,
+                )
                 async with SessionLocal() as session:
                     async with session.begin():
                         await add_job(
@@ -674,13 +779,48 @@ async def _run_mode_send_real(
                             record_id=None,
                             client_id=candidate.client_id,
                             job_type=NEWSLETTER_JOB_TYPE,
-                            run_at=utcnow(),
+                            run_at=job_run_at,
                             payload={
                                 "kind": NEWSLETTER_JOB_TYPE,
                                 "loyalty_card_text": loyalty_card_text,
                                 "campaign_run_id": run_id,
+                                "campaign_recipient_id": recipient_id,
                             },
+                            provider=exact_provider,
                         )
+                        job = await session.scalar(
+                            select(MessageJob).where(
+                                MessageJob.provider == exact_provider,
+                                MessageJob.dedupe_key == dedupe_key,
+                            )
+                        )
+                        if (
+                            job is None
+                            or job.company_id != cid
+                            or job.client_id != candidate.client_id
+                            or job.job_type != NEWSLETTER_JOB_TYPE
+                            or job.status != "queued"
+                            or not isinstance(job.payload, dict)
+                            or job.payload.get("campaign_run_id") != run_id
+                            or job.payload.get("campaign_recipient_id") != recipient_id
+                        ):
+                            raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+
+                        recip = await session.scalar(
+                            select(CampaignRecipient).where(
+                                CampaignRecipient.id == recipient_id,
+                                CampaignRecipient.provider == exact_provider,
+                                CampaignRecipient.campaign_run_id == run_id,
+                                CampaignRecipient.company_id == cid,
+                                CampaignRecipient.client_id == candidate.client_id,
+                            )
+                        )
+                        if recip is None:
+                            raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+                        recip.loyalty_card_id = card_id
+                        recip.loyalty_card_number = issued_num
+                        recip.message_job_id = job.id
+                        recip.status = "queued"
                 sent += 1
                 logger.info(
                     "Queued newsletter job client=%s card=%s",
@@ -696,25 +836,15 @@ async def _run_mode_send_real(
                 errors += 1
                 continue
 
-            # Update recipient record
-            async with SessionLocal() as session:
-                async with session.begin():
-                    res = await session.execute(
-                        select(CampaignRecipient)
-                        .where(CampaignRecipient.campaign_run_id == run_id)
-                        .where(CampaignRecipient.client_id == candidate.client_id)
-                        .limit(1)
-                    )
-                    recip = res.scalar_one_or_none()
-                    if recip is not None:
-                        recip.loyalty_card_id = card_id
-                        recip.loyalty_card_number = issued_num
-                        recip.status = "sent"
-
     finally:
         await loyalty.aclose()
 
-    await _complete_campaign_run(run_id, sent=sent, failed=errors)
+    await _complete_campaign_run(
+        run_id,
+        provider=exact_provider,
+        sent=sent,
+        failed=errors,
+    )
 
     logger.info(
         "send-real complete: run_id=%s sent=%s errors=%s",
@@ -751,6 +881,7 @@ async def run_monthly_newsletter_smart(
     card_type_id: str | None,
     client_name: str,
 ) -> int:
+    exact_provider = _require_altegio_provider(PROVIDER_ALTEGIO)
     period_start, period_end = _parse_period(month, from_date, to_date)
     raw_company_ids = _parse_company_ids(company_id_arg)
 
@@ -764,7 +895,10 @@ async def run_monthly_newsletter_smart(
 
     async with SessionLocal() as session:
         if raw_company_ids is None:
-            company_ids = await _resolve_all_company_ids(session)
+            company_ids = await _resolve_all_company_ids(
+                session,
+                provider=exact_provider,
+            )
             if not company_ids:
                 logger.error("No companies found in DB.")
                 return 2
@@ -775,6 +909,7 @@ async def run_monthly_newsletter_smart(
         for cid in company_ids:
             cands = await _compute_candidates(
                 session,
+                provider=exact_provider,
                 company_id=cid,
                 period_start=period_start,
                 period_end=period_end,
@@ -830,6 +965,7 @@ async def run_monthly_newsletter_smart(
     if mode == "send-real":
         return await _run_mode_send_real(
             all_candidates,
+            provider=exact_provider,
             period_start=period_start,
             period_end=period_end,
             company_ids=company_ids,

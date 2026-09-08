@@ -99,6 +99,7 @@ async def test_ops_campaigns_list_shows_run(
     assert response.status_code == 200
     assert str(sample_run) in response.text
     assert "completed" in response.text
+    assert "altegio" in response.text
 
 
 @pytest.mark.asyncio
@@ -133,6 +134,8 @@ async def test_ops_campaign_run_detail_returns_200(
     assert "Excluded" in response.text
     assert "Follow-up" in response.text
     assert "Follow-up eligibility" in response.text
+    assert "Provider" in response.text
+    assert "altegio" in response.text
 
 
 @pytest.mark.asyncio

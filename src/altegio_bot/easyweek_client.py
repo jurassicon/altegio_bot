@@ -1,12 +1,15 @@
 """Read-only client for the EasyWeek Public API v2 (INTEGRATION_PLAN §1.1, PR-2).
 
-Phase 1 of the EasyWeek integration is deliberately **GET-only**: the plan's hard
-rules (§1.6 p.8) forbid any mutation call, so this module exposes exactly three
-read operations and no way to issue anything else::
+The EasyWeek integration is deliberately **GET-only** here: the plan's hard
+rules forbid mutation calls, so this transport exposes only reviewed read
+operations and no generic request escape hatch::
 
     GET /ping
     GET /locations
     GET /bookings/{booking_uuid}
+    GET /workspace
+    GET /voucher-templates
+    GET /voucher-templates/{voucher_template_uuid}
 
 Everything here is built around two threats:
 
@@ -44,6 +47,8 @@ logger = logging.getLogger("easyweek_client")
 _PATH_PING = "ping"
 _PATH_LOCATIONS = "locations"
 _PATH_BOOKINGS = "bookings"
+_PATH_WORKSPACE = "workspace"
+_PATH_VOUCHER_TEMPLATES = "voucher-templates"
 
 # The ONE origin this client may ever talk to. A misconfigured base URL would
 # otherwise send the Bearer key in clear text or to a third-party host, so the
@@ -597,4 +602,53 @@ class EasyWeekClient:
         uid = payload.get("uuid")
         if not (isinstance(uid, str) and uid.strip()):
             raise EasyWeekProtocolError("booking response has no usable uuid", operation="get_booking")
+        return payload
+
+    async def get_workspace(self) -> dict[str, Any]:
+        """``GET /workspace`` for provider-scoped readiness evidence."""
+        payload = await self._get_json(_PATH_WORKSPACE, operation="get_workspace")
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError("workspace response is not a JSON object", operation="get_workspace")
+        return payload
+
+    async def list_voucher_templates(self) -> list[dict[str, Any]]:
+        """``GET /voucher-templates`` without interpreting product semantics."""
+        payload = await self._get_json(_PATH_VOUCHER_TEMPLATES, operation="list_voucher_templates")
+        if isinstance(payload, dict):
+            payload = payload.get("data")
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise EasyWeekProtocolError(
+                "voucher templates response is not a JSON list",
+                operation="list_voucher_templates",
+            )
+        return payload
+
+    async def get_voucher_template(self, voucher_template_uuid: str) -> dict[str, Any]:
+        """Documented ``GET`` by API UUID; numeric dashboard ids are rejected."""
+        try:
+            canonical = str(uuid_module.UUID(voucher_template_uuid))
+        except (ValueError, AttributeError, TypeError):
+            raise EasyWeekProtocolError(
+                "voucher template identity is not a UUID",
+                operation="get_voucher_template",
+            ) from None
+        if canonical != voucher_template_uuid:
+            raise EasyWeekProtocolError(
+                "voucher template identity is not canonical",
+                operation="get_voucher_template",
+            )
+        payload = await self._get_json(
+            _PATH_VOUCHER_TEMPLATES,
+            canonical,
+            operation="get_voucher_template",
+        )
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "voucher template response is not a JSON object",
+                operation="get_voucher_template",
+            )
         return payload

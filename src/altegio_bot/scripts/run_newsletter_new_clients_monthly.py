@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job
-from altegio_bot.models.models import Client, Record
+from altegio_bot.models.models import PROVIDER_ALTEGIO, Client, Record
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,7 @@ async def _fetch_new_clients(
     # Sub-query: clients who have ANY arrived record in the period.
     arrived_subq = (
         select(Record.client_id)
+        .where(Record.provider == PROVIDER_ALTEGIO)
         .where(Record.company_id == company_id)
         .where(Record.client_id.is_not(None))
         .where(Record.starts_at >= period_start)
@@ -91,6 +92,7 @@ async def _fetch_new_clients(
     # Sub-query: clients with MORE THAN 1 record in the period.
     multi_subq = (
         select(Record.client_id)
+        .where(Record.provider == PROVIDER_ALTEGIO)
         .where(Record.company_id == company_id)
         .where(Record.client_id.is_not(None))
         .where(Record.starts_at >= period_start)
@@ -103,6 +105,7 @@ async def _fetch_new_clients(
     # Clients who HAVE at least 1 record in period…
     has_record_subq = (
         select(Record.client_id)
+        .where(Record.provider == PROVIDER_ALTEGIO)
         .where(Record.company_id == company_id)
         .where(Record.client_id.is_not(None))
         .where(Record.starts_at >= period_start)
@@ -113,6 +116,7 @@ async def _fetch_new_clients(
 
     stmt = (
         select(Client)
+        .where(Client.provider == PROVIDER_ALTEGIO)
         .where(Client.company_id == company_id)
         .where(Client.wa_opted_out.is_(False))
         .where(Client.id.in_(select(has_record_subq.c.client_id)))
@@ -233,6 +237,7 @@ async def run_newsletter(
                                 "kind": NEWSLETTER_JOB_TYPE,
                                 "loyalty_card_text": loyalty_card_text,
                             },
+                            provider=PROVIDER_ALTEGIO,
                         )
                 sent += 1
                 logger.info("Queued newsletter job client_id=%s", client.id)

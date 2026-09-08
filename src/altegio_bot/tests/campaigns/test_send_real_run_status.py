@@ -58,6 +58,7 @@ PERIOD_END = datetime(2026, 4, 1, tzinfo=timezone.utc)
 
 def _make_params() -> RunParams:
     return RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=LOCATION,
         period_start=PERIOD_START,
@@ -452,7 +453,7 @@ async def test_partial_success_with_cleanup_failed_is_completed(runner_ok, sessi
 
     call_count = 0
 
-    async def _selective_cleanup(session, loyalty, *, location_id, client_id, campaign_code):
+    async def _selective_cleanup(session, loyalty, *, provider, location_id, client_id, campaign_code):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -486,7 +487,7 @@ async def test_partial_failure_count_includes_cleanup_failed(runner_ok, session_
 
     call_count = 0
 
-    async def _selective_cleanup(session, loyalty, *, location_id, client_id, campaign_code):
+    async def _selective_cleanup(session, loyalty, *, provider, location_id, client_id, campaign_code):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
