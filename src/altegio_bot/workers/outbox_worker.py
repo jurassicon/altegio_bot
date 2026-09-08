@@ -3161,6 +3161,17 @@ async def _process_job_in_session_inner(
     return campaign_run_id
 
 
+def _campaign_company_scope_contains(company_ids: object, company_id: object) -> bool:
+    """Accept only an unambiguous persisted company scope containing the job."""
+    if type(company_ids) is not list or not company_ids or type(company_id) is not int:
+        return False
+    if any(type(item) is not int for item in company_ids):
+        return False
+    if len(company_ids) != len(set(company_ids)):
+        return False
+    return company_id in company_ids
+
+
 async def _run_job_logic(
     session: AsyncSession,
     job: MessageJob,
@@ -3250,7 +3261,7 @@ async def _run_job_logic(
                         )
                         raise CampaignProviderRefusal(reason)
                     require_same_provider(job_provider, run.provider)
-                    if run.company_ids != [job.company_id]:
+                    if not _campaign_company_scope_contains(run.company_ids, job.company_id):
                         raise CampaignProviderRefusal("campaign_identity_mismatch")
 
                     recipient_id, recipient_error = _parse_int_payload_id(

@@ -47,14 +47,18 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
-from altegio_bot.campaigns.provider import require_campaign_execution_provider
+from altegio_bot.campaigns.provider import (
+    CAMPAIGN_IDENTITY_MISMATCH,
+    require_campaign_execution_provider,
+)
 from altegio_bot.db import SessionLocal
-from altegio_bot.message_planner import add_job
+from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     CampaignRecipient,
     CampaignRun,
     Client,
+    MessageJob,
     Record,
 )
 from altegio_bot.scripts.run_newsletter_new_clients_monthly import (
@@ -456,6 +460,42 @@ async def _save_recipients(
                 )
 
 
+async def _resolve_eligible_recipient_ids(
+    run_id: int,
+    eligible: list[CandidateInfo],
+    *,
+    provider: str,
+) -> dict[tuple[int, int], int]:
+    """Prove a unique durable recipient identity for every eligible candidate."""
+    exact_provider = _require_altegio_provider(provider)
+    recipient_ids: dict[tuple[int, int], int] = {}
+    async with SessionLocal() as session:
+        for candidate in eligible:
+            if type(candidate.company_id) is not int or type(candidate.client_id) is not int:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            key = (candidate.company_id, candidate.client_id)
+            if key in recipient_ids:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            matches = (
+                (
+                    await session.execute(
+                        select(CampaignRecipient.id).where(
+                            CampaignRecipient.provider == exact_provider,
+                            CampaignRecipient.campaign_run_id == run_id,
+                            CampaignRecipient.company_id == candidate.company_id,
+                            CampaignRecipient.client_id == candidate.client_id,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(matches) != 1:
+                raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+            recipient_ids[key] = matches[0]
+    return recipient_ids
+
+
 async def _complete_campaign_run(
     run_id: int,
     *,
@@ -656,6 +696,23 @@ async def _run_mode_send_real(
 
     await _save_recipients(run_id, all_candidates, provider=exact_provider)
 
+    try:
+        recipient_ids = await _resolve_eligible_recipient_ids(
+            run_id,
+            eligible,
+            provider=exact_provider,
+        )
+    except RuntimeError as exc:
+        logger.error("Recipient identity proof failed: %s", exc)
+        await _complete_campaign_run(
+            run_id,
+            provider=exact_provider,
+            sent=0,
+            failed=len(eligible),
+            status="failed",
+        )
+        return 2
+
     sent = 0
     errors = 0
 
@@ -666,6 +723,7 @@ async def _run_mode_send_real(
 
         for candidate in eligible:
             cid = candidate.company_id
+            recipient_id = recipient_ids[(cid, candidate.client_id)]
             phone_e164 = candidate.phone_e164 or ""
             phone_int = int(phone_e164.lstrip("+"))
 
@@ -705,6 +763,14 @@ async def _run_mode_send_real(
             loyalty_card_text = f"{_LOYALTY_CARD_PREFIX}{issued_num}"
 
             try:
+                job_run_at = utcnow()
+                dedupe_key = make_dedupe_key(
+                    job_type=NEWSLETTER_JOB_TYPE,
+                    company_id=cid,
+                    record_id=None,
+                    run_at=job_run_at,
+                    provider=exact_provider,
+                )
                 async with SessionLocal() as session:
                     async with session.begin():
                         await add_job(
@@ -713,14 +779,48 @@ async def _run_mode_send_real(
                             record_id=None,
                             client_id=candidate.client_id,
                             job_type=NEWSLETTER_JOB_TYPE,
-                            run_at=utcnow(),
+                            run_at=job_run_at,
                             payload={
                                 "kind": NEWSLETTER_JOB_TYPE,
                                 "loyalty_card_text": loyalty_card_text,
                                 "campaign_run_id": run_id,
+                                "campaign_recipient_id": recipient_id,
                             },
                             provider=exact_provider,
                         )
+                        job = await session.scalar(
+                            select(MessageJob).where(
+                                MessageJob.provider == exact_provider,
+                                MessageJob.dedupe_key == dedupe_key,
+                            )
+                        )
+                        if (
+                            job is None
+                            or job.company_id != cid
+                            or job.client_id != candidate.client_id
+                            or job.job_type != NEWSLETTER_JOB_TYPE
+                            or job.status != "queued"
+                            or not isinstance(job.payload, dict)
+                            or job.payload.get("campaign_run_id") != run_id
+                            or job.payload.get("campaign_recipient_id") != recipient_id
+                        ):
+                            raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+
+                        recip = await session.scalar(
+                            select(CampaignRecipient).where(
+                                CampaignRecipient.id == recipient_id,
+                                CampaignRecipient.provider == exact_provider,
+                                CampaignRecipient.campaign_run_id == run_id,
+                                CampaignRecipient.company_id == cid,
+                                CampaignRecipient.client_id == candidate.client_id,
+                            )
+                        )
+                        if recip is None:
+                            raise RuntimeError(CAMPAIGN_IDENTITY_MISMATCH)
+                        recip.loyalty_card_id = card_id
+                        recip.loyalty_card_number = issued_num
+                        recip.message_job_id = job.id
+                        recip.status = "queued"
                 sent += 1
                 logger.info(
                     "Queued newsletter job client=%s card=%s",
@@ -735,22 +835,6 @@ async def _run_mode_send_real(
                 )
                 errors += 1
                 continue
-
-            # Update recipient record
-            async with SessionLocal() as session:
-                async with session.begin():
-                    res = await session.execute(
-                        select(CampaignRecipient)
-                        .where(CampaignRecipient.provider == exact_provider)
-                        .where(CampaignRecipient.campaign_run_id == run_id)
-                        .where(CampaignRecipient.client_id == candidate.client_id)
-                        .limit(1)
-                    )
-                    recip = res.scalar_one_or_none()
-                    if recip is not None:
-                        recip.loyalty_card_id = card_id
-                        recip.loyalty_card_number = issued_num
-                        recip.status = "sent"
 
     finally:
         await loyalty.aclose()

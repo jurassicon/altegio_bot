@@ -17,6 +17,7 @@ import altegio_bot.workers.outbox_worker as outbox_worker
 from altegio_bot.campaigns.configuration import resolve_campaign_readiness
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
 from altegio_bot.campaigns.provider import (
+    CAMPAIGN_IDENTITY_MISMATCH,
     CAMPAIGN_PROVIDER_MISMATCH,
     CAMPAIGN_PROVIDER_UNKNOWN,
     EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
@@ -38,6 +39,56 @@ from altegio_bot.models.models import (
 
 COMPANY_ID = 758285
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+
+async def _persist_delivery_identity(
+    session,
+    *,
+    company_ids: object,
+    job_company_id: int = COMPANY_ID,
+    recipient_company_id: int | None = None,
+    payload_ids: str = "both",
+    suffix: str = "identity",
+) -> tuple[CampaignRun, CampaignRecipient, MessageJob]:
+    run = CampaignRun(
+        provider="altegio",
+        campaign_code="new_clients_monthly",
+        mode="send-real",
+        company_ids=company_ids,
+        period_start=NOW,
+        period_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        status="running",
+    )
+    session.add(run)
+    await session.flush()
+    recipient = CampaignRecipient(
+        provider="altegio",
+        campaign_run_id=run.id,
+        company_id=recipient_company_id if recipient_company_id is not None else job_company_id,
+        status="queued",
+    )
+    session.add(recipient)
+    await session.flush()
+    payload: dict[str, int | str] = {"kind": "newsletter_new_clients_monthly"}
+    if payload_ids in {"both", "run_only"}:
+        payload["campaign_run_id"] = run.id
+    if payload_ids in {"both", "recipient_only"}:
+        payload["campaign_recipient_id"] = recipient.id
+    job = MessageJob(
+        provider="altegio",
+        company_id=job_company_id,
+        job_type="newsletter_new_clients_monthly",
+        run_at=NOW,
+        status="processing",
+        attempts=0,
+        max_attempts=5,
+        dedupe_key=f"altegio:test:{suffix}:{run.id}:{job_company_id}",
+        payload=payload,
+    )
+    session.add(job)
+    await session.flush()
+    recipient.message_job_id = job.id
+    return run, recipient, job
 
 
 def _params(provider: str, *, mode: str) -> RunParams:
@@ -403,6 +454,184 @@ async def test_seeded_easyweek_resume_retry_and_followup_refuse_before_loyalty(
     retry = await runner.retry_recipient_job(recipient_id)
     assert retry == {"outcome": EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED}
     loyalty.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_partial_campaign_identity_stays_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            for payload_ids in ("run_only", "recipient_only"):
+                _run, _recipient, job = await _persist_delivery_identity(
+                    session,
+                    company_ids=[COMPANY_ID],
+                    payload_ids=payload_ids,
+                    suffix=payload_ids,
+                )
+                await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+                assert job.status == "failed"
+                assert job.last_error is not None
+
+    reached_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multi_company_run_jobs_pass_identity_guard(session_maker, monkeypatch) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                provider="altegio",
+                campaign_code="new_clients_monthly",
+                mode="send-real",
+                company_ids=[COMPANY_ID, COMPANY_ID + 1],
+                period_start=NOW,
+                period_end=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                status="running",
+            )
+            session.add(run)
+            await session.flush()
+            jobs: list[MessageJob] = []
+            for company_id in run.company_ids:
+                recipient = CampaignRecipient(
+                    provider="altegio",
+                    campaign_run_id=run.id,
+                    company_id=company_id,
+                    status="queued",
+                )
+                session.add(recipient)
+                await session.flush()
+                job = MessageJob(
+                    provider="altegio",
+                    company_id=company_id,
+                    job_type="newsletter_new_clients_monthly",
+                    run_at=NOW,
+                    status="processing",
+                    attempts=0,
+                    max_attempts=5,
+                    dedupe_key=f"altegio:test:multi:{run.id}:{company_id}",
+                    payload={
+                        "campaign_run_id": run.id,
+                        "campaign_recipient_id": recipient.id,
+                    },
+                )
+                session.add(job)
+                await session.flush()
+                recipient.message_job_id = job.id
+                jobs.append(job)
+
+            for job in jobs:
+                await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+
+            assert [job.status for job in jobs] == ["done", "done"]
+
+    assert reached_delivery.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_company_outside_run_scope_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID + 1],
+                suffix="outside",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+
+    reached_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "company_ids",
+    [
+        [],
+        [str(COMPANY_ID)],
+        [True],
+        [float(COMPANY_ID)],
+        None,
+        {"company_id": COMPANY_ID},
+        [COMPANY_ID, COMPANY_ID],
+    ],
+    ids=["empty", "string-id", "bool", "float", "null", "non-list", "duplicate"],
+)
+async def test_malformed_company_scope_is_blocked(
+    session_maker,
+    monkeypatch,
+    company_ids,
+) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=company_ids,
+                suffix=f"malformed-{type(company_ids).__name__}",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+
+    reached_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recipient_company_mismatch_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID, COMPANY_ID + 1],
+                recipient_company_id=COMPANY_ID + 1,
+                suffix="recipient-company",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+
+    reached_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_standalone_altegio_job_is_preserved(session_maker, monkeypatch) -> None:
+    reached_delivery = AsyncMock(return_value=object())
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = MessageJob(
+                provider="altegio",
+                company_id=COMPANY_ID,
+                job_type="newsletter_new_clients_monthly",
+                run_at=NOW,
+                status="processing",
+                attempts=0,
+                max_attempts=5,
+                dedupe_key="altegio:test:legacy-standalone",
+                payload={"kind": "newsletter_new_clients_monthly"},
+            )
+            session.add(job)
+            await session.flush()
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "done"
+            assert job.last_error is None
+
+    reached_delivery.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
 
 import altegio_bot.scripts.run_monthly_newsletter_smart as newsletter
+import altegio_bot.workers.outbox_worker as outbox_worker
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -789,11 +791,175 @@ async def test_all_mode_does_not_create_foreign_campaign_work(
     assert recipients[0].provider == PROVIDER_ALTEGIO
     assert recipients[0].client_id == altegio_client.id
     assert recipients[0].client_id != easyweek_client.id
+    assert recipients[0].status == "queued"
     assert len(jobs) == 1
     assert jobs[0].provider == PROVIDER_ALTEGIO
     assert jobs[0].client_id == altegio_client.id
     assert jobs[0].client_id != easyweek_client.id
+    assert jobs[0].payload["campaign_run_id"] == runs[0].id
+    assert jobs[0].payload["campaign_recipient_id"] == recipients[0].id
+    assert recipients[0].message_job_id == jobs[0].id
+    assert recipients[0].provider == runs[0].provider == jobs[0].provider
+    assert recipients[0].company_id == jobs[0].company_id
     assert outbox_count == 0
+
+
+@pytest.mark.asyncio
+async def test_smart_send_real_job_passes_identity_guard(
+    session_maker,
+    monkeypatch,
+) -> None:
+    company_id = 800006
+    phone = "+491110000601"
+    async with session_maker() as session:
+        async with session.begin():
+            client = Client(
+                provider=PROVIDER_ALTEGIO,
+                company_id=company_id,
+                altegio_client_id=8701,
+                display_name="Smart runner client",
+                phone_e164=phone,
+                raw={},
+            )
+            session.add(client)
+            await session.flush()
+            session.add(
+                Record(
+                    provider=PROVIDER_ALTEGIO,
+                    company_id=company_id,
+                    altegio_record_id=9701,
+                    client_id=client.id,
+                    starts_at=PERIOD_START + timedelta(days=1),
+                    attendance=0,
+                )
+            )
+
+    class LoyaltyProbe:
+        async def issue_card(
+            self,
+            location_id: int,
+            *,
+            loyalty_card_number: str,
+            loyalty_card_type_id: str,
+            phone: int,
+        ) -> dict[str, object]:
+            assert location_id == company_id
+            assert loyalty_card_type_id == "altegio-card-type"
+            assert phone == int("491110000601")
+            return {"id": "smart-card", "loyalty_card_number": loyalty_card_number}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(newsletter, "SessionLocal", session_maker)
+    monkeypatch.setattr(newsletter, "AltegioLoyaltyClient", LoyaltyProbe)
+
+    exit_code = await run_monthly_newsletter_smart(
+        month="2026-01",
+        from_date=None,
+        to_date=None,
+        company_id_arg=str(company_id),
+        mode="send-real",
+        test_phone="",
+        booking_link="https://example.invalid/book",
+        template_name="test-template",
+        expect_status="sent",
+        timeout_sec=1,
+        cleanup=False,
+        force=False,
+        limit=None,
+        output_format="json",
+        out_file=None,
+        card_type_id="altegio-card-type",
+        client_name="Test",
+    )
+    assert exit_code == 0
+
+    monkeypatch.setattr(outbox_worker, "_count_131026_failures", AsyncMock(return_value=0))
+    monkeypatch.setattr(outbox_worker, "_marketing_suppression_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(outbox_worker, "_pause_for_closed_meta_circuit", AsyncMock(return_value=False))
+    monkeypatch.setattr(outbox_worker, "_apply_rate_limit", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        outbox_worker,
+        "_render_message",
+        AsyncMock(return_value=("Smart newsletter body", None, "de", {"client_name": "Smart runner client"})),
+    )
+    send = AsyncMock(return_value=("wamid.smart-runner", None))
+    monkeypatch.setattr(outbox_worker, "safe_send", send)
+    monkeypatch.setattr(outbox_worker.settings, "whatsapp_send_mode", "text")
+
+    async with session_maker() as session:
+        async with session.begin():
+            job = await session.scalar(select(MessageJob).where(MessageJob.company_id == company_id))
+            assert job is not None
+            job.status = "processing"
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+
+        recipient = await session.scalar(select(CampaignRecipient).where(CampaignRecipient.company_id == company_id))
+        outbox_rows = (
+            (await session.execute(select(OutboxMessage).where(OutboxMessage.job_id == job.id))).scalars().all()
+        )
+
+    assert job.status == "done"
+    assert job.last_error is None
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].provider_message_id == "wamid.smart-runner"
+    assert recipient is not None
+    assert recipient.message_job_id == job.id
+    assert recipient.outbox_message_id == outbox_rows[0].id
+    assert recipient.provider_message_id == "wamid.smart-runner"
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_smart_send_real_refuses_unproven_recipient_before_loyalty(
+    session_maker,
+    monkeypatch,
+) -> None:
+    candidate = CandidateInfo(
+        company_id=COMPANY,
+        client_id=1,
+        altegio_client_id=1,
+        display_name="Candidate",
+        phone_e164="+491110000701",
+        total_records_in_period=1,
+        arrived_records_in_period=0,
+        is_opted_out=False,
+        is_eligible=True,
+        excluded_reason=None,
+    )
+    complete = AsyncMock()
+    loyalty = MagicMock(side_effect=AssertionError("loyalty must not be constructed"))
+    monkeypatch.setattr(newsletter, "SessionLocal", session_maker)
+    monkeypatch.setattr(newsletter, "_create_campaign_run", AsyncMock(return_value=123))
+    monkeypatch.setattr(newsletter, "_save_recipients", AsyncMock())
+    monkeypatch.setattr(newsletter, "_complete_campaign_run", complete)
+    monkeypatch.setattr(newsletter, "AltegioLoyaltyClient", loyalty)
+
+    result = await newsletter._run_mode_send_real(
+        [candidate],
+        provider=PROVIDER_ALTEGIO,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        company_ids=[COMPANY],
+        fmt="json",
+        out_file=None,
+        booking_link="https://example.invalid/book",
+        template_name="test-template",
+        limit=None,
+        card_type_id="altegio-card-type",
+    )
+
+    assert result == 2
+    loyalty.assert_not_called()
+    complete.assert_awaited_once_with(
+        123,
+        provider=PROVIDER_ALTEGIO,
+        sent=0,
+        failed=1,
+        status="failed",
+    )
 
 
 @pytest.mark.asyncio
