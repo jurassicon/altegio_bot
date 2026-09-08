@@ -7,6 +7,8 @@ operations and no generic request escape hatch::
     GET /ping
     GET /locations
     GET /bookings/{booking_uuid}
+    GET /customers/{customer_uuid}
+    GET /bookings?customer_uuid={customer_uuid}&page={page}&per_page=100
     GET /workspace
     GET /voucher-templates
     GET /voucher-templates/{voucher_template_uuid}
@@ -32,7 +34,7 @@ import random
 import time
 import uuid as uuid_module
 from types import TracebackType
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Final, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -47,6 +49,7 @@ logger = logging.getLogger("easyweek_client")
 _PATH_PING = "ping"
 _PATH_LOCATIONS = "locations"
 _PATH_BOOKINGS = "bookings"
+_PATH_CUSTOMERS = "customers"
 _PATH_WORKSPACE = "workspace"
 _PATH_VOUCHER_TEMPLATES = "voucher-templates"
 
@@ -59,6 +62,7 @@ _ALLOWED_API_HOST = "my.easyweek.io"
 _ALLOWED_API_PATH = "/api/public/v2"
 _ALLOWED_API_PORTS = (None, 443)
 CANONICAL_API_BASE_URL = f"{_ALLOWED_API_SCHEME}://{_ALLOWED_API_HOST}{_ALLOWED_API_PATH}"
+CUSTOMER_BOOKINGS_PER_PAGE: Final = 100
 
 # Bounded retry policy. EasyWeek allows 60 requests/min per key (§1.1), so a
 # short, bounded backoff is enough; unbounded retries would only burn the quota.
@@ -237,6 +241,25 @@ def _canonical_booking_uuid(value: object) -> str:
     return str(parsed)
 
 
+def _canonical_customer_uuid(value: object, *, operation: str) -> str:
+    """Return an exact canonical customer UUID without exposing the input."""
+    if not isinstance(value, str):
+        raise EasyWeekPermanentError("customer_uuid must be a canonical UUID", operation=operation)
+    try:
+        canonical = str(uuid_module.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise EasyWeekPermanentError("customer_uuid must be a canonical UUID", operation=operation) from None
+    if value != canonical:
+        raise EasyWeekPermanentError("customer_uuid must be a canonical UUID", operation=operation)
+    return canonical
+
+
+def _positive_page(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise EasyWeekPermanentError("page must be a positive integer", operation="list_customer_bookings")
+    return value
+
+
 def _has_usable_timezone(value: object) -> bool:
     """True when *value* is a timezone this integration can act on.
 
@@ -409,7 +432,12 @@ class EasyWeekClient:
             "Accept": "application/json",
         }
 
-    async def _get_json(self, *path_segments: str, operation: str) -> Any:
+    async def _get_json(
+        self,
+        *path_segments: str,
+        operation: str,
+        params: Mapping[str, str | int] | None = None,
+    ) -> Any:
         """Issue a bounded-retry GET against a known relative path.
 
         The URL is assembled here from vetted constants and an already-validated
@@ -423,7 +451,7 @@ class EasyWeekClient:
         for attempt in range(1, self._max_attempts + 1):
             started = time.monotonic()
             try:
-                response = await self._client.get(url, headers=self._headers())
+                response = await self._client.get(url, headers=self._headers(), params=params)
             except httpx.TimeoutException:
                 last_error = EasyWeekRetryableError("request timed out", operation=operation, attempts=attempt)
                 logger.warning(
@@ -602,6 +630,42 @@ class EasyWeekClient:
         uid = payload.get("uuid")
         if not (isinstance(uid, str) and uid.strip()):
             raise EasyWeekProtocolError("booking response has no usable uuid", operation="get_booking")
+        return payload
+
+    async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        """``GET /customers/{uuid}`` with strict, pre-wire identity validation."""
+        canonical = _canonical_customer_uuid(customer_uuid, operation="get_customer")
+        payload = await self._get_json(_PATH_CUSTOMERS, canonical, operation="get_customer")
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError("customer response is not a JSON object", operation="get_customer")
+        return payload
+
+    async def list_customer_bookings(
+        self,
+        customer_uuid: str,
+        page: int,
+        per_page: int = CUSTOMER_BOOKINGS_PER_PAGE,
+    ) -> dict[str, Any]:
+        """Read one fixed-size page from ``GET /bookings?customer_uuid=...``."""
+        canonical = _canonical_customer_uuid(customer_uuid, operation="list_customer_bookings")
+        exact_page = _positive_page(page)
+        if type(per_page) is not int or per_page != CUSTOMER_BOOKINGS_PER_PAGE:
+            raise EasyWeekPermanentError(
+                "per_page must equal the fixed customer history page size",
+                operation="list_customer_bookings",
+            )
+        payload = await self._get_json(
+            _PATH_BOOKINGS,
+            operation="list_customer_bookings",
+            params={"customer_uuid": canonical, "page": exact_page, "per_page": per_page},
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "customer bookings response is not a JSON object",
+                operation="list_customer_bookings",
+            )
         return payload
 
     async def get_workspace(self) -> dict[str, Any]:

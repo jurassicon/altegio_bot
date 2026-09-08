@@ -1,22 +1,19 @@
-"""Read-only EasyWeek campaign evidence for the PR-14 proven subset.
-
-This module deliberately does not implement a live send guard.  It can prove
-the local source event and re-read one booking, but the confirmed EasyWeek API
-does not expose the customer-level history needed to release a campaign send.
-Consequently every :class:`CampaignEligibilityResult` remains ``send_ready``
-false and carries ``campaign_live_guard_unproven``.
-"""
+"""Read-only EasyWeek campaign evidence and PR-15 customer-history guard."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Final, Protocol
+from typing import Awaitable, Callable, Final
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.campaigns.easyweek_customer_history import (
+    CustomerHistoryReader,
+    prove_customer_booking_history,
+)
 from altegio_bot.campaigns.provider import CAMPAIGN_LIVE_GUARD_UNPROVEN
 from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
@@ -73,8 +70,7 @@ BOOKING_CONFIGURATION_UNAVAILABLE: Final = "easyweek_campaign_booking_configurat
 BOOKING_PERMANENT_ERROR: Final = "easyweek_campaign_booking_permanent_error"
 
 
-class BookingReader(Protocol):
-    async def get_booking(self, booking_uuid: str) -> dict[str, Any]: ...
+BookingReader = CustomerHistoryReader
 
 
 @dataclass(frozen=True)
@@ -98,6 +94,17 @@ class CampaignEligibilityResult:
     send_ready: bool
     reasons: tuple[str, ...]
     retryable_uncertainty: bool
+    customer_identity_current: bool = False
+    history_complete: bool = False
+    completed_visit_count: int | None = None
+    first_visit_current: bool = False
+    no_active_future_booking: bool = False
+    live_guard_ready: bool = False
+    pages_read: int = 0
+
+    @property
+    def delivery_authorized(self) -> bool:
+        return False
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -245,8 +252,10 @@ async def evaluate_recipient(
     allowed_categories_raw: object,
     client_reader: BookingReader | None,
     now: datetime,
+    pause: Callable[[float], Awaitable[None]] | None = None,
+    pause_sec: float = 0.0,
 ) -> CampaignEligibilityResult:
-    """Re-prove one durable recipient locally and, optionally, with one GET."""
+    """Re-prove one durable recipient locally, then reconcile its live history."""
     local_reason: str | None = None
     location = registry.locations.get(recipient.company_id) if registry.ready else None
     if location is None:
@@ -326,7 +335,7 @@ async def evaluate_recipient(
             local_eligible=False,
             source_booking_current=False,
             send_ready=False,
-            reasons=tuple(dict.fromkeys((local_reason, CAMPAIGN_LIVE_GUARD_UNPROVEN))),
+            reasons=(local_reason,),
             retryable_uncertainty=False,
         )
 
@@ -339,25 +348,27 @@ async def evaluate_recipient(
             reasons=(CAMPAIGN_LIVE_GUARD_UNPROVEN,),
             retryable_uncertainty=False,
         )
-    try:
-        payload = await client_reader.get_booking(str(visit.booking_uuid))
-    except Exception as exc:  # noqa: BLE001 - class only; exception text is never retained
-        booking = classify_booking_error(exc)
-    else:
-        booking = evaluate_booking_response(
-            payload,
-            expected_booking_uuid=visit.booking_uuid,
-            location=location,
-        )
-    reasons = tuple(
-        dict.fromkeys(reason for reason in (booking.reason, CAMPAIGN_LIVE_GUARD_UNPROVEN) if reason is not None)
+    proof = await prove_customer_booking_history(
+        client_reader,
+        expected_booking_uuid=visit.booking_uuid,
+        location=location,
+        now=now,
+        pause=pause,
+        pause_sec=pause_sec,
     )
     return CampaignEligibilityResult(
         local_eligible=True,
-        source_booking_current=booking.current,
+        source_booking_current=proof.source_booking_current,
         send_ready=False,
-        reasons=reasons,
-        retryable_uncertainty=booking.retryable,
+        reasons=(proof.reason,) if proof.reason is not None else (),
+        retryable_uncertainty=proof.retryable_uncertainty,
+        customer_identity_current=proof.customer_identity_current,
+        history_complete=proof.history_complete,
+        completed_visit_count=proof.completed_visit_count,
+        first_visit_current=proof.first_visit_current,
+        no_active_future_booking=proof.no_active_future_booking,
+        live_guard_ready=proof.live_guard_ready,
+        pages_read=proof.pages_read,
     )
 
 

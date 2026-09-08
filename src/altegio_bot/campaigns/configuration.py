@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_segment import SEGMENT_SOURCE
 from altegio_bot.campaigns.provider import (
+    CAMPAIGN_EXECUTION_NOT_AUTHORIZED,
     CAMPAIGN_JOB_TYPES,
-    CAMPAIGN_LIVE_GUARD_UNPROVEN,
     validate_campaign_provider,
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
@@ -70,12 +70,12 @@ async def resolve_campaign_readiness(
             booking_page_url = validate_static_booking_page(location.booking_page_url)
             if booking_page_url is None:
                 reasons.append(CAMPAIGN_BOOKING_PAGE_UNPROVEN)
-        # PR-14 proves only a local, incomplete subset and a partial per-booking
-        # GET re-proof.  Neither is a customer-level live send guard.
+        # PR-15 provides the per-recipient read-only live guard, while delivery
+        # and gift-card writes remain explicitly unauthorised.
         segment_source = SEGMENT_SOURCE
-        live_guard = "easyweek_booking_partial_reproof"
+        live_guard = "easyweek_customer_booking_history_reproof"
         supported_job_types: tuple[str, ...] = ()
-        reasons.append(CAMPAIGN_LIVE_GUARD_UNPROVEN)
+        reasons.append(CAMPAIGN_EXECUTION_NOT_AUTHORIZED)
     else:
         # Preserve the one existing source of Altegio campaign booking links.
         from altegio_bot.workers.outbox_worker import BOOKING_LINKS

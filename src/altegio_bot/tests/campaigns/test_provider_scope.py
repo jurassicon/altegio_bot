@@ -14,11 +14,12 @@ import altegio_bot.campaigns.followup as followup
 import altegio_bot.campaigns.runner as runner
 import altegio_bot.workers.campaign_worker as campaign_worker
 import altegio_bot.workers.outbox_worker as outbox_worker
-from altegio_bot.campaigns.configuration import CAMPAIGN_LIVE_GUARD_UNPROVEN, resolve_campaign_readiness
+from altegio_bot.campaigns.configuration import resolve_campaign_readiness
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
 from altegio_bot.campaigns.easyweek_eligibility import REGISTRY_UNAVAILABLE
 from altegio_bot.campaigns.easyweek_segment import SEGMENT_SOURCE
 from altegio_bot.campaigns.provider import (
+    CAMPAIGN_EXECUTION_NOT_AUTHORIZED,
     CAMPAIGN_IDENTITY_MISMATCH,
     CAMPAIGN_PROVIDER_MISMATCH,
     CAMPAIGN_PROVIDER_UNKNOWN,
@@ -350,7 +351,8 @@ async def test_sender_and_template_lookup_do_not_cross_provider_on_numeric_colli
     assert readiness.ready_for_send is False
     assert readiness.segment_source == SEGMENT_SOURCE
     assert EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED not in readiness.reasons
-    assert CAMPAIGN_LIVE_GUARD_UNPROVEN in readiness.reasons
+    assert CAMPAIGN_EXECUTION_NOT_AUTHORIZED in readiness.reasons
+    assert readiness.live_guard == "easyweek_customer_booking_history_reproof"
 
 
 @pytest.mark.asyncio
