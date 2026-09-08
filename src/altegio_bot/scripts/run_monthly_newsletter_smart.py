@@ -50,6 +50,7 @@ from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
     CampaignRecipient,
     CampaignRun,
     Client,
@@ -378,6 +379,7 @@ async def _create_campaign_run(
     async with SessionLocal() as session:
         async with session.begin():
             run = CampaignRun(
+                provider=PROVIDER_ALTEGIO,
                 campaign_code=CAMPAIGN_CODE,
                 mode=mode,
                 company_ids=company_ids,
@@ -411,6 +413,7 @@ async def _save_recipients(
             for c in candidates:
                 session.add(
                     CampaignRecipient(
+                        provider=PROVIDER_ALTEGIO,
                         campaign_run_id=run_id,
                         company_id=c.company_id,
                         client_id=c.client_id,
@@ -680,6 +683,7 @@ async def _run_mode_send_real(
                                 "loyalty_card_text": loyalty_card_text,
                                 "campaign_run_id": run_id,
                             },
+                            provider=PROVIDER_ALTEGIO,
                         )
                 sent += 1
                 logger.info(
@@ -701,6 +705,7 @@ async def _run_mode_send_real(
                 async with session.begin():
                     res = await session.execute(
                         select(CampaignRecipient)
+                        .where(CampaignRecipient.provider == PROVIDER_ALTEGIO)
                         .where(CampaignRecipient.campaign_run_id == run_id)
                         .where(CampaignRecipient.client_id == candidate.client_id)
                         .limit(1)

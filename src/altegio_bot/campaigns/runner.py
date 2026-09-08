@@ -9,16 +9,26 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
+from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
 from altegio_bot.campaigns.loyalty_cleanup import (
     cleanup_campaign_cards,
     make_card_number,
     make_card_text,
     resolve_or_issue_loyalty_card,
 )
-from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot, find_candidates
+from altegio_bot.campaigns.provider import (
+    EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
+    CampaignProviderRefusal,
+    require_campaign_execution_provider,
+    require_same_provider,
+    validate_campaign_provider,
+)
+from altegio_bot.campaigns.source import find_candidates_for_provider
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
 from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     AltegioEvent,
     CampaignRecipient,
     CampaignRun,
@@ -40,10 +50,47 @@ CAMPAIGN_CODE = "new_clients_monthly"
 CAMPAIGN_EXECUTION_JOB_TYPE = "campaign_execute_new_clients_monthly"
 
 
+async def find_candidates(
+    *,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[ClientCandidate]:
+    """Compatibility seam that still dispatches explicitly to Altegio."""
+    return await find_candidates_for_provider(
+        provider=PROVIDER_ALTEGIO,
+        company_id=company_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
+async def _find_candidates(
+    *,
+    provider: str,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[ClientCandidate]:
+    if provider == PROVIDER_ALTEGIO:
+        return await find_candidates(
+            company_id=company_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+    return await find_candidates_for_provider(
+        provider=provider,
+        company_id=company_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
 @dataclass
 class RunParams:
     """Параметры запуска кампании."""
 
+    provider: str
     company_id: int
     location_id: int
     period_start: datetime
@@ -66,7 +113,9 @@ async def _create_run(
     status: str = "running",
 ) -> CampaignRun:
     """Создать и сохранить CampaignRun с указанным статусом."""
+    provider = validate_campaign_provider(params.provider)
     run = CampaignRun(
+        provider=provider,
         campaign_code=params.campaign_code,
         mode=params.mode,
         company_ids=[params.company_id],
@@ -91,6 +140,7 @@ async def _enqueue_campaign_execution_job(
     session: AsyncSession,
     *,
     run_id: int,
+    provider: str,
     company_id: int,
 ) -> MessageJob:
     """Поставить фоновый execution-job для кампании.
@@ -100,7 +150,9 @@ async def _enqueue_campaign_execution_job(
     его не учитывает.
     """
     run_at = utcnow()
+    exact_provider = require_campaign_execution_provider(provider)
     job = MessageJob(
+        provider=exact_provider,
         company_id=company_id,
         record_id=None,
         client_id=None,
@@ -110,10 +162,11 @@ async def _enqueue_campaign_execution_job(
         attempts=0,
         max_attempts=1,
         last_error=None,
-        dedupe_key=(f"{CAMPAIGN_EXECUTION_JOB_TYPE}:{company_id}:run:{run_id}"),
+        dedupe_key=(f"{exact_provider}:{CAMPAIGN_EXECUTION_JOB_TYPE}:{company_id}:run:{run_id}"),
         payload={
             "kind": CAMPAIGN_EXECUTION_JOB_TYPE,
             "campaign_run_id": run_id,
+            "provider": exact_provider,
         },
         locked_at=None,
     )
@@ -132,6 +185,7 @@ def _params_from_run(run: CampaignRun) -> RunParams:
         raise RuntimeError(f"CampaignRun {run.id} has empty company_ids")
 
     return RunParams(
+        provider=validate_campaign_provider(run.provider),
         company_id=int(company_ids[0]),
         location_id=int(run.location_id),
         period_start=run.period_start,
@@ -165,11 +219,14 @@ async def _mark_run_failed(run_id: int, error: str) -> None:
 
 def _build_recipient(
     run_id: int,
+    provider: str,
     candidate: ClientCandidate,
 ) -> CampaignRecipient:
     """Создать CampaignRecipient из кандидата."""
     client = candidate.client
+    exact_provider = require_same_provider(provider, candidate.client.provider)
     recipient = CampaignRecipient(
+        provider=exact_provider,
         campaign_run_id=run_id,
         company_id=client.company_id,
         client_id=client.id,
@@ -253,15 +310,29 @@ async def run_preview(params: RunParams) -> CampaignRun:
       2. CRM HTTP-запросы без открытой транзакции БД.
       3. Короткая транзакция: сохранить recipients + перевести в 'completed'.
     """
+    provider = validate_campaign_provider(params.provider)
+
     # Фаза 1: создать run (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await _create_run(session, params, status="running")
             run_id = run.id
 
+    # PR-13 deliberately has no EasyWeek segment adapter. Persist a diagnostic
+    # preview refusal, but do not import/call Altegio discovery and do not create
+    # recipients or message jobs.
+    if provider == PROVIDER_EASYWEEK:
+        await _mark_run_failed(run_id, EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED)
+        async with SessionLocal() as session:
+            refused = await session.get(CampaignRun, run_id)
+            if refused is None:  # pragma: no cover - defensive race guard
+                raise RuntimeError(f"CampaignRun {run_id} disappeared after refusal")
+            return refused
+
     # Фаза 2: CRM HTTP-запросы (без открытой транзакции БД)
     try:
-        candidates = await find_candidates(
+        candidates = await _find_candidates(
+            provider=provider,
             company_id=params.company_id,
             period_start=params.period_start,
             period_end=params.period_end,
@@ -294,7 +365,7 @@ async def run_preview(params: RunParams) -> CampaignRun:
 
             _update_run_exclusion_counters(run, candidates)
             for candidate in candidates:
-                session.add(_build_recipient(run_id, candidate))
+                session.add(_build_recipient(run_id, provider, candidate))
 
             # Записать источник обнаружения кандидатов в meta
             meta = dict(run.meta or {})
@@ -329,12 +400,14 @@ async def enqueue_send_real(params: RunParams) -> CampaignRun:
     HTTP endpoint использует именно эту функцию, чтобы быстро вернуть
     accepted и не ждать весь send-real синхронно.
     """
+    provider = require_campaign_execution_provider(params.provider)
     async with SessionLocal() as session:
         async with session.begin():
             run = await _create_run(session, params, status="queued")
             await _enqueue_campaign_execution_job(
                 session,
                 run_id=run.id,
+                provider=provider,
                 company_id=params.company_id,
             )
 
@@ -351,6 +424,7 @@ async def enqueue_send_real(params: RunParams) -> CampaignRun:
 async def _load_candidates_from_preview_snapshot(
     session: AsyncSession,
     preview_run_id: int,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> list[ClientCandidate]:
     """Загрузить кандидатов из snapshot preview-run.
 
@@ -364,6 +438,11 @@ async def _load_candidates_from_preview_snapshot(
       3. r.client_id is not None, local client не найден: данные испорчены / клиент удалён.
          Помечаем excluded_reason='no_local_client'.
     """
+    preview_run = await session.get(CampaignRun, preview_run_id)
+    if preview_run is None:
+        raise RuntimeError(f"Preview run {preview_run_id} not found")
+    require_same_provider(provider, preview_run.provider)
+
     stmt = (
         select(CampaignRecipient)
         .where(CampaignRecipient.campaign_run_id == preview_run_id)
@@ -378,14 +457,19 @@ async def _load_candidates_from_preview_snapshot(
     local_client_ids = [r.client_id for r in preview_recipients if r.client_id is not None]
     clients_map: dict[int, Client] = {}
     if local_client_ids:
-        clients_stmt = select(Client).where(Client.id.in_(local_client_ids))
+        clients_stmt = select(Client).where(
+            Client.provider == provider,
+            Client.id.in_(local_client_ids),
+        )
         clients_map = {c.id: c for c in (await session.execute(clients_stmt)).scalars()}
 
     candidates: list[ClientCandidate] = []
     for r in preview_recipients:
+        require_same_provider(provider, r.provider)
         local_client = clients_map.get(r.client_id) if r.client_id else None
 
         if local_client is not None:
+            require_same_provider(provider, local_client.provider)
             # Случай 2: локальный клиент найден — используем свежие данные
             excluded = r.excluded_reason  # None → eligible
             snapshot = ClientSnapshot(
@@ -395,6 +479,7 @@ async def _load_candidates_from_preview_snapshot(
                 display_name=local_client.display_name,
                 phone_e164=local_client.phone_e164,
                 wa_opted_out=bool(local_client.wa_opted_out),
+                provider=provider,
             )
         elif r.client_id is None:
             # Случай 1: CRM-only client (client_id=None в preview snapshot).
@@ -408,6 +493,7 @@ async def _load_candidates_from_preview_snapshot(
                 display_name=r.display_name,
                 phone_e164=r.phone_e164,
                 wa_opted_out=bool(r.is_opted_out),
+                provider=provider,
             )
         else:
             # Случай 3: client_id был задан, но клиент исчез из БД (удалён/испорчен).
@@ -420,6 +506,7 @@ async def _load_candidates_from_preview_snapshot(
                 display_name=r.display_name,
                 phone_e164=r.phone_e164,
                 wa_opted_out=bool(r.is_opted_out),
+                provider=provider,
             )
 
         c = ClientCandidate(
@@ -508,15 +595,29 @@ async def _execute_send_real_for_existing_run(
       4. Обработать каждого кандидата (loyalty + messages).
       5. Короткая транзакция: финализировать run.
     """
+    provider = require_campaign_execution_provider(params.provider)
+
     # Фаза 1: перевести в 'running' (короткая транзакция)
     async with SessionLocal() as session:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
             if run is None:
                 raise RuntimeError(f"CampaignRun {run_id} not found")
+            require_same_provider(provider, run.provider)
+
+            if params.source_preview_run_id is not None:
+                preview = await session.get(CampaignRun, params.source_preview_run_id)
+                if preview is None:
+                    raise RuntimeError(f"Preview run {params.source_preview_run_id} not found")
+                require_same_provider(provider, preview.provider)
 
             existing_recipients = await session.scalar(
-                select(func.count()).select_from(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(
+                    CampaignRecipient.provider == provider,
+                    CampaignRecipient.campaign_run_id == run_id,
+                )
             )
             if int(existing_recipients or 0) > 0:
                 raise RuntimeError(f"CampaignRun {run_id} already has recipients; re-running is unsafe")
@@ -543,10 +644,12 @@ async def _execute_send_real_for_existing_run(
             candidates = await _load_candidates_from_preview_snapshot(
                 session,
                 params.source_preview_run_id,
+                provider,
             )
     else:
         # Свежая сегментация — CRM API discovery без открытой транзакции БД.
-        candidates = await find_candidates(
+        candidates = await _find_candidates(
+            provider=provider,
             company_id=params.company_id,
             period_start=params.period_start,
             period_end=params.period_end,
@@ -585,7 +688,7 @@ async def _execute_send_real_for_existing_run(
             if candidate.excluded_reason:
                 async with SessionLocal() as session:
                     async with session.begin():
-                        recipient = _build_recipient(run_id, candidate)
+                        recipient = _build_recipient(run_id, provider, candidate)
                         session.add(recipient)
                 continue
 
@@ -593,6 +696,7 @@ async def _execute_send_real_for_existing_run(
                 loyalty=loyalty,
                 candidate=candidate,
                 run_id=run_id,
+                provider=provider,
                 company_id=params.company_id,
                 location_id=params.location_id,
                 card_type_id=card_type_id,
@@ -711,6 +815,8 @@ async def execute_queued_send_real(run_id: int) -> None:
         if run is None:
             raise RuntimeError(f"CampaignRun {run_id} not found")
 
+        require_campaign_execution_provider(run.provider)
+
         if run.mode != "send-real":
             raise RuntimeError(f"CampaignRun {run_id} mode={run.mode} is not send-real")
 
@@ -741,6 +847,7 @@ async def run_send_real(params: RunParams) -> CampaignRun:
     Оставлен для ручных/тестовых сценариев. API лучше использовать
     через enqueue_send_real(), чтобы не держать HTTP-запрос.
     """
+    require_campaign_execution_provider(params.provider)
     async with SessionLocal() as session:
         async with session.begin():
             run = await _create_run(session, params, status="running")
@@ -760,6 +867,7 @@ async def _process_eligible(
     loyalty: AltegioLoyaltyClient,
     candidate: ClientCandidate,
     run_id: int,
+    provider: str,
     company_id: int,
     location_id: int,
     card_type_id: str,
@@ -771,7 +879,7 @@ async def _process_eligible(
 
     async with SessionLocal() as session:
         async with session.begin():
-            recipient = _build_recipient(run_id, candidate)
+            recipient = _build_recipient(run_id, provider, candidate)
             session.add(recipient)
             await session.flush()
             recipient_id = recipient.id
@@ -780,6 +888,7 @@ async def _process_eligible(
         cleanup = await cleanup_campaign_cards(
             session,
             loyalty,
+            provider=provider,
             location_id=location_id,
             client_id=client_id,
             campaign_code=campaign_code,
@@ -810,6 +919,7 @@ async def _process_eligible(
             resolution = await resolve_or_issue_loyalty_card(
                 session,
                 loyalty,
+                provider=provider,
                 phone_e164=phone_e164,
                 location_id=location_id,
                 card_type_id=card_type_id,
@@ -900,6 +1010,7 @@ async def _process_eligible(
                     job_type=NEWSLETTER_JOB_TYPE,
                     run_at=run_at,
                     payload=job_payload,
+                    provider=provider,
                 )
 
                 dedupe_key = make_dedupe_key(
@@ -907,6 +1018,7 @@ async def _process_eligible(
                     company_id=company_id,
                     record_id=None,
                     run_at=run_at,
+                    provider=provider,
                 )
                 job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
                 if job:
@@ -969,6 +1081,7 @@ async def _resolve_card_type(
 async def _enqueue_newsletter_job_for_recipient(
     *,
     recipient_id: int,
+    provider: str,
     company_id: int,
     client_id: int | None,
     run_id: int,
@@ -994,6 +1107,7 @@ async def _enqueue_newsletter_job_for_recipient(
             recipient = await session.get(CampaignRecipient, recipient_id)
             if recipient is None:
                 raise RuntimeError(f"recipient_id={recipient_id} not found")
+            require_same_provider(provider, recipient.provider)
 
             recipient.loyalty_card_id = loyalty_card_id
             recipient.loyalty_card_number = loyalty_card_number
@@ -1020,6 +1134,7 @@ async def _enqueue_newsletter_job_for_recipient(
                 job_type=NEWSLETTER_JOB_TYPE,
                 run_at=run_at,
                 payload=resume_payload,
+                provider=provider,
             )
 
             dedupe_key = make_dedupe_key(
@@ -1027,6 +1142,7 @@ async def _enqueue_newsletter_job_for_recipient(
                 company_id=company_id,
                 record_id=None,
                 run_at=run_at,
+                provider=provider,
             )
             job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
             if job:
@@ -1058,7 +1174,7 @@ def _is_resume_pending_recipient(recipient: CampaignRecipient) -> bool:
     return False
 
 
-async def _recalculate_run_after_resume(run_id: int) -> tuple[int, int]:
+async def _recalculate_run_after_resume(run_id: int, *, provider: str) -> tuple[int, int]:
     """Пересчитать агрегаты CampaignRun по snapshot-данным recipient'ов.
 
     Возвращает:
@@ -1066,8 +1182,13 @@ async def _recalculate_run_after_resume(run_id: int) -> tuple[int, int]:
       remaining_pending_count
     """
     async with SessionLocal() as session:
-        stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+        stmt = select(CampaignRecipient).where(
+            CampaignRecipient.provider == provider,
+            CampaignRecipient.campaign_run_id == run_id,
+        )
         recipients = (await session.execute(stmt)).scalars().all()
+        for recipient in recipients:
+            require_same_provider(provider, recipient.provider)
 
         queued_count = 0
         cleanup_failed_count = 0
@@ -1121,6 +1242,7 @@ async def _resume_candidate_recipient(
     *,
     loyalty: AltegioLoyaltyClient,
     recipient: CampaignRecipient,
+    provider: str,
     run_id: int,
     company_id: int,
     location_id: int,
@@ -1141,6 +1263,7 @@ async def _resume_candidate_recipient(
         cleanup = await cleanup_campaign_cards(
             session,
             loyalty,
+            provider=provider,
             location_id=location_id,
             client_id=client_id,
             campaign_code=campaign_code,
@@ -1194,6 +1317,7 @@ async def _resume_candidate_recipient(
     try:
         await _enqueue_newsletter_job_for_recipient(
             recipient_id=recipient_id,
+            provider=provider,
             company_id=company_id,
             client_id=client_id,
             run_id=run_id,
@@ -1265,6 +1389,7 @@ async def resume_send_real(run_id: int) -> dict:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise ValueError(f"CampaignRun {run_id} not found")
+        provider = require_campaign_execution_provider(run.provider)
         if run.mode != "send-real":
             raise ValueError(f"Resume доступен только для send-real. mode={run.mode!r}")
         if run.status != "failed":
@@ -1272,7 +1397,10 @@ async def resume_send_real(run_id: int) -> dict:
         params = _params_from_run(run)
 
     async with SessionLocal() as session:
-        stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+        stmt = select(CampaignRecipient).where(
+            CampaignRecipient.provider == provider,
+            CampaignRecipient.campaign_run_id == run_id,
+        )
         recipients = (await session.execute(stmt)).scalars().all()
 
     loyalty = AltegioLoyaltyClient()
@@ -1305,9 +1433,11 @@ async def resume_send_real(run_id: int) -> dict:
 
             try:
                 if st == "candidate":
+                    require_same_provider(provider, recipient.provider)
                     ok = await _resume_candidate_recipient(
                         loyalty=loyalty,
                         recipient=recipient,
+                        provider=provider,
                         run_id=run_id,
                         company_id=params.company_id,
                         location_id=params.location_id,
@@ -1320,6 +1450,7 @@ async def resume_send_real(run_id: int) -> dict:
                 elif st == "card_issued" or (st == "skipped" and reason == "queue_failed"):
                     await _enqueue_newsletter_job_for_recipient(
                         recipient_id=recipient.id,
+                        provider=provider,
                         company_id=params.company_id,
                         client_id=recipient.client_id,
                         run_id=run_id,
@@ -1343,7 +1474,10 @@ async def resume_send_real(run_id: int) -> dict:
     finally:
         await loyalty.aclose()
 
-    remaining_manual_count, remaining_pending_count = await _recalculate_run_after_resume(run_id)
+    remaining_manual_count, remaining_pending_count = await _recalculate_run_after_resume(
+        run_id,
+        provider=provider,
+    )
 
     async with SessionLocal() as session:
         async with session.begin():
@@ -1421,6 +1555,7 @@ async def discard_preview_run(run_id: int) -> None:
                 select(func.count())
                 .select_from(CampaignRun)
                 .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.provider == run.provider)
                 .where(CampaignRun.mode == "send-real")
             )
             if int(used_as_source or 0) > 0:
@@ -1509,8 +1644,12 @@ async def recompute_run_counters(run_id: int) -> None:
             run = await session.get(CampaignRun, run_id)
             if run is None:
                 raise ValueError(f"CampaignRun {run_id} not found")
+            provider = require_campaign_execution_provider(run.provider)
 
-            stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+            stmt = select(CampaignRecipient).where(
+                CampaignRecipient.campaign_run_id == run_id,
+                CampaignRecipient.provider == provider,
+            )
             recipients = list((await session.execute(stmt)).scalars().all())
 
             _update_run_counters_from_recipients(run, recipients)
@@ -1965,6 +2104,7 @@ async def _sync_booked_after_from_altegio_events(
             ),
         )
         .where(AltegioEvent.company_id.in_(company_ids))
+        .where(Record.provider == PROVIDER_ALTEGIO)
         .where(AltegioEvent.resource == "record")
         .where(AltegioEvent.event_status == "create")
         .where(AltegioEvent.received_at > overall_start)
@@ -2120,6 +2260,8 @@ async def _cancel_stale_queued_followup_jobs(
     session: AsyncSession,
     run_id: int,
     recipients: list[CampaignRecipient],
+    *,
+    provider: str,
 ) -> int:
     """Cancel queued follow-up jobs whose recipients became ineligible after recompute.
 
@@ -2140,6 +2282,7 @@ async def _cancel_stale_queued_followup_jobs(
 
     stmt = (
         select(MessageJob)
+        .where(MessageJob.provider == provider)
         .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
         .where(MessageJob.status == "queued")
         .where(MessageJob.payload["campaign_run_id"].as_integer() == run_id)
@@ -2207,10 +2350,30 @@ async def recompute_campaign_run_stats(
     run = await session.get(CampaignRun, run_id)
     if run is None:
         raise ValueError(f"CampaignRun {run_id} not found")
+    provider = require_campaign_execution_provider(run.provider)
 
     # Step 1: load recipients
-    r_stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id)
+    r_stmt = select(CampaignRecipient).where(
+        CampaignRecipient.campaign_run_id == run_id,
+        CampaignRecipient.provider == provider,
+    )
     recipients = list((await session.execute(r_stmt)).scalars().all())
+    for recipient in recipients:
+        require_same_provider(provider, recipient.provider)
+
+    message_job_ids = {
+        job_id
+        for recipient in recipients
+        for job_id in (recipient.message_job_id, recipient.followup_message_job_id)
+        if job_id is not None
+    }
+    if message_job_ids:
+        jobs = (await session.execute(select(MessageJob).where(MessageJob.id.in_(message_job_ids)))).scalars().all()
+        jobs_by_id = {job.id: job for job in jobs}
+        if set(jobs_by_id) != message_job_ids:
+            raise CampaignProviderRefusal("campaign_identity_mismatch")
+        for job in jobs_by_id.values():
+            require_same_provider(provider, job.provider)
 
     # Step 1a: relink recipients whose outbox_message_id points to a failed row
     # to the latest successful OutboxMessage for their message_job_id.
@@ -2256,7 +2419,12 @@ async def recompute_campaign_run_stats(
         )
 
     # Step 4c: cancel queued follow-up jobs for recipients that became ineligible
-    canceled_followup_count = await _cancel_stale_queued_followup_jobs(session, run_id, recipients)
+    canceled_followup_count = await _cancel_stale_queued_followup_jobs(
+        session,
+        run_id,
+        recipients,
+        provider=provider,
+    )
 
     # Step 5: compute outbox_status_counts from resolved map (Python, no SQL)
     outbox_status_counts: dict[str, int] = {}
@@ -2353,6 +2521,7 @@ async def delete_preview_run(run_id: int) -> None:
                 select(func.count())
                 .select_from(CampaignRun)
                 .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.provider == run.provider)
                 .where(CampaignRun.mode == "send-real")
             )
             if int(used_as_source or 0) > 0:
@@ -2408,6 +2577,7 @@ async def remove_recipient_from_preview(
                 select(func.count())
                 .select_from(CampaignRun)
                 .where(CampaignRun.source_preview_run_id == run_id)
+                .where(CampaignRun.provider == run.provider)
                 .where(CampaignRun.mode == "send-real")
             )
             if int(used_as_source or 0) > 0:
@@ -2421,6 +2591,7 @@ async def remove_recipient_from_preview(
 
             if recipient.campaign_run_id != run_id:
                 raise ValueError(f"CampaignRecipient {recipient_id} не принадлежит run {run_id}")
+            require_same_provider(run.provider, recipient.provider)
 
             if recipient.excluded_reason != "manual_removed":
                 meta = dict(recipient.meta or {})
@@ -2502,6 +2673,15 @@ async def retry_recipient_job(recipient_id: int) -> dict:
             if recipient is None:
                 return {"outcome": "recipient_not_found"}
 
+            run = await session.get(CampaignRun, recipient.campaign_run_id)
+            if run is None:
+                return {"outcome": "campaign_identity_mismatch"}
+            try:
+                provider = require_same_provider(run.provider, recipient.provider)
+                require_campaign_execution_provider(provider)
+            except CampaignProviderRefusal as exc:
+                return {"outcome": exc.reason}
+
             if not recipient.message_job_id:
                 return {"outcome": "no_message_job"}
 
@@ -2509,6 +2689,10 @@ async def retry_recipient_job(recipient_id: int) -> dict:
             if job is None:
                 return {"outcome": "no_message_job"}
 
+            try:
+                require_same_provider(provider, job.provider)
+            except CampaignProviderRefusal as exc:
+                return {"outcome": exc.reason}
             if job.job_type != NEWSLETTER_JOB_TYPE:
                 return {
                     "outcome": "wrong_job_type",
@@ -2535,6 +2719,16 @@ async def retry_recipient_job(recipient_id: int) -> dict:
                     "outcome": "not_retryable",
                     "job_status": job.status,
                 }
+
+            payload = job.payload if isinstance(job.payload, dict) else {}
+            payload_recipient_id = payload.get("campaign_recipient_id")
+            if (
+                job.company_id != recipient.company_id
+                or payload.get("campaign_run_id") != run.id
+                or (payload_recipient_id is not None and payload_recipient_id != recipient.id)
+                or (job.client_id is not None and job.client_id != recipient.client_id)
+            ):
+                return {"outcome": "campaign_identity_mismatch"}
 
             prev_status = job.status
             prev_attempts = job.attempts

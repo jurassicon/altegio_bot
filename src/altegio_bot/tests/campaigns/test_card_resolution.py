@@ -96,6 +96,7 @@ class _MockLoyalty:
 
 def _make_run_params(*, source_preview_run_id: int | None = None) -> RunParams:
     return RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=LOCATION,
         period_start=PERIOD_START,
@@ -196,6 +197,7 @@ async def test_find_existing_returns_empty_when_no_prior_cards(
     async with session_maker() as session:
         result = await find_existing_campaign_card_for_phone(
             session,
+            provider="altegio",
             phone_e164=PHONE,
             campaign_code=CAMPAIGN_CODE,
             company_id=COMPANY,
@@ -210,6 +212,7 @@ async def test_find_existing_returns_card_when_present(session_maker) -> None:
     async with session_maker() as session:
         result = await find_existing_campaign_card_for_phone(
             session,
+            provider="altegio",
             phone_e164=PHONE,
             campaign_code=CAMPAIGN_CODE,
             company_id=COMPANY,
@@ -227,6 +230,7 @@ async def test_find_existing_ignores_different_campaign_code(
     async with session_maker() as session:
         result = await find_existing_campaign_card_for_phone(
             session,
+            provider="altegio",
             phone_e164=PHONE,
             campaign_code=CAMPAIGN_CODE,
             company_id=COMPANY,
@@ -241,6 +245,7 @@ async def test_find_existing_ignores_different_phone(session_maker) -> None:
     async with session_maker() as session:
         result = await find_existing_campaign_card_for_phone(
             session,
+            provider="altegio",
             phone_e164=PHONE,
             campaign_code=CAMPAIGN_CODE,
             company_id=COMPANY,
@@ -261,6 +266,7 @@ async def test_resolve_issues_new_card_when_no_prior(session_maker) -> None:
         res = await resolve_or_issue_loyalty_card(
             session,
             loyalty,
+            provider="altegio",
             phone_e164=PHONE,
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
@@ -283,6 +289,7 @@ async def test_resolve_reuses_existing_card(session_maker) -> None:
         res = await resolve_or_issue_loyalty_card(
             session,
             loyalty,
+            provider="altegio",
             phone_e164=PHONE,
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
@@ -306,6 +313,7 @@ async def test_resolve_conflict_when_two_cards_exist(session_maker) -> None:
         res = await resolve_or_issue_loyalty_card(
             session,
             loyalty,
+            provider="altegio",
             phone_e164=PHONE,
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
@@ -483,6 +491,7 @@ async def test_find_existing_ignores_different_company_id(
     async with session_maker() as session:
         result = await find_existing_campaign_card_for_phone(
             session,
+            provider="altegio",
             phone_e164=PHONE,
             campaign_code=CAMPAIGN_CODE,
             company_id=COMPANY,
@@ -517,6 +526,7 @@ async def test_resolve_no_conflict_when_other_branch_has_cards(
         res = await resolve_or_issue_loyalty_card(
             session,
             loyalty,
+            provider="altegio",
             phone_e164=PHONE,
             location_id=LOCATION,
             card_type_id=CARD_TYPE,
@@ -550,6 +560,7 @@ async def test_resolve_reuses_same_branch_card_correctly(
         res = await resolve_or_issue_loyalty_card(
             session,
             loyalty,
+            provider="altegio",
             phone_e164=PHONE,
             location_id=LOCATION,
             card_type_id=CARD_TYPE,

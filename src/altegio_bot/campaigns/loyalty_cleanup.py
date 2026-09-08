@@ -36,6 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
+from altegio_bot.campaigns.provider import require_campaign_execution_provider, require_same_provider
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class CardResolution:
 async def find_campaign_card_ids(
     session: AsyncSession,
     *,
+    provider: str,
     client_id: int | None,
     campaign_code: str,
 ) -> list[str]:
@@ -84,11 +86,14 @@ async def find_campaign_card_ids(
     """
     if client_id is None:
         return []
+    exact_provider = require_campaign_execution_provider(provider)
 
     # Карты, выпущенные этой кампанией для клиента
     issued_stmt = (
         select(CampaignRecipient.loyalty_card_id)
         .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.provider == exact_provider)
+        .where(CampaignRecipient.provider == exact_provider)
         .where(CampaignRecipient.client_id == client_id)
         .where(CampaignRun.campaign_code == campaign_code)
         .where(CampaignRecipient.loyalty_card_id.is_not(None))
@@ -103,6 +108,7 @@ async def find_campaign_card_ids(
     # Карты, которые уже удалялись ранее (в cleanup_card_ids любого recipient)
     cleaned_stmt = (
         select(CampaignRecipient.cleanup_card_ids)
+        .where(CampaignRecipient.provider == exact_provider)
         .where(CampaignRecipient.client_id == client_id)
         .where(CampaignRecipient.cleanup_card_ids != [])
     )
@@ -127,6 +133,7 @@ async def cleanup_campaign_cards(
     session: AsyncSession,
     loyalty: AltegioLoyaltyClient,
     *,
+    provider: str,
     location_id: int,
     client_id: int | None,
     campaign_code: str,
@@ -141,6 +148,7 @@ async def cleanup_campaign_cards(
     """
     card_ids = await find_campaign_card_ids(
         session,
+        provider=provider,
         client_id=client_id,
         campaign_code=campaign_code,
     )
@@ -186,6 +194,7 @@ def make_card_text(card_number: str) -> str:
 async def find_existing_campaign_card_for_phone(
     session: AsyncSession,
     *,
+    provider: str,
     phone_e164: str,
     campaign_code: str,
     company_id: int,
@@ -210,6 +219,7 @@ async def find_existing_campaign_card_for_phone(
     # Если в будущем добавится cleanup для CRM-only, нужно добавить
     # фильтр аналогично find_campaign_card_ids().
     """
+    exact_provider = require_campaign_execution_provider(provider)
     stmt = (
         select(
             CampaignRecipient.loyalty_card_id,
@@ -217,6 +227,8 @@ async def find_existing_campaign_card_for_phone(
             CampaignRecipient.loyalty_card_type_id,
         )
         .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.provider == exact_provider)
+        .where(CampaignRecipient.provider == exact_provider)
         .where(CampaignRecipient.phone_e164 == phone_e164)
         .where(CampaignRun.campaign_code == campaign_code)
         .where(CampaignRecipient.company_id == company_id)
@@ -238,6 +250,7 @@ async def resolve_or_issue_loyalty_card(
     session: AsyncSession,
     loyalty: AltegioLoyaltyClient,
     *,
+    provider: str,
     phone_e164: str,
     location_id: int,
     card_type_id: str,
@@ -271,6 +284,7 @@ async def resolve_or_issue_loyalty_card(
     """
     existing = await find_existing_campaign_card_for_phone(
         session,
+        provider=provider,
         phone_e164=phone_e164,
         campaign_code=campaign_code,
         company_id=company_id,
@@ -348,6 +362,7 @@ class BulkDeleteResult:
 async def find_outstanding_campaign_cards(
     session: AsyncSession,
     *,
+    provider: str,
     campaign_code: str,
     company_id: int,
 ) -> list[dict[str, Any]]:
@@ -360,6 +375,7 @@ async def find_outstanding_campaign_cards(
     Each dict contains: recipient_id, run_id, client_id, phone_e164, display_name,
     loyalty_card_id, loyalty_card_number, period_start (ISO string), location_id.
     """
+    exact_provider = require_campaign_execution_provider(provider)
     issued_stmt = (
         select(
             CampaignRecipient.id.label("recipient_id"),
@@ -373,6 +389,8 @@ async def find_outstanding_campaign_cards(
             CampaignRun.location_id.label("run_location_id"),
         )
         .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.provider == exact_provider)
+        .where(CampaignRecipient.provider == exact_provider)
         .where(CampaignRun.campaign_code == campaign_code)
         .where(CampaignRun.mode == "send-real")
         .where(CampaignRecipient.company_id == company_id)
@@ -388,6 +406,8 @@ async def find_outstanding_campaign_cards(
     cleanup_stmt = (
         select(CampaignRecipient.cleanup_card_ids)
         .join(CampaignRun, CampaignRun.id == CampaignRecipient.campaign_run_id)
+        .where(CampaignRun.provider == exact_provider)
+        .where(CampaignRecipient.provider == exact_provider)
         .where(CampaignRun.campaign_code == campaign_code)
         .where(CampaignRecipient.company_id == company_id)
         .where(CampaignRecipient.cleanup_card_ids != [])
@@ -406,6 +426,7 @@ async def find_outstanding_campaign_cards(
         result.append(
             {
                 "recipient_id": row.recipient_id,
+                "provider": exact_provider,
                 "run_id": row.campaign_run_id,
                 "client_id": row.client_id,
                 "phone_e164": row.phone_e164 or "",
@@ -423,6 +444,7 @@ async def bulk_delete_outstanding_cards(
     loyalty: AltegioLoyaltyClient,
     outstanding: list[dict[str, Any]],
     *,
+    provider: str,
     exclude_recipient_ids: set[int],
     session_factory: Any,
 ) -> BulkDeleteResult:
@@ -437,9 +459,11 @@ async def bulk_delete_outstanding_cards(
     Partial failures are tolerated: a failed delete is recorded in the result
     and the loop continues with the next card.
     """
+    exact_provider = require_campaign_execution_provider(provider)
     result = BulkDeleteResult()
 
     for card in outstanding:
+        require_same_provider(exact_provider, card.get("provider", exact_provider))
         if card["recipient_id"] in exclude_recipient_ids:
             result.skipped += 1
             continue
@@ -474,6 +498,7 @@ async def bulk_delete_outstanding_cards(
                 async with session.begin():
                     recipient = await session.get(CampaignRecipient, recipient_id)
                     if recipient is not None:
+                        require_same_provider(exact_provider, recipient.provider)
                         current = list(recipient.cleanup_card_ids or [])
                         if card_id not in [str(x) for x in current]:
                             current.append(card_id)

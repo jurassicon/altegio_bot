@@ -106,8 +106,19 @@ def make_dedupe_key(
     company_id: int,
     record_id: int | None,
     run_at: datetime,
+    provider: str | None = None,
 ) -> str:
     rid = int(record_id) if record_id is not None else 0
+    if provider is not None:
+        from altegio_bot.campaigns.provider import campaign_dedupe_key
+
+        return campaign_dedupe_key(
+            provider=provider,
+            job_type=job_type,
+            company_id=company_id,
+            record_id=record_id,
+            run_at_iso=run_at.isoformat(),
+        )
     return f"{job_type}:{company_id}:{rid}:{run_at.isoformat()}"
 
 
@@ -144,15 +155,17 @@ async def add_job(
     job_type: str,
     run_at: datetime,
     payload: dict[str, Any],
+    provider: str | None = None,
 ) -> None:
     dedupe_key = make_dedupe_key(
         job_type=job_type,
         company_id=company_id,
         record_id=record_id,
         run_at=run_at,
+        provider=provider,
     )
 
-    stmt = pg_insert(MessageJob).values(
+    values: dict[str, Any] = dict(
         company_id=company_id,
         record_id=record_id,
         client_id=client_id,
@@ -164,6 +177,10 @@ async def add_job(
         payload=payload,
         locked_at=None,
     )
+    if provider is not None:
+        values["provider"] = provider
+
+    stmt = pg_insert(MessageJob).values(**values)
 
     stmt = stmt.on_conflict_do_update(
         index_elements=[MessageJob.dedupe_key],

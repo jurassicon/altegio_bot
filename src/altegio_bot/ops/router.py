@@ -2983,6 +2983,7 @@ def _iso_str(val: Any) -> str | None:
 @router.get("/campaigns", response_class=HTMLResponse)
 async def ops_campaigns_list(request: Request) -> str:
     company_id_str = request.query_params.get("company_id", "")
+    provider_filter = request.query_params.get("provider", "")
     mode_filter = request.query_params.get("mode", "")
     status_filter = request.query_params.get("status", "")
     limit_str = request.query_params.get("limit", "50")
@@ -2995,6 +2996,8 @@ async def ops_campaigns_list(request: Request) -> str:
 
     async with SessionLocal() as session:
         conditions: list[Any] = []
+        if provider_filter in {"altegio", "easyweek"}:
+            conditions.append(CampaignRun.provider == provider_filter)
         if company_id_str:
             try:
                 conditions.append(CampaignRun.company_ids.contains([int(company_id_str)]))
@@ -3023,6 +3026,7 @@ async def ops_campaigns_list(request: Request) -> str:
         if preview_ids:
             src_stmt = select(CampaignRun.source_preview_run_id).where(
                 CampaignRun.source_preview_run_id.in_(preview_ids),
+                CampaignRun.provider.in_({r.provider for r in runs}),
                 CampaignRun.mode == "send-real",
             )
             used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
@@ -3030,6 +3034,7 @@ async def ops_campaigns_list(request: Request) -> str:
     filter_form = _filter_form(
         "/ops/campaigns",
         [
+            ("provider", "Provider", "select:altegio,easyweek", provider_filter),
             ("company_id", "Кабинет / филиал (ID)", "text", company_id_str),
             ("mode", "Mode", "select:preview,send-real", mode_filter),
             ("status", "Status", "select:running,completed,failed,queued,discarded,deleted", status_filter),
@@ -3041,6 +3046,7 @@ async def ops_campaigns_list(request: Request) -> str:
         "ID",
         "Created",
         "Completed",
+        "Provider",
         "Кабинет",
         "Mode",
         "Status",
@@ -3103,6 +3109,7 @@ async def ops_campaigns_list(request: Request) -> str:
                 str(run.id),
                 _esc(_fmt_dt(run.created_at, tz)),
                 _esc(_fmt_dt(run.completed_at, tz)),
+                _esc(run.provider),
                 _esc(_fmt_company_ids(run.company_ids)),
                 _campaign_mode_badge(run.mode),
                 _campaign_status_badge(run.status),
@@ -3379,6 +3386,12 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <div class="row g-3">
 
       <div class="col-md-4">
+        <label class="form-label">Provider</label>
+        <input id="f-provider" class="form-control" value="altegio" disabled>
+        <div class="form-text">EasyWeek campaigns: readiness only in PR-13.</div>
+      </div>
+
+      <div class="col-md-4">
         <label class="form-label">Кабинет / филиал Altegio</label>
         <select id="f-company" class="form-select">
           {company_options}
@@ -3649,6 +3662,11 @@ async function loadPreviewAndPrefill(runId) {{
     }}
 
     // Заполнить поля из preview
+    if (run.provider !== "altegio") {{
+      setAlert("preview-alert", "danger", "Этот provider не поддерживает send-real в PR-13.");
+      document.getElementById("btn-run").disabled = true;
+      return;
+    }}
     const companyId = (run.company_ids || [])[0];
     if (companyId) {{
       const companySelect = document.getElementById("f-company");
@@ -4161,6 +4179,7 @@ function buildPayload() {{
 
   // period_end — конец дня (включительно)
   return {{
+    provider: document.getElementById("f-provider").value,
     company_id: companyId,
     location_id: locationId,
     card_type_id: cardTypeId,
@@ -4359,6 +4378,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         recipient_count_stmt = (
             select(CampaignRecipient.status, func.count(CampaignRecipient.id).label("cnt"))
             .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.provider == run.provider)
             .group_by(CampaignRecipient.status)
         )
         recipient_rows = (await session.execute(recipient_count_stmt)).all()
@@ -4373,6 +4393,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                 .select_from(CampaignRun)
                 .where(
                     CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.provider == run.provider,
                     CampaignRun.mode == "send-real",
                 )
             )
@@ -4389,6 +4410,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         _funnel_statuses = ["queued", "provider_accepted", "delivered", "read", "replied", "booked_after_campaign"]
         _funnel_where = (
             CampaignRecipient.campaign_run_id == run_id,
+            CampaignRecipient.provider == run.provider,
             CampaignRecipient.status.in_(_funnel_statuses) | CampaignRecipient.followup_status.is_not(None),
         )
         funnel_total: int = (
@@ -4416,7 +4438,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         if job_ids:
             job_rows = (
                 await session.execute(
-                    select(MessageJob.id, MessageJob.status, MessageJob.run_at).where(MessageJob.id.in_(job_ids))
+                    select(MessageJob.id, MessageJob.status, MessageJob.run_at)
+                    .where(MessageJob.id.in_(job_ids))
+                    .where(MessageJob.provider == run.provider)
                 )
             ).all()
             job_info_map = {row.id: (row.status, row.run_at) for row in job_rows}
@@ -4591,6 +4615,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
     <dl class="row mb-0">
       <dt class="col-sm-3">Кабинет / филиал</dt>
       <dd class="col-sm-9">{_esc(_fmt_company_ids(run.company_ids))}</dd>
+      <dt class="col-sm-3">Provider</dt>
+      <dd class="col-sm-9">{_esc(run.provider)}</dd>
       <dt class="col-sm-3">Period</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.period_start))} → {_esc(_fmt_dt(run.period_end))}</dd>
       <dt class="col-sm-3">Created</dt>
@@ -5145,12 +5171,16 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 .select_from(CampaignRun)
                 .where(
                     CampaignRun.source_preview_run_id == run_id,
+                    CampaignRun.provider == run.provider,
                     CampaignRun.mode == "send-real",
                 )
             )
             used_as_source = int(src_count or 0) > 0
 
-        conditions: list[Any] = [CampaignRecipient.campaign_run_id == run_id]
+        conditions: list[Any] = [
+            CampaignRecipient.campaign_run_id == run_id,
+            CampaignRecipient.provider == run.provider,
+        ]
         if status_filter:
             conditions.append(CampaignRecipient.status == status_filter)
         if excluded_reason_filter:

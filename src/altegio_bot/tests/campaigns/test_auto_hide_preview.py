@@ -67,6 +67,7 @@ def _make_params(
     source_preview_run_id: int | None = None,
 ) -> RunParams:
     return RunParams(
+        provider="altegio",
         company_id=COMPANY,
         location_id=LOCATION,
         period_start=PERIOD_START,

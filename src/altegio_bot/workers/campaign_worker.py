@@ -7,6 +7,11 @@ from datetime import timedelta
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.campaigns.provider import (
+    CampaignProviderRefusal,
+    campaign_provider_refusal,
+    require_same_provider,
+)
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_EXECUTION_JOB_TYPE,
     execute_queued_send_real,
@@ -14,7 +19,7 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.db import SessionLocal
 from altegio_bot.delivery_retry_identity import claims_delivery_retry, resolve_retry_reference
 from altegio_bot.easyweek_policy import easyweek_job_type_error, normalize_provider
-from altegio_bot.models.models import PROVIDER_ALTEGIO, MessageJob
+from altegio_bot.models.models import PROVIDER_ALTEGIO, CampaignRun, MessageJob
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("campaign_worker")
@@ -122,6 +127,13 @@ async def process_job_in_session(
     # EasyWeek execution job must die here rather than start a campaign run
     # against the wrong CRM.
     job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
+    refusal = campaign_provider_refusal(job_provider)
+    if refusal is not None:
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = refusal
+        return
+
     job_type_err = easyweek_job_type_error(job_provider, job.job_type)
     if job_type_err is not None:
         job.status = "failed"
@@ -145,6 +157,37 @@ async def process_job_in_session(
         logger.error("campaign job_id=%s: missing campaign_run_id in payload", job.id)
         return
 
+    try:
+        run_id_int = int(run_id)
+    except (TypeError, ValueError):
+        job.status = "failed"
+        job.locked_at = None
+        job.last_error = "campaign_identity_mismatch"
+        return
+
+    if isinstance(session, AsyncSession):
+        run = await session.get(CampaignRun, run_id_int)
+        if run is None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "campaign_identity_mismatch"
+            return
+        try:
+            require_same_provider(job_provider, run.provider)
+            if payload.get("provider") is not None:
+                require_same_provider(job_provider, payload.get("provider"))
+        except CampaignProviderRefusal as exc:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = exc.reason
+            return
+        company_ids = run.company_ids if isinstance(run.company_ids, list) else []
+        if company_ids != [job.company_id]:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = "campaign_identity_mismatch"
+            return
+
     logger.info(
         "picked campaign execution job_id=%s run_id=%s",
         job.id,
@@ -152,7 +195,7 @@ async def process_job_in_session(
     )
 
     try:
-        await execute_queued_send_real(int(run_id))
+        await execute_queued_send_real(run_id_int)
     except Exception as exc:
         job.status = "failed"
         job.locked_at = None

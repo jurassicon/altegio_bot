@@ -58,6 +58,7 @@ ALL_SENTINELS = (
 BASE = "https://my.easyweek.io/api/public/v2"
 BOOKING_UUID = "123e4567-e89b-12d3-a456-426614174000"
 VALID_UUID = "3f2a1b6c-0d4e-4f8a-9b1c-2d3e4f5a6b7c"
+VOUCHER_TEMPLATE_UUID = "49bc000c-c3a6-47c7-bdfd-b8ccd3ae2677"
 
 # A minimal location that satisfies the required uuid/name/timezone contract.
 _LOCATION: dict[str, Any] = {"uuid": VALID_UUID, "name": "Durlach", "timezone": "Europe/Berlin"}
@@ -328,14 +329,54 @@ async def test_only_get_is_ever_issued() -> None:
             return httpx.Response(200, json=[])
         if "/bookings/" in request.url.path:
             return httpx.Response(200, json=_BOOKING_WITH_PII)
+        if request.url.path.endswith("/voucher-templates"):
+            return httpx.Response(200, json={"data": [{"uuid": VOUCHER_TEMPLATE_UUID}]})
+        if request.url.path.endswith(f"/voucher-templates/{VOUCHER_TEMPLATE_UUID}"):
+            return httpx.Response(200, json={"data": {"uuid": VOUCHER_TEMPLATE_UUID}})
+        if request.url.path.endswith("/workspace"):
+            return httpx.Response(200, json={"data": {"uuid": VALID_UUID}})
         return httpx.Response(200, json={"ping": "pong"})
 
     async with _client(handler) as client:
         await client.ping()
         await client.list_locations()
         await client.get_booking(BOOKING_UUID)
+        await client.get_workspace()
+        await client.list_voucher_templates()
+        await client.get_voucher_template(VOUCHER_TEMPLATE_UUID)
 
     assert set(methods) == {"GET"}
+
+
+@pytest.mark.asyncio
+async def test_voucher_template_uses_canonical_uuid_path() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"data": {"uuid": VOUCHER_TEMPLATE_UUID}})
+
+    async with _client(handler) as client:
+        result = await client.get_voucher_template(VOUCHER_TEMPLATE_UUID)
+
+    assert result["uuid"] == VOUCHER_TEMPLATE_UUID
+    assert seen == [f"/api/public/v2/voucher-templates/{VOUCHER_TEMPLATE_UUID}"]
+
+
+@pytest.mark.asyncio
+async def test_numeric_dashboard_voucher_id_is_rejected_before_request() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekProtocolError) as exc_info:
+            await client.get_voucher_template("33701")
+
+    assert exc_info.value.operation == "get_voucher_template"
+    assert seen == []
 
 
 @pytest.mark.asyncio

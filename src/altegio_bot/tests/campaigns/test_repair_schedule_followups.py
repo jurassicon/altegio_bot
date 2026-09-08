@@ -255,7 +255,7 @@ async def test_apply_creates_jobs_for_unread_delivered(session_maker) -> None:
 
     async with session_maker() as session:
         job = await session.scalar(
-            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key(run_id, recipient_id))
+            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key("altegio", run_id, recipient_id))
         )
         db_recipient = await session.get(CampaignRecipient, recipient_id)
 
@@ -477,7 +477,7 @@ async def test_created_job_payload_contains_run_and_recipient_ids(session_maker)
 
     async with session_maker() as session:
         job = await session.scalar(
-            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key(run_id, recipient_id))
+            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key("altegio", run_id, recipient_id))
         )
 
     assert job is not None
@@ -509,7 +509,7 @@ async def test_run_at_uses_sent_at_plus_delay(session_maker) -> None:
 
     async with session_maker() as session:
         job = await session.scalar(
-            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key(run_id, recipient_id))
+            select(MessageJob).where(MessageJob.dedupe_key == _repair_dedupe_key("altegio", run_id, recipient_id))
         )
 
     assert job is not None

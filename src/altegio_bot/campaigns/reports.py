@@ -23,7 +23,7 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, OutboxMessage
+from altegio_bot.models.models import PROVIDER_ALTEGIO, CampaignRecipient, CampaignRun, OutboxMessage
 
 # Отображение company_id → название
 COMPANIES: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
@@ -62,6 +62,7 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
             func.count(CampaignRecipient.id).label("cnt"),
         )
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == run.provider)
         .group_by(CampaignRecipient.status, CampaignRecipient.excluded_reason)
     )
     rows = (await session.execute(stmt)).all()
@@ -74,7 +75,7 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
             reason_counts[reason] = reason_counts.get(reason, 0) + cnt
 
     # Attribution из outbox_messages (свежие данные с кумулятивным подсчётом)
-    attr = await _fetch_attribution(session, run_id)
+    attr = await _fetch_attribution(session, run_id, provider=run.provider)
 
     total = run.total_clients_seen
     eligible = run.candidates_count
@@ -91,6 +92,7 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
 
     return {
         "run_id": run.id,
+        "provider": run.provider,
         "campaign_code": run.campaign_code,
         "mode": run.mode,
         "status": run.status,
@@ -135,7 +137,12 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     }
 
 
-async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, Any]:
+async def _fetch_attribution(
+    session: AsyncSession,
+    run_id: int,
+    *,
+    provider: str = PROVIDER_ALTEGIO,
+) -> dict[str, Any]:
     """Получить свежие данные атрибуции JOIN с outbox_messages.
 
     Воронка считается кумулятивно:
@@ -151,6 +158,7 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
         )
         .join(CampaignRecipient, CampaignRecipient.outbox_message_id == OutboxMessage.id)
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .group_by(OutboxMessage.status)
     )
     rows = (await session.execute(stmt)).all()
@@ -168,6 +176,7 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
             func.count(CampaignRecipient.id).label("cnt"),
         )
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .where(CampaignRecipient.followup_status.is_not(None))
         .group_by(CampaignRecipient.followup_status)
     )
@@ -178,7 +187,10 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
     attr_stmt = select(
         func.count(CampaignRecipient.id).filter(CampaignRecipient.replied_at.is_not(None)).label("replied"),
         func.count(CampaignRecipient.id).filter(CampaignRecipient.booked_after_at.is_not(None)).label("booked"),
-    ).where(CampaignRecipient.campaign_run_id == run_id)
+    ).where(
+        CampaignRecipient.campaign_run_id == run_id,
+        CampaignRecipient.provider == provider,
+    )
     attr_row = (await session.execute(attr_stmt)).one()
 
     # Follow-up eligibility breakdown.
@@ -243,7 +255,10 @@ async def _fetch_attribution(session: AsyncSession, run_id: int) -> dict[str, An
             )
         )
         .label("eligible_now"),
-    ).where(CampaignRecipient.campaign_run_id == run_id)
+    ).where(
+        CampaignRecipient.campaign_run_id == run_id,
+        CampaignRecipient.provider == provider,
+    )
     elig_row = (await session.execute(elig_stmt)).one()
 
     followup_eligibility = {
@@ -316,6 +331,7 @@ async def monthly_dashboard(
     year: int,
     month: int,
     company_ids: list[int] | None = None,
+    provider: str = PROVIDER_ALTEGIO,
 ) -> dict[str, Any]:
     """Monthly dashboard по всем филиалам за указанный месяц.
 
@@ -336,6 +352,7 @@ async def monthly_dashboard(
 
     runs_stmt = (
         select(CampaignRun)
+        .where(CampaignRun.provider == provider)
         .where(CampaignRun.period_start >= month_start)
         .where(CampaignRun.period_start < month_end)
         .where(CampaignRun.status == "completed")
@@ -362,6 +379,7 @@ async def monthly_dashboard(
 
         companies.append(
             {
+                "provider": provider,
                 "company_id": cid,
                 "company_name": company_name,
                 "runs_count": len(cid_reports),
@@ -372,6 +390,7 @@ async def monthly_dashboard(
 
         by_company.append(
             {
+                "provider": provider,
                 "company_id": cid,
                 "company_name": company_name,
                 "runs_count": len(cid_reports),

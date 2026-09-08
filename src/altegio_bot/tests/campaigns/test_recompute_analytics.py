@@ -797,6 +797,7 @@ async def test_loyalty_cleanup_deletes_old_card_and_issues_new(session_maker) ->
         cleanup_result = await cleanup_campaign_cards(
             session,
             fake_loyalty,  # type: ignore[arg-type]
+            provider="altegio",
             location_id=location_id,
             client_id=1,
             campaign_code=campaign_code,
@@ -820,6 +821,7 @@ async def test_loyalty_cleanup_deletes_old_card_and_issues_new(session_maker) ->
     async with session_maker() as session:
         pending = await find_campaign_card_ids(
             session,
+            provider="altegio",
             client_id=1,
             campaign_code=campaign_code,
         )
@@ -830,6 +832,7 @@ async def test_loyalty_cleanup_deletes_old_card_and_issues_new(session_maker) ->
         resolution = await resolve_or_issue_loyalty_card(
             session,
             fake_loyalty,  # type: ignore[arg-type]
+            provider="altegio",
             phone_e164=phone_fresh,
             location_id=location_id,
             card_type_id=card_type_id,

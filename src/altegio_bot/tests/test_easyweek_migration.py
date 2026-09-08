@@ -82,6 +82,15 @@ _PROVIDER_TABLES = (
     "whatsapp_senders",
 )
 
+# PR-13 extends durable provider identity to the two campaign-owned tables.
+# Keep the PR-3 tuple above unchanged because it describes that historical
+# migration's intentionally narrower scope.
+_CANONICAL_PROVIDER_TABLES = (
+    *_PROVIDER_TABLES,
+    "campaign_runs",
+    "campaign_recipients",
+)
+
 # (table, pre-PR-3 constraint, provider-scoped replacement)
 _UNIQUE_SWAPS = (
     ("clients", "uq_clients_company_altegio_id", "uq_clients_provider_company_altegio_id"),
@@ -271,7 +280,7 @@ def test_downgrade_fails_closed_on_cross_provider_duplicates() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("table", _PROVIDER_TABLES)
+@pytest.mark.parametrize("table", _CANONICAL_PROVIDER_TABLES)
 def test_model_metadata_declares_the_provider_column(table: str) -> None:
     column = Base.metadata.tables[table].c["provider"]
     assert column.nullable is False
@@ -280,12 +289,12 @@ def test_model_metadata_declares_the_provider_column(table: str) -> None:
     assert column.default.arg == "altegio"
 
 
-@pytest.mark.parametrize("table", _PROVIDER_TABLES)
-def test_no_provider_column_leaks_outside_the_canonical_five(table: str) -> None:
+@pytest.mark.parametrize("table", _CANONICAL_PROVIDER_TABLES)
+def test_no_provider_column_leaks_outside_the_canonical_tables(table: str) -> None:
     """Guard the boundary from the other side: nothing else may gain one."""
     del table  # the parametrization only pins the expected set below
     with_provider = {name for name, t in Base.metadata.tables.items() if "provider" in t.c}
-    assert with_provider == set(_PROVIDER_TABLES)
+    assert with_provider == set(_CANONICAL_PROVIDER_TABLES)
 
 
 @pytest.mark.parametrize(("table", "old_name", "new_name"), _UNIQUE_SWAPS)

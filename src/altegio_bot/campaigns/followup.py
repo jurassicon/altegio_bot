@@ -7,10 +7,23 @@ from datetime import datetime, timedelta
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.campaigns.provider import (
+    CampaignProviderRefusal,
+    require_campaign_execution_provider,
+    require_same_provider,
+)
 from altegio_bot.campaigns.runner import FOLLOWUP_JOB_TYPE
 from altegio_bot.db import SessionLocal
 from altegio_bot.message_planner import add_job, make_dedupe_key
-from altegio_bot.models.models import AltegioEvent, CampaignRecipient, CampaignRun, Client, MessageJob, Record
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    AltegioEvent,
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+    MessageJob,
+    Record,
+)
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -112,7 +125,7 @@ FOLLOWUP_SKIP_STATUSES: frozenset[str] = frozenset(
 )
 
 
-async def count_followup_skipped(session: AsyncSession, run_id: int) -> int:
+async def count_followup_skipped(session: AsyncSession, run_id: int, *, provider: str) -> int:
     """Сколько получателей run'а сейчас в терминальном skip-статусе follow-up.
 
     Включает как plan-time skips (локальный pre-check + финальный guard в
@@ -123,6 +136,7 @@ async def count_followup_skipped(session: AsyncSession, run_id: int) -> int:
         select(func.count())
         .select_from(CampaignRecipient)
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .where(CampaignRecipient.followup_status.in_(FOLLOWUP_SKIP_STATUSES))
     )
     return int(result or 0)
@@ -141,10 +155,15 @@ async def existing_followup_work_counts(session: AsyncSession, run_id: int) -> d
         followup_sent_at);
       * MessageJob rows of type FOLLOWUP_JOB_TYPE referencing this run.
     """
+    run = await session.get(CampaignRun, run_id)
+    if run is None:
+        raise ValueError(f"CampaignRun {run_id} not found")
+    provider = require_campaign_execution_provider(run.provider)
     recipients_count = await session.scalar(
         select(func.count())
         .select_from(CampaignRecipient)
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .where(
             or_(
                 CampaignRecipient.followup_status.is_not(None),
@@ -158,12 +177,14 @@ async def existing_followup_work_counts(session: AsyncSession, run_id: int) -> d
         select(func.count())
         .select_from(CampaignRecipient)
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .where(CampaignRecipient.followup_outbox_id.is_not(None))
     )
     jobs_count = await session.scalar(
         select(func.count())
         .select_from(MessageJob)
         .where(MessageJob.job_type == FOLLOWUP_JOB_TYPE)
+        .where(MessageJob.provider == provider)
         .where(MessageJob.payload["campaign_run_id"].astext == str(run_id))
     )
     return {
@@ -274,6 +295,7 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     run = await session.get(CampaignRun, run_id)
     if run is None:
         raise ValueError(f"CampaignRun {run_id} not found")
+    provider = require_campaign_execution_provider(run.provider)
 
     if not run.followup_enabled:
         raise ValueError(f"Follow-up не включён для run_id={run_id}")
@@ -287,12 +309,20 @@ async def plan_followup(session: AsyncSession, run_id: int) -> int:
     await session.execute(
         update(CampaignRecipient)
         .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == provider)
         .where(CampaignRecipient.followup_status == _FOLLOWUP_PROCESSING)
         .values(followup_status="followup_planned")
     )
     await session.flush()
 
-    stmt = select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id).with_for_update()
+    stmt = (
+        select(CampaignRecipient)
+        .where(
+            CampaignRecipient.campaign_run_id == run_id,
+            CampaignRecipient.provider == provider,
+        )
+        .with_for_update()
+    )
     recipients = (await session.execute(stmt)).scalars().all()
 
     # Стабильное «сейчас» на весь run, чтобы проверка будущих записей в
@@ -346,6 +376,7 @@ async def _set_followup_status(
     recipient_id: int,
     status: str,
     *,
+    provider: str,
     message_job_id: int | None = None,
 ) -> None:
     """Best-effort обновление статуса follow-up получателя."""
@@ -354,6 +385,7 @@ async def _set_followup_status(
             recipient = await session.get(CampaignRecipient, recipient_id)
             if recipient is None:
                 return
+            require_same_provider(provider, recipient.provider)
             recipient.followup_status = status
             if message_job_id is not None:
                 recipient.followup_message_job_id = message_job_id
@@ -368,6 +400,7 @@ async def execute_followup(run_id: int) -> dict:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             raise ValueError(f"CampaignRun {run_id} not found")
+        provider = require_campaign_execution_provider(run.provider)
 
         if not run.followup_enabled:
             raise ValueError(f"Follow-up не включён для run_id={run_id}")
@@ -392,11 +425,13 @@ async def execute_followup(run_id: int) -> dict:
         stmt = (
             select(CampaignRecipient)
             .where(CampaignRecipient.campaign_run_id == run_id)
+            .where(CampaignRecipient.provider == provider)
             .where(CampaignRecipient.followup_status == "followup_planned")
         )
         recipients = (await session.execute(stmt)).scalars().all()
 
     for recipient in recipients:
+        require_same_provider(provider, recipient.provider)
         company_id = recipient.company_id
         client_id = recipient.client_id
         recipient_id = recipient.id
@@ -408,6 +443,7 @@ async def execute_followup(run_id: int) -> dict:
             await _set_followup_status(
                 recipient_id,
                 "followup_skipped",
+                provider=provider,
             )
             stats["skipped"] += 1
             continue
@@ -420,6 +456,7 @@ async def execute_followup(run_id: int) -> dict:
                     claim_result = await session.execute(
                         update(CampaignRecipient)
                         .where(CampaignRecipient.id == recipient_id)
+                        .where(CampaignRecipient.provider == provider)
                         .where(CampaignRecipient.followup_status == "followup_planned")
                         .values(followup_status=_FOLLOWUP_PROCESSING)
                     )
@@ -490,6 +527,7 @@ async def execute_followup(run_id: int) -> dict:
             await _set_followup_status(
                 recipient_id,
                 "followup_planned",
+                provider=provider,
             )
             continue
 
@@ -529,6 +567,7 @@ async def execute_followup(run_id: int) -> dict:
                         job_type=FOLLOWUP_JOB_TYPE,
                         run_at=run_at,
                         payload=followup_payload,
+                        provider=provider,
                     )
 
                     dedupe_key = make_dedupe_key(
@@ -536,6 +575,7 @@ async def execute_followup(run_id: int) -> dict:
                         company_id=company_id,
                         record_id=None,
                         run_at=run_at,
+                        provider=provider,
                     )
                     job = await session.scalar(select(MessageJob).where(MessageJob.dedupe_key == dedupe_key))
 
@@ -563,6 +603,7 @@ async def execute_followup(run_id: int) -> dict:
             await _set_followup_status(
                 recipient_id,
                 "followup_planned",
+                provider=provider,
             )
 
     logger.info(
@@ -577,6 +618,7 @@ async def _find_record_create_event(
     session: AsyncSession,
     *,
     recipient: CampaignRecipient,
+    provider: str,
     company_id: int,
     attribution_start: datetime,
 ) -> datetime | None:
@@ -600,6 +642,7 @@ async def _find_record_create_event(
             Record,
             and_(
                 Record.altegio_record_id == AltegioEvent.resource_id,
+                Record.provider == provider,
                 Record.company_id == company_id,
             ),
         )
@@ -619,6 +662,7 @@ async def _has_future_record(
     session: AsyncSession,
     *,
     recipient: CampaignRecipient,
+    provider: str,
     company_id: int,
     now: datetime,
 ) -> bool:
@@ -630,6 +674,7 @@ async def _has_future_record(
 
     stmt = (
         select(Record.id)
+        .where(Record.provider == provider)
         .where(Record.company_id == company_id)
         .where(Record.starts_at > now)
         .where(func.coalesce(Record.is_deleted, False).is_(False))
@@ -644,6 +689,7 @@ async def _find_returned_after_period_record_at(
     session: AsyncSession,
     *,
     recipient: CampaignRecipient,
+    provider: str,
     company_id: int,
     boundary: datetime,
     before: datetime,
@@ -671,6 +717,7 @@ async def _find_returned_after_period_record_at(
 
     stmt = (
         select(Record.starts_at)
+        .where(Record.provider == provider)
         .where(Record.company_id == company_id)
         .where(func.coalesce(Record.is_deleted, False).is_(False))
         .where(Record.starts_at.is_not(None))
@@ -718,6 +765,28 @@ async def check_followup_final_eligibility(
     Eligible=False includes a followup_status string to persist on the recipient
     and a human-readable skip_reason for job.last_error.
     """
+    # 3.1 — status / attribution timestamps.
+    if run is None:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason="campaign_identity_mismatch",
+            followup_status="followup_provider_refused",
+            booked_after_at=None,
+        )
+    try:
+        provider = require_same_provider(
+            getattr(run, "provider", PROVIDER_ALTEGIO),
+            getattr(recipient, "provider", PROVIDER_ALTEGIO),
+        )
+        require_campaign_execution_provider(provider)
+    except CampaignProviderRefusal as exc:
+        return FollowupFinalEligibilityResult(
+            eligible=False,
+            skip_reason=exc.reason,
+            followup_status="followup_provider_refused",
+            booked_after_at=None,
+        )
+
     # 3.1 — status / attribution timestamps.
     # Priority must match classify_followup_candidate() and reports:
     #   booked_after > replied > read.
@@ -771,9 +840,12 @@ async def check_followup_final_eligibility(
     opt_client: Client | None = None
     if recipient.client_id is not None:
         opt_client = await session.get(Client, recipient.client_id)
+        if opt_client is not None and opt_client.provider != provider:
+            opt_client = None
     if opt_client is None and recipient.phone_e164:
         opt_result = await session.execute(
             select(Client)
+            .where(Client.provider == provider)
             .where(Client.company_id == recipient.company_id)
             .where(Client.phone_e164 == recipient.phone_e164)
             .limit(1)
@@ -782,6 +854,7 @@ async def check_followup_final_eligibility(
     if opt_client is None and recipient.altegio_client_id is not None:
         opt_result = await session.execute(
             select(Client)
+            .where(Client.provider == provider)
             .where(Client.company_id == recipient.company_id)
             .where(Client.altegio_client_id == recipient.altegio_client_id)
             .limit(1)
@@ -820,6 +893,7 @@ async def check_followup_final_eligibility(
         evt_at = await _find_record_create_event(
             session,
             recipient=recipient,
+            provider=provider,
             company_id=recipient.company_id,
             attribution_start=attribution_start,
         )
@@ -847,6 +921,7 @@ async def check_followup_final_eligibility(
         returned_at = await _find_returned_after_period_record_at(
             session,
             recipient=recipient,
+            provider=provider,
             company_id=recipient.company_id,
             boundary=returned_boundary,
             before=now,
@@ -863,6 +938,7 @@ async def check_followup_final_eligibility(
     has_future = await _has_future_record(
         session,
         recipient=recipient,
+        provider=provider,
         company_id=recipient.company_id,
         now=now,
     )

@@ -40,6 +40,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
+from altegio_bot.campaigns.provider import (
+    CAMPAIGN_JOB_TYPES,
+    EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
+)
 from altegio_bot.campaigns.runner import CAMPAIGN_EXECUTION_JOB_TYPE
 from altegio_bot.delivery_retry_identity import (
     DELIVERY_RETRY_JOB_TYPES,
@@ -80,6 +84,7 @@ from altegio_bot.meta_templates import (
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    CampaignRun,
     Client,
     EasyWeekEvent,
     MessageJob,
@@ -3697,7 +3702,12 @@ async def test_disallowed_easyweek_job_types_fail_terminally_in_the_outbox(
 
     assert job.status == "failed"
     assert job.locked_at is None
-    assert job.last_error == f"EasyWeek job type not enabled in this phase: {job_type}"
+    expected_error = (
+        EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED
+        if job_type in CAMPAIGN_JOB_TYPES
+        else f"EasyWeek job type not enabled in this phase: {job_type}"
+    )
+    assert job.last_error == expected_error
     assert capture.template_calls == []
     assert capture.text_calls == []
     assert await _outbox_rows(db, job) == []
@@ -3776,7 +3786,7 @@ async def test_easyweek_campaign_execution_job_dies_in_the_campaign_worker(
 
     assert job.status == "failed"
     assert job.locked_at is None
-    assert job.last_error == f"EasyWeek job type not enabled in this phase: {CAMPAIGN_EXECUTION_JOB_TYPE}"
+    assert job.last_error == EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED
     runner.assert_not_awaited()
 
 
@@ -3792,6 +3802,17 @@ async def test_altegio_campaign_execution_job_still_reaches_the_runner(
     monkeypatch.setattr(campaign_worker, "execute_queued_send_real", _fake_runner)
 
     client, _record = await _seed_altegio_client_and_record(db)
+    run = CampaignRun(
+        provider=PROVIDER_ALTEGIO,
+        campaign_code="new_clients_monthly",
+        mode="send-real",
+        company_ids=[COLLIDING_COMPANY_ID],
+        period_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        period_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        status="queued",
+    )
+    db.add(run)
+    await db.flush()
     job = await _seed_job(
         db,
         provider=PROVIDER_ALTEGIO,
@@ -3801,7 +3822,7 @@ async def test_altegio_campaign_execution_job_still_reaches_the_runner(
         client=client,
         dedupe_key="alt-campaign-execution-2",
     )
-    job.payload = {"campaign_run_id": 4242}
+    job.payload = {"campaign_run_id": run.id, "provider": PROVIDER_ALTEGIO}
     await db.flush()
 
     await campaign_worker.process_job_in_session(db, job.id)
@@ -3809,7 +3830,7 @@ async def test_altegio_campaign_execution_job_still_reaches_the_runner(
     await db.refresh(job)
 
     assert job.status == "done", job.last_error
-    assert seen == [4242]
+    assert seen == [run.id]
 
 
 # ---------------------------------------------------------------------------

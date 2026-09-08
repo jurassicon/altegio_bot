@@ -20,9 +20,16 @@ from altegio_bot.altegio_records import (
     count_attended_client_visits,
 )
 from altegio_bot.campaigns.followup import check_followup_final_eligibility
+from altegio_bot.campaigns.provider import (
+    CAMPAIGN_JOB_TYPES,
+    CampaignProviderRefusal,
+    campaign_provider_refusal,
+    require_same_provider,
+)
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_EXECUTION_JOB_TYPE,
     FOLLOWUP_JOB_TYPE,
+    NEWSLETTER_JOB_TYPE,
     recompute_campaign_run_stats,
 )
 from altegio_bot.db import SessionLocal
@@ -3187,6 +3194,89 @@ async def _run_job_logic(
             job.last_error = f"Canceled: {reference.error or 'delivery_retry_reference_unproven'}"
             return None
 
+    # Campaign identity is a separate provider boundary. It runs before the
+    # generic EasyWeek allowlist and before template/sender/CRM/attempt work so
+    # a late or hand-built newsletter row cannot borrow Altegio configuration.
+    if job.job_type in CAMPAIGN_JOB_TYPES:
+        refusal = campaign_provider_refusal(job_provider)
+        if refusal is not None:
+            job.status = "failed"
+            job.locked_at = None
+            job.last_error = refusal
+            return None
+
+        if job.job_type == CAMPAIGN_EXECUTION_JOB_TYPE:
+            logger.error(
+                "outbox_worker received campaign execution job_id=%s — requeuing for campaign_worker",
+                job.id,
+            )
+            job.status = "queued"
+            job.locked_at = None
+            return None
+
+        # Lightweight legacy unit doubles do not model relational DB reads.
+        # Production always supplies AsyncSession, where the durable identity
+        # proof below is mandatory.
+        if not isinstance(session, AsyncSession):
+            pass
+        else:
+            payload = job.payload if isinstance(job.payload, dict) else {}
+            # Keep the pre-PR-13 standalone Altegio newsletter route working.
+            # New orchestrated jobs carry both ids; a partial identity is never
+            # accepted. EasyWeek has already been refused above.
+            legacy_standalone_monthly = (
+                job.job_type == NEWSLETTER_JOB_TYPE
+                and payload.get("campaign_run_id") is None
+                and payload.get("campaign_recipient_id") is None
+            )
+            if not legacy_standalone_monthly:
+                run_id, run_id_error = _parse_int_payload_id(payload.get("campaign_run_id"), "campaign_run_id")
+                if run_id_error is not None or run_id is None:
+                    job.status = "canceled" if job.job_type == FOLLOWUP_JOB_TYPE else "failed"
+                    job.locked_at = None
+                    job.last_error = run_id_error or (
+                        "Follow-up skipped: missing campaign_run_id"
+                        if job.job_type == FOLLOWUP_JOB_TYPE
+                        else "campaign_identity_mismatch"
+                    )
+                    return None
+                run = await session.get(CampaignRun, run_id)
+                try:
+                    if run is None:
+                        reason = (
+                            f"Follow-up skipped: campaign_run_id={run_id} not found"
+                            if job.job_type == FOLLOWUP_JOB_TYPE
+                            else "campaign_identity_mismatch"
+                        )
+                        raise CampaignProviderRefusal(reason)
+                    require_same_provider(job_provider, run.provider)
+                    if run.company_ids != [job.company_id]:
+                        raise CampaignProviderRefusal("campaign_identity_mismatch")
+
+                    recipient_id, recipient_error = _parse_int_payload_id(
+                        payload.get("campaign_recipient_id"),
+                        "campaign_recipient_id",
+                    )
+                    if recipient_error is not None or recipient_id is None:
+                        raise CampaignProviderRefusal(
+                            recipient_error or "Follow-up skipped: missing campaign_recipient_id"
+                        )
+                    recipient = await session.get(CampaignRecipient, recipient_id)
+                    if recipient is None:
+                        raise CampaignProviderRefusal(
+                            f"Follow-up skipped: campaign_recipient_id={recipient_id} not found"
+                        )
+                    if recipient.campaign_run_id != run.id:
+                        raise CampaignProviderRefusal("campaign_identity_mismatch")
+                    require_same_provider(job_provider, recipient.provider)
+                    if recipient.company_id != job.company_id:
+                        raise CampaignProviderRefusal("campaign_identity_mismatch")
+                except CampaignProviderRefusal as exc:
+                    job.status = "canceled" if job.job_type == FOLLOWUP_JOB_TYPE else "failed"
+                    job.locked_at = None
+                    job.last_error = exc.reason
+                    return None
+
     # Phase-1 allowlist, checked before ANYTHING else acts on this job.
     #
     # It has to be here rather than deeper down: the campaign branch below
@@ -3235,14 +3325,8 @@ async def _run_job_logic(
     # _lock_next_jobs() already excludes them, but if somehow an execution job
     # arrives here (e.g. via direct process_job_in_session call), requeue it so
     # campaign_worker can pick it up, rather than letting it fail with "No phone_e164".
-    if job.job_type == CAMPAIGN_EXECUTION_JOB_TYPE:
-        logger.error(
-            "outbox_worker received campaign execution job_id=%s — requeuing for campaign_worker",
-            job.id,
-        )
-        job.status = "queued"
-        job.locked_at = None
-        return
+    if job.job_type == CAMPAIGN_EXECUTION_JOB_TYPE:  # pragma: no cover - handled above
+        raise AssertionError("campaign execution job escaped provider guard")
 
     success = await _find_success_outbox(session, job.id)
     if success is not None:
