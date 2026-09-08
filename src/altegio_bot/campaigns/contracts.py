@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from altegio_bot.models.models import PROVIDER_ALTEGIO
 
@@ -34,6 +36,13 @@ class ClientCandidate:
     records_after_period: int = field(default=0)
     local_client_found: bool = field(default=True)
     excluded_reason: str | None = field(default=None)
+    # PR-14 durable local source proof.  Populated only for eligible EasyWeek
+    # preview recipients; Altegio and excluded EasyWeek rows remain NULL.
+    source_easyweek_event_id: int | None = field(default=None)
+    source_record_id: int | None = field(default=None)
+    source_booking_uuid: uuid.UUID | None = field(default=None)
+    source_visits_total: int | None = field(default=None)
+    source_visits_total_updated_at: datetime | None = field(default=None)
 
     @property
     def is_eligible(self) -> bool:

@@ -8,9 +8,10 @@ from typing import Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from altegio_bot.campaigns.easyweek_segment import SEGMENT_SOURCE
 from altegio_bot.campaigns.provider import (
     CAMPAIGN_JOB_TYPES,
-    EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
+    CAMPAIGN_LIVE_GUARD_UNPROVEN,
     validate_campaign_provider,
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
@@ -25,7 +26,6 @@ CAMPAIGN_LOCATION_UNPROVEN: Final = "campaign_location_unproven"
 CAMPAIGN_BOOKING_PAGE_UNPROVEN: Final = "campaign_booking_page_unproven"
 CAMPAIGN_SENDER_UNPROVEN: Final = "campaign_sender_unproven"
 CAMPAIGN_TEMPLATE_UNPROVEN: Final = "campaign_template_unproven"
-CAMPAIGN_LIVE_GUARD_UNPROVEN: Final = "campaign_live_guard_unproven"
 
 
 @dataclass(frozen=True)
@@ -70,15 +70,12 @@ async def resolve_campaign_readiness(
             booking_page_url = validate_static_booking_page(location.booking_page_url)
             if booking_page_url is None:
                 reasons.append(CAMPAIGN_BOOKING_PAGE_UNPROVEN)
-        segment_source = None
-        live_guard = None
+        # PR-14 proves only a local, incomplete subset and a partial per-booking
+        # GET re-proof.  Neither is a customer-level live send guard.
+        segment_source = SEGMENT_SOURCE
+        live_guard = "easyweek_booking_partial_reproof"
         supported_job_types: tuple[str, ...] = ()
-        reasons.extend(
-            [
-                EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
-                CAMPAIGN_LIVE_GUARD_UNPROVEN,
-            ]
-        )
+        reasons.append(CAMPAIGN_LIVE_GUARD_UNPROVEN)
     else:
         # Preserve the one existing source of Altegio campaign booking links.
         from altegio_bot.workers.outbox_worker import BOOKING_LINKS

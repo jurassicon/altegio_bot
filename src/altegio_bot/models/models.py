@@ -1236,6 +1236,21 @@ class CampaignRecipient(Base):
             "company_id",
             "client_id",
         ),
+        CheckConstraint(
+            "((source_easyweek_event_id IS NULL) = (source_record_id IS NULL)) "
+            "AND ((source_easyweek_event_id IS NULL) = (source_booking_uuid IS NULL)) "
+            "AND ((source_easyweek_event_id IS NULL) = (source_visits_total IS NULL)) "
+            "AND ((source_easyweek_event_id IS NULL) = (source_visits_total_updated_at IS NULL))",
+            name="ck_campaign_recipients_easyweek_source_proof_complete",
+        ),
+        CheckConstraint(
+            "source_easyweek_event_id IS NULL OR provider = 'easyweek'",
+            name="ck_campaign_recipients_easyweek_source_proof_provider",
+        ),
+        CheckConstraint(
+            "source_visits_total IS NULL OR source_visits_total = 1",
+            name="ck_campaign_recipients_easyweek_source_visits_first",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -1305,6 +1320,30 @@ class CampaignRecipient(Base):
     records_after_period: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Найден ли локальный Client в нашей БД
     local_client_found: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # PR-14: restart-safe evidence for an eligible EasyWeek proven-subset row.
+    # Raw event payloads are intentionally not copied into recipient.meta.
+    source_easyweek_event_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("easyweek_events.id", name="fk_campaign_recipients_source_easyweek_event"),
+        nullable=True,
+        index=True,
+    )
+    source_record_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("records.id", name="fk_campaign_recipients_source_record"),
+        nullable=True,
+        index=True,
+    )
+    source_booking_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        nullable=True,
+    )
+    source_visits_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_visits_total_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     # -----------------------------------------------------------------------
     # Loyalty-карты
