@@ -21,6 +21,7 @@ from altegio_bot.altegio_records import (
 )
 from altegio_bot.campaigns.followup import check_followup_final_eligibility
 from altegio_bot.campaigns.provider import (
+    CAMPAIGN_IDENTITY_MISMATCH,
     CAMPAIGN_JOB_TYPES,
     CampaignProviderRefusal,
     campaign_provider_refusal,
@@ -179,6 +180,7 @@ from altegio_bot.services.meta_error_classifier import (
 )
 from altegio_bot.settings import settings
 from altegio_bot.template_validation import validate_lifecycle_template_params, validate_template_params
+from altegio_bot.webhooks.common import normalize_phone_candidate
 from altegio_bot.whatsapp_routing import pick_sender_code_for_record, pick_sender_id
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open
 from altegio_bot.workers.promo_lead_handler import (
@@ -3172,6 +3174,25 @@ def _campaign_company_scope_contains(company_ids: object, company_id: object) ->
     return company_id in company_ids
 
 
+def _campaign_optional_client_ids_match(left: object, right: object) -> bool:
+    """Compare nullable client ids without bool/string/float coercion."""
+    if left is None or right is None:
+        return left is None and right is None
+    return type(left) is int and type(right) is int and left == right
+
+
+def _campaign_job_link_matches(linked_job_id: object, job_id: object) -> bool:
+    """Require an exact durable recipient-to-job link."""
+    return type(linked_job_id) is int and type(job_id) is int and linked_job_id == job_id
+
+
+def _campaign_phone_identity_matches(recipient_phone: object, payload_phone: object) -> bool:
+    """Prove two phone values share one valid normalized representation."""
+    normalized_recipient = normalize_phone_candidate(recipient_phone)
+    normalized_payload = normalize_phone_candidate(payload_phone)
+    return normalized_recipient is not None and normalized_recipient == normalized_payload
+
+
 async def _run_job_logic(
     session: AsyncSession,
     job: MessageJob,
@@ -3282,6 +3303,42 @@ async def _run_job_logic(
                     require_same_provider(job_provider, recipient.provider)
                     if recipient.company_id != job.company_id:
                         raise CampaignProviderRefusal("campaign_identity_mismatch")
+                    if not _campaign_optional_client_ids_match(recipient.client_id, job.client_id):
+                        raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
+
+                    linked_job_id = (
+                        recipient.followup_message_job_id
+                        if job.job_type == FOLLOWUP_JOB_TYPE
+                        else recipient.message_job_id
+                    )
+                    if not _campaign_job_link_matches(linked_job_id, job.id):
+                        raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
+
+                    if job.client_id is None:
+                        if not _campaign_phone_identity_matches(
+                            recipient.phone_e164,
+                            payload.get("phone_e164"),
+                        ):
+                            raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
+                    else:
+                        if type(job.client_id) is not int:
+                            raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
+                        campaign_client = await session.get(Client, job.client_id)
+                        if (
+                            campaign_client is None
+                            or type(campaign_client.id) is not int
+                            or campaign_client.id != job.client_id
+                            or campaign_client.id != recipient.client_id
+                            or campaign_client.provider != job_provider
+                            or type(campaign_client.company_id) is not int
+                            or campaign_client.company_id != job.company_id
+                        ):
+                            raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
+                        if campaign_client.phone_e164 is None and not _campaign_phone_identity_matches(
+                            recipient.phone_e164,
+                            payload.get("phone_e164"),
+                        ):
+                            raise CampaignProviderRefusal(CAMPAIGN_IDENTITY_MISMATCH)
                 except CampaignProviderRefusal as exc:
                     job.status = "canceled" if job.job_type == FOLLOWUP_JOB_TYPE else "failed"
                     job.locked_at = None

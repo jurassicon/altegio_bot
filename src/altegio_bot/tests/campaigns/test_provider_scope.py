@@ -47,7 +47,12 @@ async def _persist_delivery_identity(
     company_ids: object,
     job_company_id: int = COMPANY_ID,
     recipient_company_id: int | None = None,
+    recipient_client_id: int | None = None,
+    job_client_id: int | None = None,
+    recipient_phone: object = "+4915111111111",
+    payload_phone: object = "+4915111111111",
     payload_ids: str = "both",
+    job_type: str = "newsletter_new_clients_monthly",
     suffix: str = "identity",
 ) -> tuple[CampaignRun, CampaignRecipient, MessageJob]:
     run = CampaignRun(
@@ -65,19 +70,24 @@ async def _persist_delivery_identity(
         provider="altegio",
         campaign_run_id=run.id,
         company_id=recipient_company_id if recipient_company_id is not None else job_company_id,
+        client_id=recipient_client_id,
+        phone_e164=recipient_phone,
         status="queued",
     )
     session.add(recipient)
     await session.flush()
-    payload: dict[str, int | str] = {"kind": "newsletter_new_clients_monthly"}
+    payload: dict[str, object] = {"kind": job_type}
     if payload_ids in {"both", "run_only"}:
         payload["campaign_run_id"] = run.id
     if payload_ids in {"both", "recipient_only"}:
         payload["campaign_recipient_id"] = recipient.id
+    if payload_phone is not None:
+        payload["phone_e164"] = payload_phone
     job = MessageJob(
         provider="altegio",
         company_id=job_company_id,
-        job_type="newsletter_new_clients_monthly",
+        client_id=job_client_id,
+        job_type=job_type,
         run_at=NOW,
         status="processing",
         attempts=0,
@@ -87,8 +97,41 @@ async def _persist_delivery_identity(
     )
     session.add(job)
     await session.flush()
-    recipient.message_job_id = job.id
+    if job_type == runner.FOLLOWUP_JOB_TYPE:
+        recipient.followup_message_job_id = job.id
+    else:
+        recipient.message_job_id = job.id
     return run, recipient, job
+
+
+async def _persist_campaign_client(
+    session,
+    *,
+    provider: str = "altegio",
+    company_id: int = COMPANY_ID,
+    external_id: int = 9001,
+    phone_e164: str | None = "+4915222222222",
+) -> Client:
+    client = Client(
+        provider=provider,
+        company_id=company_id,
+        altegio_client_id=external_id,
+        phone_e164=phone_e164,
+        raw={},
+    )
+    session.add(client)
+    await session.flush()
+    return client
+
+
+def _campaign_delivery_probes(monkeypatch):
+    reached_delivery = AsyncMock(return_value=object())
+    send_template = AsyncMock(side_effect=AssertionError("Meta must not run"))
+    send_text = AsyncMock(side_effect=AssertionError("Meta must not run"))
+    monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
+    monkeypatch.setattr(outbox_worker, "safe_send_template", send_template)
+    monkeypatch.setattr(outbox_worker, "safe_send", send_text)
+    return reached_delivery, send_template, send_text
 
 
 def _params(provider: str, *, mode: str) -> RunParams:
@@ -478,6 +521,361 @@ async def test_partial_campaign_identity_stays_blocked(session_maker, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_campaign_client_id_mismatch_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client_a = await _persist_campaign_client(session, external_id=9101)
+            client_b = await _persist_campaign_client(session, external_id=9102)
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client_a.id,
+                job_client_id=client_b.id,
+                suffix="client-mismatch",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_kind", ["other", "missing"])
+async def test_campaign_job_link_mismatch_is_blocked(
+    session_maker,
+    monkeypatch,
+    link_kind,
+) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(session, external_id=9201)
+            _run, recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                suffix=f"job-link-{link_kind}",
+            )
+            if link_kind == "other":
+                other_job = MessageJob(
+                    provider="altegio",
+                    company_id=COMPANY_ID,
+                    client_id=client.id,
+                    job_type="newsletter_new_clients_monthly",
+                    run_at=NOW,
+                    status="queued",
+                    attempts=0,
+                    max_attempts=5,
+                    dedupe_key="altegio:test:other-primary-job",
+                    payload={"kind": "newsletter_new_clients_monthly"},
+                )
+                session.add(other_job)
+                await session.flush()
+                recipient.message_job_id = other_job.id
+            else:
+                recipient.message_job_id = None
+
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_valid_primary_campaign_identity_passes(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(session, external_id=9301)
+            _run, recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                suffix="valid-primary",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert recipient.message_job_id == job.id
+            assert job.status == "done"
+            assert job.last_error is None
+            assert job.attempts == 0
+
+    reached_delivery.assert_awaited_once()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_followup_uses_followup_message_job_id(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(session, external_id=9401)
+            primary_job = MessageJob(
+                provider="altegio",
+                company_id=COMPANY_ID,
+                client_id=client.id,
+                job_type="newsletter_new_clients_monthly",
+                run_at=NOW,
+                status="done",
+                attempts=1,
+                max_attempts=5,
+                dedupe_key="altegio:test:followup-primary",
+                payload={"kind": "newsletter_new_clients_monthly"},
+            )
+            session.add(primary_job)
+            await session.flush()
+            _run, recipient, followup_job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                job_type=runner.FOLLOWUP_JOB_TYPE,
+                suffix="valid-followup",
+            )
+            recipient.message_job_id = primary_job.id
+
+            await outbox_worker._run_job_logic(session, followup_job, provider=MagicMock())
+            assert recipient.message_job_id == primary_job.id
+            assert recipient.followup_message_job_id == followup_job.id
+            assert followup_job.status == "done"
+            assert followup_job.last_error is None
+            assert followup_job.attempts == 0
+
+    reached_delivery.assert_awaited_once()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_followup_job_link_mismatch_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(session, external_id=9501)
+            _run, recipient, followup_job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                job_type=runner.FOLLOWUP_JOB_TYPE,
+                suffix="followup-link-mismatch",
+            )
+            recipient.followup_message_job_id = None
+
+            await outbox_worker._run_job_logic(session, followup_job, provider=MagicMock())
+            assert followup_job.status == "canceled"
+            assert followup_job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert followup_job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_foreign_provider_client_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(
+                session,
+                provider="easyweek",
+                external_id=9601,
+            )
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                suffix="foreign-client",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_company_mismatch_is_blocked(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(
+                session,
+                company_id=COMPANY_ID + 1,
+                external_id=9701,
+            )
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                suffix="client-company",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_crm_only_matching_phone_passes(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            _run, recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_phone="+49 151 33333333",
+                payload_phone="49151-33333333",
+                suffix="crm-phone-match",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert recipient.client_id is None
+            assert job.client_id is None
+            assert job.status == "done"
+            assert job.last_error is None
+
+    reached_delivery.assert_awaited_once()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_client_payload_phone_fallback_matches_recipient(session_maker, monkeypatch) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(
+                session,
+                external_id=9801,
+                phone_e164=None,
+            )
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                recipient_phone="+4915166666666",
+                payload_phone="49 151 66666666",
+                suffix="local-phone-fallback",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "done"
+            assert job.last_error is None
+
+    reached_delivery.assert_awaited_once()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_client_payload_phone_fallback_mismatch_is_blocked(
+    session_maker,
+    monkeypatch,
+) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            client = await _persist_campaign_client(
+                session,
+                external_id=9802,
+                phone_e164=None,
+            )
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_client_id=client.id,
+                job_client_id=client.id,
+                recipient_phone="+4915166666666",
+                payload_phone="+4915177777777",
+                suffix="local-phone-fallback-mismatch",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recipient_phone", "payload_phone"),
+    [
+        ("+4915144444444", "+4915155555555"),
+        (None, "+4915144444444"),
+        ("+4915144444444", None),
+        ("+49invalid", "+49invalid"),
+    ],
+    ids=["different", "missing-recipient", "missing-payload", "invalid"],
+)
+async def test_crm_only_phone_mismatch_is_blocked(
+    session_maker,
+    monkeypatch,
+    recipient_phone,
+    payload_phone,
+) -> None:
+    reached_delivery, send_template, send_text = _campaign_delivery_probes(monkeypatch)
+
+    async with session_maker() as session:
+        async with session.begin():
+            _run, _recipient, job = await _persist_delivery_identity(
+                session,
+                company_ids=[COMPANY_ID],
+                recipient_phone=recipient_phone,
+                payload_phone=payload_phone,
+                suffix="crm-phone-mismatch",
+            )
+            await outbox_worker._run_job_logic(session, job, provider=MagicMock())
+            assert job.status == "failed"
+            assert job.last_error == CAMPAIGN_IDENTITY_MISMATCH
+            assert job.attempts == 0
+            assert await session.scalar(select(func.count()).select_from(OutboxMessage)) == 0
+
+    reached_delivery.assert_not_awaited()
+    send_template.assert_not_awaited()
+    send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_multi_company_run_jobs_pass_identity_guard(session_maker, monkeypatch) -> None:
     reached_delivery = AsyncMock(return_value=object())
     monkeypatch.setattr(outbox_worker, "_find_success_outbox", reached_delivery)
@@ -501,6 +899,7 @@ async def test_multi_company_run_jobs_pass_identity_guard(session_maker, monkeyp
                     provider="altegio",
                     campaign_run_id=run.id,
                     company_id=company_id,
+                    phone_e164=f"+491511111{company_id}",
                     status="queued",
                 )
                 session.add(recipient)
@@ -517,6 +916,7 @@ async def test_multi_company_run_jobs_pass_identity_guard(session_maker, monkeyp
                     payload={
                         "campaign_run_id": run.id,
                         "campaign_recipient_id": recipient.id,
+                        "phone_e164": recipient.phone_e164,
                     },
                 )
                 session.add(job)
