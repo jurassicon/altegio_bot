@@ -15,13 +15,16 @@ import altegio_bot.campaigns.configuration as configuration
 import altegio_bot.campaigns.easyweek_segment as segment
 import altegio_bot.campaigns.runner as runner
 import altegio_bot.scripts.easyweek_campaign_preflight as preflight
-from altegio_bot.campaigns.configuration import CAMPAIGN_LIVE_GUARD_UNPROVEN, resolve_campaign_readiness
+from altegio_bot.campaigns.configuration import resolve_campaign_readiness
+from altegio_bot.campaigns.easyweek_customer_history import (
+    API_CONFIGURATION_UNAVAILABLE,
+    API_RETRYABLE_UNCERTAINTY,
+)
 from altegio_bot.campaigns.easyweek_eligibility import (
     BOOKING_CANCELED,
     BOOKING_LOCATION_MISMATCH,
     BOOKING_NOT_FOUND,
     BOOKING_RESPONSE_MALFORMED,
-    BOOKING_RETRYABLE_UNAVAILABLE,
     BOOKING_SERVICE_COUNT_UNPROVEN,
     BOOKING_UUID_MISMATCH,
     CONFLICTING_FIRST_VISIT_EVIDENCE,
@@ -33,7 +36,10 @@ from altegio_bot.campaigns.easyweek_segment import (
     EasyWeekSegmentUnavailable,
     build_easyweek_segment,
 )
-from altegio_bot.campaigns.provider import EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED
+from altegio_bot.campaigns.provider import (
+    CAMPAIGN_EXECUTION_NOT_AUTHORIZED,
+    EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED,
+)
 from altegio_bot.campaigns.runner import RunParams
 from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
@@ -65,6 +71,7 @@ OTHER_COMPANY_ID = 308697
 LOCATION_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 OTHER_LOCATION_UUID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 BOOKING_UUID = uuid.UUID("11111111-2222-4333-8444-555555555555")
+CUSTOMER_UUID = uuid.UUID("22222222-3333-4444-8555-666666666666")
 BOOKING_ID = 1811630
 CUSTOMER_ID = 323876
 START = datetime(2026, 8, 15, 10, tzinfo=timezone.utc)
@@ -609,6 +616,9 @@ def _api(**changes: Any) -> dict[str, Any]:
         "uuid": str(BOOKING_UUID),
         "location_uuid": LOCATION_UUID,
         "is_canceled": False,
+        "is_completed": True,
+        "customer": {"uuid": str(CUSTOMER_UUID)},
+        "start_time": START.isoformat(),
         "ordered_services": [{}],
     }
     payload.update(changes)
@@ -659,12 +669,25 @@ class _Reader:
         self.payload = payload if payload is not None else _api()
         self.error = error
         self.calls: list[str] = []
+        self.customer_calls: list[str] = []
+        self.history_calls: list[tuple[str, int, int]] = []
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
         self.calls.append(booking_uuid)
         if self.error is not None:
             raise self.error
         return self.payload  # type: ignore[return-value]
+
+    async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        self.customer_calls.append(customer_uuid)
+        return {"uuid": customer_uuid}
+
+    async def list_customer_bookings(self, customer_uuid: str, page: int, per_page: int = 100) -> dict[str, Any]:
+        self.history_calls.append((customer_uuid, page, per_page))
+        return {
+            "data": [self.payload],
+            "meta": {"current_page": page, "last_page": 1, "per_page": 100, "total": 1},
+        }
 
 
 async def _preview(session_maker, monkeypatch: pytest.MonkeyPatch) -> CampaignRun:
@@ -687,17 +710,17 @@ async def _preview(session_maker, monkeypatch: pytest.MonkeyPatch) -> CampaignRu
     ("error", "reason", "retryable"),
     [
         (EasyWeekNotFoundError("hidden", operation="get_booking", status_code=404), BOOKING_NOT_FOUND, 0),
-        (EasyWeekRetryableError("hidden", operation="get_booking", status_code=429), BOOKING_RETRYABLE_UNAVAILABLE, 1),
-        (EasyWeekRetryableError("hidden", operation="get_booking", status_code=500), BOOKING_RETRYABLE_UNAVAILABLE, 1),
-        (EasyWeekRetryableError("hidden", operation="get_booking"), BOOKING_RETRYABLE_UNAVAILABLE, 1),
+        (EasyWeekRetryableError("hidden", operation="get_booking", status_code=429), API_RETRYABLE_UNCERTAINTY, 1),
+        (EasyWeekRetryableError("hidden", operation="get_booking", status_code=500), API_RETRYABLE_UNCERTAINTY, 1),
+        (EasyWeekRetryableError("hidden", operation="get_booking"), API_RETRYABLE_UNCERTAINTY, 1),
         (
             EasyWeekConfigError("hidden", operation="get_booking"),
-            "easyweek_campaign_booking_configuration_unavailable",
+            API_CONFIGURATION_UNAVAILABLE,
             0,
         ),
         (
             EasyWeekAuthError("hidden", operation="get_booking", status_code=401),
-            "easyweek_campaign_booking_configuration_unavailable",
+            API_CONFIGURATION_UNAVAILABLE,
             0,
         ),
     ],
@@ -729,7 +752,6 @@ async def test_preflight_classifies_api_without_writes_or_attempts(
             await session.scalar(select(func.count()).select_from(OutboxMessage)),
         )
     assert report.reasons[reason] == 1
-    assert report.reasons[CAMPAIGN_LIVE_GUARD_UNPROVEN] == 1
     assert report.retryable_uncertainty_count == retryable
     assert report.send_ready_count == 0
     assert report.ready_for_send is False
@@ -770,8 +792,19 @@ async def test_preflight_success_is_partial_truncatable_and_never_send_ready(
     assert report.truncated is True
     assert report.local_eligible_count == 1
     assert report.source_booking_current_count == 1
+    assert report.customer_identity_current_count == 1
+    assert report.history_complete_count == 1
+    assert report.first_visit_current_count == 1
+    assert report.no_active_future_booking_count == 1
+    assert report.live_guard_ready_count == 1
+    assert report.pages_read == 1
     assert report.send_ready_count == 0
-    assert report.reasons == {CAMPAIGN_LIVE_GUARD_UNPROVEN: 1}
+    assert report.reasons == {}
+    assert report.live_guard_ready_count == 1
+    assert report.live_guard_ready is False  # the selected slice was truncated
+    assert report.delivery_authorized is False
+    assert report.as_safe_dict()["ready_for_send"] is False
+    assert report.as_safe_dict()["delivery_authorized"] is False
     assert reader.calls == [str(BOOKING_UUID)]
 
 
@@ -825,6 +858,7 @@ async def test_readiness_exposes_subset_but_keeps_send_blocked(session_maker, mo
         )
     assert readiness.segment_source == SEGMENT_SOURCE
     assert EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED not in readiness.reasons
-    assert CAMPAIGN_LIVE_GUARD_UNPROVEN in readiness.reasons
+    assert CAMPAIGN_EXECUTION_NOT_AUTHORIZED in readiness.reasons
+    assert readiness.live_guard == "easyweek_customer_booking_history_reproof"
     assert readiness.supported_job_types == ()
     assert readiness.ready_for_send is False

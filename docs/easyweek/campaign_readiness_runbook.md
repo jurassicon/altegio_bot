@@ -1,6 +1,6 @@
-# EasyWeek campaign readiness after PR-14
+# EasyWeek campaign readiness after PR-15
 
-PR-14 adds a local read-only EasyWeek preview of a proven subset. Existing
+PR-15 adds a read-only customer booking-history guard to the proven subset. Existing
 Altegio campaigns keep their current preview, send-real, loyalty, follow-up,
 retry and reporting paths. EasyWeek campaign sending is **not enabled**.
 
@@ -8,7 +8,7 @@ retry and reporting paths. EasyWeek campaign sending is **not enabled**.
 
 An EasyWeek preview creates a completed `CampaignRun` and durable recipient
 snapshots from processed `booking-succeeded` evidence. It reads only local
-EasyWeek rows and calls no CRM API. EasyWeek send-real, resume, retry and
+EasyWeek rows. The separate preflight uses reviewed EasyWeek GETs only. EasyWeek send-real, resume, retry and
 follow-up requests remain refused. A late EasyWeek campaign/newsletter job is
 made terminal before template/sender lookup, CRM or loyalty access, Outbox
 creation, Meta, Chatwoot, or an attempt increment.
@@ -16,10 +16,11 @@ creation, Meta, Chatwoot, or an attempt increment.
 Transport configuration is necessary but not sufficient. Readiness resolves
 the provider, location and booking page, sender, DB-first Meta template,
 language, segment source, live guard and supported job types as one scope. A
-configured URL, sender and template cannot substitute for an implemented
-EasyWeek live eligibility guard. The segment source is now
-`easyweek_booking_succeeded_local_proven_subset`; the live guard remains
-`campaign_live_guard_unproven` and supported EasyWeek job types remain empty.
+configured URL, sender and template cannot substitute for delivery authorization.
+The segment source remains `easyweek_booking_succeeded_local_proven_subset`;
+the live guard is `easyweek_customer_booking_history_reproof`, while supported
+EasyWeek job types remain empty and `campaign_execution_not_authorized` keeps
+global readiness false.
 
 ## Preview and coverage
 
@@ -59,18 +60,22 @@ Run one bounded re-proof from the application environment:
 uv run python -m altegio_bot.scripts.easyweek_campaign_preflight PREVIEW_RUN_ID --limit 50
 ```
 
-The command reads eligible recipient snapshots and issues at most one reviewed
-`GET /bookings/{uuid}` per selected recipient, sequentially. It reports counts,
-reason distribution and `truncated`; it never changes recipient status or
-attempts and never creates jobs/outbox. A truncated result proves only the
-inspected slice. The command deliberately exits non-zero because PR-14 cannot
-grant send permission.
+The command reads eligible recipient snapshots, then sequentially reads the
+source booking, its exact customer card, and every fixed-size page of
+`GET /bookings?customer_uuid=...`. Requests and pages are paced and bounded.
+The safe report separates `live_guard_ready` from
+`delivery_authorized=false` and `ready_for_send=false`; it contains counters,
+page count, reason distribution and `truncated`, but no UUID or customer PII.
+It never changes recipient status or attempts and never creates jobs/outbox. A
+truncated result proves only the inspected slice. The command deliberately
+exits non-zero because this eligibility proof cannot grant send permission.
 
-A successful GET proves only that the named booking UUID is current in the
-expected location, not canceled, and has one ordered service. Customer PII and
-UUID, status display text, links, service names and prices are ignored. The GET
-does not prove numeric customer identity, current visits total, full history or
-absence of other future bookings, so `campaign_live_guard_unproven` remains.
+`GET /customers/{uuid}` does not provide `visits_total`, and the Public API has
+no usable `/customers/{uuid}/bookings` endpoint. The proof therefore reconciles
+the complete, strictly paginated booking filter above and verifies every row
+belongs to the same EasyWeek customer card. It requires exactly one completed,
+non-canceled visit and no active future booking. This is not an import or
+reconstruction of historical Altegio visits.
 
 ## Read-only voucher evidence
 
@@ -98,10 +103,8 @@ voucher counters do not prove an issuance contract.
 
 ## Required evidence before a later send PR
 
-The next separately authorized PR must prove customer-level live eligibility
-using a documented current-visits/customer identity endpoint, a documented
-customer booking/history listing, another confirmed customer-level source, or
-a separate reconciliation contract. Gift-card sending additionally requires:
+The next separately authorized PR must prove gift-card issue/sale semantics,
+then implement the write path and controlled delivery. It requires:
 
 - a supported way to issue or sell one customer voucher;
 - idempotent write identity;
@@ -116,5 +119,5 @@ remain fail closed.
 ## Development boundary
 
 Do not run production commands, authenticated production probes, CRM mutations,
-voucher/POS writes, or customer sends while developing or reviewing PR-14.
+voucher/POS writes, or customer sends while developing or reviewing PR-15.
 Validation uses local tests and a disposable PostgreSQL 16 instance only.

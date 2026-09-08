@@ -8,6 +8,7 @@ from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK
 
 EASYWEEK_CAMPAIGN_SEGMENT_NOT_IMPLEMENTED: Final = "easyweek_campaign_segment_not_implemented"
 CAMPAIGN_LIVE_GUARD_UNPROVEN: Final = "campaign_live_guard_unproven"
+CAMPAIGN_EXECUTION_NOT_AUTHORIZED: Final = "campaign_execution_not_authorized"
 CAMPAIGN_PROVIDER_UNKNOWN: Final = "campaign_provider_unknown"
 CAMPAIGN_PROVIDER_MISMATCH: Final = "campaign_provider_mismatch"
 CAMPAIGN_IDENTITY_MISMATCH: Final = "campaign_identity_mismatch"

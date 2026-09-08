@@ -1,4 +1,4 @@
-"""Read-only PR-14 re-proof for one EasyWeek campaign preview snapshot."""
+"""Read-only PR-15 eligibility preflight; never a permission to send."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ class CampaignPreflightReport:
     checked_count: int = 0
     local_eligible_count: int = 0
     source_booking_current_count: int = 0
+    customer_identity_current_count: int = 0
+    history_complete_count: int = 0
+    first_visit_current_count: int = 0
+    no_active_future_booking_count: int = 0
+    live_guard_ready_count: int = 0
+    pages_read: int = 0
     send_ready_count: int = 0
     retryable_uncertainty_count: int = 0
     truncated: bool = False
@@ -39,6 +45,18 @@ class CampaignPreflightReport:
     @property
     def ready_for_send(self) -> bool:
         return False
+
+    @property
+    def delivery_authorized(self) -> bool:
+        return False
+
+    @property
+    def live_guard_ready(self) -> bool:
+        return (
+            self.checked_count > 0
+            and not self.truncated
+            and self.checked_count == self.candidate_count == self.live_guard_ready_count
+        )
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -49,10 +67,18 @@ class CampaignPreflightReport:
             "checked_count": self.checked_count,
             "local_eligible_count": self.local_eligible_count,
             "source_booking_current_count": self.source_booking_current_count,
+            "customer_identity_current_count": self.customer_identity_current_count,
+            "history_complete_count": self.history_complete_count,
+            "first_visit_current_count": self.first_visit_current_count,
+            "no_active_future_booking_count": self.no_active_future_booking_count,
+            "live_guard_ready_count": self.live_guard_ready_count,
+            "pages_read": self.pages_read,
             "send_ready_count": self.send_ready_count,
             "retryable_uncertainty_count": self.retryable_uncertainty_count,
             "truncated": self.truncated,
             "reasons": dict(sorted(self.reasons.items())),
+            "live_guard_ready": self.live_guard_ready,
+            "delivery_authorized": False,
             "ready_for_send": False,
         }
 
@@ -123,10 +149,18 @@ async def run_preflight(
             allowed_categories_raw=settings.easyweek_allowed_service_categories,
             client_reader=client,
             now=utcnow(),
+            pause=pause,
+            pause_sec=pause_sec,
         )
         report.checked_count += 1
         report.local_eligible_count += int(result.local_eligible)
         report.source_booking_current_count += int(result.source_booking_current)
+        report.customer_identity_current_count += int(result.customer_identity_current)
+        report.history_complete_count += int(result.history_complete)
+        report.first_visit_current_count += int(result.first_visit_current)
+        report.no_active_future_booking_count += int(result.no_active_future_booking)
+        report.live_guard_ready_count += int(result.live_guard_ready)
+        report.pages_read += result.pages_read
         report.send_ready_count += int(result.send_ready)
         report.retryable_uncertainty_count += int(result.retryable_uncertainty)
         report.reasons.update(result.reasons)
@@ -134,7 +168,9 @@ async def run_preflight(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read-only EasyWeek campaign preview preflight")
+    parser = argparse.ArgumentParser(
+        description="Read-only EasyWeek campaign eligibility preflight; this is not permission to send"
+    )
     parser.add_argument("preview_run_id", type=int)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--pause-sec", type=float, default=DEFAULT_PAUSE_SEC)
@@ -163,7 +199,7 @@ async def main(argv: list[str] | None = None) -> int:
     finally:
         await client.aclose()
     print(report.as_safe_dict())
-    # PR-14 is diagnostic only.  A successful inspection is still not a send
+    # PR-15 is diagnostic only.  A successful inspection is still not a send
     # permission, so the command deliberately remains non-zero.
     return 1
 

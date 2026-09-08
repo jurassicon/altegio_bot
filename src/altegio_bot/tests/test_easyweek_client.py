@@ -57,6 +57,7 @@ ALL_SENTINELS = (
 # intercepts every request, so no real network call happens.
 BASE = "https://my.easyweek.io/api/public/v2"
 BOOKING_UUID = "123e4567-e89b-12d3-a456-426614174000"
+CUSTOMER_UUID = "123e4567-e89b-42d3-a456-426614174001"
 VALID_UUID = "3f2a1b6c-0d4e-4f8a-9b1c-2d3e4f5a6b7c"
 VOUCHER_TEMPLATE_UUID = "49bc000c-c3a6-47c7-bdfd-b8ccd3ae2677"
 
@@ -329,6 +330,16 @@ async def test_only_get_is_ever_issued() -> None:
             return httpx.Response(200, json=[])
         if "/bookings/" in request.url.path:
             return httpx.Response(200, json=_BOOKING_WITH_PII)
+        if "/customers/" in request.url.path:
+            return httpx.Response(200, json={"data": {"uuid": CUSTOMER_UUID}})
+        if request.url.path.endswith("/bookings"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "meta": {"current_page": 1, "last_page": 1, "per_page": 100, "total": 0},
+                },
+            )
         if request.url.path.endswith("/voucher-templates"):
             return httpx.Response(200, json={"data": [{"uuid": VOUCHER_TEMPLATE_UUID}]})
         if request.url.path.endswith(f"/voucher-templates/{VOUCHER_TEMPLATE_UUID}"):
@@ -341,11 +352,126 @@ async def test_only_get_is_ever_issued() -> None:
         await client.ping()
         await client.list_locations()
         await client.get_booking(BOOKING_UUID)
+        await client.get_customer(CUSTOMER_UUID)
+        await client.list_customer_bookings(CUSTOMER_UUID, page=1)
         await client.get_workspace()
         await client.list_voucher_templates()
         await client.get_voucher_template(VOUCHER_TEMPLATE_UUID)
 
     assert set(methods) == {"GET"}
+
+
+@pytest.mark.asyncio
+async def test_customer_and_history_use_exact_paths_and_query() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "/customers/" in request.url.path:
+            return httpx.Response(200, json={"data": {"uuid": CUSTOMER_UUID}})
+        return httpx.Response(200, json={"data": [], "meta": {}})
+
+    async with _client(handler) as client:
+        customer = await client.get_customer(CUSTOMER_UUID)
+        page = await client.list_customer_bookings(CUSTOMER_UUID, page=2)
+
+    assert customer == {"uuid": CUSTOMER_UUID}
+    assert page == {"data": [], "meta": {}}
+    assert seen[0].url.path == f"/api/public/v2/customers/{CUSTOMER_UUID}"
+    assert seen[0].url.query == b""
+    assert seen[1].url.path == "/api/public/v2/bookings"
+    assert dict(seen[1].url.params) == {
+        "customer_uuid": CUSTOMER_UUID,
+        "page": "2",
+        "per_page": "100",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_uuid", ["", "not-a-uuid", BOOKING_UUID.upper(), f" {CUSTOMER_UUID}"])
+async def test_customer_uuid_is_strictly_canonical_before_wire(bad_uuid: str) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.get_customer(bad_uuid)
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_customer_bookings(bad_uuid, page=1)
+    assert seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", [True, 0, -1, 1.0, "1"])
+async def test_customer_history_page_is_positive_exact_integer(page: object) -> None:
+    async with _client(lambda request: httpx.Response(200, json={})) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_customer_bookings(CUSTOMER_UUID, page=page)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("per_page", [True, 0, 99, 101])
+async def test_customer_history_page_size_is_fixed(per_page: object) -> None:
+    async with _client(lambda request: httpx.Response(200, json={})) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_customer_bookings(CUSTOMER_UUID, page=1, per_page=per_page)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_customer_history_errors_and_logs_do_not_expose_identity_or_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=f"{CUSTOMER_NAME} {CUSTOMER_PHONE} {BODY_MARKER}")
+
+    caplog.set_level(logging.DEBUG)
+    async with _client(handler, max_attempts=1) as client:
+        with pytest.raises(EasyWeekRetryableError) as exc_info:
+            await client.list_customer_bookings(CUSTOMER_UUID, page=1)
+    combined = " ".join([caplog.text, str(exc_info.value), repr(exc_info.value)])
+    assert CUSTOMER_UUID not in combined
+    for sentinel in ALL_SENTINELS:
+        assert sentinel not in combined
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "body"),
+    [
+        ("customer", {"data": []}),
+        ("customer", []),
+        ("history", []),
+        ("history", None),
+    ],
+)
+async def test_customer_reads_reject_malformed_top_level_shapes(method: str, body: object) -> None:
+    async with _client(lambda request: httpx.Response(200, json=body)) as client:
+        with pytest.raises(EasyWeekProtocolError):
+            if method == "customer":
+                await client.get_customer(CUSTOMER_UUID)
+            else:
+                await client.list_customer_bookings(CUSTOMER_UUID, page=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (401, EasyWeekAuthError),
+        (403, EasyWeekAuthError),
+        (404, EasyWeekNotFoundError),
+        (422, EasyWeekPermanentError),
+        (429, EasyWeekRetryableError),
+        (503, EasyWeekRetryableError),
+    ],
+)
+async def test_customer_history_preserves_typed_error_taxonomy(status: int, error_type: type[EasyWeekError]) -> None:
+    async with _client(lambda request: httpx.Response(status), max_attempts=1) as client:
+        with pytest.raises(error_type):
+            await client.list_customer_bookings(CUSTOMER_UUID, page=1)
 
 
 @pytest.mark.asyncio
