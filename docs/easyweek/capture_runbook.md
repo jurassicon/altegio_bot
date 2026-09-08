@@ -861,10 +861,108 @@ SELECT payload FROM whatsapp_events WHERE id = :id;
 Автоматического TTL в PR-1 **нет** — ни cron, ни job, ни триггера. Рекомендуемая
 **ручная** политика хранения — 30 дней:
 
+<!-- easyweek-event-retention:start -->
+
+Начиная с PR-14, часть событий является durable source proof для
+`CampaignRecipient`. Такие строки намеренно хранятся вместе с campaign audit
+history и не участвуют в обычной retention-очистке. Процедура ниже выводит
+только агрегированные счётчики; она не читает и не печатает payload, raw body,
+телефоны, booking UUID или другие клиентские данные.
+
+Запускать одним `psql`-сеансом. `ON_ERROR_STOP` не позволит перейти к `COMMIT`
+после ошибки, а повторяемый snapshot удерживает один cutoff для preview,
+удаления и итоговой проверки:
+
 ```sql
-DELETE FROM easyweek_events WHERE received_at < now() - interval '30 days';
+\set ON_ERROR_STOP on
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+-- До удаления: всего старых, удержанных durable proof и доступных для удаления.
+WITH old_events AS (
+    SELECT e.id
+    FROM easyweek_events AS e
+    WHERE e.received_at < transaction_timestamp() - interval '30 days'
+)
+SELECT
+    count(*) AS old_events_total,
+    count(*) FILTER (
+        WHERE EXISTS (
+            SELECT 1
+            FROM campaign_recipients AS cr
+            WHERE cr.provider = 'easyweek'
+              AND cr.source_easyweek_event_id = old_events.id
+        )
+    ) AS retained_campaign_source_events,
+    count(*) FILTER (
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM campaign_recipients AS cr
+            WHERE cr.provider = 'easyweek'
+              AND cr.source_easyweek_event_id = old_events.id
+        )
+    ) AS deletable_old_events
+FROM old_events;
+
+-- Удаляются только старые события, не связанные с durable campaign proof.
+WITH deleted AS (
+    DELETE FROM easyweek_events AS e
+    WHERE e.received_at < transaction_timestamp() - interval '30 days'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM campaign_recipients AS cr
+          WHERE cr.provider = 'easyweek'
+            AND cr.source_easyweek_event_id = e.id
+      )
+    RETURNING 1
+)
+SELECT count(*) AS deleted_events FROM deleted;
+
+-- После удаления: удаляемых строк не должно остаться; source proof удерживается.
+SELECT
+    count(*) FILTER (
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM campaign_recipients AS cr
+            WHERE cr.provider = 'easyweek'
+              AND cr.source_easyweek_event_id = e.id
+        )
+    ) AS remaining_deletable_old_events,
+    count(*) FILTER (
+        WHERE EXISTS (
+            SELECT 1
+            FROM campaign_recipients AS cr
+            WHERE cr.provider = 'easyweek'
+              AND cr.source_easyweek_event_id = e.id
+        )
+    ) AS retained_campaign_source_events
+FROM easyweek_events AS e
+WHERE e.received_at < transaction_timestamp() - interval '30 days';
+
+-- Ненулевой остаток отменяет весь запуск через ON_ERROR_STOP.
+DO $retention_check$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM easyweek_events AS e
+        WHERE e.received_at < transaction_timestamp() - interval '30 days'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM campaign_recipients AS cr
+              WHERE cr.provider = 'easyweek'
+                AND cr.source_easyweek_event_id = e.id
+          )
+    ) THEN
+        RAISE EXCEPTION 'easyweek event retention verification failed';
+    END IF;
+END
+$retention_check$;
+
+COMMIT;
 ```
 
 Запускать только по отдельному согласованию и после бэкапа: пока идёт
 исследовательская фаза, каждая удалённая строка — потерянные данные, которые
 EasyWeek не переотправит.
+
+<!-- easyweek-event-retention:end -->

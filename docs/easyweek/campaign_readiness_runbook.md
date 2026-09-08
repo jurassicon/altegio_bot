@@ -38,6 +38,19 @@ The observed baseline had 265 of 300 EasyWeek clients without a proven current
 zero. A past `starts_at` only places an already proven succeeded booking in the
 period; it does not prove attendance by itself.
 
+## Durable source-event retention
+
+An eligible EasyWeek preview recipient keeps its referenced
+`easyweek_events` row as durable source proof. The manual event-retention
+procedure in `capture_runbook.md` therefore skips every old event referenced by
+an EasyWeek `CampaignRecipient` and reports the retained count separately.
+
+Discarding, hiding or soft-deleting a preview does not physically delete its
+`CampaignRecipient` audit rows, so it does not release the referenced source
+events. Physically deleting campaign audit history, defining its retention
+period or releasing those events is outside PR-14 and requires a separate,
+explicitly authorised task.
+
 ## Read-only preflight
 
 Run one bounded re-proof from the application environment:
