@@ -14,6 +14,7 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_CATEGORY_AMBIGUOUS,
     MULTI_SERVICE_CATEGORY_NOT_ALLOWED,
     MULTI_SERVICE_CURRENCY_MISMATCH,
+    MULTI_SERVICE_CUSTOM_DURATION_EXCLUSION_NOT_PROVEN,
     MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED,
     MULTI_SERVICE_DESCRIPTION_MISMATCH,
@@ -21,6 +22,7 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_DUPLICATE_AMBIGUOUS,
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_NAMES_NOT_DISTINCT,
+    MULTI_SERVICE_ORDERED_SERVICES_MALFORMED,
     MULTI_SERVICE_QUANTITY_UNSUPPORTED,
     MULTI_SERVICE_RECORD_COUNT_MISMATCH,
     MULTI_SERVICE_RELATED_MISSING,
@@ -37,6 +39,7 @@ from altegio_bot.easyweek_multi_service import (
     multi_service_job_payload,
     multi_service_send_guard,
     multi_service_snapshot_from_record_raw,
+    prove_exactly_two_service_custom_duration_exclusion,
     prove_exactly_two_service_snapshot,
     read_catalog_rows_cached,
     record_raw_with_multi_service_snapshot,
@@ -139,6 +142,16 @@ def _reason(**kwargs: object) -> str:
     return caught.value.reason
 
 
+def _exclusion_reason(*, booking: object, catalog=None) -> str:
+    with pytest.raises(MultiServiceProofError) as caught:
+        prove_exactly_two_service_custom_duration_exclusion(
+            webhook=_pair(),
+            booking_payload=booking,
+            catalog_rows=_catalog() if catalog is None else catalog,
+        )
+    return caught.value.reason
+
+
 def test_two_business_lines_are_kept_in_order_with_their_actual_prices() -> None:
     snapshot = _prove()
     assert [line.display_name for line in snapshot.lines] == ["Erste Leistung", "Zweite Leistung"]
@@ -233,6 +246,93 @@ def test_custom_price_and_duration_fail_closed() -> None:
     assert isinstance(rows, list)
     rows[0]["original_duration"] = _duration(45)
     assert _reason(booking=booking) == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED
+
+
+def test_custom_duration_exclusion_proves_all_other_fields_and_resource_shadow() -> None:
+    booking = _booking()
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    rows[0]["original_duration"] = _duration(15)
+    assert _reason(booking=booking) == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED
+    digest = prove_exactly_two_service_custom_duration_exclusion(
+        webhook=_pair(),
+        booking_payload=booking,
+        catalog_rows=_catalog(),
+    )
+    assert len(digest) == 64
+
+    shadow_booking = copy.deepcopy(booking)
+    shadow_rows = shadow_booking["ordered_services"]
+    assert isinstance(shadow_rows, list)
+    shadow = copy.deepcopy(shadow_rows[0])
+    shadow["uuid"] = "10000000-0000-4000-8000-000000000003"
+    shadow_rows.insert(1, shadow)
+    assert (
+        prove_exactly_two_service_custom_duration_exclusion(
+            webhook=_pair(),
+            booking_payload=shadow_booking,
+            catalog_rows=_catalog(),
+        )
+        == digest
+    )
+
+
+def test_custom_duration_exclusion_refuses_a_standard_duration_pair() -> None:
+    assert _exclusion_reason(booking=_booking()) == MULTI_SERVICE_CUSTOM_DURATION_EXCLUSION_NOT_PROVEN
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_reason"),
+    [
+        ("total", MULTI_SERVICE_TOTAL_MISMATCH),
+        ("currency", MULTI_SERVICE_CURRENCY_MISMATCH),
+        ("custom_price", MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED),
+        ("discount", MULTI_SERVICE_DISCOUNT_UNSUPPORTED),
+        ("quantity", MULTI_SERVICE_QUANTITY_UNSUPPORTED),
+        ("missing_catalog", MULTI_SERVICE_CATALOG_MATCH_MISSING),
+        ("ambiguous_catalog", MULTI_SERVICE_CATEGORY_AMBIGUOUS),
+        ("malformed", MULTI_SERVICE_ORDERED_SERVICES_MALFORMED),
+        ("duplicate", MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+        ("third_service", MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+    ],
+)
+def test_custom_duration_exclusion_does_not_hide_a_second_error(
+    damage: str,
+    expected_reason: str,
+) -> None:
+    booking = _booking()
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    rows[0]["original_duration"] = _duration(15)
+    catalog = _catalog()
+
+    if damage == "total":
+        booking["order"] = {"subtotal": 9500, "total": 9400}
+    elif damage == "currency":
+        booking["currency"] = "USD"
+    elif damage == "custom_price":
+        rows[1]["original_price"] = 6400
+    elif damage == "discount":
+        rows[1]["discount"] = 1
+    elif damage == "quantity":
+        rows[1]["quantity"] = 2
+    elif damage == "missing_catalog":
+        catalog = catalog[:1]
+    elif damage == "ambiguous_catalog":
+        duplicate = copy.deepcopy(catalog[1])
+        duplicate["uuid"] = "30000000-0000-4000-8000-000000000003"
+        duplicate["category"] = {"uuid": CATEGORY_UUID, "name": "Nagelservice"}
+        catalog.append(duplicate)
+    elif damage == "malformed":
+        rows[1] = "not-a-service-line"
+    elif damage == "duplicate":
+        rows[1] = copy.deepcopy(rows[0])
+        rows[1]["uuid"] = LINE_B_UUID
+    else:
+        rows.append(_line("Dritte Leistung", 0, 10, "10000000-0000-4000-8000-000000000004"))
+
+    assert _reason(booking=booking, catalog=catalog) == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED
+    assert _exclusion_reason(booking=booking, catalog=catalog) == expected_reason
 
 
 def test_currency_and_all_three_totals_must_agree() -> None:

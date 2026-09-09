@@ -13,7 +13,16 @@ import pytest
 from sqlalchemy import func, select
 
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_CATALOG_MATCH_MISSING,
+    MULTI_SERVICE_CATEGORY_AMBIGUOUS,
+    MULTI_SERVICE_CURRENCY_MISMATCH,
     MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
+    MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED,
+    MULTI_SERVICE_DISCOUNT_UNSUPPORTED,
+    MULTI_SERVICE_DUPLICATE_AMBIGUOUS,
+    MULTI_SERVICE_ORDERED_SERVICES_MALFORMED,
+    MULTI_SERVICE_QUANTITY_UNSUPPORTED,
+    MULTI_SERVICE_TOTAL_MISMATCH,
     clear_multi_service_catalog_cache,
 )
 from altegio_bot.easyweek_multi_service_recovery import (
@@ -137,11 +146,18 @@ def _api(
     second_price: int = 4500,
     booking_uuid: str = TEST_BOOKING_UUID,
     custom_duration: bool = False,
+    resource_shadow: bool = False,
 ) -> dict[str, Any]:
     status = "canceled" if canceled else "completed" if completed else "active"
+    first_line = _line("11111111-1111-4111-8111-111111111111", first, 3500, 30)
     second_line = _line("22222222-2222-4222-8222-222222222222", second, second_price, 45)
     if custom_duration:
         second_line["duration"] = {"value": 75, "label": "minutes"}
+    ordered_services = [first_line, second_line]
+    if resource_shadow:
+        shadow = copy.deepcopy(second_line)
+        shadow["uuid"] = "33333333-3333-4333-8333-333333333333"
+        ordered_services.insert(1, shadow)
     return {
         "uuid": booking_uuid,
         "location_uuid": TEST_LOCATION_UUID,
@@ -151,10 +167,7 @@ def _api(
         "status": {"type": status},
         "currency": "EUR",
         "order": {"subtotal": 3500 + second_price, "total": 3500 + second_price},
-        "ordered_services": [
-            _line("11111111-1111-4111-8111-111111111111", first, 3500, 30),
-            second_line,
-        ],
+        "ordered_services": ordered_services,
     }
 
 
@@ -190,6 +203,7 @@ class FakeReader:
         fail: bool = False,
         custom_duration: bool = False,
         bookings: dict[str, dict[str, Any]] | None = None,
+        catalog_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.starts_at = starts_at
         self.canceled = canceled
@@ -198,6 +212,7 @@ class FakeReader:
         self.fail = fail
         self.custom_duration = custom_duration
         self.bookings = bookings
+        self.catalog_rows = catalog_rows
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
         if self.fail:
@@ -214,7 +229,7 @@ class FakeReader:
 
     async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
         assert (location_uuid, page) == (TEST_LOCATION_UUID, 1)
-        rows = _catalog(second_category=self.second_category)
+        rows = self.catalog_rows or _catalog(second_category=self.second_category)
         return {"data": rows, "meta": {"current_page": 1, "last_page": 1, "total": len(rows)}}
 
 
@@ -464,10 +479,25 @@ async def test_contract_exclusion_does_not_resurrect_terminal_history(
 
 
 @pytest.mark.parametrize(
-    "damage",
-    ["custom_price", "discount", "quantity", "malformed", "duplicate", "total", "currency", "location"],
+    ("damage", "expected_reason"),
+    [
+        ("total", MULTI_SERVICE_TOTAL_MISMATCH),
+        ("currency", MULTI_SERVICE_CURRENCY_MISMATCH),
+        ("custom_price", MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED),
+        ("discount", MULTI_SERVICE_DISCOUNT_UNSUPPORTED),
+        ("quantity", MULTI_SERVICE_QUANTITY_UNSUPPORTED),
+        ("missing_catalog", MULTI_SERVICE_CATALOG_MATCH_MISSING),
+        ("ambiguous_catalog", MULTI_SERVICE_CATEGORY_AMBIGUOUS),
+        ("malformed", MULTI_SERVICE_ORDERED_SERVICES_MALFORMED),
+        ("duplicate", MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+        ("third_service", MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+    ],
 )
-async def test_only_custom_duration_becomes_contract_exclusion(session_maker, damage: str) -> None:
+async def test_custom_duration_with_a_second_error_stays_blocking(
+    session_maker,
+    damage: str,
+    expected_reason: str,
+) -> None:
     starts = NOW + timedelta(days=2)
     async with session_maker() as session:
         async with session.begin():
@@ -475,30 +505,88 @@ async def test_only_custom_duration_becomes_contract_exclusion(session_maker, da
         payload = _api(starts_at=starts)
         services = payload["ordered_services"]
         assert isinstance(services, list)
-        if damage == "custom_price":
+        services[0]["duration"] = {"value": 60, "label": "minutes"}
+        catalog = _catalog()
+        if damage == "total":
+            payload["order"]["total"] = 7900
+        elif damage == "currency":
+            payload["currency"] = "USD"
+        elif damage == "custom_price":
             services[1]["original_price"] = 4600
         elif damage == "discount":
             services[1]["discount"] = 1
         elif damage == "quantity":
             services[1]["quantity"] = 2
+        elif damage == "missing_catalog":
+            catalog = catalog[:1]
+        elif damage == "ambiguous_catalog":
+            duplicate = copy.deepcopy(catalog[1])
+            duplicate["uuid"] = "aaaaaaaa-3333-4333-8333-333333333333"
+            duplicate["category"] = {"name": "Other"}
+            catalog.append(duplicate)
         elif damage == "malformed":
-            payload["ordered_services"] = "not-a-list"
+            services[1] = "not-a-service-line"
         elif damage == "duplicate":
-            services.append(_line("33333333-3333-4333-8333-333333333333", "Third Fixture Service", 0, 15))
-        elif damage == "total":
-            payload["order"]["total"] = 7900
-        elif damage == "currency":
-            services[1]["currency"] = "USD"
+            services[1] = copy.deepcopy(services[0])
+            services[1]["uuid"] = "22222222-2222-4222-8222-222222222222"
         else:
-            payload["location_uuid"] = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        reader = FakeReader(starts_at=starts, bookings={TEST_BOOKING_UUID: payload})
+            services.append(_line("33333333-3333-4333-8333-333333333333", "Third Fixture Service", 0, 15))
+        reader = FakeReader(
+            starts_at=starts,
+            bookings={TEST_BOOKING_UUID: payload},
+            catalog_rows=catalog,
+        )
         clear_multi_service_catalog_cache()
         plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
 
     assert plan.records[0]["eligibility"] == PROOF_FAILED
+    assert plan.records[0]["refusal_reason"] == expected_reason
     assert CONTRACT_NOT_SUPPORTED not in {item["disposition"] for item in plan.records[0]["reminders"]}
     assert plan.summary["contract_excluded_records"] == 0
     assert plan.summary["blockers"] > 0
+    assert plan.summary["apply_ready"] is False
+
+
+async def test_resource_shadow_with_only_custom_duration_is_contract_excluded(session_maker) -> None:
+    starts = NOW + timedelta(days=2)
+    payload = _api(starts_at=starts, custom_duration=True, resource_shadow=True)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, starts_at=starts)
+        plan = await build_recovery_plan(
+            session,
+            client=FakeReader(starts_at=starts, bookings={TEST_BOOKING_UUID: payload}),
+            now=NOW,
+            pause_sec=0,
+        )
+
+    assert plan.records[0]["eligibility"] == CONTRACT_NOT_SUPPORTED
+    assert plan.records[0]["refusal_reason"] == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED
+    assert plan.summary["contract_excluded_records"] == 1
+    assert plan.summary["blockers"] == 0
+    assert plan.summary["apply_ready"] is True
+
+
+async def test_mixed_scope_stays_atomic_when_custom_duration_hides_a_real_blocker(
+    session_maker,
+) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            records, reader = await _seed_mixed_scope(session, starts_at=starts, excluded_count=1)
+        assert reader.bookings is not None
+        blocked_payload = reader.bookings[str(records[1].easyweek_booking_uuid)]
+        blocked_payload["order"]["total"] = 7900
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+
+    allowed_row = next(row for row in plan.records if row["record_id"] == records[0].id)
+    blocked_row = next(row for row in plan.records if row["record_id"] == records[1].id)
+    assert {item["disposition"] for item in allowed_row["reminders"]} == {CREATE}
+    assert blocked_row["eligibility"] == PROOF_FAILED
+    assert blocked_row["refusal_reason"] == MULTI_SERVICE_TOTAL_MISMATCH
+    assert plan.summary["reminders_to_create"] == 2
+    assert plan.summary["contract_excluded_records"] == 0
+    assert plan.summary["blockers"] == 2
     assert plan.summary["apply_ready"] is False
 
 

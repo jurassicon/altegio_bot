@@ -41,6 +41,7 @@ from altegio_bot.easyweek_multi_service import (
     evaluate_service_eligibility,
     multi_service_job_payload,
     multi_service_snapshot_from_job_payload,
+    prove_exactly_two_service_custom_duration_exclusion,
     prove_exactly_two_service_snapshot,
     read_catalog_rows_cached,
     record_raw_with_multi_service_snapshot,
@@ -247,32 +248,6 @@ def _business_pair_digest(snapshot: MultiServiceSnapshot) -> str:
 
 def _category_proof_digest(snapshot: MultiServiceSnapshot) -> str:
     return _digest([line.category for line in snapshot.lines])
-
-
-def _contract_exclusion_context_digest(
-    booking_payload: Mapping[str, Any],
-    catalog_rows: list[object] | tuple[object, ...],
-) -> str:
-    """Freeze every non-PII input that can keep an unsupported proof stable."""
-    return _digest(
-        {
-            "booking_contract": {
-                key: booking_payload.get(key)
-                for key in (
-                    "uuid",
-                    "location_uuid",
-                    "start_time",
-                    "is_canceled",
-                    "is_completed",
-                    "status",
-                    "currency",
-                    "order",
-                    "ordered_services",
-                )
-            },
-            "catalog": catalog_rows,
-        }
-    )
 
 
 def _snapshot_projection(snapshot: MultiServiceSnapshot) -> dict[str, object]:
@@ -751,18 +726,19 @@ async def build_recovery_plan(
                         refusal_reason = IDENTITY_MISMATCH
                     else:
                         catalog = await read_catalog_rows_cached(client, location_uuid=location.location_uuid)
+                        webhook_pair = WebhookServicePair(
+                            booking_uuid=booking.booking_uuid,
+                            location_uuid=location.location_uuid,
+                            service_name=booking.service_name,
+                            service_related=booking.service_related,
+                            services_description=booking.services_description,
+                            services_count=booking.services_count,
+                            quantity=booking.service_quantity,
+                            booking_currency=booking.booking_currency,
+                            total_cost=record.total_cost,
+                        )
                         snapshot = prove_exactly_two_service_snapshot(
-                            webhook=WebhookServicePair(
-                                booking_uuid=booking.booking_uuid,
-                                location_uuid=location.location_uuid,
-                                service_name=booking.service_name,
-                                service_related=booking.service_related,
-                                services_description=booking.services_description,
-                                services_count=booking.services_count,
-                                quantity=booking.service_quantity,
-                                booking_currency=booking.booking_currency,
-                                total_cost=record.total_cost,
-                            ),
+                            webhook=webhook_pair,
                             booking_payload=live_payload,
                             catalog_rows=catalog,
                         )
@@ -785,15 +761,22 @@ async def build_recovery_plan(
                             refusal_reason = decision.reason
                 except MultiServiceProofError as exc:
                     if exc.reason == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED:
-                        eligibility = CONTRACT_NOT_SUPPORTED
-                        forced = CONTRACT_NOT_SUPPORTED
-                        contract_exclusion_context_digest = _contract_exclusion_context_digest(
-                            live_payload,
-                            catalog,
-                        )
+                        try:
+                            contract_exclusion_context_digest = prove_exactly_two_service_custom_duration_exclusion(
+                                webhook=webhook_pair,
+                                booking_payload=live_payload,
+                                catalog_rows=catalog,
+                            )
+                        except MultiServiceProofError as exclusion_error:
+                            forced = PROOF_FAILED
+                            refusal_reason = exclusion_error.reason
+                        else:
+                            eligibility = CONTRACT_NOT_SUPPORTED
+                            forced = CONTRACT_NOT_SUPPORTED
+                            refusal_reason = exc.reason
                     else:
                         forced = PROOF_FAILED
-                    refusal_reason = exc.reason
+                        refusal_reason = exc.reason
                 except Exception:  # noqa: BLE001 - exception text can carry API material
                     forced = PROOF_FAILED
                     refusal_reason = MULTI_SERVICE_API_UNAVAILABLE

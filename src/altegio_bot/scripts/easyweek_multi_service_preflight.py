@@ -24,9 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_client import EasyWeekClient
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_API_UNAVAILABLE,
     MULTI_SERVICE_CATALOG_UNAVAILABLE,
     MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
@@ -37,8 +38,10 @@ from altegio_bot.easyweek_multi_service import (
     ServiceEligibilityPurpose,
     WebhookServicePair,
     evaluate_service_eligibility,
-    fetch_and_prove_exactly_two_service_snapshot,
     multi_service_snapshot_from_record_raw,
+    prove_exactly_two_service_custom_duration_exclusion,
+    prove_exactly_two_service_snapshot,
+    read_catalog_rows_cached,
     record_raw_with_multi_service_snapshot,
     resolve_effective_multi_service_snapshot,
 )
@@ -333,32 +336,39 @@ async def run_preflight(
         if api_reads:
             await pause(pause_sec)
         api_reads += 1
+        webhook_pair = WebhookServicePair(
+            booking_uuid=booking.booking_uuid,
+            location_uuid=location.location_uuid,
+            service_name=booking.service_name,
+            service_related=booking.service_related,
+            services_description=booking.services_description,
+            services_count=booking.services_count,
+            quantity=booking.service_quantity,
+            booking_currency=booking.booking_currency,
+            total_cost=record.total_cost,
+        )
         try:
-            live = await fetch_and_prove_exactly_two_service_snapshot(
-                client=client,
-                webhook=WebhookServicePair(
-                    booking_uuid=booking.booking_uuid,
-                    location_uuid=location.location_uuid,
-                    service_name=booking.service_name,
-                    service_related=booking.service_related,
-                    services_description=booking.services_description,
-                    services_count=booking.services_count,
-                    quantity=booking.service_quantity,
-                    booking_currency=booking.booking_currency,
-                    total_cost=record.total_cost,
-                ),
-            )
-        except MultiServiceProofError as exc:
-            if exc.reason == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED:
-                report.contract_excluded += 1
-                report.reasons[exc.reason] += 1
-                _contract_exclusion_consistency(
-                    report,
-                    record=record,
-                    jobs=jobs.get(record.id, []),
-                    outboxes=outboxes.get(record.id, []),
+            try:
+                booking_payload = await client.get_booking(str(booking.booking_uuid))
+            except EasyWeekError:
+                raise MultiServiceProofError(MULTI_SERVICE_API_UNAVAILABLE, recoverable=True) from None
+            catalog_rows = await read_catalog_rows_cached(client, location_uuid=location.location_uuid)
+            try:
+                live = prove_exactly_two_service_snapshot(
+                    webhook=webhook_pair,
+                    booking_payload=booking_payload,
+                    catalog_rows=catalog_rows,
                 )
-                continue
+            except MultiServiceProofError as initial_error:
+                if initial_error.reason != MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED:
+                    raise
+                prove_exactly_two_service_custom_duration_exclusion(
+                    webhook=webhook_pair,
+                    booking_payload=booking_payload,
+                    catalog_rows=catalog_rows,
+                )
+                live = None
+        except MultiServiceProofError as exc:
             report.ambiguous += 1
             report.unexplained += 1
             report.reasons[exc.reason] += 1
@@ -367,6 +377,17 @@ async def run_preflight(
             report.ambiguous += 1
             report.unexplained += 1
             report.reasons[MULTI_SERVICE_CATALOG_UNAVAILABLE] += 1
+            continue
+
+        if live is None:
+            report.contract_excluded += 1
+            report.reasons[MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED] += 1
+            _contract_exclusion_consistency(
+                report,
+                record=record,
+                jobs=jobs.get(record.id, []),
+                outboxes=outboxes.get(record.id, []),
+            )
             continue
 
         report.structurally_proven += 1
