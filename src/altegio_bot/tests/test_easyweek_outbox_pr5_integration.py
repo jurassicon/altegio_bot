@@ -55,6 +55,14 @@ from altegio_bot.delivery_retry_identity import (
 from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch_template_contract
 from altegio_bot.easyweek_client import EasyWeekConfigError, EasyWeekRetryableError
 from altegio_bot.easyweek_locations import EasyWeekLocation
+from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_SEND_DISABLED,
+    WebhookServicePair,
+    multi_service_job_payload,
+    prove_exactly_two_service_snapshot,
+    record_raw_with_multi_service_snapshot,
+)
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid, normalize_event
 from altegio_bot.easyweek_policy import (
     EASYWEEK_CUSTOMER_JOB_TYPES,
@@ -211,6 +219,8 @@ def _pr5_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
     monkeypatch.setattr(
         settings,
         "easyweek_allowed_service_categories",
@@ -8041,3 +8051,232 @@ async def test_the_two_paths_serialise_instead_of_deadlocking(
         assert persisted.attempts == 0
         assert rows == []
         assert capture.template_calls == []
+
+
+# ---------------------------------------------------------------------------
+# PR-7.4: exactly-two rendering, digest guard and independent send fence
+# ---------------------------------------------------------------------------
+
+
+def _outbox_pair_snapshot(*, first_price: int = 3000, second_price: int = 6500):
+    booking_uuid = uuid.UUID("11111111-2222-4333-8444-555555555555")
+    location_uuid = "cccccccc-dddd-4eee-8fff-000000000001"
+
+    def line(line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any]:
+        return {
+            "uuid": line_uuid,
+            "name": name,
+            "currency": "EUR",
+            "price": price,
+            "original_price": price,
+            "discount": 0,
+            "quantity": 1,
+            "duration": {"value": duration, "label": "minutes"},
+            "original_duration": {"value": duration, "label": "minutes"},
+        }
+
+    total = first_price + second_price
+    return prove_exactly_two_service_snapshot(
+        webhook=WebhookServicePair(
+            booking_uuid=booking_uuid,
+            location_uuid=location_uuid,
+            service_name="Erste Leistung",
+            service_related="Zweite Leistung",
+            services_description="Erste Leistung, Zweite Leistung",
+            services_count=2,
+            quantity=2,
+            booking_currency="EUR",
+            total_cost=Decimal(total) / Decimal(100),
+        ),
+        booking_payload={
+            "uuid": str(booking_uuid),
+            "location_uuid": location_uuid,
+            "currency": "EUR",
+            "order": {"subtotal": total, "total": total},
+            "ordered_services": [
+                line("aaaaaaaa-1111-4111-8111-111111111111", "Erste Leistung", first_price, 30),
+                line("aaaaaaaa-2222-4222-8222-222222222222", "Zweite Leistung", second_price, 65),
+            ],
+        },
+        catalog_rows=[
+            {
+                "uuid": "bbbbbbbb-1111-4111-8111-111111111111",
+                "name": "Erste Leistung",
+                "currency": "EUR",
+                "price": first_price,
+                "duration": {"value": 30, "label": "minutes"},
+                "category": {"name": "Wimpernverlängerung"},
+            },
+            {
+                "uuid": "bbbbbbbb-2222-4222-8222-222222222222",
+                "name": "Zweite Leistung",
+                "currency": "EUR",
+                "price": second_price,
+                "duration": {"value": 65, "label": "minutes"},
+                "category": {"name": "Wimpernverlängerung"},
+            },
+        ],
+    )
+
+
+async def _attach_outbox_pair(db: AsyncSession, job: MessageJob) -> None:
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    snapshot = _outbox_pair_snapshot()
+    record.raw = record_raw_with_multi_service_snapshot(
+        record_raw_with_services_count(record.raw, 2),
+        snapshot,
+    )
+    record.total_cost = Decimal("95.00")
+    job.payload = multi_service_job_payload(snapshot)
+    await db.flush()
+
+
+async def test_exactly_two_snapshot_renders_each_actual_price_and_one_total(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Erste Leistung, Zweite Leistung", "95.00"),),
+        total_cost="95.00",
+    )
+    await _attach_outbox_pair(db, job)
+    record = await db.get(Record, job.record_id)
+    client = await db.get(Client, job.client_id)
+    assert record is not None and client is not None
+
+    _body, _sender, _lang, ctx = await ow._render_message(
+        db,
+        company_id=job.company_id,
+        template_code=job.job_type,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+    )
+    assert ctx["primary_service"] == "Erste Leistung"
+    assert ctx["services"] == "Erste Leistung — 30.00€\nZweite Leistung — 65.00€"
+    assert ctx["total_cost"] == "95.00"
+
+    params = await _run_and_get_params(db, capture, job)
+    assert params[4] == "Erste Leistung — 30.00€, Zweite Leistung — 65.00€"
+    assert params[5] == "95.00"
+    assert params[4].count("Erste Leistung") == params[4].count("Zweite Leistung") == 1
+
+
+async def test_recovery_job_snapshot_renders_without_record_backfill(db: AsyncSession) -> None:
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Erste Leistung, Zweite Leistung", "95.00"),),
+        total_cost="95.00",
+    )
+    snapshot = _outbox_pair_snapshot()
+    record = await db.get(Record, job.record_id)
+    client = await db.get(Client, job.client_id)
+    assert record is not None and client is not None
+    record.raw = record_raw_with_services_count(record.raw, 2)
+    job.payload = multi_service_job_payload(snapshot, include_snapshot=True)
+    await db.flush()
+
+    _body, _sender, _lang, ctx = await ow._render_message(
+        db,
+        company_id=job.company_id,
+        template_code=job.job_type,
+        record=record,
+        client=client,
+        provider=PROVIDER_EASYWEEK,
+        job_payload=job.payload,
+    )
+
+    assert ctx["services"] == "Erste Leistung — 30.00€\nZweite Leistung — 65.00€"
+    assert ctx["total_cost"] == "95.00"
+    assert "multi_service_snapshot" not in record.raw["easyweek"]
+
+
+@pytest.mark.parametrize(
+    ("planning_enabled", "expected_reason"),
+    [(True, MULTI_SERVICE_SEND_DISABLED), (False, "multi_service_disabled")],
+)
+async def test_multi_fences_hold_a_proven_job_without_attempt_or_provider_call(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    planning_enabled: bool,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "easyweek_multi_service_notifications_enabled",
+        planning_enabled,
+        raising=False,
+    )
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", not planning_enabled, raising=False)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.last_error == expected_reason
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_closed_send_fence_query_skips_only_digest_bound_jobs(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
+    multi_job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, multi_job)
+    record = await db.get(Record, multi_job.record_id)
+    client = await db.get(Client, multi_job.client_id)
+    assert record is not None and client is not None
+    single_job = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=multi_job.company_id,
+        job_type="record_updated",
+        record=record,
+        client=client,
+        dedupe_key="single-control-beside-held-pair",
+    )
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert [item.id for item in claimed] == [single_job.id]
+    await db.refresh(multi_job)
+    assert multi_job.status == "queued" and multi_job.attempts == 0 and multi_job.locked_at is None
+
+
+@pytest.mark.parametrize("damage", ["stale_job_digest", "missing_snapshot"])
+async def test_corrupt_or_stale_pair_is_canceled_before_meta_chatwoot_and_outbox(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    if damage == "stale_job_digest":
+        job.payload = {**job.payload, MULTI_SERVICE_JOB_DIGEST_KEY: "0" * 64}
+    else:
+        record.raw = record_raw_with_multi_service_snapshot(record.raw, None)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+    assert job.last_error in {"multi_service_snapshot_missing", "multi_service_snapshot_digest_mismatch"}

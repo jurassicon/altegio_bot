@@ -6,6 +6,7 @@ operations and no generic request escape hatch::
 
     GET /ping
     GET /locations
+    GET /locations/{location_uuid}/services
     GET /bookings/{booking_uuid}
     GET /customers/{customer_uuid}
     GET /bookings?customer_uuid={customer_uuid}&page={page}&per_page=100
@@ -48,6 +49,7 @@ logger = logging.getLogger("easyweek_client")
 # booking id nor a redirect can retarget the request at another host.
 _PATH_PING = "ping"
 _PATH_LOCATIONS = "locations"
+_PATH_SERVICES = "services"
 _PATH_BOOKINGS = "bookings"
 _PATH_CUSTOMERS = "customers"
 _PATH_WORKSPACE = "workspace"
@@ -232,12 +234,17 @@ def _canonical_booking_uuid(value: object) -> str:
     caller-controlled part of a path, so anything that is not a real UUID
     (``../``, an absolute URL, a query string) must never reach the wire.
     """
+    return _canonical_resource_uuid(value, operation="get_booking", label="booking_uuid")
+
+
+def _canonical_resource_uuid(value: object, *, operation: str, label: str) -> str:
+    """Validate a path UUID before construction, with operation-safe errors."""
     if not isinstance(value, str) or not value.strip():
-        raise EasyWeekPermanentError("booking_uuid must be a non-empty string", operation="get_booking")
+        raise EasyWeekPermanentError(f"{label} must be a non-empty string", operation=operation)
     try:
         parsed = uuid_module.UUID(value.strip())
     except (ValueError, AttributeError, TypeError):
-        raise EasyWeekPermanentError("booking_uuid is not a valid UUID", operation="get_booking") from None
+        raise EasyWeekPermanentError(f"{label} is not a valid UUID", operation=operation) from None
     return str(parsed)
 
 
@@ -254,9 +261,9 @@ def _canonical_customer_uuid(value: object, *, operation: str) -> str:
     return canonical
 
 
-def _positive_page(value: object) -> int:
+def _positive_page(value: object, *, operation: str = "list_customer_bookings") -> int:
     if type(value) is not int or value < 1:
-        raise EasyWeekPermanentError("page must be a positive integer", operation="list_customer_bookings")
+        raise EasyWeekPermanentError("page must be a positive integer", operation=operation)
     return value
 
 
@@ -630,6 +637,34 @@ class EasyWeekClient:
         uid = payload.get("uuid")
         if not (isinstance(uid, str) and uid.strip()):
             raise EasyWeekProtocolError("booking response has no usable uuid", operation="get_booking")
+        return payload
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        """Read one page of a location's catalogue through the pinned GET path.
+
+        Pagination completeness and row validation are deliberately owned by
+        ``easyweek_migration.service_catalog.read_full_catalog_rows``.  Keeping
+        this method transport-only lets normal runtime reuse that reviewed
+        parser without importing the mutating migration client.
+        """
+        canonical = _canonical_resource_uuid(
+            location_uuid,
+            operation="list_location_services",
+            label="location_uuid",
+        )
+        exact_page = _positive_page(page, operation="list_location_services")
+        payload = await self._get_json(
+            _PATH_LOCATIONS,
+            canonical,
+            _PATH_SERVICES,
+            operation="list_location_services",
+            params={"page": exact_page},
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "location services response is not a JSON object",
+                operation="list_location_services",
+            )
         return payload
 
     async def get_customer(self, customer_uuid: str) -> dict[str, Any]:

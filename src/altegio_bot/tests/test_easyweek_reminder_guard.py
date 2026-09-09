@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -33,12 +34,21 @@ from altegio_bot.easyweek_client import (
     EasyWeekRetryableError,
 )
 from altegio_bot.easyweek_locations import EasyWeekLocation
+from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
+    WebhookServicePair,
+    clear_multi_service_catalog_cache,
+    multi_service_job_payload,
+    prove_exactly_two_service_snapshot,
+    record_raw_with_multi_service_snapshot,
+)
 from altegio_bot.easyweek_reminder_guard import (
     GuardOutcome,
     check_api_response,
     classify_client_error,
     verify_reminder_is_current,
 )
+from altegio_bot.easyweek_service_category import record_raw_with_services_count
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK, MessageJob, Record
 
 BOOKING = uuid.UUID("11111111-2222-4333-8444-555555555555")
@@ -174,6 +184,176 @@ async def test_a_booking_that_matches_on_every_axis_is_proven() -> None:
 async def test_both_reminder_kinds_are_verified_the_same_way(job_type: str) -> None:
     result = await _verify(job=_job(job_type=job_type))
     assert result.proven is True
+
+
+def _pair_line(line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any]:
+    return {
+        "uuid": line_uuid,
+        "name": name,
+        "currency": "EUR",
+        "price": price,
+        "original_price": price,
+        "discount": 0,
+        "quantity": 1,
+        "duration": {"value": duration, "label": "minutes"},
+        "original_duration": {"value": duration, "label": "minutes"},
+    }
+
+
+def _pair_catalog() -> list[dict[str, Any]]:
+    return [
+        {
+            "uuid": "cccccccc-1111-4111-8111-111111111111",
+            "name": "Erste Leistung",
+            "currency": "EUR",
+            "price": 3000,
+            "duration": {"value": 30, "label": "minutes"},
+            "category": {"name": "Wimpernverlängerung"},
+        },
+        {
+            "uuid": "cccccccc-2222-4222-8222-222222222222",
+            "name": "Zweite Leistung",
+            "currency": "EUR",
+            "price": 6500,
+            "duration": {"value": 65, "label": "minutes"},
+            "category": {"name": "Wimpernverlängerung"},
+        },
+    ]
+
+
+def _pair_api(*, second_price: int = 6500, include_shadow: bool = False) -> dict[str, Any]:
+    first = _pair_line("aaaaaaaa-1111-4111-8111-111111111111", "Erste Leistung", 3000, 30)
+    second = _pair_line("aaaaaaaa-2222-4222-8222-222222222222", "Zweite Leistung", second_price, 65)
+    ordered = [first, second]
+    if include_shadow:
+        ordered.insert(
+            1,
+            {**first, "uuid": "aaaaaaaa-3333-4333-8333-333333333333"},
+        )
+    total = 3000 + second_price
+    return _api(
+        currency="EUR",
+        order={"subtotal": total, "total": total},
+        ordered_services=ordered,
+    )
+
+
+def _stored_pair() -> tuple[MessageJob, Record]:
+    snapshot = prove_exactly_two_service_snapshot(
+        webhook=WebhookServicePair(
+            booking_uuid=BOOKING,
+            location_uuid=LOCATION_UUID,
+            service_name="Erste Leistung",
+            service_related="Zweite Leistung",
+            services_description="Erste Leistung, Zweite Leistung",
+            services_count=2,
+            quantity=2,
+            booking_currency="EUR",
+            total_cost=Decimal("95.00"),
+        ),
+        booking_payload=_pair_api(),
+        catalog_rows=_pair_catalog(),
+    )
+    record = _record()
+    record.total_cost = Decimal("95.00")
+    record.raw = record_raw_with_multi_service_snapshot(
+        record_raw_with_services_count({}, 2),
+        snapshot,
+    )
+    job = _job()
+    job.payload.update(multi_service_job_payload(snapshot))
+    return job, record
+
+
+class MultiFakeReader(FakeReader):
+    def __init__(self, payload: dict[str, Any], *, catalog_error: Exception | None = None) -> None:
+        super().__init__(payload)
+        self.catalog_error = catalog_error
+        self.catalog_calls: list[tuple[str, int]] = []
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        self.catalog_calls.append((location_uuid, page))
+        if self.catalog_error is not None:
+            raise self.catalog_error
+        rows = _pair_catalog()
+        return {
+            "data": rows,
+            "meta": {"current_page": 1, "last_page": 1, "total": len(rows)},
+        }
+
+
+@pytest.mark.parametrize("job_type", ["reminder_24h", "reminder_2h"])
+@pytest.mark.parametrize("include_shadow", [False, True])
+async def test_multi_reminder_reproves_live_pair_and_ignores_exact_shadow(
+    job_type: str,
+    include_shadow: bool,
+) -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_pair()
+    job.job_type = job_type
+    reader = MultiFakeReader(_pair_api(include_shadow=include_shadow))
+
+    result = await _verify(job=job, record=record, reader=reader)
+
+    assert result.outcome is GuardOutcome.PROVEN_CURRENT
+    assert reader.calls == [str(BOOKING)]
+    assert reader.catalog_calls == [(LOCATION_UUID, 1)]
+
+
+async def test_recovery_snapshot_in_job_reproves_without_mutating_record() -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_pair()
+    snapshot_payload = record.raw["easyweek"]["multi_service_snapshot"]
+    record.raw = record_raw_with_services_count({}, 2)
+    job.payload = {
+        **job.payload,
+        "multi_service_snapshot": snapshot_payload,
+    }
+    reader = MultiFakeReader(_pair_api())
+
+    result = await _verify(job=job, record=record, reader=reader)
+
+    assert result.outcome is GuardOutcome.PROVEN_CURRENT
+    assert "multi_service_snapshot" not in record.raw["easyweek"]
+
+
+async def test_changed_live_pair_cancels_stale_reminder() -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_pair()
+    reader = MultiFakeReader(_pair_api(second_price=6600))
+
+    result = await _verify(job=job, record=record, reader=reader)
+
+    assert result.outcome is GuardOutcome.MULTI_SERVICE_MISMATCH
+    assert result.proven is False
+
+
+async def test_stale_job_digest_is_refused_before_live_api_or_catalog() -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_pair()
+    job.payload["multi_service_snapshot_digest"] = "0" * 64
+    reader = MultiFakeReader(_pair_api())
+
+    result = await _verify(job=job, record=record, reader=reader)
+
+    assert result.outcome is GuardOutcome.MULTI_SERVICE_MISMATCH
+    assert result.reason.endswith(MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
+    assert reader.calls == []
+    assert reader.catalog_calls == []
+
+
+async def test_catalog_unavailability_is_recoverable_for_multi_reminder() -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_pair()
+    reader = MultiFakeReader(
+        _pair_api(),
+        catalog_error=EasyWeekRetryableError("no catalogue", operation="list_location_services"),
+    )
+
+    result = await _verify(job=job, record=record, reader=reader)
+
+    assert result.outcome is GuardOutcome.RETRYABLE_UNAVAILABLE
+    assert result.recoverable is True
 
 
 @pytest.mark.parametrize(

@@ -96,6 +96,29 @@ def easyweek_reminder_dedupe_key(
     return f"{_KEY_PREFIX}:{job_type}:{digest}"
 
 
+def easyweek_multi_service_reminder_dedupe_key(
+    *,
+    booking_uuid: uuid.UUID,
+    job_type: str,
+    starts_at: datetime,
+    multi_service_snapshot_digest: str,
+) -> str:
+    """The runtime identity for one digest-bound two-service reminder.
+
+    PR-7.4 must distinguish a reminder planned for one proven service pair from
+    a later pair at the same booking time.  Keeping this transformation next to
+    the ordinary PR-8 key gives inbox planning and operator recovery one exact
+    contract instead of two copies of the hashing rule.
+    """
+    base = easyweek_reminder_dedupe_key(
+        booking_uuid=booking_uuid,
+        job_type=job_type,
+        starts_at=starts_at,
+    )
+    digest = hashlib.sha256(f"{base}|{multi_service_snapshot_digest}".encode()).hexdigest()[:40]
+    return f"{_KEY_PREFIX}:{job_type}:{digest}"
+
+
 def plan_reminders(
     *,
     booking_uuid: uuid.UUID,

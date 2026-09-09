@@ -249,6 +249,11 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # it holds a third, different power — it can create and cancel MESSAGE
         # JOBS, and can create neither a customer nor a booking.
         "easyweek-migration-prepare-handover",
+        # PR-7.4 controlled recovery re-proves current bookings/catalogues
+        # before creating only still-future reminder jobs. It is an ops-only,
+        # restart:no one-off with no EasyWeek mutation method and is not part
+        # of the normal service graph.
+        "easyweek-multi-service-reminder-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

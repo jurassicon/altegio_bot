@@ -614,6 +614,14 @@ class Settings(BaseSettings):
     # single Meta attempt. There is no mode that sends a reminder unverified.
     easyweek_reminder_api_guard_enabled: bool = False
 
+    # --- PR-7.4: exactly-two lifecycle/reminder notifications ------------
+    # Independent default-false fences.  The first permits live proof,
+    # persistence of the bounded snapshot and planning for exactly two services.
+    # The second is the outbox send fence for jobs carrying that snapshot.
+    # Neither changes the established single-service path.
+    easyweek_multi_service_notifications_enabled: bool = False
+    easyweek_multi_service_send_enabled: bool = False
+
     # --- PR-9: review_3d --------------------------------------------------
     # Same two-flag shape as PR-8, and for the same reason: planning and sending
     # are turned on at different points in the rollout.

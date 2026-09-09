@@ -237,6 +237,11 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         # it holds a third, different power — it can create and cancel MESSAGE
         # JOBS, and can create neither a customer nor a booking.
         "easyweek-migration-prepare-handover",
+        # PR-7.4 controlled recovery must re-prove each existing booking and
+        # its full catalogue immediately before inserting only reminder jobs.
+        # It is an ops-profile, restart:no one-off with a private report mount;
+        # it has no EasyWeek mutation method and is never started by normal up.
+        "easyweek-multi-service-reminder-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

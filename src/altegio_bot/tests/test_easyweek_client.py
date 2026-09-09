@@ -288,6 +288,54 @@ async def test_get_booking_issues_single_get_to_canonical_uuid_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_location_catalog_issues_only_pinned_get_with_exact_page() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={"data": [], "meta": {"current_page": 2, "last_page": 2, "total": 0}},
+        )
+
+    async with _client(handler) as client:
+        result = await client.list_location_services(VALID_UUID.upper(), page=2)
+
+    assert result["data"] == []
+    assert len(seen) == 1 and seen[0].method == "GET"
+    assert str(seen[0].url) == f"{BASE}/locations/{VALID_UUID}/services?page=2"
+
+
+@pytest.mark.parametrize(
+    ("location_uuid", "page"),
+    [
+        ("not-a-uuid", 1),
+        ("../../bookings", 1),
+        (VALID_UUID, 0),
+        (VALID_UUID, True),
+        (VALID_UUID, "1"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_location_catalog_rejects_unusable_path_or_page_before_wire(
+    location_uuid: object,
+    page: object,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekPermanentError) as caught:
+            await client.list_location_services(location_uuid, page=page)  # type: ignore[arg-type]
+
+    assert caught.value.operation == "list_location_services"
+    assert seen == []
+
+
+@pytest.mark.asyncio
 async def test_auth_and_workspace_headers_are_sent() -> None:
     seen: list[httpx.Request] = []
 
@@ -328,6 +376,11 @@ async def test_only_get_is_ever_issued() -> None:
         methods.append(request.method)
         if request.url.path.endswith("/locations"):
             return httpx.Response(200, json=[])
+        if request.url.path.endswith("/services"):
+            return httpx.Response(
+                200,
+                json={"data": [], "meta": {"current_page": 1, "last_page": 1, "total": 0}},
+            )
         if "/bookings/" in request.url.path:
             return httpx.Response(200, json=_BOOKING_WITH_PII)
         if "/customers/" in request.url.path:
@@ -351,6 +404,7 @@ async def test_only_get_is_ever_issued() -> None:
     async with _client(handler) as client:
         await client.ping()
         await client.list_locations()
+        await client.list_location_services(VALID_UUID, page=1)
         await client.get_booking(BOOKING_UUID)
         await client.get_customer(CUSTOMER_UUID)
         await client.list_customer_bookings(CUSTOMER_UUID, page=1)

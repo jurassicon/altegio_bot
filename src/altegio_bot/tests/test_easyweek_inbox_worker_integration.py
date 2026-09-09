@@ -22,6 +22,12 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
+from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_SNAPSHOT_KEY,
+    clear_multi_service_catalog_cache,
+    multi_service_snapshot_from_record_raw,
+)
 from altegio_bot.easyweek_normalizer import NormalizationError, canonical_booking_uuid
 from altegio_bot.easyweek_review import easyweek_review_dedupe_key
 from altegio_bot.easyweek_service_category import (
@@ -64,6 +70,9 @@ def _enable_processing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Processing on, notifications OFF — the production default for PR-4."""
     monkeypatch.setattr(settings, "easyweek_processing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
+    clear_multi_service_catalog_cache()
     monkeypatch.setattr(
         settings,
         "easyweek_allowed_service_categories",
@@ -5481,3 +5490,434 @@ async def test_a_disabled_visit_counter_defers_the_delivery_instead_of_spending_
     async with bound_session_local() as session:
         event = (await session.execute(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id))).scalars().one()
         assert event.status == "processed"
+
+
+# ===========================================================================
+# PR-7.4 exactly-two-service snapshot and planning contract
+# ===========================================================================
+
+
+def _multi_webhook(
+    *,
+    first: str = "Fixture Service",
+    second: str = "Second Fixture Service",
+    total_minor: int = 8000,
+) -> dict[str, Any]:
+    payload = booking_created_multi_service()
+    payload["service_name"] = first
+    payload["service_related"] = second
+    payload["services_description"] = f"{first}, {second}"
+    payload["services_count"] = 2
+    payload["quantity"] = 2
+    payload["booking_price_currency"] = "EUR"
+    set_booking_price(payload, total_minor)
+    return payload
+
+
+def _multi_line(*, line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any]:
+    return {
+        "uuid": line_uuid,
+        "name": name,
+        "currency": "EUR",
+        "price": price,
+        "original_price": price,
+        "discount": 0,
+        "quantity": 1,
+        "duration": {"value": duration, "label": "minutes"},
+        "original_duration": {"value": duration, "label": "minutes"},
+    }
+
+
+def _multi_booking(
+    *,
+    first: str = "Fixture Service",
+    second: str = "Second Fixture Service",
+    first_price: int = 3500,
+    second_price: int = 4500,
+) -> dict[str, Any]:
+    total = first_price + second_price
+    return {
+        "uuid": TEST_BOOKING_UUID,
+        "location_uuid": TEST_LOCATION_UUID,
+        "currency": "EUR",
+        "order": {"subtotal": total, "total": total},
+        "ordered_services": [
+            _multi_line(
+                line_uuid="11111111-1111-4111-8111-111111111111",
+                name=first,
+                price=first_price,
+                duration=30,
+            ),
+            _multi_line(
+                line_uuid="22222222-2222-4222-8222-222222222222",
+                name=second,
+                price=second_price,
+                duration=45,
+            ),
+        ],
+    }
+
+
+def _catalog_row(*, service_uuid: str, name: str, price: int, duration: int, category: str) -> dict[str, Any]:
+    return {
+        "uuid": service_uuid,
+        "name": name,
+        "currency": "EUR",
+        "price": price,
+        "duration": {"value": duration, "label": "minutes"},
+        "category": {"name": category},
+    }
+
+
+def _multi_catalog(
+    *,
+    first: str = "Fixture Service",
+    second: str = "Second Fixture Service",
+    first_category: str = "Fixture Category",
+    second_category: str = "Fixture Category",
+) -> list[dict[str, Any]]:
+    return [
+        _catalog_row(
+            service_uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+            name=first,
+            price=3500,
+            duration=30,
+            category=first_category,
+        ),
+        _catalog_row(
+            service_uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+            name=second,
+            price=4500,
+            duration=45,
+            category=second_category,
+        ),
+    ]
+
+
+class _MultiReader:
+    def __init__(self, booking: dict[str, Any], catalog: list[dict[str, Any]]) -> None:
+        self.booking = booking
+        self.catalog = catalog
+
+    async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
+        assert booking_uuid == self.booking["uuid"]
+        return self.booking
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        assert location_uuid == TEST_LOCATION_UUID
+        assert page == 1
+        return {
+            "data": self.catalog,
+            "meta": {"current_page": 1, "last_page": 1, "total": len(self.catalog)},
+        }
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _enable_multi_planning(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    booking: dict[str, Any] | None = None,
+    catalog: list[dict[str, Any]] | None = None,
+) -> None:
+    booking_state = booking if booking is not None else _multi_booking()
+    catalog_state = catalog if catalog is not None else _multi_catalog()
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(worker, "EasyWeekClient", lambda: _MultiReader(booking_state, catalog_state))
+
+
+async def test_proven_pair_is_persisted_in_jsonb_and_plans_a_digest_bound_job(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-allowed",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        service = (
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().one()
+        )
+        job = (await session.execute(select(MessageJob).where(MessageJob.provider == "easyweek"))).scalars().one()
+
+    snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and snapshot is not None
+    assert [line.display_name for line in snapshot.lines] == ["Fixture Service", "Second Fixture Service"]
+    assert [line.actual_price_minor for line in snapshot.lines] == [3500, 4500]
+    assert record.raw[EASYWEEK_RAW_NAMESPACE][MULTI_SERVICE_SNAPSHOT_KEY]["digest"] == snapshot.digest
+    assert service.title == "Fixture Service, Second Fixture Service"
+    assert service.amount == 2
+    assert service.cost_to_pay == record.total_cost == Decimal("80.00")
+    assert job.job_type == "record_created"
+    assert job.payload[MULTI_SERVICE_JOB_DIGEST_KEY] == snapshot.digest
+
+
+async def test_proven_pair_plans_both_digest_bound_reminders(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="multi-reminders",
+    )
+
+    jobs = await _easyweek_jobs(bound_session_local)
+    assert {job.job_type for job in jobs} == {"record_created", "reminder_24h", "reminder_2h"}
+    digests = {job.payload.get(MULTI_SERVICE_JOB_DIGEST_KEY) for job in jobs}
+    assert len(digests) == 1 and None not in digests
+
+
+async def test_canceled_booking_reproves_pair_and_plans_digest_bound_cancellation(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", False, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-before-cancel",
+    )
+
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    canceled = _multi_webhook()
+    canceled["booking_status"] = "Canceled appointment"
+    await _capture_and_process(
+        bound_session_local,
+        canceled,
+        event_hint="booking-canceled",
+        payload_hash="multi-canceled",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        job = (await session.execute(select(MessageJob).where(MessageJob.provider == "easyweek"))).scalars().one()
+    snapshot = multi_service_snapshot_from_record_raw(record.raw)[0]
+    assert record.is_deleted is True
+    assert snapshot is not None
+    assert job.job_type == "record_canceled"
+    assert job.payload[MULTI_SERVICE_JOB_DIGEST_KEY] == snapshot.digest
+
+
+async def test_all_categories_policy_suppresses_mixed_and_disallowed_pairs(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(
+        monkeypatch,
+        catalog=_multi_catalog(second_category="Nagelservice"),
+    )
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-mixed",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        jobs = list((await session.execute(select(MessageJob).where(MessageJob.provider == "easyweek"))).scalars())
+    snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and snapshot is not None, "structural proof survives a business suppression"
+    assert jobs == []
+
+    # A second transaction proves the all-disallowed production shape too.
+    clear_multi_service_catalog_cache()
+    second_uuid = "33333333-3333-4333-8333-333333333333"
+    payload = _multi_webhook()
+    payload["uid"] = second_uuid
+    payload["id"] = TEST_BOOKING_ID + 1
+    payload["customer_id"] = TEST_CUSTOMER_ID + 1
+    booking = _multi_booking()
+    booking["uuid"] = second_uuid
+    catalog = _multi_catalog(first_category="Nagelservice", second_category="Nagelservice")
+    monkeypatch.setattr(worker, "EasyWeekClient", lambda: _MultiReader(booking, catalog))
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, payload, event_hint="booking-created", payload_hash="multi-disallowed")
+    assert await _run_until_idle() == 1
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
+async def test_multi_planning_fence_off_keeps_domain_aggregate_but_calls_no_api(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", False, raising=False)
+
+    def forbidden_client():
+        raise AssertionError("planning fence must stop before API construction")
+
+    monkeypatch.setattr(worker, "EasyWeekClient", forbidden_client)
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-fenced",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        service = (
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().one()
+        )
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+    assert (service.title, service.amount, service.cost_to_pay) == (
+        "Fixture Service, Second Fixture Service",
+        2,
+        Decimal("80.00"),
+    )
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
+async def test_partial_update_preserves_pair_and_explicit_clear_revokes_it(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-before-patch",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        before = multi_service_snapshot_from_record_raw(record.raw)[0]
+    assert before is not None
+
+    partial = booking_updated()
+    for key in (
+        "service_id",
+        "service_name",
+        "service_related",
+        "services_description",
+        "services_count",
+        "quantity",
+        "booking_price_currency",
+        *PRICE_FIELDS,
+    ):
+        partial.pop(key, None)
+    await _capture_and_process(
+        bound_session_local,
+        partial,
+        event_hint="booking-updated",
+        payload_hash="multi-partial",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        after_partial = multi_service_snapshot_from_record_raw(record.raw)[0]
+    assert after_partial is not None and after_partial.digest == before.digest
+
+    explicit_clear = _multi_webhook()
+    explicit_clear["service_related"] = ""
+    await _capture_and_process(
+        bound_session_local,
+        explicit_clear,
+        event_hint="booking-updated",
+        payload_hash="multi-clear",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+
+
+async def test_malformed_carried_total_revokes_pair_instead_of_leaving_stale_price(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-before-bad-total",
+    )
+
+    malformed = _multi_webhook()
+    malformed["booking_price"] = "not-minor-units"
+    await _capture_and_process(
+        bound_session_local,
+        malformed,
+        event_hint="booking-updated",
+        payload_hash="multi-bad-total",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        service = (
+            (await session.execute(select(RecordService).where(RecordService.record_id == record.id))).scalars().one()
+        )
+    assert record.total_cost is None and service.cost_to_pay is None
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+
+
+async def test_transitions_two_to_one_and_to_another_pair_update_the_proof(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_booking = _multi_booking()
+    current_catalog = _multi_catalog()
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(worker, "EasyWeekClient", lambda: _MultiReader(current_booking, current_catalog))
+    await _capture_and_process(
+        bound_session_local,
+        _multi_webhook(),
+        event_hint="booking-created",
+        payload_hash="multi-transition-1",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        first_digest = multi_service_snapshot_from_record_raw(record.raw)[0]
+    assert first_digest is not None
+
+    single = booking_updated()
+    single["service_name"] = "Fixture Service"
+    single["service_related"] = ""
+    single["services_description"] = "Fixture Service"
+    single["services_count"] = 1
+    single["quantity"] = 1
+    set_booking_price(single, 3500)
+    await _capture_and_process(
+        bound_session_local,
+        single,
+        event_hint="booking-updated",
+        payload_hash="multi-transition-2",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+    assert services_count_from_record_raw(record.raw) == 1
+
+    clear_multi_service_catalog_cache()
+    current_booking.clear()
+    current_booking.update(_multi_booking(second="Third Fixture Service", second_price=5500))
+    current_catalog.clear()
+    current_catalog.extend(_multi_catalog(second="Third Fixture Service"))
+    # Keep the full catalogue row consistent with the new actual price.
+    current_catalog[1]["price"] = 5500
+    payload = _multi_webhook(second="Third Fixture Service", total_minor=9000)
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint="booking-updated",
+        payload_hash="multi-transition-3",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        new_snapshot = multi_service_snapshot_from_record_raw(record.raw)[0]
+    assert new_snapshot is not None and new_snapshot.digest != first_digest.digest

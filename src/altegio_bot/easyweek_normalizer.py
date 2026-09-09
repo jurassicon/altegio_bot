@@ -245,6 +245,7 @@ class NormalizedBooking:
     # --- service / price (PR-5 renders from domain data, not from payload) ---
     service_id: int | None
     service_name: str | None
+    service_related: str | None
     service_quantity: int | None
     # Customer-facing description of the WHOLE service set, and how many
     # services the booking has. Confirmed root fields in the live capture.
@@ -253,6 +254,7 @@ class NormalizedBooking:
     # Root-level machine category. It is normalized here but eligibility is
     # deliberately decided later from the persisted Record.raw snapshot.
     service_category: str | None
+    booking_currency: str | None
     # Booking-level total. `booking_price` is the authoritative storage value in
     # exact minor units ("12000" == 120.00); `booking_price_int` is NOT a cent
     # count and is never read. See `_price_to_decimal`.
@@ -470,6 +472,36 @@ def _optional_services_count(payload: dict[str, Any]) -> int | None:
     if count is None or count < 0 or count > PG_INT_MAX:
         return None
     return count
+
+
+def _optional_service_quantity(payload: dict[str, Any]) -> int | None:
+    """Keep malformed quantity visible as an explicit loss of proof.
+
+    Quantity is not a database identity.  Treating an unusable carried value as
+    a fatal event would leave an older two-service snapshot in place, whereas
+    PR-7.4 requires that explicit null/malformed service evidence revoke it.
+    Valid single-service deliveries are unchanged.
+    """
+    if "quantity" not in payload:
+        return None
+    # Preserve the established single-service parser exactly: its malformed
+    # non-null quantity remains an invalid event.  Only an explicitly declared
+    # two-service delivery needs the PR-7.4 revoke-proof semantics below.
+    if _as_exact_int(payload.get("services_count")) != 2:
+        return _optional_bounded_int(payload, "quantity", minimum=0, maximum=PG_INT_MAX)
+    quantity = _as_exact_int(payload.get("quantity"))
+    if quantity is None or quantity < 0 or quantity > PG_INT_MAX:
+        return None
+    return quantity
+
+
+def _optional_currency(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if not candidate or len(candidate) > 8 or not candidate.isascii() or not candidate.isalpha():
+        return None
+    return candidate
 
 
 def _optional_str(value: Any, *, limit: int | None = None) -> str | None:
@@ -928,9 +960,17 @@ def normalize_event(
             maximum=PG_INT_MAX,
         )
     # record_services.amount is INTEGER.
-    service_quantity = _optional_bounded_int(payload, "quantity", minimum=0, maximum=PG_INT_MAX)
+    service_quantity = _optional_service_quantity(payload)
     services_count = _optional_services_count(payload)
-    total_cost = _price_to_decimal(payload)
+    try:
+        total_cost = _price_to_decimal(payload)
+    except NormalizationError:
+        # A malformed carried total on an explicitly two-service delivery must
+        # revoke the old pair proof instead of leaving a stale price eligible.
+        # The single-service parser keeps its established strict rejection.
+        if _as_exact_int(payload.get("services_count")) != 2 or "booking_price" not in payload:
+            raise
+        total_cost = None
 
     manage_link, manage_link_present = extract_manage_link(payload)
 
@@ -951,10 +991,12 @@ def normalize_event(
                 ("comment", "booking_attributes.booking_comment"),
                 ("service_id", "service_id"),
                 ("service_name", "service_name"),
+                ("service_related", "service_related"),
                 ("service_quantity", "quantity"),
                 ("services_description", "services_description"),
                 ("services_count", "services_count"),
                 ("service_category", "service_category"),
+                ("booking_currency", "booking_price_currency"),
                 # The authoritative price field, and the only one presence is
                 # keyed on: a delivery that carries only display variants has
                 # not proven a price. See `_price_to_decimal`.
@@ -997,6 +1039,7 @@ def normalize_event(
         manage_link_present=manage_link_present,
         service_id=service_id,
         service_name=_optional_str(payload.get("service_name"), limit=512),
+        service_related=_optional_str(payload.get("service_related"), limit=512),
         service_quantity=service_quantity,
         services_description=_optional_str(payload.get("services_description"), limit=512),
         services_count=services_count,
@@ -1005,6 +1048,7 @@ def normalize_event(
             if (normalized_category := normalize_service_category(payload.get("service_category"))) is not None
             else None
         ),
+        booking_currency=_optional_currency(payload.get("booking_price_currency")),
         total_cost=total_cost,
         present_fields=present_fields,
     )
