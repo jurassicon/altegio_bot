@@ -18,7 +18,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -58,6 +58,7 @@ MULTI_SERVICE_QUANTITY_UNSUPPORTED: Final = "multi_service_quantity_unsupported"
 MULTI_SERVICE_DISCOUNT_UNSUPPORTED: Final = "multi_service_discount_unsupported"
 MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED: Final = "multi_service_custom_price_unsupported"
 MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED: Final = "multi_service_custom_duration_unsupported"
+MULTI_SERVICE_CUSTOM_DURATION_EXCLUSION_NOT_PROVEN: Final = "multi_service_custom_duration_exclusion_not_proven"
 MULTI_SERVICE_DUPLICATE_AMBIGUOUS: Final = "multi_service_duplicate_ambiguous"
 MULTI_SERVICE_BUSINESS_COUNT_MISMATCH: Final = "multi_service_business_count_mismatch"
 MULTI_SERVICE_TOTAL_MISMATCH: Final = "multi_service_total_mismatch"
@@ -279,7 +280,7 @@ class _OrderedLine:
     signature_digest: str
 
 
-def _ordered_line(value: object) -> _OrderedLine:
+def _read_ordered_line(value: object) -> _OrderedLine:
     if not isinstance(value, Mapping):
         raise MultiServiceProofError(MULTI_SERVICE_ORDERED_SERVICES_MALFORMED)
     name = _display_name(value.get("name"))
@@ -306,8 +307,6 @@ def _ordered_line(value: object) -> _OrderedLine:
     original_duration = _duration_minutes(value.get("original_duration"))
     if duration is None or original_duration is None:
         raise MultiServiceProofError(MULTI_SERVICE_ORDERED_SERVICES_MALFORMED)
-    if duration != original_duration:
-        raise MultiServiceProofError(MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED)
 
     # Every service-line field can affect whether two rows are the same
     # business line.  Only the observed order-line UUID is excluded.  The
@@ -324,11 +323,21 @@ def _ordered_line(value: object) -> _OrderedLine:
     )
 
 
-def _business_lines(payload: Mapping[str, Any]) -> tuple[_OrderedLine, _OrderedLine]:
+def _ordered_line(value: object) -> _OrderedLine:
+    line = _read_ordered_line(value)
+    if line.duration != line.original_duration:
+        raise MultiServiceProofError(MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED)
+    return line
+
+
+def _ordered_service_rows(payload: Mapping[str, Any]) -> list[object]:
     raw = payload.get("ordered_services")
     if not isinstance(raw, list) or len(raw) not in (2, 3):
         raise MultiServiceProofError(MULTI_SERVICE_BUSINESS_COUNT_MISMATCH)
-    lines = [_ordered_line(item) for item in raw]
+    return raw
+
+
+def _collapse_business_lines(lines: list[_OrderedLine]) -> tuple[_OrderedLine, _OrderedLine]:
     counts = Counter(line.signature_digest for line in lines)
 
     if len(lines) == 2:
@@ -349,6 +358,16 @@ def _business_lines(payload: Mapping[str, Any]) -> tuple[_OrderedLine, _OrderedL
     if len(representatives) != 2:
         raise MultiServiceProofError(MULTI_SERVICE_BUSINESS_COUNT_MISMATCH)
     return representatives[0], representatives[1]
+
+
+def _business_lines(payload: Mapping[str, Any]) -> tuple[_OrderedLine, _OrderedLine]:
+    return _collapse_business_lines([_ordered_line(item) for item in _ordered_service_rows(payload)])
+
+
+def _business_lines_allowing_custom_duration(
+    payload: Mapping[str, Any],
+) -> tuple[_OrderedLine, _OrderedLine]:
+    return _collapse_business_lines([_read_ordered_line(item) for item in _ordered_service_rows(payload)])
 
 
 def _category_for_name(normalized_name: str, catalog_rows: Sequence[object]) -> str:
@@ -372,13 +391,13 @@ def _category_for_name(normalized_name: str, catalog_rows: Sequence[object]) -> 
     return categories[0]
 
 
-def prove_exactly_two_service_snapshot(
+def _prove_business_pair(
     *,
     webhook: WebhookServicePair,
     booking_payload: object,
     catalog_rows: Sequence[object],
-) -> MultiServiceSnapshot:
-    """Prove and project exactly two distinct business services."""
+    read_lines: Callable[[Mapping[str, Any]], tuple[_OrderedLine, _OrderedLine]],
+) -> tuple[str, tuple[MultiServiceLine, MultiServiceLine]]:
     webhook_names = _validate_webhook(webhook)
     if not isinstance(booking_payload, Mapping):
         raise MultiServiceProofError(MULTI_SERVICE_ORDERED_SERVICES_MALFORMED)
@@ -388,7 +407,7 @@ def prove_exactly_two_service_snapshot(
     if location_uuid is None or _canonical_uuid(booking_payload.get("location_uuid")) != location_uuid:
         raise MultiServiceProofError(MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN)
 
-    lines = _business_lines(booking_payload)
+    lines = read_lines(booking_payload)
     if tuple(line.normalized_name for line in lines) != webhook_names:
         raise MultiServiceProofError(MULTI_SERVICE_BUSINESS_COUNT_MISMATCH)
     if lines[0].normalized_name == lines[1].normalized_name:
@@ -431,6 +450,22 @@ def prove_exactly_two_service_snapshot(
                 business_signature_digest=line.signature_digest,
             )
         )
+    return location_uuid, (projected[0], projected[1])
+
+
+def prove_exactly_two_service_snapshot(
+    *,
+    webhook: WebhookServicePair,
+    booking_payload: object,
+    catalog_rows: Sequence[object],
+) -> MultiServiceSnapshot:
+    """Prove and project exactly two distinct business services."""
+    location_uuid, lines = _prove_business_pair(
+        webhook=webhook,
+        booking_payload=booking_payload,
+        catalog_rows=catalog_rows,
+        read_lines=_business_lines,
+    )
 
     unsigned = {
         "version": MULTI_SERVICE_SNAPSHOT_VERSION,
@@ -438,13 +473,46 @@ def prove_exactly_two_service_snapshot(
         "booking_uuid": str(webhook.booking_uuid),
         "location_uuid": location_uuid,
         "services_count": 2,
-        "lines": [line.as_dict() for line in projected],
+        "lines": [line.as_dict() for line in lines],
     }
     return MultiServiceSnapshot(
         booking_uuid=str(webhook.booking_uuid),
         location_uuid=location_uuid,
-        lines=(projected[0], projected[1]),
+        lines=lines,
         digest=_sha256_json(unsigned),
+    )
+
+
+def prove_exactly_two_service_custom_duration_exclusion(
+    *,
+    webhook: WebhookServicePair,
+    booking_payload: object,
+    catalog_rows: Sequence[object],
+) -> str:
+    """Prove that custom duration is the pair's only unsupported property.
+
+    The result is a PII-free digest of the complete validated evidence.  This
+    helper never constructs a runtime snapshot and therefore cannot authorize
+    planning, rendering or sending.
+    """
+    location_uuid, lines = _prove_business_pair(
+        webhook=webhook,
+        booking_payload=booking_payload,
+        catalog_rows=catalog_rows,
+        read_lines=_business_lines_allowing_custom_duration,
+    )
+    if not any(line.actual_duration_minutes != line.original_duration_minutes for line in lines):
+        raise MultiServiceProofError(MULTI_SERVICE_CUSTOM_DURATION_EXCLUSION_NOT_PROVEN)
+    return _sha256_json(
+        {
+            "version": 1,
+            "provider": PROVIDER,
+            "reason": MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
+            "booking_uuid": str(webhook.booking_uuid),
+            "location_uuid": location_uuid,
+            "services_count": 2,
+            "lines": [line.as_dict() for line in lines],
+        }
     )
 
 
@@ -782,6 +850,7 @@ __all__ = [name for name in globals() if name.startswith("MULTI_SERVICE_")] + [
     "multi_service_snapshot_for_job",
     "multi_service_snapshot_from_job_payload",
     "multi_service_snapshot_from_record_raw",
+    "prove_exactly_two_service_custom_duration_exclusion",
     "resolve_effective_multi_service_snapshot",
     "prove_exactly_two_service_snapshot",
     "read_catalog_rows_cached",

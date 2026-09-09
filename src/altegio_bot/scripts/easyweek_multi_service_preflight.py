@@ -24,10 +24,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_client import EasyWeekClient
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_API_UNAVAILABLE,
     MULTI_SERVICE_CATALOG_UNAVAILABLE,
+    MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_SNAPSHOT_KEY,
     MultiServiceProofError,
@@ -36,8 +38,10 @@ from altegio_bot.easyweek_multi_service import (
     ServiceEligibilityPurpose,
     WebhookServicePair,
     evaluate_service_eligibility,
-    fetch_and_prove_exactly_two_service_snapshot,
     multi_service_snapshot_from_record_raw,
+    prove_exactly_two_service_custom_duration_exclusion,
+    prove_exactly_two_service_snapshot,
+    read_catalog_rows_cached,
     record_raw_with_multi_service_snapshot,
     resolve_effective_multi_service_snapshot,
 )
@@ -48,7 +52,7 @@ from altegio_bot.easyweek_service_category import (
     SERVICES_COUNT_SNAPSHOT_KEY,
     record_raw_with_services_count,
 )
-from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, Record
+from altegio_bot.models.models import PROVIDER_EASYWEEK, EasyWeekEvent, MessageJob, OutboxMessage, Record
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
@@ -57,6 +61,7 @@ DEFAULT_LIMIT: Final = 500
 # EasyWeek's workspace-wide 60 requests/minute ceiling.
 DEFAULT_PAUSE_SEC: Final = 1.1
 OPEN_JOB_STATUSES: Final = ("queued", "processing")
+NON_TERMINAL_OUTBOX_STATUSES: Final = ("queued", "sending")
 _LIFECYCLE_HINTS: Final = (
     "booking-created",
     "booking-updated",
@@ -83,6 +88,7 @@ class MultiServicePreflightReport:
     structurally_proven: int = 0
     allowed: int = 0
     disallowed_by_category: int = 0
+    contract_excluded: int = 0
     ambiguous: int = 0
     open_jobs: int = 0
     jobs_held_by_send_fence: int = 0
@@ -97,8 +103,8 @@ class MultiServicePreflightReport:
             self.active_multi_service > 0
             and not self.truncated
             and self.checked == self.active_multi_service
-            and self.structurally_proven == self.active_multi_service
-            and self.allowed + self.disallowed_by_category == self.active_multi_service
+            and self.structurally_proven + self.contract_excluded == self.active_multi_service
+            and self.allowed + self.disallowed_by_category == self.structurally_proven
             and self.ambiguous == 0
             and self.stale_snapshot_digest == 0
             and self.unexplained == 0
@@ -113,6 +119,7 @@ class MultiServicePreflightReport:
             "structurally_proven": self.structurally_proven,
             "allowed": self.allowed,
             "disallowed_by_category": self.disallowed_by_category,
+            "contract_excluded": self.contract_excluded,
             "ambiguous": self.ambiguous,
             "open_jobs": self.open_jobs,
             "jobs_held_by_send_fence": self.jobs_held_by_send_fence,
@@ -192,6 +199,26 @@ async def _open_jobs_by_record(
     return result
 
 
+async def _non_terminal_outboxes_by_record(
+    session: AsyncSession,
+    records: list[Record],
+) -> dict[int, list[OutboxMessage]]:
+    record_ids = [record.id for record in records]
+    if not record_ids:
+        return {}
+    stmt = (
+        select(OutboxMessage)
+        .where(OutboxMessage.record_id.in_(record_ids))
+        .where(OutboxMessage.status.in_(NON_TERMINAL_OUTBOX_STATUSES))
+        .order_by(OutboxMessage.id.asc())
+    )
+    result: dict[int, list[OutboxMessage]] = {}
+    for row in (await session.execute(stmt)).scalars():
+        if row.record_id is not None:
+            result.setdefault(row.record_id, []).append(row)
+    return result
+
+
 def _snapshot_key_present(raw: object) -> bool:
     if not isinstance(raw, Mapping):
         return False
@@ -243,6 +270,27 @@ def _record_job_consistency(
             report.reasons[guard_error or "multi_service_snapshot_digest_mismatch"] += 1
 
 
+def _contract_exclusion_consistency(
+    report: MultiServicePreflightReport,
+    *,
+    record: Record,
+    jobs: list[MessageJob],
+    outboxes: list[OutboxMessage],
+) -> None:
+    if _snapshot_key_present(record.raw):
+        _snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+        report.stale_snapshot_digest += 1
+        report.unexplained += 1
+        report.reasons[error or "contract_excluded_snapshot_present"] += 1
+    for _job in jobs:
+        report.open_jobs += 1
+        report.unexplained += 1
+        report.reasons["contract_excluded_open_job"] += 1
+    for _outbox in outboxes:
+        report.unexplained += 1
+        report.reasons["contract_excluded_non_terminal_outbox"] += 1
+
+
 async def run_preflight(
     session: AsyncSession,
     *,
@@ -257,6 +305,7 @@ async def run_preflight(
     report = MultiServicePreflightReport(active_multi_service=len(records), truncated=truncated)
     events = await _latest_lifecycle_events(session, records)
     jobs = await _open_jobs_by_record(session, records)
+    outboxes = await _non_terminal_outboxes_by_record(session, records)
     registry = configured_easyweek_locations()
 
     api_reads = 0
@@ -287,21 +336,38 @@ async def run_preflight(
         if api_reads:
             await pause(pause_sec)
         api_reads += 1
+        webhook_pair = WebhookServicePair(
+            booking_uuid=booking.booking_uuid,
+            location_uuid=location.location_uuid,
+            service_name=booking.service_name,
+            service_related=booking.service_related,
+            services_description=booking.services_description,
+            services_count=booking.services_count,
+            quantity=booking.service_quantity,
+            booking_currency=booking.booking_currency,
+            total_cost=record.total_cost,
+        )
         try:
-            live = await fetch_and_prove_exactly_two_service_snapshot(
-                client=client,
-                webhook=WebhookServicePair(
-                    booking_uuid=booking.booking_uuid,
-                    location_uuid=location.location_uuid,
-                    service_name=booking.service_name,
-                    service_related=booking.service_related,
-                    services_description=booking.services_description,
-                    services_count=booking.services_count,
-                    quantity=booking.service_quantity,
-                    booking_currency=booking.booking_currency,
-                    total_cost=record.total_cost,
-                ),
-            )
+            try:
+                booking_payload = await client.get_booking(str(booking.booking_uuid))
+            except EasyWeekError:
+                raise MultiServiceProofError(MULTI_SERVICE_API_UNAVAILABLE, recoverable=True) from None
+            catalog_rows = await read_catalog_rows_cached(client, location_uuid=location.location_uuid)
+            try:
+                live = prove_exactly_two_service_snapshot(
+                    webhook=webhook_pair,
+                    booking_payload=booking_payload,
+                    catalog_rows=catalog_rows,
+                )
+            except MultiServiceProofError as initial_error:
+                if initial_error.reason != MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED:
+                    raise
+                prove_exactly_two_service_custom_duration_exclusion(
+                    webhook=webhook_pair,
+                    booking_payload=booking_payload,
+                    catalog_rows=catalog_rows,
+                )
+                live = None
         except MultiServiceProofError as exc:
             report.ambiguous += 1
             report.unexplained += 1
@@ -311,6 +377,17 @@ async def run_preflight(
             report.ambiguous += 1
             report.unexplained += 1
             report.reasons[MULTI_SERVICE_CATALOG_UNAVAILABLE] += 1
+            continue
+
+        if live is None:
+            report.contract_excluded += 1
+            report.reasons[MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED] += 1
+            _contract_exclusion_consistency(
+                report,
+                record=record,
+                jobs=jobs.get(record.id, []),
+                outboxes=outboxes.get(record.id, []),
+            )
             continue
 
         report.structurally_proven += 1

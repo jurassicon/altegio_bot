@@ -5678,6 +5678,30 @@ async def test_proven_pair_plans_both_digest_bound_reminders(
     assert len(digests) == 1 and None not in digests
 
 
+async def test_custom_duration_pair_creates_no_snapshot_lifecycle_or_reminder_jobs(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    booking = _multi_booking()
+    services = booking["ordered_services"]
+    assert isinstance(services, list)
+    services[1]["duration"] = {"value": 75, "label": "minutes"}
+    _enable_multi_planning(monkeypatch, booking=booking)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="multi-custom-duration-unsupported",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
 async def test_canceled_booking_reproves_pair_and_plans_digest_bound_cancellation(
     bound_session_local,
     monkeypatch: pytest.MonkeyPatch,

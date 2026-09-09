@@ -56,6 +56,9 @@ apply report атомарно с mode `0600`; их нельзя коммитит
 `plan` заново выбирает весь текущий future scope, делает paced GET каждой
 booking и полного каталога, повторяет основной PR-7.4 proof и только затем
 сравнивает jobs/outbox. SQL-мутирующих команд, commit и внешней отправки нет.
+После этого hotfix старые recovery `plan.json`/apply report version 1
+несовместимы: не переиспользовать и не редактировать их, а обязательно создать
+новый plan и новый digest после deploy.
 
 ```bash
 docker compose -p altegio_bot --profile ops run --rm --build \
@@ -70,9 +73,10 @@ docker compose -p altegio_bot --profile ops run --rm --build \
 
 ```text
 records_seen≈20
-structurally_proven≈20
+structurally_proven≈14
 allowed_records≈4
-disallowed_records≈16
+disallowed_records≈10
+contract_excluded_records≈6
 reminders_to_create=0..8
 blockers=0
 truncated=false
@@ -82,7 +86,10 @@ apply_ready=true
 Ровно восемь jobs не требуется: прошедший `reminder_24h` получает
 `window_passed`, а если прошло и двухчасовое окно, recovery ничего не создаёт.
 `Nagelservice` и mixed allowed/disallowed pair получают
-`category_not_allowed`. Любой API timeout/429/5xx, неполный каталог,
+`category_not_allowed`. Exact `multi_service_custom_duration_unsupported`
+получает `contract_not_supported`, не получает snapshot/dedupe/reminder и не
+блокирует независимые allowed records. Эти числа — текущий наблюдаемый
+baseline, а не постоянный контракт. Любой API timeout/429/5xx, неполный каталог,
 identity/price/time/digest mismatch или processing/non-terminal outbox делает
 план неприменимым.
 
@@ -132,6 +139,8 @@ Outbox rows и ещё раз проверяет локальное состоя�
 `reminder_24h`/`reminder_2h` с canonical run_at/dedupe/payload. Existing
 queued/done не переписываются, processing блокирует волну, canceled/failed не
 воскрешаются. Повторный apply того же snapshot идемпотентен (`created=0`).
+Apply запускать только при `blockers=0` и `apply_ready=true`; contract-excluded
+records не входят в mutation set и reminders не получают.
 
 ## 6. Verify snapshot/apply/result
 
@@ -144,9 +153,12 @@ docker compose -p altegio_bot --profile ops run --rm --build \
 
 Требуются `passed=true`, `counts_match=true`, `created_jobs_match=true` и
 пустые `unexpected_job_ids`, `unexpected_outbox_ids`, `disallowed_jobs`,
-`overdue_jobs`, `digest_mismatches`, `identity_mismatches`. До открытия send
-fence ожидается только status `queued`; `subsequent_job_ids` и
-`subsequent_outbox_ids` должны быть пустыми.
+`contract_excluded_jobs`, `overdue_jobs`, `digest_mismatches`,
+`identity_mismatches`, `state_mismatch_record_ids`. Проверка охватывает tagged
+и untagged reminder jobs, новые outbox rows и PII-free digests Record, Client и
+RecordService для contract-excluded records. До открытия send fence ожидается
+только status `queued`; `subsequent_job_ids` и `subsequent_outbox_ids` должны
+быть пустыми.
 
 ## 7. Общий reminder preflight
 
@@ -159,7 +171,10 @@ snapshot из payload recovery job, даже если
 `Record.raw.easyweek.multi_service_snapshot` отсутствует. Это ожидаемый
 embedded-only контракт §34.5, а не повод делать запрещённый Record backfill;
 при наличии stored и embedded snapshot их digest обязан совпадать с текущим
-live proof.
+live proof. Новый contract-excluded subset участвует в readiness как
+`structurally_proven + contract_excluded == active_multi_service`; при этом
+`allowed + disallowed_by_category == structurally_proven`, а exclusion с
+open job/non-terminal outbox остаётся `unexplained` и закрывает gate.
 
 ```bash
 docker compose -p altegio_bot run --rm --no-deps \
