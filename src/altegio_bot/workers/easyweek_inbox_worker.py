@@ -53,7 +53,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ..db import SessionLocal
+from ..easyweek_client import EasyWeekClient
 from ..easyweek_locations import configured_easyweek_locations
+from ..easyweek_multi_service import (
+    MULTI_SERVICE_DISABLED,
+    MultiServiceProofError,
+    MultiServiceSnapshot,
+    ServiceEligibilityPurpose,
+    WebhookServicePair,
+    evaluate_service_eligibility,
+    fetch_and_prove_exactly_two_service_snapshot,
+    multi_service_job_payload,
+    multi_service_snapshot_from_record_raw,
+    record_raw_with_multi_service_snapshot,
+    webhook_pair_is_touched,
+)
 from ..easyweek_normalizer import (
     CREATE,
     DELETE,
@@ -77,7 +91,11 @@ from ..easyweek_policy import (
     REPEAT_10D,
     REVIEW_3D,
 )
-from ..easyweek_reminders import plan_reminders, reminder_job_payload
+from ..easyweek_reminders import (
+    easyweek_multi_service_reminder_dedupe_key,
+    plan_reminders,
+    reminder_job_payload,
+)
 from ..easyweek_retention import (
     RETENTION_BASELINE_UNPROVEN,
     RETENTION_SERVICE_UNPROVEN,
@@ -736,6 +754,76 @@ async def upsert_record(
     return record
 
 
+async def sync_multi_service_snapshot(
+    record: Record,
+    booking: NormalizedBooking,
+    *,
+    event_id: int | None,
+) -> MultiServiceSnapshot | None:
+    """Rebuild or revoke the bounded pair proof under patch semantics."""
+    if not webhook_pair_is_touched(booking.present_fields):
+        snapshot, _reason = multi_service_snapshot_from_record_raw(record.raw)
+        return snapshot
+
+    # Any explicit transition away from exactly two services revokes the pair
+    # proof immediately.  The established single-service snapshot remains the
+    # source for a subsequent single-service notification.
+    if booking.services_count != 2:
+        record.raw = record_raw_with_multi_service_snapshot(record.raw, None)
+        return None
+
+    if not bool(settings.easyweek_multi_service_notifications_enabled):
+        record.raw = record_raw_with_multi_service_snapshot(record.raw, None)
+        logger.info(
+            "easyweek multi-service suppressed event_id=%s record_id=%s company_id=%s reason=%s",
+            event_id,
+            record.id,
+            record.company_id,
+            MULTI_SERVICE_DISABLED,
+        )
+        return None
+
+    registry = configured_easyweek_locations()
+    location = registry.locations.get(record.company_id) if registry.ready else None
+    if location is None:
+        raise RecoverableCategoryConfigurationError("multi_service_catalog_unavailable")
+
+    webhook = WebhookServicePair(
+        booking_uuid=booking.booking_uuid,
+        location_uuid=location.location_uuid,
+        service_name=booking.service_name,
+        service_related=booking.service_related,
+        services_description=booking.services_description,
+        services_count=booking.services_count,
+        quantity=booking.service_quantity,
+        booking_currency=booking.booking_currency,
+        total_cost=record.total_cost,
+    )
+    try:
+        client = EasyWeekClient()
+    except Exception:
+        raise RecoverableCategoryConfigurationError("multi_service_api_unavailable") from None
+    try:
+        snapshot = await fetch_and_prove_exactly_two_service_snapshot(client=client, webhook=webhook)
+    except MultiServiceProofError as exc:
+        if exc.recoverable:
+            raise RecoverableCategoryConfigurationError(exc.reason) from None
+        record.raw = record_raw_with_multi_service_snapshot(record.raw, None)
+        logger.info(
+            "easyweek multi-service suppressed event_id=%s record_id=%s company_id=%s reason=%s",
+            event_id,
+            record.id,
+            record.company_id,
+            exc.reason,
+        )
+        return None
+    finally:
+        await client.aclose()
+
+    record.raw = record_raw_with_multi_service_snapshot(record.raw, snapshot)
+    return snapshot
+
+
 def _service_title(booking: NormalizedBooking) -> str | None:
     """Customer-facing service text under the shared patch contract.
 
@@ -880,9 +968,22 @@ async def plan_lifecycle_job(
     if not settings.easyweek_notifications_enabled:
         return
 
-    eligibility = evaluate_service_category(
+    if services_count_from_record_raw(record.raw) == 2 and not bool(
+        settings.easyweek_multi_service_notifications_enabled
+    ):
+        logger.info(
+            "easyweek lifecycle suppressed event_id=%s record_id=%s company_id=%s reason=%s",
+            event_id,
+            record.id,
+            booking.company_id,
+            MULTI_SERVICE_DISABLED,
+        )
+        return
+
+    eligibility = evaluate_service_eligibility(
         record_raw=record.raw,
         allowed_categories_raw=settings.easyweek_allowed_service_categories,
+        purpose=ServiceEligibilityPurpose.LIFECYCLE_REMINDER,
     )
     if not eligibility.allowed:
         if eligibility.recoverable_configuration:
@@ -924,6 +1025,7 @@ async def plan_lifecycle_job(
             "provider": PROVIDER,
             "booking_uuid": str(booking.booking_uuid),
             "event_hint": event_hint,
+            **multi_service_job_payload(multi_service_snapshot_from_record_raw(record.raw)[0]),
         },
     )
     # A Resend of the same delivery produces the same key; do nothing rather
@@ -1828,7 +1930,19 @@ async def sync_reminder_jobs(
         now=now,
         is_deleted=bool(record.is_deleted),
     )
-    desired_keys = {item.dedupe_key for item in desired}
+    snapshot, _snapshot_error = multi_service_snapshot_from_record_raw(record.raw)
+    effective_desired: list[tuple[Any, str]] = []
+    for item in desired:
+        key = item.dedupe_key
+        if snapshot is not None:
+            key = easyweek_multi_service_reminder_dedupe_key(
+                booking_uuid=booking.booking_uuid,
+                job_type=item.job_type,
+                starts_at=record.starts_at,
+                multi_service_snapshot_digest=snapshot.digest,
+            )
+        effective_desired.append((item, key))
+    desired_keys = {key for _item, key in effective_desired}
 
     # Anything queued for this booking that the current appointment no longer
     # owes: a reschedule changed the start instant (and therefore the key), or
@@ -1850,9 +1964,21 @@ async def sync_reminder_jobs(
     if not (settings.easyweek_notifications_enabled and settings.easyweek_reminders_enabled):
         return
 
-    eligibility = evaluate_service_category(
+    if services_count_from_record_raw(record.raw) == 2 and not bool(
+        settings.easyweek_multi_service_notifications_enabled
+    ):
+        logger.info(
+            "easyweek reminders suppressed record_id=%s company_id=%s reason=%s",
+            record.id,
+            booking.company_id,
+            MULTI_SERVICE_DISABLED,
+        )
+        return
+
+    eligibility = evaluate_service_eligibility(
         record_raw=record.raw,
         allowed_categories_raw=settings.easyweek_allowed_service_categories,
+        purpose=ServiceEligibilityPurpose.LIFECYCLE_REMINDER,
     )
     if not eligibility.allowed:
         if eligibility.recoverable_configuration:
@@ -1868,7 +1994,7 @@ async def sync_reminder_jobs(
         )
         return
 
-    for item in desired:
+    for item, dedupe_key in effective_desired:
         stmt = pg_insert(MessageJob).values(
             provider=PROVIDER,
             company_id=booking.company_id,
@@ -1877,13 +2003,16 @@ async def sync_reminder_jobs(
             job_type=item.job_type,
             run_at=item.run_at,
             status="queued",
-            dedupe_key=item.dedupe_key,
-            payload=reminder_job_payload(
-                booking_uuid=booking.booking_uuid,
-                company_id=booking.company_id,
-                starts_at=record.starts_at,
-                job_type=item.job_type,
-            ),
+            dedupe_key=dedupe_key,
+            payload={
+                **reminder_job_payload(
+                    booking_uuid=booking.booking_uuid,
+                    company_id=booking.company_id,
+                    starts_at=record.starts_at,
+                    job_type=item.job_type,
+                ),
+                **multi_service_job_payload(snapshot),
+            },
         )
         # An identical business fact — a Resend, an unrelated edit, a second
         # delivery of the same appointment — owes the same reminder, and a
@@ -1954,6 +2083,7 @@ async def apply_booking(
     # reference it.
     await session.flush()
     await sync_record_service(session, record, booking)
+    await sync_multi_service_snapshot(record, booking, event_id=event_id)
     await plan_lifecycle_job(
         session,
         booking=booking,

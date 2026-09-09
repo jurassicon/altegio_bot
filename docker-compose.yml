@@ -93,6 +93,10 @@ services:
   # planning: a queued retention job is still a customer message, so the master
   # fence has to be able to stop one that is already in the queue.
   #
+  # PR-7.4 reads BOTH multi-service flags here: the shared outbox re-checks the
+  # planning authority and the independent send fence before a digest-bound
+  # lifecycle/reminder job can be claimed or reach any provider call.
+  #
   # This service is also the base image for the one-off review preflight
   # (`run --rm --no-deps --entrypoint /app/.venv/bin/python
   # altegio-outbox-worker -m altegio_bot.scripts.easyweek_review_preflight`),
@@ -179,6 +183,8 @@ services:
   # PR-8: this service reads EASYWEEK_REMINDERS_ENABLED (reminder PLANNING).
   # The send fence, EASYWEEK_REMINDER_API_GUARD_ENABLED, is read by
   # altegio-outbox-worker instead — recreate that one when flipping it.
+  # PR-7.4: this service reads EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED;
+  # the outbox worker reads EASYWEEK_MULTI_SERVICE_SEND_ENABLED.
   #
   # PR-9: likewise EASYWEEK_REVIEWS_ENABLED (review PLANNING) is read here;
   # its send fence EASYWEEK_REVIEW_SEND_ENABLED belongs to the outbox worker.
@@ -398,6 +404,35 @@ services:
         "/app/.venv/bin/python",
         "-m",
         "altegio_bot.scripts.easyweek_post_booking_handover",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
+  # PR-7.4 controlled recovery of still-current reminder obligations for
+  # existing proven exactly-two-service EasyWeek records. The same image is
+  # used for plan/apply/verify; plan and verify are read-only, while apply can
+  # only insert the two reminder MessageJob types. The private mount preserves
+  # the UUID-bearing 0600 snapshot and apply report outside the container and
+  # under git-ignored outputs/.
+  easyweek-multi-service-reminder-recovery:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MULTI_SERVICE_RECOVERY_STATE_DIR:-./outputs/easyweek_multi_service_recovery}:/recovery
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_multi_service_reminder_recovery",
       ]
     command: ["--help"]
     working_dir: /app

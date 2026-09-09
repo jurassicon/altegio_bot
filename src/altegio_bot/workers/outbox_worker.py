@@ -51,6 +51,16 @@ from altegio_bot.easyweek_branches import (
 )
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
+from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_DISABLED,
+    MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_SEND_DISABLED,
+    MULTI_SERVICE_SNAPSHOT_MISSING,
+    MultiServiceSnapshot,
+    ServiceEligibilityPurpose,
+    evaluate_service_eligibility,
+    resolve_effective_multi_service_snapshot,
+)
 from altegio_bot.easyweek_normalizer import extract_manage_link, normalize_booking_hash_id
 from altegio_bot.easyweek_policy import (
     COMEBACK_3D,
@@ -116,7 +126,7 @@ from altegio_bot.easyweek_review import (
     validate_google_review_url,
     visit_limit_verdict,
 )
-from altegio_bot.easyweek_service_category import evaluate_service_category, services_count_from_record_raw
+from altegio_bot.easyweek_service_category import services_count_from_record_raw
 from altegio_bot.message_planner import (
     COMEBACK_3D_DELAY,
     COMEBACK_3D_SOURCE_CANCELLED_AT_KEY,
@@ -647,6 +657,15 @@ def easyweek_retention_job_blocked(job: MessageJob) -> str | None:
     return None
 
 
+def _easyweek_multi_service_fence_reason() -> str | None:
+    """Current pair-delivery fence outcome, shared by claim and race guard."""
+    if not bool(settings.easyweek_multi_service_notifications_enabled):
+        return MULTI_SERVICE_DISABLED
+    if not bool(settings.easyweek_multi_service_send_enabled):
+        return MULTI_SERVICE_SEND_DISABLED
+    return None
+
+
 async def _lock_next_jobs(
     session: AsyncSession,
     batch_size: int,
@@ -678,6 +697,17 @@ async def _lock_next_jobs(
         stmt = stmt.where(
             ~((MessageJob.provider == PROVIDER_EASYWEEK) & (MessageJob.job_type.in_(EASYWEEK_REMINDER_JOB_TYPES)))
         )
+
+    # PR-7.4 send fence.  It is deliberately narrower than either lifecycle or
+    # reminder fences: only jobs carrying the immutable pair digest are held.
+    # Single-service jobs with the same provider/job_type remain claimable.
+    if _easyweek_multi_service_fence_reason() is not None:
+        multi_rows = (
+            (MessageJob.provider == PROVIDER_EASYWEEK)
+            & (MessageJob.job_type.in_(EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES))
+            & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_DIGEST_KEY)
+        )
+        stmt = stmt.where(~multi_rows)
 
     # PR-9 send fence, the same shape and for the same reason: with the fence
     # shut an EasyWeek review is not claimed AT ALL, so it keeps its `queued`
@@ -1896,6 +1926,8 @@ async def _render_message(
     record: Record | None,
     client: Client | None,
     provider: str = PROVIDER_ALTEGIO,
+    job_payload: object = None,
+    effective_multi_service_snapshot: MultiServiceSnapshot | None = None,
 ) -> tuple[str, int, str, dict[str, Any]]:
     is_easyweek = provider == PROVIDER_EASYWEEK
     language = (
@@ -1969,21 +2001,47 @@ async def _render_message(
         svc_res = await session.execute(svc_stmt)
         services = list(svc_res.scalars().all())
 
-        if is_easyweek and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES:
+        claims_multi_service = isinstance(job_payload, dict) and MULTI_SERVICE_JOB_DIGEST_KEY in job_payload
+        needs_multi_service_snapshot = (
+            is_easyweek
+            and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES
+            and (
+                services_count_from_record_raw(record.raw) == 2
+                or claims_multi_service
+                or effective_multi_service_snapshot is not None
+            )
+        )
+        if needs_multi_service_snapshot and effective_multi_service_snapshot is None:
+            # The presend path must pass the already validated effective
+            # snapshot.  Never independently reinterpret a recovery payload or
+            # fall back to the aggregate RecordService for a claimed pair.
+            raise ValueError(MULTI_SERVICE_SNAPSHOT_MISSING)
+
+        if is_easyweek and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES and not needs_multi_service_snapshot:
             # BEFORE the loop below, which is what would flatten an unknown
             # title into "None" and an unknown price into "0.00".
             snapshot_err = _easyweek_service_snapshot_error(record, services)
             if snapshot_err is not None:
                 raise ValueError(snapshot_err)
 
-        if services:
-            primary_service = services[0].title or ""
-
         lines: list[str] = []
-        for svc in services:
-            lines.append(f"{svc.title} — {_fmt_money(svc.cost_to_pay)}€")
-            if svc.cost_to_pay is not None:
-                total_cost += svc.cost_to_pay
+        if (
+            is_easyweek
+            and effective_multi_service_snapshot is not None
+            and template_code in EASYWEEK_SERVICE_SNAPSHOT_JOB_TYPES
+        ):
+            primary_service = effective_multi_service_snapshot.lines[0].display_name
+            for line in effective_multi_service_snapshot.lines:
+                price = (Decimal(line.actual_price_minor) / Decimal(100)).quantize(Decimal("0.01"))
+                lines.append(f"{line.display_name} — {_fmt_money(price)}€")
+                total_cost += price
+        else:
+            if services:
+                primary_service = services[0].title or ""
+            for svc in services:
+                lines.append(f"{svc.title} — {_fmt_money(svc.cost_to_pay)}€")
+                if svc.cost_to_pay is not None:
+                    total_cost += svc.cost_to_pay
 
         services_text = "\n".join(lines)
 
@@ -3213,6 +3271,23 @@ async def _run_job_logic(
     # Altegio path, exactly as before.
     job_provider = normalize_provider(getattr(job, "provider", None), default=PROVIDER_ALTEGIO)
 
+    payload = job.payload if isinstance(job.payload, dict) else {}
+    claims_multi_service = MULTI_SERVICE_JOB_DIGEST_KEY in payload
+    effective_multi_service_snapshot: MultiServiceSnapshot | None = None
+    multi_service_fence_reason = _easyweek_multi_service_fence_reason()
+    if (
+        claims_multi_service
+        and job_provider == PROVIDER_EASYWEEK
+        and job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+        and multi_service_fence_reason is not None
+    ):
+        # Race-safe half of the query fence: a batch claimed just before the
+        # operator closed the flag is returned untouched and spends no attempt.
+        job.status = "queued"
+        job.locked_at = None
+        job.last_error = multi_service_fence_reason
+        return None
+
     # Retry syntax/reference/type is a routing boundary. It runs before campaign
     # and promo dispatch so a malformed or legacy row cannot be interpreted as
     # a different local command, much less reach an API or Meta. Full
@@ -3595,13 +3670,52 @@ async def _run_job_logic(
             )
             return None
 
-        # Re-prove the CURRENT persisted category after provider/company/record
-        # identity, but before the phone, rate limit, rendering, Meta, Chatwoot
-        # or any Outbox audit row. This closes queued/pre-PR-7.1 jobs and the
-        # allowed -> disallowed race between planner and claim.
-        eligibility = evaluate_service_category(
+        purpose = (
+            ServiceEligibilityPurpose.LIFECYCLE_REMINDER
+            if (
+                job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES
+                and bool(settings.easyweek_multi_service_notifications_enabled)
+            )
+            else ServiceEligibilityPurpose.SINGLE_SERVICE_ONLY
+        )
+
+        # Resolve the effective pair after provider/company/record/client
+        # identity, but before category eligibility, live API, phone, render,
+        # attempts, Outbox, Meta or Chatwoot. Recovery may carry the snapshot
+        # only in the job payload; normal runtime carries it on Record.raw.
+        if claims_multi_service or (
+            purpose is ServiceEligibilityPurpose.LIFECYCLE_REMINDER and services_count_from_record_raw(record.raw) == 2
+        ):
+            owned_location, _owned_profile, _owned_error = _easyweek_owned_branch(job.company_id)
+            effective_multi_service_snapshot, pair_error = resolve_effective_multi_service_snapshot(
+                record_raw=record.raw,
+                job_payload=job.payload,
+                record_total_cost=record.total_cost,
+                expected_booking_uuid=record.easyweek_booking_uuid,
+                expected_location_uuid=(owned_location.location_uuid if owned_location is not None else None),
+            )
+            if pair_error is not None:
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = pair_error
+                logger.info(
+                    "EasyWeek multi-service refused before send job_id=%s company_id=%s record_id=%s reason=%s",
+                    job.id,
+                    job.company_id,
+                    record.id,
+                    pair_error,
+                )
+                return None
+
+        # Re-prove the CURRENT category after identity and pair resolution, but
+        # before the phone, rate limit, rendering, Meta, Chatwoot or any Outbox
+        # audit row. The same strict all-categories policy consumes either the
+        # stored or recovery-embedded effective snapshot.
+        eligibility = evaluate_service_eligibility(
             record_raw=record.raw,
             allowed_categories_raw=settings.easyweek_allowed_service_categories,
+            purpose=purpose,
+            effective_multi_service_snapshot=effective_multi_service_snapshot,
         )
         if not eligibility.allowed:
             if eligibility.recoverable_configuration:
@@ -4446,6 +4560,8 @@ async def _run_job_logic(
                 record=record,
                 client=client,
                 provider=job_provider,
+                job_payload=payload,
+                effective_multi_service_snapshot=effective_multi_service_snapshot,
             )
     except Exception as exc:
         job.status = "failed"
