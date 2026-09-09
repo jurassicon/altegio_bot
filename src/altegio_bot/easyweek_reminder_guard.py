@@ -61,16 +61,16 @@ from altegio_bot.easyweek_client import (
 )
 from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
     MultiServiceProofError,
     WebhookServicePair,
-    multi_service_job_digest,
-    multi_service_send_guard,
-    multi_service_snapshot_for_job,
     prove_exactly_two_service_snapshot,
     read_catalog_rows_cached,
+    resolve_effective_multi_service_snapshot,
 )
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
+from altegio_bot.easyweek_service_category import services_count_from_record_raw
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageJob, Record
 
 # EasyWeek uses both result nouns and adjectives across API surfaces. Keeping
@@ -510,15 +510,16 @@ async def verify_reminder_is_current(
     expected_start = _job_record_starts_at(job)
     assert booking_uuid is not None and expected_start is not None and location is not None
 
-    snapshot, _snapshot_error = multi_service_snapshot_for_job(
-        record_raw=getattr(record, "raw", None),
-        job_payload=getattr(job, "payload", None),
+    record_raw = getattr(record, "raw", None)
+    job_payload = getattr(job, "payload", None)
+    claims_pair = services_count_from_record_raw(record_raw) == 2 or (
+        isinstance(job_payload, dict) and MULTI_SERVICE_JOB_DIGEST_KEY in job_payload
     )
-    claims_pair = multi_service_job_digest(getattr(job, "payload", None)) is not None
-    if snapshot is not None or claims_pair:
-        pair_error = multi_service_send_guard(
+    snapshot = None
+    if claims_pair:
+        snapshot, pair_error = resolve_effective_multi_service_snapshot(
             record_raw=getattr(record, "raw", None),
-            job_payload=getattr(job, "payload", None),
+            job_payload=job_payload,
             record_total_cost=getattr(record, "total_cost", None),
             expected_booking_uuid=getattr(record, "easyweek_booking_uuid", None),
             expected_location_uuid=getattr(location, "location_uuid", None),

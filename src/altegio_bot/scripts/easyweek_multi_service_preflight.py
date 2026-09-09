@@ -32,14 +32,14 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_SNAPSHOT_KEY,
     MultiServiceProofError,
     MultiServiceReader,
+    MultiServiceSnapshot,
     ServiceEligibilityPurpose,
     WebhookServicePair,
     evaluate_service_eligibility,
     fetch_and_prove_exactly_two_service_snapshot,
-    multi_service_job_digest,
-    multi_service_send_guard,
     multi_service_snapshot_from_record_raw,
     record_raw_with_multi_service_snapshot,
+    resolve_effective_multi_service_snapshot,
 )
 from altegio_bot.easyweek_normalizer import NormalizationError, normalize_event
 from altegio_bot.easyweek_policy import EASYWEEK_LIFECYCLE_JOB_TYPES, EASYWEEK_REMINDER_JOB_TYPES
@@ -203,12 +203,12 @@ def _record_job_consistency(
     report: MultiServicePreflightReport,
     *,
     record: Record,
-    live_digest: str,
+    live_snapshot: MultiServiceSnapshot,
     jobs: list[MessageJob],
 ) -> None:
     stored, stored_error = multi_service_snapshot_from_record_raw(record.raw)
     has_stored_value = _snapshot_key_present(record.raw)
-    if has_stored_value and (stored is None or stored.digest != live_digest):
+    if has_stored_value and (stored is None or stored.digest != live_snapshot.digest):
         report.stale_snapshot_digest += 1
         report.unexplained += 1
         report.reasons[stored_error or "multi_service_snapshot_digest_mismatch"] += 1
@@ -230,23 +230,17 @@ def _record_job_consistency(
             report.unexplained += 1
             report.reasons["multi_service_job_not_held"] += 1
 
-        digest = multi_service_job_digest(payload)
-        if stored is None or digest != live_digest:
-            report.stale_snapshot_digest += 1
-            report.unexplained += 1
-            report.reasons["multi_service_snapshot_digest_mismatch"] += 1
-            continue
-        guard_error = multi_service_send_guard(
+        effective, guard_error = resolve_effective_multi_service_snapshot(
             record_raw=record.raw,
             job_payload=payload,
             record_total_cost=record.total_cost,
             expected_booking_uuid=record.easyweek_booking_uuid,
-            expected_location_uuid=stored.location_uuid,
+            expected_location_uuid=live_snapshot.location_uuid,
         )
-        if guard_error is not None:
+        if guard_error is not None or effective is None or effective.digest != live_snapshot.digest:
             report.stale_snapshot_digest += 1
             report.unexplained += 1
-            report.reasons[guard_error] += 1
+            report.reasons[guard_error or "multi_service_snapshot_digest_mismatch"] += 1
 
 
 async def run_preflight(
@@ -342,7 +336,7 @@ async def run_preflight(
         _record_job_consistency(
             report,
             record=record,
-            live_digest=live.digest,
+            live_snapshot=live,
             jobs=jobs.get(record.id, []),
         )
 

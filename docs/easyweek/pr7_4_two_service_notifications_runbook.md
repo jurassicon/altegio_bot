@@ -154,6 +154,13 @@ Recovery verify доказывает точность созданных обя�
 preflight независимо доказывает, что **каждая открытая EasyWeek reminder job**
 прямо сейчас проходит тот же live API guard, что и outbox worker:
 
+Post-recovery `easyweek_multi_service_preflight` принимает digest-валидный
+snapshot из payload recovery job, даже если
+`Record.raw.easyweek.multi_service_snapshot` отсутствует. Это ожидаемый
+embedded-only контракт §34.5, а не повод делать запрещённый Record backfill;
+при наличии stored и embedded snapshot их digest обязан совпадать с текущим
+live proof.
+
 ```bash
 docker compose -p altegio_bot run --rm --no-deps \
   --entrypoint /app/.venv/bin/python altegio-outbox-worker \

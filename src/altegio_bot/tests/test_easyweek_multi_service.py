@@ -22,9 +22,11 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_NAMES_NOT_DISTINCT,
     MULTI_SERVICE_QUANTITY_UNSUPPORTED,
+    MULTI_SERVICE_RECORD_COUNT_MISMATCH,
     MULTI_SERVICE_RELATED_MISSING,
     MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
     MULTI_SERVICE_SNAPSHOT_MISSING,
+    MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED,
     MULTI_SERVICE_TOTAL_MISMATCH,
     MultiServiceProofError,
     ServiceEligibilityPurpose,
@@ -38,6 +40,7 @@ from altegio_bot.easyweek_multi_service import (
     prove_exactly_two_service_snapshot,
     read_catalog_rows_cached,
     record_raw_with_multi_service_snapshot,
+    resolve_effective_multi_service_snapshot,
 )
 
 BOOKING_UUID = uuid.UUID("11111111-2222-4333-8444-555555555555")
@@ -403,6 +406,132 @@ def test_job_digest_must_match_current_snapshot_and_total() -> None:
         )
         == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
     )
+
+
+def test_effective_recovery_snapshot_is_bound_to_current_record_and_job_metadata() -> None:
+    snapshot = _prove()
+    payload = multi_service_job_payload(snapshot, include_snapshot=True)
+    identity = {
+        "expected_booking_uuid": BOOKING_UUID,
+        "expected_location_uuid": LOCATION_UUID,
+    }
+    effective, error = resolve_effective_multi_service_snapshot(
+        record_raw={"easyweek": {"services_count": 2}},
+        job_payload=payload,
+        record_total_cost=Decimal("95.00"),
+        **identity,
+    )
+    assert error is None and effective == snapshot
+
+    without_digest = dict(payload)
+    without_digest.pop(MULTI_SERVICE_JOB_DIGEST_KEY)
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 2}},
+            job_payload=without_digest,
+            record_total_cost=Decimal("95.00"),
+            **identity,
+        )
+        == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    )
+
+    wrong_version = {**payload, "multi_service_snapshot_version": 999}
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 2}},
+            job_payload=wrong_version,
+            record_total_cost=Decimal("95.00"),
+            **identity,
+        )
+        == MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
+    )
+    unsupported_snapshot = copy.deepcopy(payload)
+    unsupported_snapshot["multi_service_snapshot"]["version"] = 999
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 2}},
+            job_payload=unsupported_snapshot,
+            record_total_cost=Decimal("95.00"),
+            **identity,
+        )
+        == MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
+    )
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 1}},
+            job_payload=payload,
+            record_total_cost=Decimal("95.00"),
+            **identity,
+        )
+        == MULTI_SERVICE_RECORD_COUNT_MISMATCH
+    )
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 2}},
+            job_payload=payload,
+            record_total_cost=Decimal("94.00"),
+            **identity,
+        )
+        == MULTI_SERVICE_TOTAL_MISMATCH
+    )
+    assert (
+        multi_service_send_guard(
+            record_raw={"easyweek": {"services_count": 2}},
+            job_payload=payload,
+            record_total_cost=Decimal("95.00"),
+            expected_booking_uuid=BOOKING_UUID,
+            expected_location_uuid="bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        )
+        == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    )
+
+
+def test_stored_and_embedded_snapshots_must_match_and_use_one_category_policy() -> None:
+    stored = _prove()
+    embedded = _prove(catalog=_catalog(first_category="Nagelservice"))
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, stored)
+    assert (
+        multi_service_send_guard(
+            record_raw=raw,
+            job_payload=multi_service_job_payload(embedded, include_snapshot=True),
+            record_total_cost=Decimal("95.00"),
+            expected_booking_uuid=BOOKING_UUID,
+            expected_location_uuid=LOCATION_UUID,
+        )
+        == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    )
+    malformed_embedded = multi_service_job_payload(stored)
+    malformed_embedded["multi_service_snapshot"] = None
+    assert (
+        multi_service_send_guard(
+            record_raw=raw,
+            job_payload=malformed_embedded,
+            record_total_cost=Decimal("95.00"),
+            expected_booking_uuid=BOOKING_UUID,
+            expected_location_uuid=LOCATION_UUID,
+        )
+        == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    )
+    malformed_stored = {"easyweek": {"services_count": 2, "multi_service_snapshot": None}}
+    assert (
+        multi_service_send_guard(
+            record_raw=malformed_stored,
+            job_payload=multi_service_job_payload(stored, include_snapshot=True),
+            record_total_cost=Decimal("95.00"),
+            expected_booking_uuid=BOOKING_UUID,
+            expected_location_uuid=LOCATION_UUID,
+        )
+        == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    )
+
+    eligibility = evaluate_service_eligibility(
+        record_raw={"easyweek": {"services_count": 2}},
+        allowed_categories_raw=json.dumps(["Wimpernverlängerung"]),
+        purpose=ServiceEligibilityPurpose.LIFECYCLE_REMINDER,
+        effective_multi_service_snapshot=embedded,
+    )
+    assert eligibility.allowed is False
+    assert eligibility.reason == MULTI_SERVICE_CATEGORY_NOT_ALLOWED
 
 
 class _UnavailableReader:

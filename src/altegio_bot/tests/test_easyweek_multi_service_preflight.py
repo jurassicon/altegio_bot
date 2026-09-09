@@ -147,7 +147,14 @@ class FakeReader:
         }
 
 
-async def _seed_active_pair(session, *, with_snapshot: bool = False, stale_job: bool = False) -> None:
+async def _seed_active_pair(
+    session,
+    *,
+    with_snapshot: bool = False,
+    embedded_snapshot: bool = False,
+    malformed_embedded: bool = False,
+    stale_job: bool = False,
+) -> None:
     client = Client(
         provider="easyweek",
         company_id=TEST_LOCATION_ID,
@@ -203,8 +210,17 @@ async def _seed_active_pair(session, *, with_snapshot: bool = False, stale_job: 
             body_truncated=False,
         )
     )
-    if with_snapshot:
-        job_payload = multi_service_job_payload(snapshot)
+    if with_snapshot or embedded_snapshot:
+        job_payload = multi_service_job_payload(snapshot, include_snapshot=embedded_snapshot)
+        if embedded_snapshot:
+            job_payload.update(
+                {
+                    "multi_service_recovery_plan_digest": "a" * 64,
+                    "multi_service_recovery_snapshot_version": 1,
+                }
+            )
+        if malformed_embedded:
+            job_payload["multi_service_snapshot"] = None
         if stale_job:
             job_payload["multi_service_snapshot_digest"] = "0" * 64
         session.add(
@@ -277,6 +293,36 @@ async def test_matching_controlled_job_is_counted_as_held_by_send_fence(session_
     assert report.open_jobs == report.jobs_held_by_send_fence == 1
     assert report.stale_snapshot_digest == report.unexplained == 0
     assert report.ready is True
+
+
+async def test_embedded_only_recovery_job_is_ready_without_record_backfill(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session, embedded_snapshot=True)
+
+    async with session_maker() as session:
+        record = (await session.execute(select(Record))).scalar_one()
+        assert "multi_service_snapshot" not in record.raw["easyweek"]
+        report = await run_preflight(session, client=FakeReader(), sleep=_no_sleep)
+
+    assert report.open_jobs == report.jobs_held_by_send_fence == 1
+    assert report.stale_snapshot_digest == 0
+    assert report.unexplained == 0
+    assert report.ready is True
+
+
+async def test_malformed_embedded_recovery_snapshot_is_stale_and_not_ready(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session, embedded_snapshot=True, malformed_embedded=True)
+
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_no_sleep)
+
+    assert report.open_jobs == report.jobs_held_by_send_fence == 1
+    assert report.stale_snapshot_digest == report.unexplained == 1
+    assert report.reasons == {"multi_service_snapshot_digest_mismatch": 1}
+    assert report.ready is False
 
 
 async def test_stale_job_digest_is_counted_and_never_green(session_maker) -> None:

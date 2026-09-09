@@ -56,9 +56,13 @@ from altegio_bot.easyweek_branches import BRANCH_PROFILES, BranchProfile, branch
 from altegio_bot.easyweek_client import EasyWeekConfigError, EasyWeekRetryableError
 from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_CATEGORY_NOT_ALLOWED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_RECORD_COUNT_MISMATCH,
     MULTI_SERVICE_SEND_DISABLED,
+    MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
     WebhookServicePair,
+    clear_multi_service_catalog_cache,
     multi_service_job_payload,
     prove_exactly_two_service_snapshot,
     record_raw_with_multi_service_snapshot,
@@ -8058,28 +8062,85 @@ async def test_the_two_paths_serialise_instead_of_deadlocking(
 # ---------------------------------------------------------------------------
 
 
-def _outbox_pair_snapshot(*, first_price: int = 3000, second_price: int = 6500):
-    booking_uuid = uuid.UUID("11111111-2222-4333-8444-555555555555")
-    location_uuid = "cccccccc-dddd-4eee-8fff-000000000001"
+def _outbox_pair_line(line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any]:
+    return {
+        "uuid": line_uuid,
+        "name": name,
+        "currency": "EUR",
+        "price": price,
+        "original_price": price,
+        "discount": 0,
+        "quantity": 1,
+        "duration": {"value": duration, "label": "minutes"},
+        "original_duration": {"value": duration, "label": "minutes"},
+    }
 
-    def line(line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any]:
-        return {
-            "uuid": line_uuid,
-            "name": name,
+
+def _outbox_pair_booking_payload(
+    *,
+    first_price: int = 3000,
+    second_price: int = 6500,
+    starts_at: datetime | None = None,
+) -> dict[str, Any]:
+    total = first_price + second_price
+    payload: dict[str, Any] = {
+        "uuid": str(EASYWEEK_BOOKING_UUID),
+        "location_uuid": EASYWEEK_LOCATION_UUID_VALUE,
+        "currency": "EUR",
+        "order": {"subtotal": total, "total": total},
+        "ordered_services": [
+            _outbox_pair_line("aaaaaaaa-1111-4111-8111-111111111111", "Erste Leistung", first_price, 30),
+            _outbox_pair_line("aaaaaaaa-2222-4222-8222-222222222222", "Zweite Leistung", second_price, 65),
+        ],
+    }
+    if starts_at is not None:
+        payload.update(
+            {
+                "start_time": starts_at.isoformat(),
+                "is_canceled": False,
+                "is_completed": False,
+            }
+        )
+    return payload
+
+
+def _outbox_pair_catalog(
+    *,
+    first_price: int = 3000,
+    second_price: int = 6500,
+    category: str = "Wimpernverlängerung",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "uuid": "bbbbbbbb-1111-4111-8111-111111111111",
+            "name": "Erste Leistung",
             "currency": "EUR",
-            "price": price,
-            "original_price": price,
-            "discount": 0,
-            "quantity": 1,
-            "duration": {"value": duration, "label": "minutes"},
-            "original_duration": {"value": duration, "label": "minutes"},
-        }
+            "price": first_price,
+            "duration": {"value": 30, "label": "minutes"},
+            "category": {"name": category},
+        },
+        {
+            "uuid": "bbbbbbbb-2222-4222-8222-222222222222",
+            "name": "Zweite Leistung",
+            "currency": "EUR",
+            "price": second_price,
+            "duration": {"value": 65, "label": "minutes"},
+            "category": {"name": category},
+        },
+    ]
 
+
+def _outbox_pair_snapshot(
+    *,
+    first_price: int = 3000,
+    second_price: int = 6500,
+    category: str = "Wimpernverlängerung",
+):
     total = first_price + second_price
     return prove_exactly_two_service_snapshot(
         webhook=WebhookServicePair(
-            booking_uuid=booking_uuid,
-            location_uuid=location_uuid,
+            booking_uuid=EASYWEEK_BOOKING_UUID,
+            location_uuid=EASYWEEK_LOCATION_UUID_VALUE,
             service_name="Erste Leistung",
             service_related="Zweite Leistung",
             services_description="Erste Leistung, Zweite Leistung",
@@ -8088,35 +8149,51 @@ def _outbox_pair_snapshot(*, first_price: int = 3000, second_price: int = 6500):
             booking_currency="EUR",
             total_cost=Decimal(total) / Decimal(100),
         ),
-        booking_payload={
-            "uuid": str(booking_uuid),
-            "location_uuid": location_uuid,
-            "currency": "EUR",
-            "order": {"subtotal": total, "total": total},
-            "ordered_services": [
-                line("aaaaaaaa-1111-4111-8111-111111111111", "Erste Leistung", first_price, 30),
-                line("aaaaaaaa-2222-4222-8222-222222222222", "Zweite Leistung", second_price, 65),
-            ],
-        },
-        catalog_rows=[
-            {
-                "uuid": "bbbbbbbb-1111-4111-8111-111111111111",
-                "name": "Erste Leistung",
-                "currency": "EUR",
-                "price": first_price,
-                "duration": {"value": 30, "label": "minutes"},
-                "category": {"name": "Wimpernverlängerung"},
-            },
-            {
-                "uuid": "bbbbbbbb-2222-4222-8222-222222222222",
-                "name": "Zweite Leistung",
-                "currency": "EUR",
-                "price": second_price,
-                "duration": {"value": 65, "label": "minutes"},
-                "category": {"name": "Wimpernverlängerung"},
-            },
-        ],
+        booking_payload=_outbox_pair_booking_payload(first_price=first_price, second_price=second_price),
+        catalog_rows=_outbox_pair_catalog(
+            first_price=first_price,
+            second_price=second_price,
+            category=category,
+        ),
     )
+
+
+class _PairReminderReader:
+    def __init__(self) -> None:
+        self.booking_calls: list[str] = []
+        self.catalog_calls: list[tuple[str, int]] = []
+
+    async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
+        self.booking_calls.append(booking_uuid)
+        return _outbox_pair_booking_payload(starts_at=REMINDER_STARTS_AT)
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        self.catalog_calls.append((location_uuid, page))
+        rows = _outbox_pair_catalog()
+        return {
+            "data": rows,
+            "meta": {"current_page": 1, "last_page": 1, "total": len(rows)},
+        }
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _seed_embedded_recovery_reminder(db: AsyncSession) -> tuple[MessageJob, Any]:
+    job = await _seed_reminder_job(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    snapshot = _outbox_pair_snapshot()
+    record.raw = record_raw_with_services_count(record.raw, 2)
+    record.total_cost = Decimal("95.00")
+    job.payload = {
+        **job.payload,
+        **multi_service_job_payload(snapshot, include_snapshot=True),
+        "multi_service_recovery_plan_digest": "a" * 64,
+        "multi_service_recovery_snapshot_version": 1,
+    }
+    await db.flush()
+    return job, snapshot
 
 
 async def _attach_outbox_pair(db: AsyncSession, job: MessageJob) -> None:
@@ -8156,6 +8233,7 @@ async def test_exactly_two_snapshot_renders_each_actual_price_and_one_total(
         record=record,
         client=client,
         provider=PROVIDER_EASYWEEK,
+        effective_multi_service_snapshot=_outbox_pair_snapshot(),
     )
     assert ctx["primary_service"] == "Erste Leistung"
     assert ctx["services"] == "Erste Leistung — 30.00€\nZweite Leistung — 65.00€"
@@ -8189,11 +8267,152 @@ async def test_recovery_job_snapshot_renders_without_record_backfill(db: AsyncSe
         client=client,
         provider=PROVIDER_EASYWEEK,
         job_payload=job.payload,
+        effective_multi_service_snapshot=snapshot,
     )
 
     assert ctx["services"] == "Erste Leistung — 30.00€\nZweite Leistung — 65.00€"
     assert ctx["total_cost"] == "95.00"
     assert "multi_service_snapshot" not in record.raw["easyweek"]
+
+
+async def test_renderer_never_flattens_claimed_pair_without_validated_effective_snapshot(
+    db: AsyncSession,
+) -> None:
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "unsafe aggregate title", "95.00"),),
+        total_cost="95.00",
+    )
+    snapshot = _outbox_pair_snapshot()
+    record = await db.get(Record, job.record_id)
+    client = await db.get(Client, job.client_id)
+    assert record is not None and client is not None
+    record.raw = record_raw_with_services_count(record.raw, 2)
+    payload = multi_service_job_payload(snapshot, include_snapshot=True)
+    payload["multi_service_snapshot"] = None
+    await db.flush()
+
+    with pytest.raises(ValueError) as caught:
+        await ow._render_message(
+            db,
+            company_id=job.company_id,
+            template_code=job.job_type,
+            record=record,
+            client=client,
+            provider=PROVIDER_EASYWEEK,
+            job_payload=payload,
+        )
+
+    assert str(caught.value) == "multi_service_snapshot_missing"
+
+
+async def test_embedded_only_recovery_reminder_passes_full_outbox_path(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    clear_multi_service_catalog_cache()
+    reader = _PairReminderReader()
+    monkeypatch.setattr(ow, "EasyWeekClient", lambda *args, **kwargs: reader)
+    rendered_context: dict[str, Any] = {}
+    original_render = ow._render_message
+
+    async def _capture_render_context(*args: Any, **kwargs: Any):
+        result = await original_render(*args, **kwargs)
+        rendered_context.update(result[3])
+        return result
+
+    monkeypatch.setattr(ow, "_render_message", _capture_render_context)
+    job, _snapshot = await _seed_embedded_recovery_reminder(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert job.last_error is None
+    assert job.attempts == 1
+    assert reader.booking_calls == [str(EASYWEEK_BOOKING_UUID)]
+    assert reader.catalog_calls == [(EASYWEEK_LOCATION_UUID_VALUE, 1)]
+    assert len(capture.template_calls) == 1
+    params = capture.template_calls[0]["params"]
+    assert params[4] == "Erste Leistung — 30.00€, Zweite Leistung — 65.00€"
+    assert rendered_context["total_cost"] == "95.00"
+    assert params[5] == "https://eyw.me/r/90000001"
+    assert params[4].count("Erste Leistung") == params[4].count("Zweite Leistung") == 1
+    assert len(await _outbox_rows(db, job)) == 1
+
+
+async def test_closed_multi_send_fence_holds_embedded_only_recovery_reminder(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    reader = _PairReminderReader()
+    monkeypatch.setattr(ow, "EasyWeekClient", lambda *args, **kwargs: reader)
+    job, _snapshot = await _seed_embedded_recovery_reminder(db)
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.last_error == MULTI_SERVICE_SEND_DISABLED
+    assert reader.booking_calls == reader.catalog_calls == []
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_reason"),
+    [
+        ("record_count_changed", MULTI_SERVICE_RECORD_COUNT_MISMATCH),
+        ("disallowed_category", MULTI_SERVICE_CATEGORY_NOT_ALLOWED),
+        ("stored_embedded_mismatch", MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH),
+    ],
+)
+async def test_recovery_pair_drift_stops_before_live_api_render_and_provider(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    reader = _PairReminderReader()
+    monkeypatch.setattr(ow, "EasyWeekClient", lambda *args, **kwargs: reader)
+    job, allowed_snapshot = await _seed_embedded_recovery_reminder(db)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+
+    if damage == "record_count_changed":
+        record.raw = record_raw_with_services_count(record.raw, 1)
+    elif damage == "disallowed_category":
+        disallowed = _outbox_pair_snapshot(category="Nagelservice")
+        job.payload = {
+            **job.payload,
+            **multi_service_job_payload(disallowed, include_snapshot=True),
+        }
+    else:
+        disallowed = _outbox_pair_snapshot(category="Nagelservice")
+        record.raw = record_raw_with_multi_service_snapshot(record.raw, disallowed)
+        assert allowed_snapshot.digest != disallowed.digest
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    assert job.last_error == expected_reason
+    assert reader.booking_calls == reader.catalog_calls == []
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
 
 
 @pytest.mark.parametrize(

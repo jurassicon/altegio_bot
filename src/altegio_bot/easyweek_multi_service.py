@@ -69,6 +69,7 @@ MULTI_SERVICE_CATEGORY_NOT_ALLOWED: Final = "multi_service_category_not_allowed"
 MULTI_SERVICE_SNAPSHOT_MISSING: Final = "multi_service_snapshot_missing"
 MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED: Final = "multi_service_snapshot_version_unsupported"
 MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH: Final = "multi_service_snapshot_digest_mismatch"
+MULTI_SERVICE_RECORD_COUNT_MISMATCH: Final = "multi_service_record_services_count_mismatch"
 
 _CATALOG_TTL_SECONDS: Final = 300.0
 _HEX_DIGEST_LENGTH: Final = 64
@@ -535,9 +536,11 @@ def multi_service_snapshot_from_record_raw(raw: object) -> tuple[MultiServiceSna
     namespace = raw.get(EASYWEEK_RAW_NAMESPACE)
     if not isinstance(namespace, Mapping):
         return None, MULTI_SERVICE_SNAPSHOT_MISSING
+    if MULTI_SERVICE_SNAPSHOT_KEY not in namespace:
+        return None, MULTI_SERVICE_SNAPSHOT_MISSING
     value = namespace.get(MULTI_SERVICE_SNAPSHOT_KEY)
     if not isinstance(value, Mapping):
-        return None, MULTI_SERVICE_SNAPSHOT_MISSING
+        return None, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
     if value.get("version") != MULTI_SERVICE_SNAPSHOT_VERSION:
         return None, MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
     if value.get("provider") != PROVIDER or value.get("services_count") != 2:
@@ -613,6 +616,7 @@ def evaluate_service_eligibility(
     record_raw: object,
     allowed_categories_raw: object,
     purpose: ServiceEligibilityPurpose,
+    effective_multi_service_snapshot: MultiServiceSnapshot | None = None,
 ) -> ServiceCategoryEligibility:
     """Single service stays PR-7.1; only the closed lifecycle purpose expands."""
     count = services_count_from_record_raw(record_raw)
@@ -624,7 +628,10 @@ def evaluate_service_eligibility(
     allowed = parse_allowed_service_categories(allowed_categories_raw)
     if reason := allowed.unavailable_reason:
         return ServiceCategoryEligibility(False, reason, recoverable_configuration=True)
-    snapshot, error = multi_service_snapshot_from_record_raw(record_raw)
+    snapshot = effective_multi_service_snapshot
+    error: str | None = None
+    if snapshot is None:
+        snapshot, error = multi_service_snapshot_from_record_raw(record_raw)
     if snapshot is None:
         return ServiceCategoryEligibility(False, error or MULTI_SERVICE_SNAPSHOT_MISSING)
     for line in snapshot.lines:
@@ -669,9 +676,9 @@ def multi_service_snapshot_from_job_payload(
     """Read an embedded recovery projection with the ordinary snapshot parser."""
     if not isinstance(payload, Mapping):
         return None, MULTI_SERVICE_SNAPSHOT_MISSING
-    value = payload.get(MULTI_SERVICE_JOB_SNAPSHOT_KEY)
-    if value is None:
+    if MULTI_SERVICE_JOB_SNAPSHOT_KEY not in payload:
         return None, MULTI_SERVICE_SNAPSHOT_MISSING
+    value = payload.get(MULTI_SERVICE_JOB_SNAPSHOT_KEY)
     return multi_service_snapshot_from_record_raw({EASYWEEK_RAW_NAMESPACE: {MULTI_SERVICE_SNAPSHOT_KEY: value}})
 
 
@@ -696,6 +703,50 @@ def multi_service_snapshot_for_job(
     return None, embedded_error or stored_error or MULTI_SERVICE_SNAPSHOT_MISSING
 
 
+def resolve_effective_multi_service_snapshot(
+    *,
+    record_raw: object,
+    job_payload: object,
+    record_total_cost: Decimal | None,
+    expected_booking_uuid: object,
+    expected_location_uuid: object,
+) -> tuple[MultiServiceSnapshot | None, str | None]:
+    """Resolve and validate the one snapshot a concrete job may consume.
+
+    Normal runtime jobs use the projection in ``Record.raw``; controlled
+    recovery jobs may carry it only in their payload.  Both sources go through
+    the same parser, and a job is usable only when its immutable metadata,
+    current Record count/total and provider identities agree with that
+    projection.  The helper is pure and never backfills either source.
+    """
+    snapshot, error = multi_service_snapshot_for_job(
+        record_raw=record_raw,
+        job_payload=job_payload,
+    )
+    if snapshot is None:
+        return None, error or MULTI_SERVICE_SNAPSHOT_MISSING
+    if services_count_from_record_raw(record_raw) != 2:
+        return None, MULTI_SERVICE_RECORD_COUNT_MISMATCH
+    if not isinstance(job_payload, Mapping):
+        return None, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    if job_payload.get(MULTI_SERVICE_JOB_VERSION_KEY) != snapshot.version:
+        return None, MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
+    if multi_service_job_digest(job_payload) != snapshot.digest:
+        return None, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+
+    expected_booking = (
+        str(expected_booking_uuid)
+        if isinstance(expected_booking_uuid, uuid.UUID)
+        else _canonical_uuid(expected_booking_uuid)
+    )
+    expected_location = _canonical_uuid(expected_location_uuid)
+    if snapshot.booking_uuid != expected_booking or snapshot.location_uuid != expected_location:
+        return None, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+    if _minor_from_decimal(record_total_cost) != snapshot.total_minor:
+        return None, MULTI_SERVICE_TOTAL_MISMATCH
+    return snapshot, None
+
+
 def multi_service_send_guard(
     *,
     record_raw: object,
@@ -705,27 +756,14 @@ def multi_service_send_guard(
     expected_location_uuid: object,
 ) -> str | None:
     """Re-prove the persisted pair and immutable job digest before rendering."""
-    snapshot, error = multi_service_snapshot_for_job(
+    _snapshot, error = resolve_effective_multi_service_snapshot(
         record_raw=record_raw,
         job_payload=job_payload,
+        record_total_cost=record_total_cost,
+        expected_booking_uuid=expected_booking_uuid,
+        expected_location_uuid=expected_location_uuid,
     )
-    if snapshot is None:
-        return error or MULTI_SERVICE_SNAPSHOT_MISSING
-    expected_booking = (
-        str(expected_booking_uuid)
-        if isinstance(expected_booking_uuid, uuid.UUID)
-        else _canonical_uuid(expected_booking_uuid)
-    )
-    expected_location = _canonical_uuid(expected_location_uuid)
-    if snapshot.booking_uuid != expected_booking or snapshot.location_uuid != expected_location:
-        return MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
-    if not isinstance(job_payload, Mapping) or job_payload.get(MULTI_SERVICE_JOB_VERSION_KEY) != snapshot.version:
-        return MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
-    if multi_service_job_digest(job_payload) != snapshot.digest:
-        return MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
-    if _minor_from_decimal(record_total_cost) != snapshot.total_minor:
-        return MULTI_SERVICE_TOTAL_MISMATCH
-    return None
+    return error
 
 
 __all__ = [name for name in globals() if name.startswith("MULTI_SERVICE_")] + [
@@ -744,6 +782,7 @@ __all__ = [name for name in globals() if name.startswith("MULTI_SERVICE_")] + [
     "multi_service_snapshot_for_job",
     "multi_service_snapshot_from_job_payload",
     "multi_service_snapshot_from_record_raw",
+    "resolve_effective_multi_service_snapshot",
     "prove_exactly_two_service_snapshot",
     "read_catalog_rows_cached",
     "record_raw_with_multi_service_snapshot",
