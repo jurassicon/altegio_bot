@@ -12,17 +12,23 @@ from typing import Any
 import pytest
 from sqlalchemy import func, select
 
-from altegio_bot.easyweek_multi_service import clear_multi_service_catalog_cache
+from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
+    clear_multi_service_catalog_cache,
+)
 from altegio_bot.easyweek_multi_service_recovery import (
     ALREADY_DONE,
     ALREADY_PROCESSING,
     ALREADY_QUEUED,
+    APPLY_REPORT_VERSION,
     CATEGORY_NOT_ALLOWED,
+    CONTRACT_NOT_SUPPORTED,
     CREATE,
     IDENTITY_MISMATCH,
     LIVE_BOOKING_NOT_ACTIVE,
     NON_TERMINAL_OUTBOX_PRESENT,
     PROOF_FAILED,
+    SNAPSHOT_VERSION,
     TERMINAL_HISTORY_PRESENT,
     WINDOW_PASSED,
     RecoveryError,
@@ -38,7 +44,7 @@ from altegio_bot.easyweek_multi_service_recovery import (
 )
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_service_category import record_raw_with_services_count
-from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, OutboxMessage, Record
+from altegio_bot.models.models import Client, EasyWeekEvent, MessageJob, OutboxMessage, Record, RecordService
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import (
     TEST_BOOKING_ID,
@@ -85,8 +91,18 @@ def _configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_multi_service_catalog_cache()
 
 
-def _webhook(*, first: str = "Fixture Service", second: str = "Second Fixture Service") -> dict[str, Any]:
+def _webhook(
+    *,
+    first: str = "Fixture Service",
+    second: str = "Second Fixture Service",
+    booking_uuid: str = TEST_BOOKING_UUID,
+    booking_id: int = TEST_BOOKING_ID,
+    customer_id: int = TEST_CUSTOMER_ID,
+) -> dict[str, Any]:
     payload = booking_created_multi_service()
+    payload["uid"] = booking_uuid
+    payload["id"] = booking_id
+    payload["customer_id"] = customer_id
     payload["service_name"] = first
     payload["service_related"] = second
     payload["services_description"] = f"{first}, {second}"
@@ -119,10 +135,15 @@ def _api(
     first: str = "Fixture Service",
     second: str = "Second Fixture Service",
     second_price: int = 4500,
+    booking_uuid: str = TEST_BOOKING_UUID,
+    custom_duration: bool = False,
 ) -> dict[str, Any]:
     status = "canceled" if canceled else "completed" if completed else "active"
+    second_line = _line("22222222-2222-4222-8222-222222222222", second, second_price, 45)
+    if custom_duration:
+        second_line["duration"] = {"value": 75, "label": "minutes"}
     return {
-        "uuid": TEST_BOOKING_UUID,
+        "uuid": booking_uuid,
         "location_uuid": TEST_LOCATION_UUID,
         "start_time": starts_at.isoformat(),
         "is_canceled": canceled,
@@ -132,7 +153,7 @@ def _api(
         "order": {"subtotal": 3500 + second_price, "total": 3500 + second_price},
         "ordered_services": [
             _line("11111111-1111-4111-8111-111111111111", first, 3500, 30),
-            _line("22222222-2222-4222-8222-222222222222", second, second_price, 45),
+            second_line,
         ],
     }
 
@@ -167,18 +188,29 @@ class FakeReader:
         completed: bool = False,
         second_category: str = "Fixture Category",
         fail: bool = False,
+        custom_duration: bool = False,
+        bookings: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.starts_at = starts_at
         self.canceled = canceled
         self.completed = completed
         self.second_category = second_category
         self.fail = fail
+        self.custom_duration = custom_duration
+        self.bookings = bookings
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
-        assert booking_uuid == TEST_BOOKING_UUID
         if self.fail:
             raise TimeoutError
-        return _api(starts_at=self.starts_at, canceled=self.canceled, completed=self.completed)
+        if self.bookings is not None:
+            return self.bookings[booking_uuid]
+        assert booking_uuid == TEST_BOOKING_UUID
+        return _api(
+            starts_at=self.starts_at,
+            canceled=self.canceled,
+            completed=self.completed,
+            custom_duration=self.custom_duration,
+        )
 
     async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
         assert (location_uuid, page) == (TEST_LOCATION_UUID, 1)
@@ -193,11 +225,14 @@ async def _seed(
     client_provider: str = "easyweek",
     job_status: str | None = None,
     add_non_terminal_outbox: bool = False,
+    booking_uuid: str = TEST_BOOKING_UUID,
+    booking_id: int = TEST_BOOKING_ID,
+    customer_id: int = TEST_CUSTOMER_ID,
 ) -> tuple[Record, MessageJob | None]:
     client = Client(
         provider=client_provider,
         company_id=TEST_LOCATION_ID,
-        altegio_client_id=TEST_CUSTOMER_ID,
+        altegio_client_id=customer_id,
         display_name="Recovery fixture",
         phone_e164="+49000000000",
         raw={},
@@ -207,8 +242,8 @@ async def _seed(
     record = Record(
         provider="easyweek",
         company_id=TEST_LOCATION_ID,
-        altegio_record_id=TEST_BOOKING_ID,
-        easyweek_booking_uuid=uuid.UUID(TEST_BOOKING_UUID),
+        altegio_record_id=booking_id,
+        easyweek_booking_uuid=uuid.UUID(booking_uuid),
         client_id=client.id,
         starts_at=starts_at,
         total_cost=Decimal("80.00"),
@@ -217,13 +252,13 @@ async def _seed(
     )
     session.add(record)
     await session.flush()
-    payload = _webhook()
+    payload = _webhook(booking_uuid=booking_uuid, booking_id=booking_id, customer_id=customer_id)
     session.add(
         EasyWeekEvent(
             status="processed",
             event_hint="booking-created",
             auth_via="query",
-            payload_hash="recovery-fixture",
+            payload_hash=f"recovery-fixture-{booking_id}",
             payload=payload,
             booking_uuid=canonical_booking_uuid(payload),
             body_truncated=False,
@@ -283,6 +318,30 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+async def _seed_mixed_scope(session, *, starts_at: datetime, excluded_count: int) -> tuple[list[Record], FakeReader]:
+    records: list[Record] = []
+    bookings: dict[str, dict[str, Any]] = {}
+    allowed, _job = await _seed(session, starts_at=starts_at)
+    records.append(allowed)
+    bookings[TEST_BOOKING_UUID] = _api(starts_at=starts_at)
+    for index in range(excluded_count):
+        booking_uuid = f"22222222-2222-4222-8222-{index + 1:012d}"
+        record, _job = await _seed(
+            session,
+            starts_at=starts_at,
+            booking_uuid=booking_uuid,
+            booking_id=TEST_BOOKING_ID + index + 1,
+            customer_id=TEST_CUSTOMER_ID + index + 1,
+        )
+        records.append(record)
+        bookings[booking_uuid] = _api(
+            starts_at=starts_at,
+            booking_uuid=booking_uuid,
+            custom_duration=True,
+        )
+    return records, FakeReader(starts_at=starts_at, bookings=bookings)
+
+
 async def test_plan_is_read_only_and_two_future_windows_are_create(session_maker) -> None:
     starts = NOW + timedelta(days=2)
     async with session_maker() as session:
@@ -305,6 +364,142 @@ async def test_plan_is_read_only_and_two_future_windows_are_create(session_maker
     assert "Recovery fixture" not in safe_output
     assert "+49000000000" not in safe_output
     assert "customer" not in safe_output.casefold()
+
+
+@pytest.mark.parametrize("excluded_count", [1, 6])
+async def test_allowed_and_custom_duration_records_are_planned_independently(
+    session_maker,
+    excluded_count: int,
+) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            records, reader = await _seed_mixed_scope(
+                session,
+                starts_at=starts,
+                excluded_count=excluded_count,
+            )
+        before = await _counts(session)
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+        after = await _counts(session)
+
+    assert before == after == (len(records), len(records), 0, 0)
+    assert plan.summary["records_seen"] == excluded_count + 1
+    assert plan.summary["structurally_proven"] == 1
+    assert plan.summary["allowed_records"] == 1
+    assert plan.summary["contract_excluded_records"] == excluded_count
+    assert plan.summary["reminders_to_create"] == 2
+    assert plan.summary["blockers"] == 0
+    assert plan.summary["apply_ready"] is True
+    excluded = [row for row in plan.records if row["eligibility"] == CONTRACT_NOT_SUPPORTED]
+    assert len(excluded) == excluded_count
+    assert all(row["refusal_reason"] == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED for row in excluded)
+    assert all(row["multi_service_snapshot"] is None for row in excluded)
+    assert all(row["multi_service_snapshot_digest"] is None for row in excluded)
+    assert all(
+        {reminder["disposition"] for reminder in row["reminders"]} == {CONTRACT_NOT_SUPPORTED}
+        and all(reminder["dedupe_key"] is None for reminder in row["reminders"])
+        for row in excluded
+    )
+
+
+@pytest.mark.parametrize("status", ["queued", "processing"])
+@pytest.mark.parametrize("with_outbox", [False, True])
+async def test_contract_exclusion_does_not_hide_existing_open_queue(
+    session_maker,
+    status: str,
+    with_outbox: bool,
+) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            _record, job = await _seed(
+                session,
+                starts_at=starts,
+                job_status=status,
+                add_non_terminal_outbox=with_outbox,
+            )
+        clear_multi_service_catalog_cache()
+        plan = await build_recovery_plan(
+            session,
+            client=FakeReader(starts_at=starts, custom_duration=True),
+            now=NOW,
+            pause_sec=0,
+        )
+
+    assert job is not None
+    row = plan.records[0]
+    assert row["eligibility"] == CONTRACT_NOT_SUPPORTED
+    assert {item["disposition"] for item in row["reminders"]} == {CONTRACT_NOT_SUPPORTED}
+    assert job.id in row["contract_exclusion_blockers"]["open_reminder_job_ids"]
+    assert plan.summary["contract_exclusion_blockers"] >= 1
+    assert plan.summary["blockers"] >= 1
+    assert plan.summary["apply_ready"] is False
+
+
+@pytest.mark.parametrize("status", ["done", "canceled", "failed"])
+async def test_contract_exclusion_does_not_resurrect_terminal_history(
+    session_maker,
+    status: str,
+) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            _record, job = await _seed(session, starts_at=starts, job_status=status)
+        clear_multi_service_catalog_cache()
+        plan = await build_recovery_plan(
+            session,
+            client=FakeReader(starts_at=starts, custom_duration=True),
+            now=NOW,
+            pause_sec=0,
+        )
+
+    assert job is not None
+    row = plan.records[0]
+    assert row["eligibility"] == CONTRACT_NOT_SUPPORTED
+    assert not any(row["contract_exclusion_blockers"].values())
+    assert plan.summary["reminders_to_create"] == 0
+    assert plan.summary["blockers"] == 0
+    assert plan.summary["apply_ready"] is True
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["custom_price", "discount", "quantity", "malformed", "duplicate", "total", "currency", "location"],
+)
+async def test_only_custom_duration_becomes_contract_exclusion(session_maker, damage: str) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, starts_at=starts)
+        payload = _api(starts_at=starts)
+        services = payload["ordered_services"]
+        assert isinstance(services, list)
+        if damage == "custom_price":
+            services[1]["original_price"] = 4600
+        elif damage == "discount":
+            services[1]["discount"] = 1
+        elif damage == "quantity":
+            services[1]["quantity"] = 2
+        elif damage == "malformed":
+            payload["ordered_services"] = "not-a-list"
+        elif damage == "duplicate":
+            services.append(_line("33333333-3333-4333-8333-333333333333", "Third Fixture Service", 0, 15))
+        elif damage == "total":
+            payload["order"]["total"] = 7900
+        elif damage == "currency":
+            services[1]["currency"] = "USD"
+        else:
+            payload["location_uuid"] = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        reader = FakeReader(starts_at=starts, bookings={TEST_BOOKING_UUID: payload})
+        clear_multi_service_catalog_cache()
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+
+    assert plan.records[0]["eligibility"] == PROOF_FAILED
+    assert CONTRACT_NOT_SUPPORTED not in {item["disposition"] for item in plan.records[0]["reminders"]}
+    assert plan.summary["contract_excluded_records"] == 0
+    assert plan.summary["blockers"] > 0
+    assert plan.summary["apply_ready"] is False
 
 
 async def test_single_service_and_altegio_records_are_out_of_scope(session_maker) -> None:
@@ -515,6 +710,69 @@ async def test_snapshot_authorization_rejects_digest_confirmation_age_and_fences
         )
 
 
+async def test_snapshot_v1_and_tampered_contract_exclusion_are_rejected(session_maker, tmp_path) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, starts_at=starts)
+        plan = await build_recovery_plan(
+            session,
+            client=FakeReader(starts_at=starts, custom_duration=True),
+            now=NOW,
+            pause_sec=0,
+        )
+
+    assert plan.snapshot()["version"] == SNAPSHOT_VERSION == 2
+    path = tmp_path / "contract-excluded-plan.json"
+    payload = copy.deepcopy(plan.snapshot())
+    payload["version"] = 1
+    write_private_json(payload, path)
+    with pytest.raises(RecoveryError, match="snapshot_version_unsupported"):
+        read_snapshot(path)
+
+    payload = copy.deepcopy(plan.snapshot())
+    payload["records"][0]["refusal_reason"] = "different_reason"
+    write_private_json(payload, path)
+    with pytest.raises(RecoveryError, match="snapshot_schema_invalid"):
+        read_snapshot(path)
+
+    payload = copy.deepcopy(plan.snapshot())
+    payload["records"][0]["contract_exclusion_blockers"]["open_reminder_job_ids"] = [999]
+    write_private_json(payload, path)
+    with pytest.raises(RecoveryError, match="snapshot_schema_invalid"):
+        read_snapshot(path)
+
+    payload = copy.deepcopy(plan.snapshot())
+    payload["summary"]["contract_excluded_records"] = 0
+    write_private_json(payload, path)
+    with pytest.raises(RecoveryError, match="snapshot_digest_mismatch"):
+        read_snapshot(path)
+
+
+async def test_apply_report_v1_is_rejected(session_maker, tmp_path) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, starts_at=starts)
+        frozen = await _frozen_plan(session, starts, tmp_path)
+        clear_multi_service_catalog_cache()
+        applied = await apply_recovery_plan(
+            session,
+            frozen=frozen,
+            client=FakeReader(starts_at=starts),
+            now=NOW + timedelta(seconds=1),
+            pause_sec=0,
+        )
+
+    assert applied.report()["version"] == APPLY_REPORT_VERSION == 2
+    payload = applied.report()
+    payload["version"] = 1
+    report_path = tmp_path / "legacy-apply-report.json"
+    write_private_json(payload, report_path)
+    with pytest.raises(RecoveryError, match="apply_report_version_unsupported"):
+        read_apply_report(report_path, frozen=frozen)
+
+
 async def _frozen_plan(session, starts: datetime, tmp_path):
     plan = await build_recovery_plan(session, client=FakeReader(starts_at=starts), now=NOW, pause_sec=0)
     path = tmp_path / "plan.json"
@@ -560,6 +818,211 @@ async def test_apply_creates_only_expected_jobs_and_is_idempotent(session_maker,
         job.payload["multi_service_snapshot"]["digest"] == job.payload["multi_service_snapshot_digest"] for job in jobs
     )
     assert {job.job_type for job in jobs} == {"reminder_24h", "reminder_2h"}
+
+
+async def test_apply_creates_only_allowed_jobs_and_reports_contract_exclusion(session_maker, tmp_path) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            records, reader = await _seed_mixed_scope(session, starts_at=starts, excluded_count=1)
+            excluded_service = RecordService(
+                record_id=records[1].id,
+                service_id=991,
+                title="Excluded fixture service",
+                amount=1,
+                cost_to_pay=Decimal("45.00"),
+                raw={"fixture": "unchanged"},
+            )
+            session.add(excluded_service)
+            await session.flush()
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+        path = tmp_path / "mixed-plan.json"
+        write_snapshot(plan, path)
+        frozen = read_snapshot(path)
+        excluded = next(row for row in frozen.records if row["eligibility"] == CONTRACT_NOT_SUPPORTED)
+        excluded_record = next(record for record in records if record.id == excluded["record_id"])
+        excluded_client = await session.get(Client, excluded_record.client_id)
+        assert excluded_client is not None
+        excluded_raw_before = copy.deepcopy(excluded_record.raw)
+        excluded_client_before = (
+            excluded_client.display_name,
+            excluded_client.phone_e164,
+            copy.deepcopy(excluded_client.raw),
+        )
+        excluded_service_before = (
+            excluded_service.title,
+            excluded_service.amount,
+            excluded_service.cost_to_pay,
+            copy.deepcopy(excluded_service.raw),
+        )
+
+        clear_multi_service_catalog_cache()
+        first = await apply_recovery_plan(
+            session,
+            frozen=frozen,
+            client=reader,
+            now=NOW + timedelta(seconds=1),
+            pause_sec=0,
+        )
+        jobs = list((await session.execute(select(MessageJob).order_by(MessageJob.id))).scalars())
+        await session.refresh(excluded_record)
+        await session.refresh(excluded_client)
+        await session.refresh(excluded_service)
+        assert excluded_record.raw == excluded_raw_before
+        assert (
+            excluded_client.display_name,
+            excluded_client.phone_e164,
+            excluded_client.raw,
+        ) == excluded_client_before
+        assert (
+            excluded_service.title,
+            excluded_service.amount,
+            excluded_service.cost_to_pay,
+            excluded_service.raw,
+        ) == excluded_service_before
+        assert {job.record_id for job in jobs} == {records[0].id}
+        assert len(first.created_job_ids) == 2
+        assert first.contract_excluded_record_ids == (excluded_record.id,)
+        assert first.report()["contract_excluded_record_ids"] == [excluded_record.id]
+        assert int((await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one()) == 0
+
+        clear_multi_service_catalog_cache()
+        second = await apply_recovery_plan(
+            session,
+            frozen=frozen,
+            client=reader,
+            now=NOW + timedelta(seconds=2),
+            pause_sec=0,
+        )
+
+    assert second.created_job_ids == ()
+    assert set(second.already_present_job_ids) == set(first.created_job_ids)
+    assert second.contract_excluded_record_ids == (excluded_record.id,)
+
+
+async def test_apply_refuses_contract_exclusion_catalog_drift(session_maker, tmp_path) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, starts_at=starts)
+        plan = await build_recovery_plan(
+            session,
+            client=FakeReader(starts_at=starts, custom_duration=True),
+            now=NOW,
+            pause_sec=0,
+        )
+        path = tmp_path / "excluded-catalog-plan.json"
+        write_snapshot(plan, path)
+        frozen = read_snapshot(path)
+        clear_multi_service_catalog_cache()
+
+        with pytest.raises(RecoveryError, match="live_scope_changed"):
+            await apply_recovery_plan(
+                session,
+                frozen=frozen,
+                client=FakeReader(
+                    starts_at=starts,
+                    custom_duration=True,
+                    second_category="Other",
+                ),
+                now=NOW + timedelta(seconds=1),
+                pause_sec=0,
+            )
+
+        assert int((await session.execute(select(func.count()).select_from(MessageJob))).scalar_one()) == 0
+        assert int((await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one()) == 0
+
+
+async def test_verify_detects_untagged_job_for_contract_excluded_record(session_maker, tmp_path) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            records, reader = await _seed_mixed_scope(session, starts_at=starts, excluded_count=1)
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+        path = tmp_path / "mixed-verify-plan.json"
+        write_snapshot(plan, path)
+        frozen = read_snapshot(path)
+        clear_multi_service_catalog_cache()
+        applied = await apply_recovery_plan(
+            session,
+            frozen=frozen,
+            client=reader,
+            now=NOW + timedelta(seconds=1),
+            pause_sec=0,
+        )
+        excluded_record = records[1]
+        bad_job = MessageJob(
+            provider="easyweek",
+            company_id=excluded_record.company_id,
+            record_id=excluded_record.id,
+            client_id=excluded_record.client_id,
+            job_type="reminder_24h",
+            run_at=starts - timedelta(hours=24),
+            status="queued",
+            dedupe_key="untagged-contract-excluded-reminder",
+            payload={},
+            created_at=NOW + timedelta(seconds=2),
+        )
+        session.add(bad_job)
+        await session.commit()
+        verified = await verify_recovery(
+            session,
+            frozen=frozen,
+            apply_report=applied.report(),
+            now=NOW + timedelta(seconds=3),
+        )
+
+    assert verified["passed"] is False
+    assert verified["contract_excluded_record_ids"] == [excluded_record.id]
+    assert verified["contract_excluded_jobs"] == [bad_job.id]
+
+
+@pytest.mark.parametrize("mutation", ["record", "client", "service"])
+async def test_verify_detects_excluded_domain_state_mutation(session_maker, tmp_path, mutation: str) -> None:
+    starts = NOW + timedelta(days=2)
+    async with session_maker() as session:
+        async with session.begin():
+            records, reader = await _seed_mixed_scope(session, starts_at=starts, excluded_count=1)
+        plan = await build_recovery_plan(session, client=reader, now=NOW, pause_sec=0)
+        path = tmp_path / f"state-{mutation}-plan.json"
+        write_snapshot(plan, path)
+        frozen = read_snapshot(path)
+        clear_multi_service_catalog_cache()
+        applied = await apply_recovery_plan(
+            session,
+            frozen=frozen,
+            client=reader,
+            now=NOW + timedelta(seconds=1),
+            pause_sec=0,
+        )
+        excluded_record = records[1]
+        if mutation == "record":
+            excluded_record.comment = "changed after apply"
+        elif mutation == "client":
+            excluded_client = await session.get(Client, excluded_record.client_id)
+            assert excluded_client is not None
+            excluded_client.display_name = "Changed after apply"
+        else:
+            session.add(
+                RecordService(
+                    record_id=excluded_record.id,
+                    service_id=999,
+                    title="Changed after apply",
+                    amount=1,
+                    cost_to_pay=Decimal("1.00"),
+                    raw={},
+                )
+            )
+        await session.commit()
+        verified = await verify_recovery(
+            session,
+            frozen=frozen,
+            apply_report=applied.report(),
+            now=NOW + timedelta(seconds=2),
+        )
+
+    assert verified["passed"] is False
+    assert verified["state_mismatch_record_ids"] == [excluded_record.id]
 
 
 @pytest.mark.parametrize("drift", ["starts_at", "service", "configuration", "processing"])

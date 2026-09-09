@@ -30,7 +30,7 @@ def test_both_multi_service_fences_default_false() -> None:
 @_PLAN_PRESENT
 def test_canonical_plan_records_owner_authorization_and_narrow_scope() -> None:
     text = PLAN.read_text(encoding="utf-8")
-    section = text.split("## 34. Ревизия 30 — exactly-two-service notifications (PR-7.4)", 1)[1]
+    section = text.split("## 34. Ревизия 31 — exactly-two-service notifications (PR-7.4)", 1)[1]
     for required in (
         "09.09.2026",
         "20 из 20",
@@ -48,6 +48,9 @@ def test_canonical_plan_records_owner_authorization_and_narrow_scope() -> None:
         "historical backfill",
         "automatic resend",
         "outbox worker",
+        "contract_not_supported",
+        "multi_service_custom_duration_unsupported",
+        "structurally_proven + contract_excluded_records == records_seen",
     ):
         assert required in section
 
@@ -61,9 +64,10 @@ def test_runbook_pins_safe_rollout_preflight_canary_and_rollback() -> None:
         "easyweek-multi-service-reminder-recovery apply",
         "easyweek-multi-service-reminder-recovery verify",
         "records_seen≈20",
-        "structurally_proven≈20",
+        "structurally_proven≈14",
         "allowed_records≈4",
-        "disallowed_records≈16",
+        "disallowed_records≈10",
+        "contract_excluded_records≈6",
         "reminders_to_create=0..8",
         "easyweek_reminder_preflight",
         "force-recreate",

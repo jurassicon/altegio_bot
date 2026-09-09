@@ -32,6 +32,7 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_API_UNAVAILABLE,
     MULTI_SERVICE_CATEGORY_NOT_ALLOWED,
+    MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MultiServiceProofError,
     MultiServiceSnapshot,
@@ -66,11 +67,12 @@ from altegio_bot.models.models import (
     MessageJob,
     OutboxMessage,
     Record,
+    RecordService,
 )
 from altegio_bot.settings import settings
 
-SNAPSHOT_VERSION: Final = 1
-APPLY_REPORT_VERSION: Final = 1
+SNAPSHOT_VERSION: Final = 2
+APPLY_REPORT_VERSION: Final = 2
 DEFAULT_MAX_SNAPSHOT_AGE_SEC: Final = 600
 MAX_SNAPSHOT_AGE_SEC: Final = 900
 DEFAULT_LIMIT: Final = 500
@@ -91,8 +93,13 @@ WINDOW_PASSED: Final = "window_passed"
 CATEGORY_NOT_ALLOWED: Final = "category_not_allowed"
 LIVE_BOOKING_NOT_ACTIVE: Final = "live_booking_not_active"
 PROOF_FAILED: Final = "proof_failed"
+CONTRACT_NOT_SUPPORTED: Final = "contract_not_supported"
 IDENTITY_MISMATCH: Final = "identity_mismatch"
 NON_TERMINAL_OUTBOX_PRESENT: Final = "non_terminal_outbox_present"
+
+EXCLUSION_OPEN_REMINDER_JOB_IDS: Final = "open_reminder_job_ids"
+EXCLUSION_IDENTITY_MISMATCH_JOB_IDS: Final = "identity_mismatch_job_ids"
+EXCLUSION_NON_TERMINAL_OUTBOX_IDS: Final = "non_terminal_outbox_ids"
 
 RECOVERY_PLAN_DIGEST_KEY: Final = "multi_service_recovery_plan_digest"
 RECOVERY_SNAPSHOT_VERSION_KEY: Final = "multi_service_recovery_snapshot_version"
@@ -169,6 +176,10 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _valid_digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def confirmation_phrase(plan_digest: str) -> str:
     return f"create easyweek multi-service reminders {plan_digest}"
 
@@ -238,6 +249,32 @@ def _category_proof_digest(snapshot: MultiServiceSnapshot) -> str:
     return _digest([line.category for line in snapshot.lines])
 
 
+def _contract_exclusion_context_digest(
+    booking_payload: Mapping[str, Any],
+    catalog_rows: list[object] | tuple[object, ...],
+) -> str:
+    """Freeze every non-PII input that can keep an unsupported proof stable."""
+    return _digest(
+        {
+            "booking_contract": {
+                key: booking_payload.get(key)
+                for key in (
+                    "uuid",
+                    "location_uuid",
+                    "start_time",
+                    "is_canceled",
+                    "is_completed",
+                    "status",
+                    "currency",
+                    "order",
+                    "ordered_services",
+                )
+            },
+            "catalog": catalog_rows,
+        }
+    )
+
+
 def _snapshot_projection(snapshot: MultiServiceSnapshot) -> dict[str, object]:
     # This is PII-free and is needed to render and re-prove a recovery-created
     # job without writing the historical Record.
@@ -259,6 +296,92 @@ def _record_identity(record: Record, client: Client | None) -> dict[str, object]
     }
 
 
+def _record_state_digest(record: Record) -> str:
+    """Hash mutable Record state without exposing customer or service data."""
+    return _digest(
+        {
+            "provider": record.provider,
+            "company_id": record.company_id,
+            "altegio_record_id": record.altegio_record_id,
+            "easyweek_booking_uuid": (
+                str(record.easyweek_booking_uuid) if record.easyweek_booking_uuid is not None else None
+            ),
+            "easyweek_booking_hash_id": record.easyweek_booking_hash_id,
+            "client_id": record.client_id,
+            "altegio_client_id": record.altegio_client_id,
+            "staff_id": record.staff_id,
+            "staff_name": record.staff_name,
+            "starts_at": _timestamp(record.starts_at) if record.starts_at is not None else None,
+            "ends_at": _timestamp(record.ends_at) if record.ends_at is not None else None,
+            "duration_sec": record.duration_sec,
+            "comment": record.comment,
+            "short_link": record.short_link,
+            "confirmed": record.confirmed,
+            "attendance": record.attendance,
+            "visit_attendance": record.visit_attendance,
+            "is_deleted": bool(record.is_deleted),
+            "total_cost": str(record.total_cost) if record.total_cost is not None else None,
+            "last_change_at": _timestamp(record.last_change_at) if record.last_change_at is not None else None,
+            "raw": record.raw,
+        }
+    )
+
+
+def _client_state_digest(client: Client | None) -> str | None:
+    """Hash mutable Client state; the private plan stores only the digest."""
+    if client is None:
+        return None
+    return _digest(
+        {
+            "provider": client.provider,
+            "company_id": client.company_id,
+            "altegio_client_id": client.altegio_client_id,
+            "phone_e164": client.phone_e164,
+            "display_name": client.display_name,
+            "email": client.email,
+            "raw": client.raw,
+            "wa_opted_out": bool(client.wa_opted_out),
+            "wa_opted_out_at": _timestamp(client.wa_opted_out_at) if client.wa_opted_out_at is not None else None,
+            "wa_opt_out_reason": client.wa_opt_out_reason,
+            "easyweek_visits_total": client.easyweek_visits_total,
+            "easyweek_visits_total_updated_at": (
+                _timestamp(client.easyweek_visits_total_updated_at)
+                if client.easyweek_visits_total_updated_at is not None
+                else None
+            ),
+        }
+    )
+
+
+async def _record_service_state_digests(
+    session: AsyncSession,
+    records: list[Record],
+    *,
+    lock: bool = False,
+) -> dict[int, str]:
+    record_ids = [record.id for record in records]
+    grouped: dict[int, list[dict[str, object]]] = {record_id: [] for record_id in record_ids}
+    if record_ids:
+        stmt = (
+            select(RecordService)
+            .where(RecordService.record_id.in_(record_ids))
+            .order_by(RecordService.record_id.asc(), RecordService.service_id.asc())
+        )
+        if lock:
+            stmt = stmt.with_for_update()
+        for service in (await session.execute(stmt)).scalars():
+            grouped[service.record_id].append(
+                {
+                    "service_id": service.service_id,
+                    "title": service.title,
+                    "amount": service.amount,
+                    "cost_to_pay": str(service.cost_to_pay) if service.cost_to_pay is not None else None,
+                    "raw": service.raw,
+                }
+            )
+    return {record_id: _digest(rows) for record_id, rows in grouped.items()}
+
+
 def _identity_matches(record: Record, client: Client | None) -> bool:
     return bool(
         record.provider == PROVIDER_EASYWEEK
@@ -271,6 +394,49 @@ def _identity_matches(record: Record, client: Client | None) -> bool:
         and record.starts_at is not None
         and not record.is_deleted
     )
+
+
+def _excluded_reminder_identity_matches(record: Record, job: MessageJob) -> bool:
+    payload = job.payload if isinstance(job.payload, Mapping) else {}
+    try:
+        payload_start = _parse_timestamp(payload.get("record_starts_at"))
+    except RecoveryError:
+        return False
+    return bool(
+        job.provider == PROVIDER_EASYWEEK
+        and job.company_id == record.company_id
+        and job.record_id == record.id
+        and job.client_id == record.client_id
+        and job.job_type in EASYWEEK_REMINDER_JOB_TYPES
+        and record.starts_at is not None
+        and record.easyweek_booking_uuid is not None
+        and _utc(job.run_at) == _utc(record.starts_at) - REMINDER_OFFSETS[job.job_type]
+        and payload.get("provider") == PROVIDER_EASYWEEK
+        and payload.get("booking_uuid") == str(record.easyweek_booking_uuid)
+        and payload.get("company_id") == record.company_id
+        and payload.get("job_type") == job.job_type
+        and payload_start == _utc(record.starts_at)
+    )
+
+
+def _contract_exclusion_blockers(
+    *,
+    record: Record,
+    jobs: list[MessageJob],
+    outboxes: list[OutboxMessage],
+) -> dict[str, list[int]]:
+    open_reminders = [
+        job for job in jobs if job.job_type in EASYWEEK_REMINDER_JOB_TYPES and job.status in OPEN_JOB_STATUSES
+    ]
+    return {
+        EXCLUSION_OPEN_REMINDER_JOB_IDS: sorted(job.id for job in open_reminders),
+        EXCLUSION_IDENTITY_MISMATCH_JOB_IDS: sorted(
+            job.id for job in open_reminders if not _excluded_reminder_identity_matches(record, job)
+        ),
+        EXCLUSION_NON_TERMINAL_OUTBOX_IDS: sorted(
+            row.id for row in outboxes if row.status in NON_TERMINAL_OUTBOX_STATUSES
+        ),
+    }
 
 
 async def _select_records(
@@ -470,13 +636,24 @@ def _summary(records: list[dict[str, object]], *, truncated: bool) -> dict[str, 
     structural = [record for record in records if record.get("multi_service_snapshot_digest")]
     allowed = [record for record in records if record.get("eligibility") == "allowed"]
     disallowed = [record for record in records if record.get("eligibility") == CATEGORY_NOT_ALLOWED]
-    blocker_count = sum(value in BLOCKING_DISPOSITIONS for value in dispositions)
+    contract_excluded = [record for record in records if record.get("eligibility") == CONTRACT_NOT_SUPPORTED]
+    exclusion_blocker_count = sum(
+        bool(ids)
+        for record in contract_excluded
+        for ids in record.get("contract_exclusion_blockers", {}).values()  # type: ignore[union-attr]
+    )
+    blocker_count = sum(value in BLOCKING_DISPOSITIONS for value in dispositions) + exclusion_blocker_count
     create_count = dispositions.count(CREATE)
     return {
         "records_seen": len(records),
         "structurally_proven": len(structural),
         "allowed_records": len(allowed),
         "disallowed_records": len(disallowed),
+        "contract_excluded_records": len(contract_excluded),
+        "contract_excluded_by_reason": {
+            MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED: len(contract_excluded),
+        },
+        "contract_exclusion_blockers": exclusion_blocker_count,
         "reminders_to_create": create_count,
         "reminder_24h_to_create": sum(
             item["job_type"] == REMINDER_24H and item["disposition"] == CREATE
@@ -508,6 +685,7 @@ async def build_recovery_plan(
     records, truncated = await _select_records(session, now=moment, limit=limit)
     events = await _latest_proof_events(session, records)
     clients, jobs_by_record, outbox_by_record = await _scope_state(session, records)
+    service_state_digests = await _record_service_state_digests(session, records)
     registry = configured_easyweek_locations()
     pause = sleep if sleep is not None else asyncio.sleep
     rows: list[dict[str, object]] = []
@@ -524,6 +702,12 @@ async def build_recovery_plan(
         eligibility = PROOF_FAILED
         refusal_reason: str | None = None
         forced: str | None = None
+        contract_exclusion_context_digest: str | None = None
+        contract_blockers: dict[str, list[int]] = {
+            EXCLUSION_OPEN_REMINDER_JOB_IDS: [],
+            EXCLUSION_IDENTITY_MISMATCH_JOB_IDS: [],
+            EXCLUSION_NON_TERMINAL_OUTBOX_IDS: [],
+        }
 
         if not _identity_matches(record, client_row) or event is None or location is None:
             forced = IDENTITY_MISMATCH
@@ -600,11 +784,26 @@ async def build_recovery_plan(
                             forced = PROOF_FAILED
                             refusal_reason = decision.reason
                 except MultiServiceProofError as exc:
-                    forced = PROOF_FAILED
+                    if exc.reason == MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED:
+                        eligibility = CONTRACT_NOT_SUPPORTED
+                        forced = CONTRACT_NOT_SUPPORTED
+                        contract_exclusion_context_digest = _contract_exclusion_context_digest(
+                            live_payload,
+                            catalog,
+                        )
+                    else:
+                        forced = PROOF_FAILED
                     refusal_reason = exc.reason
                 except Exception:  # noqa: BLE001 - exception text can carry API material
                     forced = PROOF_FAILED
                     refusal_reason = MULTI_SERVICE_API_UNAVAILABLE
+
+        if eligibility == CONTRACT_NOT_SUPPORTED:
+            contract_blockers = _contract_exclusion_blockers(
+                record=record,
+                jobs=jobs,
+                outboxes=outboxes,
+            )
 
         reminders = _reminder_rows(
             record=record,
@@ -617,6 +816,9 @@ async def build_recovery_plan(
         rows.append(
             {
                 **identity,
+                "record_state_digest": _record_state_digest(record),
+                "client_state_digest": _client_state_digest(client_row),
+                "record_services_state_digest": service_state_digests[record.id],
                 "proof_event_id": event.id if event is not None else None,
                 "location_uuid": location.location_uuid if location is not None else None,
                 "multi_service_snapshot_digest": snapshot.digest if snapshot is not None else None,
@@ -625,6 +827,8 @@ async def build_recovery_plan(
                 "multi_service_snapshot": _snapshot_projection(snapshot) if snapshot is not None else None,
                 "eligibility": eligibility,
                 "refusal_reason": refusal_reason,
+                "contract_exclusion_context_digest": contract_exclusion_context_digest,
+                "contract_exclusion_blockers": contract_blockers,
                 "reminders": reminders,
                 "existing_jobs": [_job_state(job) for job in jobs],
                 "existing_outboxes": [_outbox_state(row) for row in outboxes],
@@ -711,6 +915,7 @@ def read_snapshot(path: str | Path) -> FrozenRecoveryPlan:
     ):
         raise RecoveryError("snapshot_schema_invalid")
     for row in payload["records"]:
+        exclusion_blockers = row.get("contract_exclusion_blockers") if isinstance(row, dict) else None
         if (
             not isinstance(row, dict)
             or type(row.get("record_id")) is not int
@@ -720,6 +925,20 @@ def read_snapshot(path: str | Path) -> FrozenRecoveryPlan:
             or not isinstance(row.get("reminders"), list)
             or not isinstance(row.get("existing_jobs"), list)
             or not isinstance(row.get("existing_outboxes"), list)
+            or not _valid_digest(row.get("record_state_digest"))
+            or not _valid_digest(row.get("record_services_state_digest"))
+            or (row.get("client_state_digest") is not None and not _valid_digest(row.get("client_state_digest")))
+            or not isinstance(exclusion_blockers, dict)
+            or set(exclusion_blockers)
+            != {
+                EXCLUSION_OPEN_REMINDER_JOB_IDS,
+                EXCLUSION_IDENTITY_MISMATCH_JOB_IDS,
+                EXCLUSION_NON_TERMINAL_OUTBOX_IDS,
+            }
+            or any(
+                not isinstance(ids, list) or any(type(item) is not int for item in ids)
+                for ids in exclusion_blockers.values()
+            )
         ):
             raise RecoveryError("snapshot_schema_invalid")
         if len(row["reminders"]) != 2 or {
@@ -757,6 +976,7 @@ def read_snapshot(path: str | Path) -> FrozenRecoveryPlan:
                     PROOF_FAILED,
                     IDENTITY_MISMATCH,
                     NON_TERMINAL_OUTBOX_PRESENT,
+                    CONTRACT_NOT_SUPPORTED,
                 }
             ):
                 raise RecoveryError("snapshot_schema_invalid")
@@ -784,6 +1004,44 @@ def read_snapshot(path: str | Path) -> FrozenRecoveryPlan:
                     or reminder.get("dedupe_key") != expected_key
                 ):
                     raise RecoveryError("snapshot_schema_invalid")
+        if row.get("eligibility") == CONTRACT_NOT_SUPPORTED:
+            expected_open_ids = sorted(
+                int(item["id"])
+                for item in row["existing_jobs"]
+                if item.get("job_type") in EASYWEEK_REMINDER_JOB_TYPES and item.get("status") in OPEN_JOB_STATUSES
+            )
+            expected_outbox_ids = sorted(
+                int(item["id"])
+                for item in row["existing_outboxes"]
+                if item.get("status") in NON_TERMINAL_OUTBOX_STATUSES
+            )
+            if (
+                row.get("refusal_reason") != MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED
+                or not _valid_digest(row.get("contract_exclusion_context_digest"))
+                or any(
+                    row.get(key) is not None
+                    for key in (
+                        "multi_service_snapshot_digest",
+                        "live_business_pair_digest",
+                        "category_proof_digest",
+                        "multi_service_snapshot",
+                    )
+                )
+                or any(
+                    reminder.get("disposition") != CONTRACT_NOT_SUPPORTED or reminder.get("dedupe_key") is not None
+                    for reminder in row["reminders"]
+                )
+                or exclusion_blockers[EXCLUSION_OPEN_REMINDER_JOB_IDS] != expected_open_ids
+                or not set(exclusion_blockers[EXCLUSION_IDENTITY_MISMATCH_JOB_IDS]).issubset(expected_open_ids)
+                or exclusion_blockers[EXCLUSION_NON_TERMINAL_OUTBOX_IDS] != expected_outbox_ids
+            ):
+                raise RecoveryError("snapshot_schema_invalid")
+        elif (
+            row.get("contract_exclusion_context_digest") is not None
+            or any(exclusion_blockers.values())
+            or any(reminder.get("disposition") == CONTRACT_NOT_SUPPORTED for reminder in row["reminders"])
+        ):
+            raise RecoveryError("snapshot_schema_invalid")
     _parse_timestamp(payload["planned_at"])
     embedded = payload.get("plan_digest")
     unsigned = dict(payload)
@@ -844,6 +1102,11 @@ def _plan_stable_view(record: Mapping[str, Any]) -> dict[str, object]:
         "multi_service_snapshot",
         "eligibility",
         "refusal_reason",
+        "record_state_digest",
+        "client_state_digest",
+        "record_services_state_digest",
+        "contract_exclusion_context_digest",
+        "contract_exclusion_blockers",
     )
     return {key: record.get(key) for key in keys}
 
@@ -954,11 +1217,17 @@ async def _lock_and_compare_local_state(
     if [row.id for row in locked] != sorted(ids):
         raise RecoveryError("record_state_changed")
     clients, jobs, outboxes = await _scope_state(session, locked, lock=True)
+    service_state_digests = await _record_service_state_digests(session, locked, lock=True)
     expected = {int(row["record_id"]): row for row in current.records}
     for record in locked:
         client = clients.get(record.client_id) if record.client_id is not None else None
         row = expected[record.id]
-        if _record_identity(record, client) != {key: row.get(key) for key in _record_identity(record, client)}:
+        if (
+            _record_identity(record, client) != {key: row.get(key) for key in _record_identity(record, client)}
+            or _record_state_digest(record) != row.get("record_state_digest")
+            or _client_state_digest(client) != row.get("client_state_digest")
+            or service_state_digests[record.id] != row.get("record_services_state_digest")
+        ):
             raise RecoveryError("record_state_changed")
         if [_job_state(item) for item in jobs.get(record.id, [])] != row.get("existing_jobs", []):
             raise RecoveryError("job_state_changed")
@@ -975,6 +1244,7 @@ class ApplyResult:
     skipped_window_passed: int
     outbox_ids_before: tuple[int, ...]
     outbox_ids_after: tuple[int, ...]
+    contract_excluded_record_ids: tuple[int, ...]
     applied_at: datetime
 
     def report(self) -> dict[str, object]:
@@ -992,6 +1262,7 @@ class ApplyResult:
             "halted": False,
             "outbox_ids_before": list(self.outbox_ids_before),
             "outbox_ids_after": list(self.outbox_ids_after),
+            "contract_excluded_record_ids": list(self.contract_excluded_record_ids),
             "applied_at": _timestamp(self.applied_at),
         }
         return {**payload, "report_digest": _digest(payload)}
@@ -1010,6 +1281,11 @@ def read_apply_report(path: str | Path, *, frozen: FrozenRecoveryPlan) -> dict[s
     if not isinstance(digest, str) or digest != _digest(unsigned):
         raise RecoveryError("apply_report_digest_mismatch")
     if payload.get("plan_digest") != frozen.digest or payload.get("snapshot_version") != SNAPSHOT_VERSION:
+        raise RecoveryError("plan_apply_digest_mismatch")
+    expected_excluded_ids = sorted(
+        int(row["record_id"]) for row in frozen.records if row.get("eligibility") == CONTRACT_NOT_SUPPORTED
+    )
+    if payload.get("contract_excluded_record_ids") != expected_excluded_ids:
         raise RecoveryError("plan_apply_digest_mismatch")
     return payload
 
@@ -1127,6 +1403,9 @@ async def apply_recovery_plan(
         ),
         outbox_ids_before=tuple(before_outboxes),
         outbox_ids_after=tuple(after_outboxes),
+        contract_excluded_record_ids=tuple(
+            sorted(int(row["record_id"]) for row in frozen.records if row.get("eligibility") == CONTRACT_NOT_SUPPORTED)
+        ),
         applied_at=mutation_boundary,
     )
 
@@ -1155,8 +1434,10 @@ async def verify_recovery(
         else []
     )
     clients, _unused_jobs, _unused_outboxes = await _scope_state(session, records)
+    service_state_digests = await _record_service_state_digests(session, records)
     frozen_by_id = {int(row["record_id"]): row for row in frozen.records}
     identity_mismatches: list[int] = []
+    state_mismatches: list[int] = []
     for record in records:
         client = clients.get(record.client_id) if record.client_id is not None else None
         expected_identity = frozen_by_id.get(record.id)
@@ -1164,7 +1445,15 @@ async def verify_recovery(
             key: expected_identity.get(key) for key in _record_identity(record, client)
         }:
             identity_mismatches.append(record.id)
-    identity_mismatches.extend(sorted(set(record_ids) - {record.id for record in records}))
+        if expected_identity is None or (
+            _record_state_digest(record) != expected_identity.get("record_state_digest")
+            or _client_state_digest(client) != expected_identity.get("client_state_digest")
+            or service_state_digests[record.id] != expected_identity.get("record_services_state_digest")
+        ):
+            state_mismatches.append(record.id)
+    missing_record_ids = sorted(set(record_ids) - {record.id for record in records})
+    identity_mismatches.extend(missing_record_ids)
+    state_mismatches.extend(missing_record_ids)
     jobs = list(
         (
             await session.execute(
@@ -1222,6 +1511,17 @@ async def verify_recovery(
         and job.job_type in EASYWEEK_REMINDER_JOB_TYPES
         and _utc(job.created_at) >= frozen.planned_at
     ]
+    contract_excluded_ids = {
+        int(row["record_id"]) for row in frozen.records if row.get("eligibility") == CONTRACT_NOT_SUPPORTED
+    }
+    contract_excluded_jobs = [
+        job.id
+        for job in jobs
+        if job.record_id in contract_excluded_ids
+        and job.provider == PROVIDER_EASYWEEK
+        and job.job_type in EASYWEEK_REMINDER_JOB_TYPES
+        and _utc(job.created_at) >= frozen.planned_at
+    ]
     try:
         applied_at = _parse_timestamp(apply_report.get("applied_at"))
     except RecoveryError:
@@ -1269,8 +1569,10 @@ async def verify_recovery(
         and created_jobs_match
         and not unexpected_outbox_ids
         and not disallowed_jobs
+        and not contract_excluded_jobs
         and not overdue_jobs
         and not identity_mismatches
+        and not state_mismatches
     )
     return {
         "mode": MODE_VERIFY,
@@ -1285,9 +1587,12 @@ async def verify_recovery(
         "subsequent_job_ids": sorted(subsequent_job_ids),
         "job_status_counts": dict(sorted(job_status_counts.items())),
         "disallowed_jobs": sorted(disallowed_jobs),
+        "contract_excluded_record_ids": sorted(contract_excluded_ids),
+        "contract_excluded_jobs": sorted(contract_excluded_jobs),
         "overdue_jobs": sorted(overdue_jobs),
         "digest_mismatches": sorted(digest_mismatches),
         "identity_mismatches": sorted(identity_mismatches),
+        "state_mismatch_record_ids": sorted(state_mismatches),
         "missing_expected_jobs": missing_keys,
     }
 
@@ -1298,6 +1603,7 @@ __all__ = [
     "ALREADY_QUEUED",
     "APPLY_REPORT_VERSION",
     "CATEGORY_NOT_ALLOWED",
+    "CONTRACT_NOT_SUPPORTED",
     "CREATE",
     "DEFAULT_LIMIT",
     "DEFAULT_MAX_SNAPSHOT_AGE_SEC",

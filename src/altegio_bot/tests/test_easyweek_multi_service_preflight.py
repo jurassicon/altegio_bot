@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import func, select
 
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     WebhookServicePair,
     clear_multi_service_catalog_cache,
     multi_service_job_payload,
@@ -93,16 +94,22 @@ def _line(line_uuid: str, name: str, price: int, duration: int) -> dict[str, Any
     }
 
 
-def _api() -> dict[str, Any]:
+def _api(*, custom_duration: bool = False, malformed: bool = False) -> dict[str, Any]:
+    second = _line("22222222-2222-4222-8222-222222222222", "Second Fixture Service", 4500, 45)
+    if custom_duration:
+        second["duration"] = {"value": 75, "label": "minutes"}
+    ordered_services: object = [
+        _line("11111111-1111-4111-8111-111111111111", "Fixture Service", 3500, 30),
+        second,
+    ]
+    if malformed:
+        ordered_services = "not-a-list"
     return {
         "uuid": TEST_BOOKING_UUID,
         "location_uuid": TEST_LOCATION_UUID,
         "currency": "EUR",
         "order": {"subtotal": 8000, "total": 8000},
-        "ordered_services": [
-            _line("11111111-1111-4111-8111-111111111111", "Fixture Service", 3500, 30),
-            _line("22222222-2222-4222-8222-222222222222", "Second Fixture Service", 4500, 45),
-        ],
+        "ordered_services": ordered_services,
     }
 
 
@@ -128,14 +135,16 @@ def _catalog() -> list[dict[str, Any]]:
 
 
 class FakeReader:
-    def __init__(self) -> None:
+    def __init__(self, *, custom_duration: bool = False, malformed: bool = False) -> None:
         self.booking_calls = 0
         self.catalog_calls = 0
+        self.custom_duration = custom_duration
+        self.malformed = malformed
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
         assert booking_uuid == TEST_BOOKING_UUID
         self.booking_calls += 1
-        return _api()
+        return _api(custom_duration=self.custom_duration, malformed=self.malformed)
 
     async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
         assert (location_uuid, page) == (TEST_LOCATION_UUID, 1)
@@ -154,6 +163,8 @@ async def _seed_active_pair(
     embedded_snapshot: bool = False,
     malformed_embedded: bool = False,
     stale_job: bool = False,
+    unsafe_open_job: bool = False,
+    non_terminal_outbox: bool = False,
 ) -> None:
     client = Client(
         provider="easyweek",
@@ -236,6 +247,35 @@ async def _seed_active_pair(
                 payload=job_payload,
             )
         )
+    if unsafe_open_job or non_terminal_outbox:
+        unsafe_job = MessageJob(
+            provider="easyweek",
+            company_id=TEST_LOCATION_ID,
+            record_id=record.id,
+            client_id=client.id,
+            job_type="reminder_24h",
+            run_at=utcnow(),
+            status="queued",
+            dedupe_key=f"unsafe-contract-excluded-{record.id}",
+            payload={},
+        )
+        session.add(unsafe_job)
+        await session.flush()
+        if non_terminal_outbox:
+            session.add(
+                OutboxMessage(
+                    company_id=TEST_LOCATION_ID,
+                    client_id=client.id,
+                    record_id=record.id,
+                    job_id=unsafe_job.id,
+                    phone_e164="+49000000000",
+                    template_code="reminder_24h",
+                    body="fixture",
+                    status="queued",
+                    scheduled_at=utcnow(),
+                    meta={},
+                )
+            )
     await session.flush()
 
 
@@ -270,6 +310,7 @@ async def test_historical_pair_without_snapshot_is_proven_and_preflight_is_read_
         "structurally_proven": 1,
         "allowed": 1,
         "disallowed_by_category": 0,
+        "contract_excluded": 0,
         "ambiguous": 0,
         "open_jobs": 0,
         "jobs_held_by_send_fence": 0,
@@ -336,6 +377,57 @@ async def test_stale_job_digest_is_counted_and_never_green(session_maker) -> Non
     assert report.open_jobs == report.jobs_held_by_send_fence == 1
     assert report.stale_snapshot_digest == report.unexplained == 1
     assert report.reasons == {"multi_service_snapshot_digest_mismatch": 1}
+    assert report.ready is False
+
+
+async def test_custom_duration_is_a_clean_contract_exclusion(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session)
+        report = await run_preflight(
+            session,
+            client=FakeReader(custom_duration=True),
+            sleep=_no_sleep,
+        )
+
+    assert report.contract_excluded == 1
+    assert report.structurally_proven == report.allowed == report.disallowed_by_category == 0
+    assert report.ambiguous == report.unexplained == 0
+    assert report.reasons == {MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED: 1}
+    assert report.ready is True
+
+
+@pytest.mark.parametrize("with_outbox", [False, True])
+async def test_contract_exclusion_with_open_queue_is_not_ready(session_maker, with_outbox: bool) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(
+                session,
+                unsafe_open_job=True,
+                non_terminal_outbox=with_outbox,
+            )
+        report = await run_preflight(
+            session,
+            client=FakeReader(custom_duration=True),
+            sleep=_no_sleep,
+        )
+
+    assert report.contract_excluded == 1
+    assert report.open_jobs == 1
+    assert report.unexplained >= 1
+    assert report.reasons["contract_excluded_open_job"] == 1
+    assert report.reasons["contract_excluded_non_terminal_outbox"] == int(with_outbox)
+    assert report.ready is False
+
+
+async def test_non_custom_duration_proof_error_remains_unexplained(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session)
+        report = await run_preflight(session, client=FakeReader(malformed=True), sleep=_no_sleep)
+
+    assert report.contract_excluded == 0
+    assert report.ambiguous == report.unexplained == 1
     assert report.ready is False
 
 
