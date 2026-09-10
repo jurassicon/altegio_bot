@@ -725,6 +725,33 @@ def test_a_data_object_envelope_is_accepted() -> None:
     assert projection.proven is True
 
 
+def test_root_and_data_invoices_are_an_ambiguous_malformed_response() -> None:
+    """A clean root invoice must not hide a persistence signal in data.invoice."""
+    projection = _envelope(
+        {
+            **canonical_response(),
+            "data": canonical_response(status="open", voucher_code=ARTIFACT_MARKER),
+        }
+    )
+
+    assert projection.proven is False
+    assert projection.reasons == (GIFT_CARD_CALCULATION_RESPONSE_MALFORMED,)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {**canonical_response(), "data": "unexpected"},
+        {"invoice": "unexpected", "data": canonical_response()},
+    ],
+)
+def test_an_invalid_container_cannot_be_hidden_by_a_valid_invoice(envelope) -> None:
+    projection = _envelope(envelope)
+
+    assert projection.proven is False
+    assert projection.reasons == (GIFT_CARD_CALCULATION_RESPONSE_MALFORMED,)
+
+
 # ---------------------------------------------------------------------------
 # Persistence identity, at every level
 # ---------------------------------------------------------------------------

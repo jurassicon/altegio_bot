@@ -31,6 +31,8 @@ transport accepts only:
 
 - the confirmed Karlsruhe location UUID — not "some canonical UUID";
 - the confirmed voucher template UUID — not "some canonical UUID";
+- the confirmed workspace slug — a different non-empty workspace header is
+  refused while constructing the calculate transport;
 - the exact `1500` minor-unit nominal as an exact integer — not "some positive
   integer";
 - quantity exactly `1`, which is not a parameter at all.
@@ -141,6 +143,10 @@ the one HTTP 200 answer. Anything else fails closed.
 inside `invoice`. The full response body is kept and **every** level that
 carries either field is inspected:
 
+- exactly one invoice placement is accepted: either root `invoice` or
+  `data.invoice`; returning both is ambiguous and malformed, and a present
+  `data`/`invoice` container of the wrong type is malformed even when the other
+  placement looks valid;
 - the field must be present on at least one supported level, otherwise the
   response is malformed;
 - every occurrence must be strictly `null`;

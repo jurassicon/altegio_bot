@@ -69,6 +69,7 @@ from altegio_bot.easyweek_client import (
 )
 from altegio_bot.easyweek_voucher_identity import (
     EASYWEEK_VOUCHER_TEMPLATE_UUID,
+    EASYWEEK_WORKSPACE_SLUG,
     KARLSRUHE_LOCATION_UUID,
     SUPPORTED_VOUCHER_PRICE_MINOR,
     SUPPORTED_VOUCHER_QUANTITY,
@@ -232,9 +233,11 @@ class EasyWeekVoucherCalculationClient:
             raise EasyWeekConfigError("EASYWEEK_API_KEY is not configured")
         if not (isinstance(slug, str) and slug.strip()):
             raise EasyWeekConfigError("EASYWEEK_WORKSPACE_SLUG is not configured")
+        if slug.strip() != EASYWEEK_WORKSPACE_SLUG:
+            raise EasyWeekConfigError("EASYWEEK_WORKSPACE_SLUG is not the confirmed voucher workspace")
 
         self._api_key = key.strip()
-        self._workspace_slug = slug.strip()
+        self._workspace_slug = EASYWEEK_WORKSPACE_SLUG
         self._base_url = _normalize_base_url(base_url if base_url is not None else settings.easyweek_api_base_url)
 
         # Always built here, always owned here. A caller cannot supply a client,

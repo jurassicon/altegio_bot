@@ -33,6 +33,7 @@ from altegio_bot.easyweek_voucher_calculation import (
 )
 from altegio_bot.easyweek_voucher_identity import (
     EASYWEEK_VOUCHER_TEMPLATE_UUID,
+    EASYWEEK_WORKSPACE_SLUG,
     KARLSRUHE_LOCATION_UUID,
     SUPPORTED_VOUCHER_PRICE_MINOR,
 )
@@ -43,10 +44,11 @@ from altegio_bot.tests.easyweek_voucher_evidence_fixtures import (
 )
 
 KEY = "SENTINEL_CALCKEY_aaa111"
-SLUG = "SENTINEL_CALCSLUG_aaa222"
+SLUG = EASYWEEK_WORKSPACE_SLUG
+FOREIGN_SLUG = "SENTINEL_CALCSLUG_aaa222"
 BODY_MARKER = "SENTINEL_CALCBODY_aaa333"
 ERROR_MARKER = "SENTINEL_CALCERROR_aaa444"
-ALL_SENTINELS = (KEY, SLUG, BODY_MARKER, ERROR_MARKER)
+ALL_SENTINELS = (KEY, FOREIGN_SLUG, BODY_MARKER, ERROR_MARKER)
 
 BASE = "https://my.easyweek.io/api/public/v2"
 CALCULATE_PATH = "/api/public/v2/orders/calculate"
@@ -252,6 +254,18 @@ async def test_only_the_supported_nominal_reaches_the_wire(bad_price) -> None:
                 voucher_template_uuid=TEMPLATE_UUID,
                 price_minor=bad_price,
             )
+
+
+def test_only_the_confirmed_workspace_slug_can_construct_the_transport() -> None:
+    with pytest.raises(EasyWeekConfigError) as excinfo:
+        EasyWeekVoucherCalculationClient(
+            api_key=KEY,
+            workspace_slug=FOREIGN_SLUG,
+            base_url=BASE,
+            transport=httpx.MockTransport(_refusing_handler),
+        )
+
+    assert FOREIGN_SLUG not in str(excinfo.value)
 
 
 @pytest.mark.asyncio

@@ -416,14 +416,26 @@ def _levels(envelope: dict[str, Any]) -> list[tuple[dict[str, Any], frozenset[st
 
 
 def _invoice_object(envelope: dict[str, Any]) -> dict[str, Any] | None:
-    """The invoice object from the envelope or from ``data``, if there is one."""
-    direct = envelope.get("invoice")
-    if isinstance(direct, dict):
-        return direct
+    """The one unambiguous invoice object, or ``None`` for any other shape.
+
+    The two observed/supported placements are a root ``invoice`` and
+    ``data.invoice``.  They are alternatives, not aliases: accepting both would
+    make one of two potentially conflicting invoices invisible to the amount,
+    artifact and persistence checks below.  Likewise, a present ``data`` or
+    ``invoice`` container of the wrong type is an unexplained response shape and
+    must not be ignored merely because the other placement happens to be valid.
+    """
     inner = envelope.get("data")
-    if isinstance(inner, dict) and isinstance(inner.get("invoice"), dict):
-        return inner["invoice"]
-    return None
+    if "data" in envelope and not isinstance(inner, dict):
+        return None
+
+    direct_present = "invoice" in envelope
+    nested_present = isinstance(inner, dict) and "invoice" in inner
+    if direct_present == nested_present:  # both present, or neither present
+        return None
+
+    invoice = envelope["invoice"] if direct_present else inner["invoice"]
+    return invoice if isinstance(invoice, dict) else None
 
 
 def evaluate_calculation_invoice(

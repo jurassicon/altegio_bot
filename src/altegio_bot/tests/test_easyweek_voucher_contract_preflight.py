@@ -18,6 +18,7 @@ import pytest
 
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_voucher_calculation import EasyWeekVoucherCalculationClient
+from altegio_bot.easyweek_voucher_identity import EASYWEEK_WORKSPACE_SLUG
 from altegio_bot.scripts import easyweek_voucher_contract_preflight as preflight
 from altegio_bot.scripts.easyweek_voucher_contract_preflight import (
     EXIT_ARGUMENTS,
@@ -39,7 +40,7 @@ from altegio_bot.tests.easyweek_voucher_evidence_fixtures import (
 )
 
 KEY = "SENTINEL_PREKEY_ccc111"
-SLUG = "SENTINEL_PRESLUG_ccc222"
+SLUG = EASYWEEK_WORKSPACE_SLUG
 BODY_MARKER = "SENTINEL_PREBODY_ccc333"
 BASE = "https://my.easyweek.io/api/public/v2"
 CONFIRM = "--confirm-nonpersistent-calculate"
