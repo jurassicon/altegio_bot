@@ -5,40 +5,52 @@ for a campaign?". It owns one documented, officially non-persistent endpoint::
 
     POST /orders/calculate
 
-and nothing else. Deliberately absent, and deliberately not addable here:
-``POST /orders``, ``POST /orders/{uuid}/pay``, ``POST /orders/{uuid}/refund``,
-voucher-template writes, order/account/staffer reads, and any generic
-``request``/``post`` escape hatch. A caller cannot hand this client a URL, a
-body, a quantity, a discount, a promocode, a customer or a staffer.
+and nothing else. Deliberately absent, and deliberately not addable here: the
+persistent order endpoint, its pay and refund actions, voucher-template writes,
+order/account/staffer reads, and any generic ``request``/``post`` escape hatch.
+A caller cannot hand this client a URL, a body, a quantity, a discount, a
+promocode, a customer or a staffer.
 
-Why a separate module
----------------------
-``easyweek_client.EasyWeekClient`` is GET-only by construction (plan §1.6 p.8)
-and stays that way. ``easyweek_migration.write_client`` is the cutover's
-mutation surface; binding campaign evidence to it would let a migration change
-widen the campaign path. So the transport *policy* is reused by importing the
-pinned origin, timeout and typed errors from the read client, while the request
-surface is defined here and only here.
+Literal-pinned scope
+--------------------
+The public method does not accept "some canonical UUID" and "some positive
+price". It accepts exactly the confirmed Karlsruhe location, exactly the
+confirmed voucher template and exactly the supported €15 nominal — the literals
+in :mod:`altegio_bot.easyweek_voucher_identity`. A syntactically valid but
+different identity, or a different price, is refused before the wire. The
+operator flow still reads the price from the fresh template first and only
+reaches this method once ``cost == value == 1500`` is proven; this transport is
+the second, independent fence, not the first one.
+
+No redirect, ever
+-----------------
+The client always creates and owns its own ``httpx.AsyncClient`` with
+``follow_redirects=False``. There is no parameter through which a caller could
+supply a pre-built client, because a client built with ``follow_redirects=True``
+would let a ``307``/``308`` answer replay this POST — Authorization header and
+body included — against the *persistent* order endpoint. A 3xx is therefore a
+typed, fail-closed refusal after the single request, and ``Location`` is never
+read.
 
 One POST, ever
 --------------
 ``/orders/calculate`` is documented as non-persistent, but "documented" is not
-"proven for this workspace". This client therefore issues exactly one POST per
-call and never retries — not on a timeout, not on a transport failure, not on a
-429, not on any 5xx. Each of those leaves the outcome uninterpretable, and a
-second POST would trade a clean unknown for a second unexplained server-side
-event. Those outcomes are raised as :class:`EasyWeekCalculationUncertain`, which
-is deliberately NOT a subclass of the generic retryable error: no "is it
-retryable?" sweep can pick it up by accident.
+"proven for this workspace". This client issues exactly one POST per call and
+never retries — not on a timeout, not on a transport failure, not on a 429, not
+on any 5xx. Each of those leaves the outcome uninterpretable, and a second POST
+would trade a clean unknown for a second unexplained server-side event. Those
+outcomes are raised as :class:`EasyWeekCalculationUncertain`, which is
+deliberately NOT a subclass of the generic retryable error: no "is it
+retryable?" sweep can pick it up by accident, and no caller may re-run the
+command automatically after one.
 
-Nothing here logs a secret, a header, a URL or a response body.
+Nothing here logs or reprs a secret, a header, a URL or a response body.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid as uuid_module
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Final
 
@@ -55,6 +67,12 @@ from altegio_bot.easyweek_client import (
     _normalize_base_url,
     _unwrap_secret,
 )
+from altegio_bot.easyweek_voucher_identity import (
+    EASYWEEK_VOUCHER_TEMPLATE_UUID,
+    KARLSRUHE_LOCATION_UUID,
+    SUPPORTED_VOUCHER_PRICE_MINOR,
+    SUPPORTED_VOUCHER_QUANTITY,
+)
 from altegio_bot.settings import settings
 
 logger = logging.getLogger("easyweek_voucher_calculation")
@@ -65,10 +83,12 @@ _PATH_ORDERS: Final = "orders"
 _PATH_CALCULATE: Final = "calculate"
 CALCULATE_OPERATION: Final = "calculate_voucher_order"
 
-# The supported contract is one voucher line. Quantity is not a parameter: a
-# caller that could pass it could also preview a bulk purchase, and no bulk
-# evidence exists.
-VOUCHER_QUANTITY: Final = 1
+# Re-exported so a reader of this module sees the pinned line without following
+# an import. The transport accepts nothing else.
+VOUCHER_QUANTITY: Final = SUPPORTED_VOUCHER_QUANTITY
+
+# Every redirect status. None of them is followed; each is a fail-closed refusal.
+_REDIRECT_STATUSES: Final = frozenset({301, 302, 303, 307, 308})
 
 # Field names that may be echoed back from a 422. Nothing outside this set —
 # and never a value, a message or a body — reaches an operator.
@@ -96,55 +116,59 @@ class EasyWeekCalculationUncertain(EasyWeekError):
 class VoucherCalculationResult:
     """A 2xx answer whose envelope was readable. Amounts are NOT judged here.
 
-    The transport proves only that the server answered with a JSON object that
-    carries an ``invoice`` key. Whether the invoice is a supported calculation
-    is a domain question, answered by
-    ``campaigns.easyweek_voucher_contract``.
+    ``envelope`` is the COMPLETE parsed JSON object, exactly as the server sent
+    it — nothing is unwrapped and nothing is dropped. An earlier version handed
+    back only the inner ``data`` object, which silently discarded any
+    ``order_uuid``/``status`` sitting on the outer envelope: precisely the
+    signals this evidence path exists to catch.
+
+    It carries ``repr=False`` because a dataclass repr lands in tracebacks,
+    pytest output and log records, and this field may hold a voucher artifact,
+    a customer subtree or a URL.
     """
 
     http_status: int
-    payload: dict[str, Any]
+    envelope: dict[str, Any] = field(repr=False)
 
 
-def _canonical_lowercase_uuid(value: object, *, label: str) -> str:
-    """Return *value* only when it already is a canonical lowercase UUID.
+def _pinned_identity(value: object, *, expected: str, label: str) -> str:
+    """Accept only the one confirmed literal for *label*.
 
-    Checked BEFORE the request is built. ``uuid.UUID(...)`` would happily accept
-    braces, urn prefixes, uppercase and stray whitespace and then normalise
-    them; accepting those would mean the wire carries an identity the caller
-    never typed. The offending value is never echoed into the error.
+    Deliberately an equality check rather than "is this a canonical UUID?". A
+    well-formed UUID for another branch or another product would still be a
+    request this evidence path has no permission to make, and the difference
+    between "syntactically valid" and "the one we proved" is the whole fence.
+    The offending value is never echoed into the error.
     """
-    if not isinstance(value, str) or not value:
-        raise EasyWeekPermanentError(f"{label} must be a canonical lowercase UUID", operation=CALCULATE_OPERATION)
-    try:
-        canonical = str(uuid_module.UUID(value))
-    except (ValueError, AttributeError, TypeError):
+    if not isinstance(value, str) or value != expected:
         raise EasyWeekPermanentError(
-            f"{label} must be a canonical lowercase UUID", operation=CALCULATE_OPERATION
-        ) from None
-    if canonical != value:
-        raise EasyWeekPermanentError(f"{label} must be a canonical lowercase UUID", operation=CALCULATE_OPERATION)
-    return canonical
+            f"{label} is not the confirmed voucher-scope identity",
+            operation=CALCULATE_OPERATION,
+        )
+    return expected
 
 
-def _exact_positive_minor_amount(value: object) -> int:
-    """Return a strictly positive exact ``int`` price in minor units.
+def _pinned_price_minor(value: object) -> int:
+    """Accept only the exact supported nominal, as an exact ``int``.
 
     ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` to
     ``isinstance`` and would silently become a one-cent price. Floats and
     numeric strings are refused too — money that survived a float is money we
     cannot prove.
 
-    Zero and negative prices are refused by the transport, not merely by the
-    domain layer: production evidence shows EasyWeek accepts both and returns a
-    happily-calculated invoice, so the refusal has to sit where the request is
-    built.
+    Zero, negative and merely-different prices are all refused here, not only in
+    the domain layer: production evidence shows EasyWeek accepts ``0`` and
+    ``1499`` and returns a happily calculated invoice, so the refusal has to sit
+    where the request is built.
     """
     if type(value) is not int:
         raise EasyWeekPermanentError("price_minor must be an exact integer", operation=CALCULATE_OPERATION)
-    if value <= 0:
-        raise EasyWeekPermanentError("price_minor must be strictly positive", operation=CALCULATE_OPERATION)
-    return value
+    if value != SUPPORTED_VOUCHER_PRICE_MINOR:
+        raise EasyWeekPermanentError(
+            "price_minor is not the supported voucher nominal",
+            operation=CALCULATE_OPERATION,
+        )
+    return SUPPORTED_VOUCHER_PRICE_MINOR
 
 
 def _safe_validation_fields(response: httpx.Response) -> list[str]:
@@ -182,14 +206,15 @@ class EasyWeekVoucherCalculationClient:
 
         async with EasyWeekVoucherCalculationClient() as client:
             result = await client.calculate_single_voucher(
-                location_uuid=...,
-                voucher_template_uuid=...,
-                price_minor=...,
+                location_uuid=KARLSRUHE_LOCATION_UUID,
+                voucher_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+                price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
             )
 
-    ``transport``, ``http_client`` and ``timeout`` exist for dependency
-    injection: the unit suite drives an ``httpx.MockTransport`` and never
-    touches the network.
+    ``transport`` and ``timeout`` are the ONLY injection points, and neither can
+    change redirect policy: the unit suite drives an ``httpx.MockTransport`` and
+    never touches the network. There is deliberately no ``http_client``
+    parameter — see the module docstring.
     """
 
     def __init__(
@@ -200,7 +225,6 @@ class EasyWeekVoucherCalculationClient:
         base_url: str | None = None,
         timeout: httpx.Timeout | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         key = _unwrap_secret(api_key if api_key is not None else settings.easyweek_api_key)
         slug = _unwrap_secret(workspace_slug if workspace_slug is not None else settings.easyweek_workspace_slug)
@@ -213,24 +237,19 @@ class EasyWeekVoucherCalculationClient:
         self._workspace_slug = slug.strip()
         self._base_url = _normalize_base_url(base_url if base_url is not None else settings.easyweek_api_base_url)
 
-        if http_client is not None:
-            self._client = http_client
-            self._owns_client = False
-        else:
-            self._client = httpx.AsyncClient(
-                timeout=timeout or _DEFAULT_TIMEOUT,
-                # A redirect would re-send the Authorization header to whatever
-                # host the response named.
-                follow_redirects=False,
-                transport=transport,
-            )
-            self._owns_client = True
+        # Always built here, always owned here. A caller cannot supply a client,
+        # so a caller cannot turn redirects back on and let a 307 replay this
+        # POST against the persistent order endpoint.
+        self._client = httpx.AsyncClient(
+            timeout=timeout or _DEFAULT_TIMEOUT,
+            follow_redirects=False,
+            transport=transport,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._client.aclose()
 
     async def __aenter__(self) -> EasyWeekVoucherCalculationClient:
         return self
@@ -244,8 +263,10 @@ class EasyWeekVoucherCalculationClient:
         await self.aclose()
 
     def __repr__(self) -> str:
-        # No key, no slug, no headers: a repr lands in logs and tracebacks.
-        return f"<EasyWeekVoucherCalculationClient base_url={self._base_url!r}>"
+        # No key, no slug, no headers and no URL: a repr lands in logs and
+        # tracebacks, and the base URL is the one thing an operator never needs
+        # from a repr but an incident report should never carry either.
+        return "<EasyWeekVoucherCalculationClient>"
 
     __str__ = __repr__
 
@@ -270,41 +291,48 @@ class EasyWeekVoucherCalculationClient:
     ) -> VoucherCalculationResult:
         """``POST /orders/calculate`` for exactly one voucher line, exactly once.
 
-        The body is assembled here from validated scalars — there is no
-        parameter that accepts a dict, so no caller can smuggle a discount, a
-        promocode, a customer, a staffer, an account, goods, services or a
-        second line into it.
+        All three arguments must equal the confirmed literals; they exist as
+        arguments so that a caller states its intent explicitly and a test can
+        prove the refusal, not so that a caller can choose. The body is
+        assembled here from those validated scalars — there is no parameter that
+        accepts a dict, so no caller can smuggle a discount, a promocode, a
+        customer, a staffer, an account, goods, services or a second line in.
 
-        Outcomes, all of them terminal after a single POST:
+        Outcomes, all of them terminal after a single request:
 
-        ==========================  ==========================================
-        2xx with a readable object  :class:`VoucherCalculationResult`
-        2xx, non-JSON/non-object    :class:`EasyWeekProtocolError`
-        2xx without ``invoice``     :class:`EasyWeekProtocolError`
-        401 / 403                   :class:`EasyWeekAuthError`
-        404                         :class:`EasyWeekNotFoundError`
-        422                         :class:`EasyWeekPermanentError` + field names
-        other 4xx                   :class:`EasyWeekPermanentError`
-        429 / any 5xx               :class:`EasyWeekCalculationUncertain`
-        timeout / transport error   :class:`EasyWeekCalculationUncertain`
-        ==========================  ==========================================
+        ==============================  ======================================
+        2xx with a readable envelope    :class:`VoucherCalculationResult`
+        2xx, non-JSON/non-object        :class:`EasyWeekProtocolError`
+        2xx without ``invoice``         :class:`EasyWeekProtocolError`
+        301/302/303/307/308             :class:`EasyWeekPermanentError`
+        401 / 403                       :class:`EasyWeekAuthError`
+        404                             :class:`EasyWeekNotFoundError`
+        422                             :class:`EasyWeekPermanentError` + fields
+        other 4xx                       :class:`EasyWeekPermanentError`
+        429 / any 5xx                   :class:`EasyWeekCalculationUncertain`
+        timeout / transport error       :class:`EasyWeekCalculationUncertain`
+        ==============================  ======================================
 
         429 is uncertain rather than retryable on purpose. Elsewhere a 429 is a
         safe retry because the limiter refuses the request before the handler
         runs — but this call exists to prove that nothing was persisted, and a
         second POST would make that proof weaker, not stronger.
         """
-        canonical_location = _canonical_lowercase_uuid(location_uuid, label="location_uuid")
-        canonical_template = _canonical_lowercase_uuid(voucher_template_uuid, label="voucher_template_uuid")
-        exact_price = _exact_positive_minor_amount(price_minor)
+        pinned_location = _pinned_identity(location_uuid, expected=KARLSRUHE_LOCATION_UUID, label="location_uuid")
+        pinned_template = _pinned_identity(
+            voucher_template_uuid,
+            expected=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            label="voucher_template_uuid",
+        )
+        exact_price = _pinned_price_minor(price_minor)
 
         body: dict[str, Any] = {
-            "location_uuid": canonical_location,
+            "location_uuid": pinned_location,
             "vouchers": [
                 {
-                    "voucher_template_uuid": canonical_template,
+                    "voucher_template_uuid": pinned_template,
                     "price": exact_price,
-                    "quantity": VOUCHER_QUANTITY,
+                    "quantity": SUPPORTED_VOUCHER_QUANTITY,
                 }
             ],
         }
@@ -334,8 +362,22 @@ class EasyWeekVoucherCalculationClient:
         status = response.status_code
         logger.info("easyweek_voucher_calculation: status=%s attempts=1", status)
 
+        if status in _REDIRECT_STATUSES:
+            # `Location` is neither read nor logged. A 307/308 preserves method
+            # and body, so following one here would be a second POST — possibly
+            # at the persistent order endpoint — carrying the Authorization
+            # header. There is no interpretation of a redirect that this
+            # evidence path is allowed to act on.
+            logger.error("easyweek_voucher_calculation: redirect refused status=%s", status)
+            raise EasyWeekPermanentError(
+                "calculation endpoint answered with a redirect; not followed",
+                operation=CALCULATE_OPERATION,
+                status_code=status,
+                attempts=1,
+            )
+
         if 200 <= status < 300:
-            return VoucherCalculationResult(http_status=status, payload=self._readable_object(response))
+            return VoucherCalculationResult(http_status=status, envelope=self._readable_envelope(response))
 
         if status == 429 or 500 <= status < 600:
             logger.error(
@@ -383,13 +425,18 @@ class EasyWeekVoucherCalculationClient:
         )
 
     @staticmethod
-    def _readable_object(response: httpx.Response) -> dict[str, Any]:
-        """Unwrap a 2xx body to the object that must carry ``invoice``.
+    def _readable_envelope(response: httpx.Response) -> dict[str, Any]:
+        """Return the COMPLETE 2xx body, once it is known to carry an invoice.
 
-        A 200 whose body is not JSON, not an object, or has no ``invoice`` is a
-        contract problem, not a calculation: reporting it as a success would let
-        an empty page from a proxy read as proven evidence. The body is never
-        echoed into the error.
+        Nothing is unwrapped: the domain projection needs every level of the
+        envelope, because ``order_uuid`` and ``status`` may sit on the outer
+        object, inside ``data`` or inside ``invoice``, and a value on a level
+        this transport had discarded would have been a persistence signal lost.
+
+        A 200 whose body is not JSON, not an object, or carries no ``invoice``
+        at any supported level is a contract problem, not a calculation:
+        reporting it as a success would let an empty page from a proxy read as
+        proven evidence. The body is never echoed into the error.
         """
         try:
             payload: Any = response.json()
@@ -400,15 +447,16 @@ class EasyWeekVoucherCalculationClient:
                 status_code=response.status_code,
             ) from None
 
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            payload = payload["data"]
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError(
                 "calculation response is not a JSON object",
                 operation=CALCULATE_OPERATION,
                 status_code=response.status_code,
             )
-        if "invoice" not in payload:
+
+        inner = payload.get("data")
+        carries_invoice = "invoice" in payload or (isinstance(inner, dict) and "invoice" in inner)
+        if not carries_invoice:
             raise EasyWeekProtocolError(
                 "calculation response carries no invoice",
                 operation=CALCULATE_OPERATION,

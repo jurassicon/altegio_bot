@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,12 @@ from altegio_bot.scripts.easyweek_voucher_contract_preflight import (
     EXIT_ARGUMENTS,
     EXIT_CONTRACT_MISMATCH,
     EXIT_OK,
-    EXIT_RETRYABLE_UNCERTAINTY,
+    EXIT_UNCERTAIN,
     GIFT_CARD_CALCULATION_NOT_CONFIRMED,
     main,
 )
 from altegio_bot.tests.easyweek_voucher_evidence_fixtures import (
+    KARLSRUHE_UUID,
     LOCATIONS,
     TEMPLATE,
     TEMPLATE_UUID,
@@ -41,6 +43,7 @@ SLUG = "SENTINEL_PRESLUG_ccc222"
 BODY_MARKER = "SENTINEL_PREBODY_ccc333"
 BASE = "https://my.easyweek.io/api/public/v2"
 CONFIRM = "--confirm-nonpersistent-calculate"
+FOREIGN_UUID = "11111111-2222-4333-8444-555555555555"
 
 
 class Recorder:
@@ -51,10 +54,12 @@ class Recorder:
         *,
         calculate_response: httpx.Response | None = None,
         template_after: dict[str, Any] | None = None,
+        template_after_status: int | None = None,
     ) -> None:
         self.seen: list[tuple[str, str]] = []
         self.calculate_response = calculate_response
         self.template_after = template_after
+        self.template_after_status = template_after_status
         self._template_reads = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -71,8 +76,11 @@ class Recorder:
             return httpx.Response(200, json=[TEMPLATE])
         if path == f"/voucher-templates/{TEMPLATE_UUID}":
             self._template_reads += 1
-            if self._template_reads > 1 and self.template_after is not None:
-                return httpx.Response(200, json=self.template_after)
+            if self._template_reads > 1:
+                if self.template_after_status is not None:
+                    return httpx.Response(self.template_after_status, json={})
+                if self.template_after is not None:
+                    return httpx.Response(200, json=self.template_after)
             return httpx.Response(200, json=TEMPLATE)
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
@@ -241,6 +249,7 @@ def test_counter_drift_fails_closed_with_the_mismatch_code(monkeypatch, capsys) 
 
     report = _output(capsys)
     assert report["template_counters_unchanged"] is False
+    assert report["template_state_unchanged"] is True
     assert "gift_card_template_counter_drift" in report["reasons"]
 
 
@@ -248,15 +257,40 @@ def test_counter_drift_fails_closed_with_the_mismatch_code(monkeypatch, capsys) 
     "calculate_response,expected_code",
     [
         (httpx.Response(200, json=canonical_response()), EXIT_OK),
-        (httpx.Response(429, json={}), EXIT_RETRYABLE_UNCERTAINTY),
-        (httpx.Response(503, json={}), EXIT_RETRYABLE_UNCERTAINTY),
+        (httpx.Response(429, json={}), EXIT_UNCERTAIN),
+        (httpx.Response(503, json={}), EXIT_UNCERTAIN),
         (httpx.Response(422, json={}), EXIT_CONTRACT_MISMATCH),
         (httpx.Response(403, json={}), EXIT_CONTRACT_MISMATCH),
-        (httpx.Response(200, json=canonical_response(total=1499)), EXIT_CONTRACT_MISMATCH),
+        (httpx.Response(404, json={}), EXIT_CONTRACT_MISMATCH),
+        # A refused redirect is a mismatch, never an unknown and never green.
         (
-            httpx.Response(200, json=canonical_response(order_uuid="11111111-2222-4333-8444-555555555555")),
+            httpx.Response(307, headers={"Location": "https://my.easyweek.io/api/public/v2/orders"}),
             EXIT_CONTRACT_MISMATCH,
         ),
+        (httpx.Response(200, json=canonical_response(total=1499)), EXIT_CONTRACT_MISMATCH),
+        (
+            httpx.Response(200, json=canonical_response(order_uuid=FOREIGN_UUID)),
+            EXIT_CONTRACT_MISMATCH,
+        ),
+        # Outer-level persistence signal next to a clean invoice.
+        (
+            httpx.Response(200, json={**canonical_response(), "order_uuid": FOREIGN_UUID, "status": None}),
+            EXIT_CONTRACT_MISMATCH,
+        ),
+        # A voucher artifact.
+        (
+            httpx.Response(200, json={**canonical_response(), "voucher_code": BODY_MARKER}),
+            EXIT_CONTRACT_MISMATCH,
+        ),
+        # Promocode and taxes.
+        (httpx.Response(200, json=canonical_response(promocode="PROMO")), EXIT_CONTRACT_MISMATCH),
+        (
+            httpx.Response(200, json=canonical_response(promocode_discount_amount=-100)),
+            EXIT_CONTRACT_MISMATCH,
+        ),
+        (httpx.Response(200, json=canonical_response(taxes=[{"rate": 19}])), EXIT_CONTRACT_MISMATCH),
+        # An unexplained field is not a tolerated extra.
+        (httpx.Response(200, json={**canonical_response(), "surprise": 1}), EXIT_CONTRACT_MISMATCH),
     ],
 )
 def test_each_outcome_has_its_own_stable_exit_code(monkeypatch, capsys, calculate_response, expected_code) -> None:
@@ -285,10 +319,43 @@ def test_an_unreached_run_reports_the_same_shape_as_a_real_one(monkeypatch, caps
 
 
 def test_the_four_exit_codes_are_distinct() -> None:
-    codes = {EXIT_OK, EXIT_ARGUMENTS, EXIT_RETRYABLE_UNCERTAINTY, EXIT_CONTRACT_MISMATCH}
+    codes = {EXIT_OK, EXIT_ARGUMENTS, EXIT_UNCERTAIN, EXIT_CONTRACT_MISMATCH}
     assert len(codes) == 4
     assert EXIT_OK == 0
-    assert 0 not in {EXIT_ARGUMENTS, EXIT_RETRYABLE_UNCERTAINTY, EXIT_CONTRACT_MISMATCH}
+    assert 0 not in {EXIT_ARGUMENTS, EXIT_UNCERTAIN, EXIT_CONTRACT_MISMATCH}
+
+
+def test_the_unknown_code_is_not_named_retryable() -> None:
+    """`exit 3` must not invite a wrapper to run the whole POST flow again."""
+    assert not hasattr(preflight, "EXIT_RETRYABLE_UNCERTAINTY")
+    assert EXIT_UNCERTAIN == 3
+    names = [name for name in vars(preflight) if name.startswith("EXIT_")]
+    assert all("RETRY" not in name for name in names), names
+
+
+def test_a_failed_verification_after_the_post_is_unknown_not_mismatch(monkeypatch, capsys) -> None:
+    """A 5xx on the confirming GET means we did not look, not that we saw drift."""
+    recorder = Recorder(template_after_status=503)
+    _install(monkeypatch, recorder)
+
+    assert main([CONFIRM]) == EXIT_UNCERTAIN
+
+    report = _output(capsys)
+    assert "gift_card_template_verification_uncertain" in report["reasons"]
+    assert "gift_card_template_counter_drift" not in report["reasons"]
+    assert report["calculation_contract_ready"] is False
+    # The POST still happened exactly once.
+    assert sum(1 for method, _ in recorder.seen if method == "POST") == 1
+
+
+def test_template_state_drift_after_the_post_is_a_mismatch(monkeypatch, capsys) -> None:
+    _install(monkeypatch, Recorder(template_after={**TEMPLATE, "cost": 1600}))
+
+    assert main([CONFIRM]) == EXIT_CONTRACT_MISMATCH
+
+    report = _output(capsys)
+    assert report["template_state_unchanged"] is False
+    assert "gift_card_template_state_drift" in report["reasons"]
 
 
 def test_the_safe_output_carries_no_uuid_secret_or_raw_body(monkeypatch, capsys) -> None:
@@ -348,3 +415,125 @@ def test_the_confirmation_flag_name_is_the_documented_one() -> None:
     assert preflight.CONFIRMATION_FLAG == CONFIRM
     tree = ast.parse(inspect.getsource(preflight))
     assert isinstance(tree, ast.Module)
+
+
+# ---------------------------------------------------------------------------
+# --help is not evidence
+# ---------------------------------------------------------------------------
+
+
+def test_help_exits_with_the_argument_code_and_makes_no_request(monkeypatch, capsys) -> None:
+    """A help screen must never be indistinguishable from a proven calculation."""
+
+    def forbidden(*args: Any, **kwargs: Any):  # pragma: no cover - must not run
+        raise AssertionError("--help must not construct a client")
+
+    monkeypatch.setattr(preflight, "EasyWeekClient", forbidden)
+    monkeypatch.setattr(preflight, "EasyWeekVoucherCalculationClient", forbidden)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--help"])
+
+    assert excinfo.value.code == EXIT_ARGUMENTS
+    assert excinfo.value.code != EXIT_OK
+    out = capsys.readouterr().out
+    # It printed usage, not a green report.
+    assert CONFIRM in out
+    assert '"calculation_contract_ready": true' not in out.lower()
+
+
+def test_only_a_proven_calculation_can_reach_exit_zero(monkeypatch, capsys) -> None:
+    _install(monkeypatch, Recorder())
+
+    assert main([CONFIRM]) == EXIT_OK
+    report = _output(capsys)
+
+    assert report["calculation_contract_ready"] is True
+    assert report["delivery_authorized"] is False
+    assert report["ready_for_send"] is False
+
+
+@pytest.mark.parametrize(
+    "argv,expected",
+    [
+        ([], EXIT_ARGUMENTS),
+        (["--help"], EXIT_ARGUMENTS),
+        (["-h"], EXIT_ARGUMENTS),
+        (["--confirm"], EXIT_ARGUMENTS),
+        (["--nonsense"], EXIT_ARGUMENTS),
+    ],
+)
+def test_every_non_running_invocation_uses_the_argument_code(monkeypatch, capsys, argv, expected) -> None:
+    def forbidden(*args: Any, **kwargs: Any):  # pragma: no cover - must not run
+        raise AssertionError("a non-running invocation must not construct a client")
+
+    monkeypatch.setattr(preflight, "EasyWeekClient", forbidden)
+    monkeypatch.setattr(preflight, "EasyWeekVoucherCalculationClient", forbidden)
+
+    try:
+        code = main(argv)
+    except SystemExit as exc:
+        code = exc.code
+    assert code == expected
+    capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# No URL, body or credential in the operator transcript
+# ---------------------------------------------------------------------------
+
+
+def test_the_cli_silences_url_logging_before_any_client_exists(monkeypatch, caplog) -> None:
+    """The shared test conftest already pins httpx to WARNING, which HID this bug.
+
+    So this test deliberately puts httpx (and httpcore) back to INFO first, then
+    runs the command and proves the full request URL still never appears. Without
+    the CLI's own `_silence_url_logging`, httpx would log
+    ``HTTP Request: POST https://my.easyweek.io/... "HTTP/1.1 200 OK"`` straight
+    into an operator's transcript.
+    """
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.INFO)
+    caplog.set_level(logging.INFO)
+
+    _install(monkeypatch, Recorder())
+    assert main([CONFIRM]) == EXIT_OK
+
+    recorded = "\n".join(record.getMessage() for record in caplog.records)
+    for forbidden in ("my.easyweek.io", "/orders/calculate", "/voucher-templates", KEY, SLUG, "Bearer"):
+        assert forbidden not in recorded, forbidden
+    # The httpx request logger really was raised before the run.
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_no_uuid_body_or_credential_reaches_the_captured_logs(monkeypatch, caplog) -> None:
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.INFO)
+    caplog.set_level(logging.DEBUG)
+
+    response = canonical_response()
+    response["invoice"]["comment"] = BODY_MARKER
+    response["voucher_code"] = BODY_MARKER
+    _install(monkeypatch, Recorder(calculate_response=httpx.Response(200, json=response)))
+
+    main([CONFIRM])
+
+    recorded = "\n".join(record.getMessage() for record in caplog.records)
+    for forbidden in (KEY, SLUG, BODY_MARKER, TEMPLATE_UUID, KARLSRUHE_UUID, "my.easyweek.io", "Bearer"):
+        assert forbidden not in recorded, forbidden
+
+
+def test_the_client_reprs_carry_no_url_or_credential(monkeypatch) -> None:
+    read_client = EasyWeekClient(api_key=KEY, workspace_slug=SLUG, base_url=BASE)
+    calc_client = EasyWeekVoucherCalculationClient(api_key=KEY, workspace_slug=SLUG, base_url=BASE)
+    try:
+        for text in (repr(calc_client), str(calc_client)):
+            for forbidden in (KEY, SLUG, BASE, "my.easyweek.io", "Authorization", "Bearer"):
+                assert forbidden not in text, forbidden
+        # The pre-existing GET-only client is unchanged and still carries no
+        # key, slug or header in its repr.
+        for text in (repr(read_client), str(read_client)):
+            for forbidden in (KEY, SLUG, "Authorization", "Bearer"):
+                assert forbidden not in text, forbidden
+    finally:
+        pass

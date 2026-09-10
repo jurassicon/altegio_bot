@@ -110,7 +110,10 @@ and persists nothing. It is documented in
 
 It is a manual command and nothing else: `GET /ops/campaigns/new-clients/readiness`
 stays GET-only and never issues that POST, not even with
-`include_gift_card=true`. A green run is momentary operator evidence, is stored
+`include_gift_card=true`. It never follows a redirect, so it can never reach the
+persistent order endpoint. Its `exit 3` means UNKNOWN and must not be wired to an
+automatic re-run; `--help` exits `2`, so only a confirmed run with a proven
+report can return `0`. A green run is momentary operator evidence, is stored
 nowhere, and is not send authorization — `issue_contract_ready`,
 `delivery_authorized` and `ready_for_send` stay `false` in every report, and
 `gift_card_online_sales_disabled`, `gift_card_public_url_unproven`,

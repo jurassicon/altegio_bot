@@ -11,10 +11,15 @@ from decimal import Decimal
 from typing import Any, Final, Protocol
 from urllib.parse import urlsplit
 
-EASYWEEK_WORKSPACE_UUID: Final = "e66be240-362c-4fe4-9388-6ed187b27b93"
-EASYWEEK_WORKSPACE_SLUG: Final = "kitilash"
-KARLSRUHE_LOCATION_UUID: Final = "8395fab6-7ee8-4702-88d9-fd78f92539c1"
-EASYWEEK_VOUCHER_TEMPLATE_UUID: Final = "49bc000c-c3a6-47c7-bdfd-b8ccd3ae2677"
+# Re-exported from the single literal source so the transport and the
+# calculation evidence pin themselves to exactly these values without importing
+# this readiness module. Readiness semantics are unchanged.
+from altegio_bot.easyweek_voucher_identity import (
+    EASYWEEK_VOUCHER_TEMPLATE_UUID,
+    EASYWEEK_WORKSPACE_SLUG,
+    EASYWEEK_WORKSPACE_UUID,
+    KARLSRUHE_LOCATION_UUID,
+)
 
 GIFT_CARD_TEMPLATE_UNPROVEN: Final = "gift_card_template_unproven"
 GIFT_CARD_WORKSPACE_MISMATCH: Final = "gift_card_workspace_mismatch"

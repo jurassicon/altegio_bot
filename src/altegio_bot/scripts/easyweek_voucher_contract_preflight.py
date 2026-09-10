@@ -5,7 +5,8 @@ What it does, in this order and nothing else:
 1. reviewed GETs — ``/workspace``, ``/locations``, ``/voucher-templates`` and
    the exact ``/voucher-templates/{uuid}``;
 2. exactly one ``POST /orders/calculate`` for one voucher line;
-3. the exact ``/voucher-templates/{uuid}`` again, to compare the counters.
+3. the exact ``/voucher-templates/{uuid}`` again, to re-check the whole
+   normative template state, counters included.
 
 Usage::
 
@@ -13,7 +14,9 @@ Usage::
         --confirm-nonpersistent-calculate
 
 Without that flag the command performs **no HTTP call at all** — not even the
-reads — and exits with the argument code.
+reads — and exits with the argument code. ``--help`` also exits with the
+argument code: a safety command must never be able to report success without
+having proved anything.
 
 Deliberately not here
 ---------------------
@@ -27,6 +30,10 @@ confirmed constants, and the price is read from the *fresh* template.
 NOT permission to issue a voucher, to charge anybody, or to send a message. The
 report says so on every run, and the exit code cannot be stored as a standing
 authorization.
+
+``exit 3`` means UNKNOWN. Do not re-run this command automatically after one: a
+POST has already been sent and its effect is exactly what is unproven. An
+operator decides what to do next.
 """
 
 from __future__ import annotations
@@ -40,7 +47,6 @@ from typing import Any, Final
 
 from altegio_bot.campaigns.easyweek_voucher_contract import (
     GIFT_CARD_CALCULATION_CONFIGURATION_UNAVAILABLE,
-    GIFT_CARD_CALCULATION_RETRYABLE_UNCERTAINTY,
     VoucherCalculator,
     VoucherContractEvidence,
     VoucherTemplateReader,
@@ -49,11 +55,13 @@ from altegio_bot.campaigns.easyweek_voucher_contract import (
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError
 from altegio_bot.easyweek_voucher_calculation import EasyWeekVoucherCalculationClient
 
-# Distinct, stable exit codes so a wrapper can tell the three failures apart
-# without parsing text. EXIT_OK is evidence, never authorization.
+# Distinct, stable exit codes so a wrapper can tell the failures apart without
+# parsing text. EXIT_OK is evidence, never authorization.
 EXIT_OK: Final = 0
 EXIT_ARGUMENTS: Final = 2
-EXIT_RETRYABLE_UNCERTAINTY: Final = 3
+# Deliberately not called "retryable": the POST already happened and its outcome
+# is unknown. Nothing here may be re-run automatically.
+EXIT_UNCERTAIN: Final = 3
 EXIT_CONTRACT_MISMATCH: Final = 4
 
 CONFIRMATION_FLAG: Final = "--confirm-nonpersistent-calculate"
@@ -63,9 +71,28 @@ GIFT_CARD_CALCULATION_NOT_CONFIRMED: Final = "gift_card_calculation_not_confirme
 # its own as a permission.
 SEND_AUTHORIZATION_NOTICE: Final = "calculation_evidence_is_not_send_authorization"
 
+# httpx logs every request at INFO as a full URL, and httpcore can log connection
+# targets. Neither belongs in an operator transcript for this command.
+_URL_LOGGING_NAMESPACES: Final = ("httpx", "httpcore")
+
+
+class _SafetyArgumentParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that can never hand back a success exit code.
+
+    ``--help`` normally exits ``0``, which for this command is the same code a
+    fully proven, non-persistent calculation returns. A wrapper that mistyped
+    the flag would then read "success" from a help screen. Every argparse exit
+    is therefore the argument code.
+    """
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:  # type: ignore[override]
+        if message:
+            self._print_message(message, sys.stderr)
+        raise SystemExit(EXIT_ARGUMENTS if status == 0 else status)
+
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _SafetyArgumentParser(
         prog="easyweek_voucher_contract_preflight",
         description=(
             "One non-persistent EasyWeek voucher calculation as operator evidence. "
@@ -83,6 +110,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Required. Without it the command makes no HTTP request at all.",
     )
     return parser
+
+
+def _silence_url_logging() -> None:
+    """Keep full request URLs out of this command's stderr.
+
+    Called before any client exists. The URL carries no secret by itself, but an
+    operator transcript of a safety command should name an operation and a
+    status, not an endpoint — and the same INFO line is where a future query
+    string would leak.
+    """
+    for name in _URL_LOGGING_NAMESPACES:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _print_json(payload: dict[str, Any]) -> None:
@@ -109,6 +148,7 @@ def _nothing_proven_report(reason: str) -> dict[str, Any]:
             template_counters_before=None,
             template_counters_after=None,
             template_counters_unchanged=False,
+            template_state_unchanged=False,
             calculation_contract_ready=False,
             account_paid_amount_observed=None,
             reasons=(reason,),
@@ -120,8 +160,8 @@ def exit_code_for(evidence: VoucherContractEvidence) -> int:
     """Green, "we do not know", or "the contract does not hold" — never merged."""
     if evidence.calculation_contract_ready:
         return EXIT_OK
-    if GIFT_CARD_CALCULATION_RETRYABLE_UNCERTAINTY in evidence.reasons:
-        return EXIT_RETRYABLE_UNCERTAINTY
+    if evidence.uncertain:
+        return EXIT_UNCERTAIN
     return EXIT_CONTRACT_MISMATCH
 
 
@@ -146,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    _silence_url_logging()
     args = _build_parser().parse_args(argv)
 
     if not args.confirmed:

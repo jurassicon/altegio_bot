@@ -36,12 +36,16 @@ TEMPLATE: dict[str, Any] = {
     "validity": None,
     "forces_activation": True,
     "is_connected_all_branches": True,
+    "branches_count": 3,
+    "all_branches_count": 3,
     "is_connected_all_services": True,
     "vouchers_count": 0,
     "activated_vouchers_count": 0,
 }
 
-# The canonical live response for price=1500 (matrix case 1).
+# The canonical live response for price=1500 (matrix case 1), carrying the full
+# observed invoice shape: the promocode slot, its discount amount and the tax
+# list are part of the contract, not optional extras.
 CANONICAL_INVOICE: dict[str, Any] = {
     "base_amount": 1500,
     "base_price": 1500,
@@ -51,6 +55,9 @@ CANONICAL_INVOICE: dict[str, Any] = {
     "discount_amount": 0,
     "amount_paid": 0,
     "voucher_paid_amount": 0,
+    "promocode": None,
+    "promocode_discount_amount": 0,
+    "taxes": [],
     "account_paid_amount": -1500,
     "order_uuid": None,
     "status": None,
