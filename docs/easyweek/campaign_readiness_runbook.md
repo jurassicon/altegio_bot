@@ -101,6 +101,22 @@ nominal. Text containing `10%` is not machine-readable discount proof.
 `validity=null` is reported as `unproven_or_unlimited_per_api`. Template and
 voucher counters do not prove an issuance contract.
 
+## Non-persistent calculation evidence
+
+A separate operator command proves that the officially non-persistent
+`POST /orders/calculate` returns a supported invoice for one €15 voucher line
+and persists nothing. It is documented in
+`voucher_contract_evidence_runbook.md`.
+
+It is a manual command and nothing else: `GET /ops/campaigns/new-clients/readiness`
+stays GET-only and never issues that POST, not even with
+`include_gift_card=true`. A green run is momentary operator evidence, is stored
+nowhere, and is not send authorization — `issue_contract_ready`,
+`delivery_authorized` and `ready_for_send` stay `false` in every report, and
+`gift_card_online_sales_disabled`, `gift_card_public_url_unproven`,
+`gift_card_semantics_unproven`, `gift_card_issue_contract_unproven` and
+`campaign_execution_not_authorized` are unchanged by it.
+
 ## Required evidence before a later send PR
 
 The next separately authorized PR must prove gift-card issue/sale semantics,
