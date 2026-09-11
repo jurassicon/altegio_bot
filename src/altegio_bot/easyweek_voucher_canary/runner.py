@@ -28,6 +28,11 @@ bounded, complete, marker-scoped walk of this customer's orders in this branch,
 the pay and the refund by reading the one exact order the ledger names — and
 every one of those readings is written monotonically, so a reconciliation can
 never hand the same POST back to be claimed again.
+
+That walk is scoped by branch and customer, not by staffer: a production probe
+proved that adding the staffer filter hides the very order this canary created.
+The staffer remains mandatory for identity, membership, the CREATE request and
+the ledger binding, where it is actually provable.
 """
 
 from __future__ import annotations
@@ -1083,7 +1088,6 @@ async def _reconcile_create(
             reader,
             location_uuid=KARLSRUHE_LOCATION_UUID,
             customer_uuid=identity.customer_uuid,
-            staffer_uuid=identity.staffer_uuid,
             marker=snapshot.reconciliation_marker,
             window_start=snapshot.create_window_start,
             window_end=snapshot.create_window_end,

@@ -36,6 +36,7 @@ from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
     CUSTOMER_UUID,
     ORDER_UUID,
     STAFFER_UUID,
+    issued_voucher,
     open_order,
     paid_order,
 )
@@ -265,6 +266,36 @@ def test_an_exception_carrying_an_observation_still_leaks_nothing() -> None:
 
     for forbidden in _forbidden_strings():
         assert forbidden not in str(error), forbidden
+
+
+def test_the_issued_artifact_shape_leaks_neither_its_code_nor_its_digest() -> None:
+    """The shape production actually returned, through every safe surface.
+
+    This body is the one the canary now accepts as proof of a single voucher,
+    so the code inside it reaches the observation, the ledger evidence and the
+    stage report. None of them may carry it, or any digest of it.
+    """
+    order = open_order(
+        marker=MARKER,
+        vouchers=[issued_voucher(code=SENSITIVE["voucher_code"], public_url=SENSITIVE["public_url"])],
+    )
+    observation = _observe(order)
+    safe = observation.as_safe_dict()
+
+    assert safe["voucher_line_proven"] is True
+    assert safe["voucher_quantity_proof"] == "singleton_issued_artifact"
+    for surface in (json.dumps(safe, sort_keys=True), repr(observation), str(observation)):
+        for forbidden in _forbidden_strings():
+            assert forbidden not in surface, forbidden
+
+
+def test_the_proof_label_is_a_closed_vocabulary_not_a_value() -> None:
+    """Only three strings can ever appear there, and none is data."""
+    order = open_order(marker=MARKER, vouchers=[issued_voucher(code=SENSITIVE["voucher_code"])])
+
+    label = _observe(order).as_safe_dict()["voucher_quantity_proof"]
+
+    assert label in {"explicit_quantity", "singleton_issued_artifact", "unproven"}
 
 
 def test_a_runtime_uuid_is_still_fingerprinted_and_that_is_deliberate() -> None:

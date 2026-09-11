@@ -2,15 +2,26 @@
 
 Scope lives in the request, not in the body
 -------------------------------------------
-The documented order listing takes ``location_uuid``, ``customer_uuid`` and
-``staffer_uuid`` as filters. The observed order body carries **neither** a
-top-level ``location_uuid`` nor a ``staffer_uuid`` — so a matcher requiring both
-to be echoed back could never match a real order and would report every unknown
-create as unresolved forever.
+The order listing is scoped by ``location_uuid`` and ``customer_uuid``. The
+observed order body carries **neither** a top-level ``location_uuid`` nor a
+``staffer_uuid`` — so a matcher requiring either to be echoed back could never
+match a real order and would report every unknown create as unresolved forever.
 
-So the documented request proves the scope, and only what the response really
-carries is checked locally: the unique marker, the created-at window, and the
-customer when the body names one.
+So the request proves the branch and the customer, and only what the response
+really carries is checked locally: the unique marker, the bounded created-at
+window, and the customer when the body names one.
+
+The staffer is deliberately not a listing filter. A production probe ran the
+same listing twice against a real, confirmed voucher order: with the staffer
+filter the completed walk did not contain it, without the staffer filter the
+completed walk did. That is the whole proven fact — not a theory about why —
+and it is enough to stop sending a filter that hides the order we must find.
+The staffer stays mandatory everywhere it IS provable: runtime identity, live
+branch membership, the CREATE request, the fingerprint and the ledger binding.
+
+Dates are checked here, not asked for. Passing the ledger window as
+``created_at_from``/``created_at_to`` was answered 422 in production, so the
+window is proven locally against each row's own timezone-aware ``created_at``.
 
 An unrecognised state is not "open"
 -----------------------------------
@@ -32,11 +43,13 @@ page 1 has not shown us the end of anything.
 
 from __future__ import annotations
 
+import uuid as uuid_module
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Final
 
 from altegio_bot.easyweek_voucher_canary.artifact import REDACTED_CONTAINER_KEYS, matches_customer
+from altegio_bot.easyweek_voucher_canary.voucher_line import prove_voucher_line
 from altegio_bot.easyweek_voucher_identity import SUPPORTED_VOUCHER_PRICE_MINOR
 
 # Order classifications, decided from documented fields only.
@@ -80,6 +93,23 @@ _CANCELLED_STATUSES: Final = frozenset({"canceled", "cancelled"})
 # single voucher line is out of scope for this canary.
 _ITEM_COLLECTION_KEYS: Final = ("services", "goods", "products", "items")
 _TOTAL_KEYS: Final = ("total", "subtotal", "amount_due")
+
+
+def canonical_uuid(value: object) -> str | None:
+    """The canonical lowercase form of *value*, or ``None``. Never echoes input.
+
+    Canonical means the string is already exactly what ``uuid.UUID`` renders:
+    an upper-case or brace-wrapped spelling of the same identifier is refused
+    rather than normalised, because every comparison downstream — the ledger
+    target, the listing match, the exact readback — is a string comparison.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        canonical = str(uuid_module.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return canonical if canonical == value else None
 
 
 def order_object(payload: object) -> dict[str, Any] | None:
@@ -263,6 +293,16 @@ def classify_order(payload: object) -> tuple[str, str]:
     return ORDER_UNKNOWN, PAYMENT_PROOF_NONE
 
 
+def _empty_collection(value: object) -> bool:
+    """A collection this order proves it has nothing in.
+
+    An empty list or an empty object is a proven "none of these". A string, a
+    number or anything else under one of these keys is a shape we cannot price,
+    and an unpriceable order is not payable.
+    """
+    return (isinstance(value, list) or isinstance(value, dict)) and not value
+
+
 def payable_order_reasons(
     payload: object,
     *,
@@ -271,9 +311,16 @@ def payable_order_reasons(
 ) -> tuple[str, ...]:
     """Why this order is NOT the exact one-voucher order we may pay for.
 
-    An empty tuple means the order carries exactly one voucher line for the
-    confirmed template at the exact nominal and quantity, no other line items,
-    and a total that agrees where the body publishes one.
+    An empty tuple means all three of these hold: the order carries exactly one
+    voucher for the confirmed template at the exact nominal, with its count
+    proven (see ``voucher_line``); it carries no other line items; and it
+    publishes at least one total, with every published total exactly the
+    nominal.
+
+    A missing total blocks. The payment settles the ORDER, so "we could not
+    find a sum anywhere" is not a small gap — it is the whole amount being
+    unproven, and a payment authorised for €15 must not be sent at a figure
+    nobody read.
 
     This gates the PAYMENT only. A refund never consults it: an already-paid
     order must stay refundable even when its voucher body turns out to be
@@ -281,55 +328,33 @@ def payable_order_reasons(
     """
     order = order_object(payload)
     if order is None:
-        return (CANARY_VOUCHER_LINE_UNPROVEN,)
+        return (CANARY_VOUCHER_LINE_UNPROVEN, CANARY_ORDER_TOTAL_UNPROVEN)
 
     reasons: list[str] = []
 
-    vouchers = order.get("vouchers")
-    single = order.get("voucher")
-    lines: list[Any]
-    if isinstance(vouchers, list):
-        lines = list(vouchers)
-    elif isinstance(single, dict):
-        lines = [single]
-    else:
-        lines = []
-
-    if len(lines) != 1 or not isinstance(lines[0], dict):
+    if not prove_voucher_line(
+        order,
+        expected_template_uuid=expected_template_uuid,
+        expected_price_minor=expected_price_minor,
+    ).proven:
         reasons.append(CANARY_VOUCHER_LINE_UNPROVEN)
-    else:
-        line = lines[0]
-        price = _exact_int(line.get("price"))
-        quantity = _exact_int(line.get("quantity"))
-        if (
-            line.get("voucher_template_uuid") != expected_template_uuid
-            or price != expected_price_minor
-            or quantity != 1
-        ):
-            reasons.append(CANARY_VOUCHER_LINE_UNPROVEN)
 
     # Services, goods or any other line collection would make the payable sum
-    # something other than the one voucher we planned for.
+    # something other than the one voucher we planned for. Present-and-empty is
+    # fine; present-and-anything-else is not.
     for key in _ITEM_COLLECTION_KEYS:
-        value = order.get(key)
-        if isinstance(value, list) and value:
-            reasons.append(CANARY_ORDER_EXTRA_ITEMS)
-            break
-        if isinstance(value, dict) and value:
+        if key in order and not _empty_collection(order[key]):
             reasons.append(CANARY_ORDER_EXTRA_ITEMS)
             break
 
-    # Totals are checked where the body publishes them. A total that is present
-    # but wrong is a different order; a total that is absent is simply not part
-    # of the observed contract yet, and absence alone does not block.
+    # Every published total must be the nominal, and at least one must exist.
+    # Two totals disagreeing is itself a refusal: we would not know which one
+    # the payment settles.
     invoice = order.get("invoice")
     invoice = invoice if isinstance(invoice, dict) else order
-    for key in _TOTAL_KEYS:
-        if key not in invoice:
-            continue
-        if _exact_int(invoice.get(key)) != expected_price_minor:
-            reasons.append(CANARY_ORDER_TOTAL_UNPROVEN)
-            break
+    published = [_exact_int(invoice.get(key)) for key in _TOTAL_KEYS if key in invoice]
+    if not published or any(value != expected_price_minor for value in published):
+        reasons.append(CANARY_ORDER_TOTAL_UNPROVEN)
 
     return tuple(dict.fromkeys(reasons))
 
@@ -411,7 +436,6 @@ async def find_marker_orders(
     *,
     location_uuid: str,
     customer_uuid: str,
-    staffer_uuid: str,
     marker: str,
     window_start: datetime,
     window_end: datetime,
@@ -419,15 +443,18 @@ async def find_marker_orders(
 ) -> MarkerMatch:
     """Walk this customer's orders in this branch, completely, and match ours.
 
+    Scoped by branch and customer only — see the module docstring for the probe
+    that proved adding the staffer filter excludes the order we created. No
+    server-side date filter is sent; the window is proven row by row.
+
     No candidate UUID is logged or printed; only the single match, and only into
     the ledger where a payment and a refund need it.
     """
 
     async def fetch(page: int) -> Any:
-        return await reader.list_location_orders(
+        return await reader.list_location_customer_orders(
             location_uuid=location_uuid,
             customer_uuid=customer_uuid,
-            staffer_uuid=staffer_uuid,
             page=page,
         )
 
@@ -442,8 +469,11 @@ async def find_marker_orders(
             window_end=window_end,
         ):
             continue
-        found = row.get("uuid")
-        if isinstance(found, str) and found:
+        # A row that matched on everything else but cannot produce a canonical
+        # UUID is not a usable candidate: the ledger, the pay and the refund all
+        # address the order by that exact string.
+        found = canonical_uuid(row.get("uuid"))
+        if found is not None:
             matches.append(found)
 
     unique = list(dict.fromkeys(matches))

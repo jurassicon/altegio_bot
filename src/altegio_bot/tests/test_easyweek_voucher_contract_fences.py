@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from altegio_bot import easyweek_client as client_module
 from altegio_bot import easyweek_voucher_calculation as calculation_module
 from altegio_bot import easyweek_voucher_identity as identity_module
 from altegio_bot.campaigns import gift_card_readiness as gift_card_module
@@ -202,6 +203,32 @@ def test_no_new_alembic_migration_is_added() -> None:
         text = path.read_text()
         assert "voucher_calculation" not in text
         assert "voucher_contract" not in text
+
+
+def test_the_canary_ledger_migration_is_the_only_one_and_is_unchanged() -> None:
+    """The production ledger row already exists under this migration.
+
+    Fixing the canary must not introduce a second migration, a new scope or a
+    schema bump: there is a real row in `created` awaiting a payment, and it has
+    to stay exactly where it is.
+    """
+    versions = REPO_ROOT / "alembic" / "versions"
+    canary = [path for path in versions.glob("*.py") if "voucher_canary" in path.read_text()]
+
+    assert len(canary) == 1, [path.name for path in canary]
+
+
+def test_the_order_listing_has_exactly_one_closed_entry_point() -> None:
+    """No staffer filter, no date filter, and nothing generic to add one with."""
+    source = code_without_docstrings(client_module)
+
+    assert "list_location_customer_orders" in source
+    # The old, staffer-scoped listing is gone rather than deprecated in place.
+    assert "list_location_orders" not in source
+    # The refused server-side date form appears nowhere but the prose that
+    # explains why it is refused.
+    for refused in ("created_at_from", "created_at_to"):
+        assert refused not in source
 
 
 # ---------------------------------------------------------------------------

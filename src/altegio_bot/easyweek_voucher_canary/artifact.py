@@ -48,6 +48,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final
 
+from altegio_bot.easyweek_voucher_canary.voucher_line import (
+    QUANTITY_PROOF_UNPROVEN,
+    prove_voucher_line,
+)
+
 # Traversal bounds. Generous enough for a real order, small enough that a
 # hostile or broken response cannot turn a projection into an outage.
 MAX_DEPTH: Final = 6
@@ -252,6 +257,10 @@ class ArtifactObservation:
     truncated: bool
     order_customer_binding_proven: bool
     voucher_line_proven: bool
+    # How the count of one was established, if it was: the closed vocabulary in
+    # `voucher_line`. Always consistent with `voucher_line_proven`, because both
+    # come from the same proof.
+    voucher_quantity_proof: str
     voucher_line_shape_unknown: bool
     individual_voucher_artifact_observed: bool
     artifact_kind_observed: str
@@ -266,6 +275,7 @@ class ArtifactObservation:
             "truncated": self.truncated,
             "order_customer_binding_proven": self.order_customer_binding_proven,
             "voucher_line_proven": self.voucher_line_proven,
+            "voucher_quantity_proof": self.voucher_quantity_proof,
             "voucher_line_shape_unknown": self.voucher_line_shape_unknown,
             "individual_voucher_artifact_observed": self.individual_voucher_artifact_observed,
             "artifact_kind_observed": self.artifact_kind_observed,
@@ -437,6 +447,7 @@ def observe_artifact(
             truncated=False,
             order_customer_binding_proven=False,
             voucher_line_proven=False,
+            voucher_quantity_proof=QUANTITY_PROOF_UNPROVEN,
             voucher_line_shape_unknown=True,
             individual_voucher_artifact_observed=False,
             artifact_kind_observed=ARTIFACT_NONE,
@@ -452,20 +463,16 @@ def observe_artifact(
     order_customer_binding = matches_customer(order, expected_customer_uuid)
 
     kind, nodes = _voucher_artifacts(order)
-    voucher_line_proven = False
-    voucher_line_shape_unknown = True
-    if len(nodes) == 1 and isinstance(nodes[0], dict):
-        line = nodes[0]
-        voucher_line_proven = (
-            line.get("voucher_template_uuid") == expected_template_uuid
-            and type(line.get("price")) is int
-            and line.get("price") == expected_price_minor
-            and type(line.get("quantity")) is int
-            and line.get("quantity") == 1
-        )
-        # A line that names the right template is a shape we recognise, even
-        # when the price or the quantity is not what we expected.
-        voucher_line_shape_unknown = line.get("voucher_template_uuid") != expected_template_uuid
+    # The SAME proof the payment pre-condition uses. Two implementations of
+    # "is this one voucher for fifteen euros?" could disagree, and either
+    # direction of that disagreement is a bug with money in it.
+    line_proof = prove_voucher_line(
+        order,
+        expected_template_uuid=expected_template_uuid,
+        expected_price_minor=expected_price_minor,
+    )
+    voucher_line_proven = line_proof.proven
+    voucher_line_shape_unknown = not line_proof.shape_recognised
 
     individual = _carries_individual_artifact(nodes)
     artifact_customer_binding = any(
@@ -477,6 +484,7 @@ def observe_artifact(
         truncated=truncated,
         order_customer_binding_proven=order_customer_binding,
         voucher_line_proven=voucher_line_proven,
+        voucher_quantity_proof=line_proof.quantity_proof,
         voucher_line_shape_unknown=voucher_line_shape_unknown,
         individual_voucher_artifact_observed=individual,
         artifact_kind_observed=kind if individual else (ARTIFACT_EMPTY_COLLECTION if not nodes else kind),
