@@ -130,13 +130,15 @@ and the `reasons` list says which fact.
 
 The owner reads the printed snapshot and approves **the exact digest of that
 stage**. It is the authorisation token for that stage and no other. It is
-deliberately not stored anywhere: each mutation command recomputes its own stage
-plan live, seconds before it claims, and refuses unless the recomputed digest is
-identical. A template price that moved, a staffer who left the branch, an account
-that disappeared, a ledger that is not where the stage requires it to be, or a
-target order that is no longer in the expected state all change the snapshot, so
-they all change the digest, so they all stop the stage before anything is
-claimed.
+stored in the stage's ledger claim only after the mutation command recomputes
+the stage plan live, seconds before the claim, and proves that the supplied
+digest is exactly that live snapshot at the supplied `plan_issued_at`. The fresh
+internal plan has a later issue time and therefore a different digest; that
+internal digest is not substituted for the operator-approved one. A template
+price that moved, a staffer who left the branch, an account that disappeared, a
+ledger that is not where the stage requires it to be, or a target order that is
+no longer in the expected state all change the snapshot, so they stop the stage
+before anything is claimed.
 
 An approval also goes stale: `plan_issued_at` must be within the plan's short
 maximum age. Re-run `plan` and get a fresh approval if it has expired.
@@ -234,12 +236,14 @@ same POST could be claimed from:
 | cancelled | `created` and `pay_rejected` record **manual cleanup observed**. Nothing where a payment of ours may still be outstanding |
 | unknown or malformed | nothing at all, and the outcome is never `proven` |
 
-A verification timestamp is written only where this canary actually attempted
-that stage. Somebody settling or cancelling the order in the dashboard is
-recorded as an observation, never as our own proof. And when the ledger and the
-order contradict each other — a `refunded` row over an order that reads paid —
-the report says so instead of `proven`, because the expensive possibility is
-that the money is still out.
+A verification timestamp is written only from `pay_claimed`/`pay_unknown` or
+`refund_claimed`/`refund_unknown`, where this canary's operation may have had the
+observed effect. A later change after a proven `*_rejected` response, or somebody
+settling or cancelling the order in the dashboard, is recorded as an
+observation, never as proof of our operation. And when the ledger and the order
+contradict each other — a `refunded` row over an order that reads paid — the
+report says so instead of `proven`, because the expensive possibility is that
+the money is still out.
 
 ## 7. Pay
 

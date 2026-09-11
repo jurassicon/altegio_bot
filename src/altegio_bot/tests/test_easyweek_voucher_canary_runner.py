@@ -269,18 +269,30 @@ class RefusingMutator:
         raise AssertionError("no mutation may be sent")
 
 
-async def _authorised(reader: FakeReader, stage: str, session_maker) -> dict[str, Any]:
+async def _operator_plan(
+    reader: FakeReader,
+    stage: str,
+    session_maker,
+    *,
+    now=None,
+):
     snapshot = await ledger_module.load(session_maker)
-    plan = await build_stage_plan(
+    return await build_stage_plan(
         reader,
         stage=stage,
         identity=IDENTITY,
         enabled=True,
         ledger_status=snapshot.status,
         target_order_uuid=snapshot.target_order_uuid,
+        ledger_identity=snapshot.identity_fingerprints if snapshot.exists else None,
         create_window_start=snapshot.create_window_start,
         create_window_end=snapshot.create_window_end,
+        now=now,
     )
+
+
+async def _authorised(reader: FakeReader, stage: str, session_maker) -> dict[str, Any]:
+    plan = await _operator_plan(reader, stage, session_maker)
     return {
         "plan_digest": plan.digest,
         "plan_issued_at": plan.issued_at,
@@ -784,8 +796,8 @@ def test_the_transition_table_never_walks_a_stage_backwards() -> None:
 # no-op, and a transition present here must land exactly where it says.
 #
 # `None` = observe and leave the row alone. The third column is the verification
-# timestamp, which is only ever stamped where THIS canary attempted that stage —
-# somebody settling the order in the dashboard is an observation, not our proof.
+# timestamp, which is stamped only where THIS canary's operation may have had
+# the observed effect — a later dashboard action is observation, not our proof.
 _EXPECTED_TRANSITIONS: dict[tuple[str, str], tuple[str | None, str | None]] = {
     # --- created ----------------------------------------------------------
     (ledger_module.STATUS_CREATED, ORDER_OPEN): (None, None),
@@ -805,7 +817,7 @@ _EXPECTED_TRANSITIONS: dict[tuple[str, str], tuple[str | None, str | None]] = {
     (ledger_module.STATUS_PAY_UNKNOWN, ORDER_CANCELLED): (None, None),
     # --- a payment that provably did not happen ----------------------------
     (ledger_module.STATUS_PAY_REJECTED, ORDER_OPEN): (None, None),
-    (ledger_module.STATUS_PAY_REJECTED, ORDER_PAID): (ledger_module.STATUS_PAID, "pay_verified_at"),
+    (ledger_module.STATUS_PAY_REJECTED, ORDER_PAID): (ledger_module.STATUS_PAID, None),
     (ledger_module.STATUS_PAY_REJECTED, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
     (ledger_module.STATUS_PAY_REJECTED, ORDER_CANCELLED): (ledger_module.STATUS_MANUALLY_CLEANED, None),
     # --- paid --------------------------------------------------------------
@@ -833,7 +845,7 @@ _EXPECTED_TRANSITIONS: dict[tuple[str, str], tuple[str | None, str | None]] = {
     (ledger_module.STATUS_REFUND_REJECTED, ORDER_PAID): (None, None),
     (ledger_module.STATUS_REFUND_REJECTED, ORDER_REFUNDED): (
         ledger_module.STATUS_REFUNDED,
-        "refund_verified_at",
+        None,
     ),
     (ledger_module.STATUS_REFUND_REJECTED, ORDER_CANCELLED): (None, None),
 }
@@ -902,7 +914,7 @@ def test_no_reading_ever_returns_a_stage_to_a_claimable_state(status, remote) ->
 
 @pytest.mark.parametrize("status", ledger_module.ALL_STATUSES)
 @pytest.mark.parametrize("remote", _REMOTE_STATES)
-def test_a_verification_stamp_only_appears_where_we_attempted_that_stage(status, remote) -> None:
+def test_a_verification_stamp_only_appears_where_our_operation_may_have_acted(status, remote) -> None:
     """`pay_verified_at` means "the pay WE sent is confirmed" and nothing else.
 
     Stamping it because somebody settled the order in the dashboard would
@@ -912,8 +924,14 @@ def test_a_verification_stamp_only_appears_where_we_attempted_that_stage(status,
     if field is None:
         return
 
-    stage = field.removesuffix("_verified_at")
-    assert status.startswith(stage), f"{status} never attempted a {stage}"
+    effect_possible_from = {
+        "pay_verified_at": {ledger_module.STATUS_PAY_CLAIMED, ledger_module.STATUS_PAY_UNKNOWN},
+        "refund_verified_at": {
+            ledger_module.STATUS_REFUND_CLAIMED,
+            ledger_module.STATUS_REFUND_UNKNOWN,
+        },
+    }
+    assert status in effect_possible_from[field]
 
 
 @pytest.mark.asyncio
@@ -1122,19 +1140,44 @@ async def test_a_payment_rejected_by_the_endpoint_can_be_tried_again_by_hand(ses
     reader = FakeReader()
     mutator = await _created(session_maker, reader)
     mutator.pay_error = EasyWeekPermanentError("rejected", status_code=422, attempts=1)
+    first_plan = await _operator_plan(reader, STAGE_PAY, session_maker, now=utcnow() - timedelta(seconds=2))
 
-    first = await _pay(session_maker, reader, mutator)
+    first = await run_pay(
+        session_maker,
+        reader,
+        mutator,
+        identity=IDENTITY,
+        enabled=True,
+        plan_digest=first_plan.digest,
+        plan_issued_at=first_plan.issued_at,
+        confirmation_phrase=first_plan.confirmation_phrase,
+    )
 
     assert first.outcome == OUTCOME_CONTRACT_MISMATCH
-    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_PAY_REJECTED
+    rejected = await ledger_module.load(session_maker)
+    assert rejected.status == ledger_module.STATUS_PAY_REJECTED
+    assert rejected.stage_plan_digests[STAGE_PAY] == first_plan.digest
 
     # The operator fixes the cause and authorises the stage again, from scratch.
     mutator.pay_error = None
-    second = await _pay(session_maker, reader, mutator)
+    second_plan = await _operator_plan(reader, STAGE_PAY, session_maker, now=utcnow() - timedelta(seconds=1))
+    assert second_plan.digest != first_plan.digest
+    second = await run_pay(
+        session_maker,
+        reader,
+        mutator,
+        identity=IDENTITY,
+        enabled=True,
+        plan_digest=second_plan.digest,
+        plan_issued_at=second_plan.issued_at,
+        confirmation_phrase=second_plan.confirmation_phrase,
+    )
 
     assert second.outcome == OUTCOME_PROVEN
     assert mutator.calls == ["create", "pay", "pay"]
-    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_PAID
+    retried = await ledger_module.load(session_maker)
+    assert retried.status == ledger_module.STATUS_PAID
+    assert retried.stage_plan_digests[STAGE_PAY] == second_plan.digest
 
 
 @pytest.mark.asyncio
@@ -1175,6 +1218,89 @@ async def _paid(session_maker, reader: FakeReader, **mutator_kwargs: Any) -> Fak
     mutator = await _created(session_maker, reader, **mutator_kwargs)
     await _pay(session_maker, reader, mutator)
     return mutator
+
+
+@pytest.mark.asyncio
+async def test_each_delayed_stage_claim_stores_the_exact_operator_digest(session_maker) -> None:
+    """The live T2 plan proves T1 facts; the ledger keeps T1's approval."""
+    reader = FakeReader()
+    mutator = FakeMutator(reader)
+
+    for stage, runner in (
+        (STAGE_CREATE, run_create),
+        (STAGE_PAY, run_pay),
+        (STAGE_REFUND, run_refund),
+    ):
+        t1 = utcnow() - timedelta(seconds=2)
+        operator_plan = await _operator_plan(reader, stage, session_maker, now=t1)
+        fresh_plan = await _operator_plan(reader, stage, session_maker, now=t1 + timedelta(microseconds=1))
+
+        assert operator_plan.ready is True
+        assert fresh_plan.ready is True
+        assert fresh_plan.digest != operator_plan.digest
+        assert fresh_plan.digest_for(operator_plan.issued_at) == operator_plan.digest
+
+        report = await runner(
+            session_maker,
+            reader,
+            mutator,
+            identity=IDENTITY,
+            enabled=True,
+            plan_digest=operator_plan.digest,
+            plan_issued_at=operator_plan.issued_at,
+            confirmation_phrase=operator_plan.confirmation_phrase,
+        )
+
+        assert report.outcome == OUTCOME_PROVEN, report.reasons
+        snapshot = await ledger_module.load(session_maker)
+        assert snapshot.stage_plan_digests[stage] == operator_plan.digest
+
+
+async def _ready_stage(session_maker, stage: str) -> tuple[FakeReader, FakeMutator]:
+    reader = FakeReader()
+    if stage == STAGE_CREATE:
+        return reader, FakeMutator(reader)
+
+    mutator = await _created(session_maker, reader)
+    if stage == STAGE_REFUND:
+        await _pay(session_maker, reader, mutator)
+    return reader, mutator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [STAGE_CREATE, STAGE_PAY, STAGE_REFUND])
+@pytest.mark.parametrize("denial", ["phrase", "digest", "expired"])
+async def test_a_denied_approval_never_claims_or_mutates_any_stage(session_maker, stage, denial) -> None:
+    reader, mutator = await _ready_stage(session_maker, stage)
+    issued_at = utcnow() - timedelta(days=1) if denial == "expired" else utcnow() - timedelta(seconds=1)
+    operator_plan = await _operator_plan(reader, stage, session_maker, now=issued_at)
+    inputs = {
+        "plan_digest": operator_plan.digest,
+        "plan_issued_at": operator_plan.issued_at,
+        "confirmation_phrase": operator_plan.confirmation_phrase,
+    }
+    if denial == "phrase":
+        inputs["confirmation_phrase"] = "not-the-authorised-phrase"
+    elif denial == "digest":
+        inputs["plan_digest"] = "0" * 64
+
+    before = (await ledger_module.load(session_maker)).as_safe_dict()
+    calls_before = list(mutator.calls)
+    runner = {STAGE_CREATE: run_create, STAGE_PAY: run_pay, STAGE_REFUND: run_refund}[stage]
+
+    report = await runner(
+        session_maker,
+        reader,
+        mutator,
+        identity=IDENTITY,
+        enabled=True,
+        **inputs,
+    )
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert report.external_mutation_attempted is False
+    assert mutator.calls == calls_before
+    assert (await ledger_module.load(session_maker)).as_safe_dict() == before
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1464,68 @@ async def _claim_pay(session_maker, outcome_status: str) -> None:
         status=outcome_status,
         expected_statuses=frozenset({ledger_module.STATUS_PAY_CLAIMED}),
     )
+
+
+async def _claim_refund(session_maker, outcome_status: str) -> None:
+    snapshot = await ledger_module.load(session_maker)
+    await ledger_module.claim_refund(
+        session_maker,
+        refund_plan_digest="b" * 64,
+        template_config_digest=snapshot.template_config_digest or "",
+        identity_fingerprints=IDENTITY.fingerprints,
+    )
+    await ledger_module.record_outcome(
+        session_maker,
+        status=outcome_status,
+        expected_statuses=frozenset({ledger_module.STATUS_REFUND_CLAIMED}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ledger_status,remote_state,expected_status,pay_verified,refund_verified",
+    [
+        (ledger_module.STATUS_CREATED, ORDER_PAID, ledger_module.STATUS_PAID, False, False),
+        (ledger_module.STATUS_PAY_CLAIMED, ORDER_PAID, ledger_module.STATUS_PAID, True, False),
+        (ledger_module.STATUS_PAY_UNKNOWN, ORDER_PAID, ledger_module.STATUS_PAID, True, False),
+        (ledger_module.STATUS_PAY_REJECTED, ORDER_PAID, ledger_module.STATUS_PAID, False, False),
+        (ledger_module.STATUS_PAID, ORDER_REFUNDED, ledger_module.STATUS_REFUNDED, True, False),
+        (ledger_module.STATUS_REFUND_CLAIMED, ORDER_REFUNDED, ledger_module.STATUS_REFUNDED, True, True),
+        (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_REFUNDED, ledger_module.STATUS_REFUNDED, True, True),
+        (ledger_module.STATUS_REFUND_REJECTED, ORDER_REFUNDED, ledger_module.STATUS_REFUNDED, True, False),
+    ],
+)
+async def test_reconcile_verification_timestamps_preserve_operation_provenance(
+    session_maker,
+    ledger_status,
+    remote_state,
+    expected_status,
+    pay_verified,
+    refund_verified,
+) -> None:
+    reader = FakeReader()
+    if ledger_status == ledger_module.STATUS_CREATED:
+        await _created(session_maker, reader)
+    elif ledger_status in {
+        ledger_module.STATUS_PAY_CLAIMED,
+        ledger_module.STATUS_PAY_UNKNOWN,
+        ledger_module.STATUS_PAY_REJECTED,
+    }:
+        await _created(session_maker, reader)
+        await _claim_pay(session_maker, ledger_status)
+    else:
+        await _paid(session_maker, reader)
+        if ledger_status != ledger_module.STATUS_PAID:
+            await _claim_refund(session_maker, ledger_status)
+
+    reader.order = paid_order(marker=MARKER) if remote_state == ORDER_PAID else refunded_order(marker=MARKER)
+
+    await run_reconcile(session_maker, reader, identity=IDENTITY)
+    snapshot = await ledger_module.load(session_maker)
+
+    assert snapshot.status == expected_status
+    assert (snapshot.stage_timestamps["pay_verified_at"] is not None) is pay_verified
+    assert (snapshot.stage_timestamps["refund_verified_at"] is not None) is refund_verified
 
 
 @pytest.mark.asyncio

@@ -318,14 +318,16 @@ async def _read_order_and_counters(
 
 @dataclass(frozen=True)
 class Authorisation:
-    """A freshly recomputed stage plan that still authorises its own stage."""
+    """Live stage proof plus the exact operator approval it validated."""
 
     plan: StagePlan
     reasons: tuple[str, ...]
+    authoritative_digest: str | None
+    authoritative_issued_at: datetime | None
 
     @property
     def granted(self) -> bool:
-        return not self.reasons
+        return not self.reasons and self.authoritative_digest is not None and self.authoritative_issued_at is not None
 
 
 async def authorise(
@@ -367,7 +369,12 @@ async def authorise(
         supplied_phrase=confirmation_phrase,
         now=now,
     )
-    return Authorisation(plan=plan, reasons=reasons)
+    return Authorisation(
+        plan=plan,
+        reasons=reasons,
+        authoritative_digest=plan_digest if not reasons else None,
+        authoritative_issued_at=plan_issued_at if not reasons else None,
+    )
 
 
 def _refusal(stage: str, reasons: tuple[str, ...] | list[str], ledger: dict[str, Any]) -> StageReport:
@@ -412,10 +419,12 @@ async def run_create(
         return _refusal(STAGE_CREATE, authorisation.reasons, snapshot.as_safe_dict())
 
     plan = authorisation.plan
+    authorised_digest = authorisation.authoritative_digest
+    assert authorised_digest is not None  # guaranteed by Authorisation.granted
     now = utcnow()
     claim = await ledger_module.claim_create(
         session_maker,
-        create_plan_digest=plan.digest,
+        create_plan_digest=authorised_digest,
         template_config_digest=plan.immutable_template_digest,
         customer_fingerprint=identity.fingerprints["customer"],
         staffer_fingerprint=identity.fingerprints["staffer"],
@@ -587,10 +596,12 @@ async def run_pay(
         return _refusal(STAGE_PAY, [REASON_LEDGER_STATE_INVALID], snapshot.as_safe_dict())
 
     plan = authorisation.plan
+    authorised_digest = authorisation.authoritative_digest
+    assert authorised_digest is not None  # guaranteed by Authorisation.granted
     target = snapshot.target_order_uuid
     claim = await ledger_module.claim_pay(
         session_maker,
-        pay_plan_digest=plan.digest,
+        pay_plan_digest=authorised_digest,
         template_config_digest=plan.immutable_template_digest,
         identity_fingerprints=identity.fingerprints,
     )
@@ -742,10 +753,12 @@ async def run_refund(
         return _refusal(STAGE_REFUND, [REASON_LEDGER_STATE_INVALID], snapshot.as_safe_dict())
 
     plan = authorisation.plan
+    authorised_digest = authorisation.authoritative_digest
+    assert authorised_digest is not None  # guaranteed by Authorisation.granted
     target = snapshot.target_order_uuid
     claim = await ledger_module.claim_refund(
         session_maker,
-        refund_plan_digest=plan.digest,
+        refund_plan_digest=authorised_digest,
         template_config_digest=plan.immutable_template_digest,
         identity_fingerprints=identity.fingerprints,
     )
@@ -881,22 +894,20 @@ _POST_CREATE_STATUSES: Final = (
     ledger_module.STATUS_REFUND_REJECTED,
 )
 
-# States in which THIS canary actually sent a payment, and a refund. Only these
-# may carry a verification timestamp for that stage: `pay_verified_at` means
-# "the pay we sent is confirmed", and stamping it because somebody settled the
-# order in the dashboard would invent an attribution the ledger cannot support.
-_PAY_ATTEMPTED_STATUSES: Final = frozenset(
+# States in which THIS canary's operation may have had the observed effect.
+# Only these may carry a verification timestamp for that stage:
+# `pay_verified_at` means "the pay we sent is confirmed", and stamping it after
+# a proven rejection would attribute a later dashboard action to this canary.
+_PAY_MAY_HAVE_HAD_EFFECT_STATUSES: Final = frozenset(
     {
         ledger_module.STATUS_PAY_CLAIMED,
         ledger_module.STATUS_PAY_UNKNOWN,
-        ledger_module.STATUS_PAY_REJECTED,
     }
 )
-_REFUND_ATTEMPTED_STATUSES: Final = frozenset(
+_REFUND_MAY_HAVE_HAD_EFFECT_STATUSES: Final = frozenset(
     {
         ledger_module.STATUS_REFUND_CLAIMED,
         ledger_module.STATUS_REFUND_UNKNOWN,
-        ledger_module.STATUS_REFUND_REJECTED,
     }
 )
 
@@ -918,12 +929,13 @@ def _build_reconcile_transitions() -> dict[tuple[str, str], _Transition]:
     ``remote refunded``
         the money is back, which is the most advanced thing that can be true of
         this order, so any unfinished post-create state may record it. The
-        verification stamp is only for states where WE sent the refund.
+        verification stamp is only for states where our refund may have acted.
 
     ``remote paid``
-        recordable from `created` and from every state where our payment may
-        have landed. Never from a refund state: that would walk the ledger back
-        to somewhere a refund can be claimed again.
+        recordable from `created`, from states where our payment may have
+        landed, and from `pay_rejected` as an unattributed later observation.
+        Never from a refund state: that would walk the ledger back to somewhere
+        a refund can be claimed again.
 
     ``remote open``
         only `pay_claimed` moves, and only to `pay_unknown`: a payment whose
@@ -943,13 +955,16 @@ def _build_reconcile_transitions() -> dict[tuple[str, str], _Transition]:
         table[(status, ORDER_REFUNDED)] = _Transition(
             status=ledger_module.STATUS_REFUNDED,
             expected_from=frozenset({status}),
-            verified_field="refund_verified_at" if status in _REFUND_ATTEMPTED_STATUSES else None,
+            verified_field=("refund_verified_at" if status in _REFUND_MAY_HAVE_HAD_EFFECT_STATUSES else None),
         )
-        if status in _PAY_ATTEMPTED_STATUSES or status == ledger_module.STATUS_CREATED:
+        if status in _PAY_MAY_HAVE_HAD_EFFECT_STATUSES or status in {
+            ledger_module.STATUS_CREATED,
+            ledger_module.STATUS_PAY_REJECTED,
+        }:
             table[(status, ORDER_PAID)] = _Transition(
                 status=ledger_module.STATUS_PAID,
                 expected_from=frozenset({status}),
-                verified_field="pay_verified_at" if status in _PAY_ATTEMPTED_STATUSES else None,
+                verified_field=("pay_verified_at" if status in _PAY_MAY_HAVE_HAD_EFFECT_STATUSES else None),
             )
         if status in _CANCELLABLE_FROM:
             table[(status, ORDER_CANCELLED)] = _Transition(
@@ -1245,7 +1260,12 @@ def _reconcile_outcome(status: str, remote_state: str) -> str:
         return OUTCOME_AMBIGUOUS
     if remote_state in {ORDER_MALFORMED, ORDER_UNKNOWN}:
         # Nothing was established, so nothing is proven — including a rollback.
-        if status in _REFUND_ATTEMPTED_STATUSES or status == ledger_module.STATUS_PAID:
+        if status in {
+            ledger_module.STATUS_PAID,
+            ledger_module.STATUS_REFUND_CLAIMED,
+            ledger_module.STATUS_REFUND_UNKNOWN,
+            ledger_module.STATUS_REFUND_REJECTED,
+        }:
             return OUTCOME_ROLLBACK_UNPROVEN
         return OUTCOME_UNKNOWN_MUTATION
     if status in ledger_module.UNRESOLVED_STATUSES:
