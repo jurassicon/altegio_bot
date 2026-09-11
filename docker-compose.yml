@@ -109,6 +109,14 @@ services:
   altegio-outbox-worker:
     build: .
     restart: always
+    # This service's image and env_file list are also what the §35 voucher
+    # mutation canary runs in, as a throwaway one-off container:
+    #   docker compose run --rm --no-deps --entrypoint /app/.venv/bin/python \
+    #     altegio-outbox-worker -m altegio_bot.scripts.easyweek_voucher_canary ...
+    # It needs easyweek.env for the canary fence and the three runtime
+    # identities, and `--no-deps` plus the replaced entrypoint mean the worker
+    # itself never starts. The long-running service reads none of those
+    # variables; see docs/easyweek/voucher_canary_runbook.md.
     env_file:
       - .env
       - path: easyweek.env
