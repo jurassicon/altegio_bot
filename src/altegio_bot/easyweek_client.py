@@ -13,6 +13,10 @@ operations and no generic request escape hatch::
     GET /workspace
     GET /voucher-templates
     GET /voucher-templates/{voucher_template_uuid}
+    GET /orders?location_uuid&customer_uuid&page&per_page=100
+    GET /orders/{order_uuid}
+    GET /accounts?location_uuid&page&per_page=100
+    GET /staffers?location_uuid&page&per_page=100
 
 Everything here is built around two threats:
 
@@ -22,6 +26,11 @@ Everything here is built around two threats:
   subtree plus notes and order totals. This client therefore never logs a
   response body, and its exceptions carry only metadata (operation, HTTP status,
   attempt count, retryable flag) — never bodies, headers, URLs or PII.
+
+The last four were added for the §35 voucher-canary reconciliation and are
+still reads: proving what a POS mutation did needs a way to look, and looking
+must not require the mutation client. The mutation surface itself lives in
+``easyweek_voucher_mutation`` and is not reachable from here.
 
 Deliberately NOT here: EasyWeek domain modelling. PR-4 owns normalization; PR-2
 only needs the transport, a safe JSON-shape check, and typed failures.
@@ -54,6 +63,11 @@ _PATH_BOOKINGS = "bookings"
 _PATH_CUSTOMERS = "customers"
 _PATH_WORKSPACE = "workspace"
 _PATH_VOUCHER_TEMPLATES = "voucher-templates"
+# Read-only POS surface, added for the §35 voucher-canary reconciliation. The
+# mutation side lives in `easyweek_voucher_mutation`; these are GETs only.
+_PATH_ORDERS = "orders"
+_PATH_ACCOUNTS = "accounts"
+_PATH_STAFFERS = "staffers"
 
 # The ONE origin this client may ever talk to. A misconfigured base URL would
 # otherwise send the Bearer key in clear text or to a third-party host, so the
@@ -65,6 +79,9 @@ _ALLOWED_API_PATH = "/api/public/v2"
 _ALLOWED_API_PORTS = (None, 443)
 CANONICAL_API_BASE_URL = f"{_ALLOWED_API_SCHEME}://{_ALLOWED_API_HOST}{_ALLOWED_API_PATH}"
 CUSTOMER_BOOKINGS_PER_PAGE: Final = 100
+# One fixed page size for every POS read. A caller that could choose it could
+# also ask for a page so small that a complete walk silently truncates.
+POS_PER_PAGE: Final = 100
 
 # Bounded retry policy. EasyWeek allows 60 requests/min per key (§1.1), so a
 # short, bounded backoff is enough; unbounded retries would only burn the quota.
@@ -749,5 +766,116 @@ class EasyWeekClient:
             raise EasyWeekProtocolError(
                 "voucher template response is not a JSON object",
                 operation="get_voucher_template",
+            )
+        return payload
+
+    # -- POS reads for the §35 voucher canary ------------------------------
+    #
+    # Reconciliation after an unknown mutation is the ONLY reason these exist.
+    # They are GETs with a closed filter set: there is no parameter through
+    # which a caller could pass a free-form query, a different page size, or an
+    # arbitrary endpoint. Everything they return is handed to a caller that
+    # projects safe facts out of it; this client still never logs a body.
+
+    async def list_location_orders(
+        self,
+        *,
+        location_uuid: str,
+        customer_uuid: str,
+        page: int,
+        per_page: int = POS_PER_PAGE,
+    ) -> dict[str, Any]:
+        """``GET /orders?location_uuid&customer_uuid&page&per_page`` — one page.
+
+        Both UUIDs are required and validated before the wire: a workspace-wide
+        order listing is not something this integration has any reason to pull,
+        and an unscoped walk would page through other customers' orders.
+
+        Pagination completeness is the caller's contract, not this method's — it
+        returns one page verbatim so the reconciler can prove it walked all of
+        them.
+        """
+        canonical_location = _canonical_resource_uuid(
+            location_uuid, operation="list_location_orders", label="location_uuid"
+        )
+        canonical_customer = _canonical_customer_uuid(customer_uuid, operation="list_location_orders")
+        exact_page = _positive_page(page, operation="list_location_orders")
+        if type(per_page) is not int or per_page != POS_PER_PAGE:
+            raise EasyWeekPermanentError(
+                "per_page must equal the fixed POS page size",
+                operation="list_location_orders",
+            )
+        payload = await self._get_json(
+            _PATH_ORDERS,
+            operation="list_location_orders",
+            params={
+                "location_uuid": canonical_location,
+                "customer_uuid": canonical_customer,
+                "page": exact_page,
+                "per_page": per_page,
+            },
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "orders response is not a JSON object",
+                operation="list_location_orders",
+            )
+        return payload
+
+    async def get_order(self, order_uuid: str) -> dict[str, Any]:
+        """``GET /orders/{uuid}`` for one exact POS order.
+
+        The response may carry customer PII and, after a voucher sale, whatever
+        an issued voucher looks like. Nothing is interpreted here: the caller
+        projects safe facts, and this client never logs the body.
+        """
+        canonical = _canonical_resource_uuid(order_uuid, operation="get_order", label="order_uuid")
+        payload = await self._get_json(_PATH_ORDERS, canonical, operation="get_order")
+        if isinstance(payload, dict) and "data" in payload:
+            inner = payload["data"]
+            if not isinstance(inner, dict):
+                raise EasyWeekProtocolError("order data is not a JSON object", operation="get_order")
+            payload = inner
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError("order response is not a JSON object", operation="get_order")
+        return payload
+
+    async def list_location_accounts(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        """``GET /accounts?location_uuid&page&per_page`` — one page of POS accounts.
+
+        Used only to prove that the operator-supplied payment account really
+        exists in the confirmed branch before a payment is claimed.
+        """
+        canonical = _canonical_resource_uuid(location_uuid, operation="list_location_accounts", label="location_uuid")
+        exact_page = _positive_page(page, operation="list_location_accounts")
+        payload = await self._get_json(
+            _PATH_ACCOUNTS,
+            operation="list_location_accounts",
+            params={"location_uuid": canonical, "page": exact_page, "per_page": POS_PER_PAGE},
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "accounts response is not a JSON object",
+                operation="list_location_accounts",
+            )
+        return payload
+
+    async def list_location_staffers(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        """``GET /staffers?location_uuid&page&per_page`` — one page of staffers.
+
+        Used only to prove that the operator-supplied staffer really exists in
+        the confirmed branch before an order is claimed.
+        """
+        canonical = _canonical_resource_uuid(location_uuid, operation="list_location_staffers", label="location_uuid")
+        exact_page = _positive_page(page, operation="list_location_staffers")
+        payload = await self._get_json(
+            _PATH_STAFFERS,
+            operation="list_location_staffers",
+            params={"location_uuid": canonical, "page": exact_page, "per_page": POS_PER_PAGE},
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError(
+                "staffers response is not a JSON object",
+                operation="list_location_staffers",
             )
         return payload

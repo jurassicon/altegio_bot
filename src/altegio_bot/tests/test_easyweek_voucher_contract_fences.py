@@ -56,6 +56,16 @@ SHIPPED_ARTIFACTS = (
     REPO_ROOT / "docs/easyweek/voucher_contract_evidence_runbook.md",
     REPO_ROOT / "docs/easyweek/campaign_readiness_runbook.md",
 )
+SHIPPED_CANARY_ARTIFACTS = (
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_mutation.py",
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/plan.py",
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/ledger.py",
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/runner.py",
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/artifact.py",
+    REPO_ROOT / "src/altegio_bot/scripts/easyweek_voucher_canary.py",
+    REPO_ROOT / "src/altegio_bot/tests/easyweek_voucher_canary_fixtures.py",
+    REPO_ROOT / "docs/easyweek/voucher_canary_runbook.md",
+)
 NEW_TEST_FILES = (
     REPO_ROOT / "src/altegio_bot/tests/test_easyweek_voucher_calculation.py",
     REPO_ROOT / "src/altegio_bot/tests/campaigns/test_easyweek_voucher_contract.py",
@@ -286,3 +296,138 @@ def test_the_runbook_keeps_every_send_blocker() -> None:
 def test_the_runbook_claims_no_absolute_consistency_guarantee() -> None:
     text = EVIDENCE_RUNBOOK.read_text()
     assert "not an absolute consistency" in text
+
+
+# ---------------------------------------------------------------------------
+# §35 voucher mutation canary — it opens nothing it was not allowed to open
+# ---------------------------------------------------------------------------
+
+
+def test_the_canary_creates_no_campaign_job_or_outbox_row() -> None:
+    from altegio_bot.easyweek_voucher_canary import ledger as canary_ledger
+    from altegio_bot.easyweek_voucher_canary import plan as canary_plan
+    from altegio_bot.easyweek_voucher_canary import runner as canary_runner
+    from altegio_bot.scripts import easyweek_voucher_canary as canary_cli
+
+    for module in (canary_plan, canary_ledger, canary_runner, canary_cli):
+        code = code_without_docstrings(module)
+        for forbidden in ("CampaignRun", "CampaignRecipient", "MessageJob", "OutboxMessage", "Outbox("):
+            assert forbidden not in code, (module.__name__, forbidden)
+        imported = imported_modules(module)
+        assert not any("chatwoot" in name or "meta_" in name for name in imported), module.__name__
+
+
+def test_the_canary_touches_only_its_own_table() -> None:
+    from altegio_bot.easyweek_voucher_canary import ledger as canary_ledger
+
+    code = code_without_docstrings(canary_ledger)
+    assert "EasyWeekVoucherCanaryLedger" in code
+    for forbidden in ("EasyWeekMigrationLedger", "CampaignRun", "MessageJob", "Record(", "Client("):
+        assert forbidden not in code, forbidden
+
+
+def test_the_canary_does_not_reuse_the_migration_ledger() -> None:
+    from altegio_bot.easyweek_voucher_canary import ledger as canary_ledger
+
+    imported = imported_modules(canary_ledger)
+    assert not any(name.startswith("altegio_bot.easyweek_migration") for name in imported), imported
+
+
+def test_readiness_and_supported_job_types_are_unchanged_by_the_canary() -> None:
+    """Code existing is not evidence. Only a real production transcript is."""
+    result = evaluate_gift_card_readiness(
+        workspace_payload=WORKSPACE,
+        locations_payload=LOCATIONS,
+        template_payload=TEMPLATE,
+    )
+    assert result.ready is False
+    for blocker in (
+        GIFT_CARD_ONLINE_SALES_DISABLED,
+        GIFT_CARD_PUBLIC_URL_UNPROVEN,
+        GIFT_CARD_SEMANTICS_UNPROVEN,
+        GIFT_CARD_ISSUE_CONTRACT_UNPROVEN,
+    ):
+        assert blocker in result.reasons
+
+    with pytest.raises(CampaignProviderRefusal):
+        require_campaign_execution_provider("easyweek")
+
+
+def test_the_readiness_endpoint_cannot_reach_the_mutation_client() -> None:
+    imported = imported_modules(campaigns_api)
+    assert "altegio_bot.easyweek_voucher_mutation" not in imported
+    assert not any("voucher_canary" in name for name in imported), imported
+
+    source = inspect.getsource(campaigns_api)
+    for forbidden in ("create_voucher_order", "pay_voucher_order", "refund_voucher_order"):
+        assert forbidden not in source, forbidden
+
+
+def test_the_read_client_is_still_get_only_after_the_pos_reads_were_added() -> None:
+    from altegio_bot.easyweek_client import EasyWeekClient as ReadClient
+
+    for name in (
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "request",
+        "create_voucher_order",
+        "pay_voucher_order",
+        "refund_voucher_order",
+    ):
+        assert not hasattr(ReadClient, name), name
+
+
+@pytest.mark.parametrize("path", SHIPPED_CANARY_ARTIFACTS, ids=lambda path: path.name)
+def test_no_canary_artifact_carries_a_dashboard_identity_or_admin_url(path: Path) -> None:
+    text = path.read_text()
+    assert FORBIDDEN_DASHBOARD_ID not in text
+    assert FORBIDDEN_ADMIN_PATH not in text
+    assert not re.search(r"my\.easyweek\.io/[a-z]+/gift", text)
+
+
+@pytest.mark.parametrize("path", SHIPPED_CANARY_ARTIFACTS, ids=lambda path: path.name)
+def test_no_canary_artifact_commits_a_production_runtime_identity(path: Path) -> None:
+    """The customer, staffer and account UUIDs arrive at run time and stay there."""
+    from altegio_bot.tests import easyweek_voucher_canary_fixtures as canary_fixtures
+
+    allowed = {
+        identity_module.EASYWEEK_WORKSPACE_UUID,
+        identity_module.KARLSRUHE_LOCATION_UUID,
+        identity_module.EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        # Obviously synthetic fixtures.
+        canary_fixtures.CUSTOMER_UUID,
+        canary_fixtures.STAFFER_UUID,
+        canary_fixtures.ACCOUNT_UUID,
+        canary_fixtures.ORDER_UUID,
+        canary_fixtures.OTHER_UUID,
+        "00000000-0000-0000-0000-000000000000",
+        "11111111-2222-4333-8444-555555555555",
+    }
+    pattern = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    found = {match.lower() for match in re.findall(pattern, path.read_text())}
+    assert found <= allowed, found - allowed
+
+
+def test_the_canary_settings_are_fail_closed_by_default() -> None:
+    from altegio_bot.settings import Settings
+
+    defaults = Settings.model_fields
+    assert defaults["easyweek_voucher_canary_enabled"].default is False
+    for name in (
+        "easyweek_voucher_canary_customer_uuid",
+        "easyweek_voucher_canary_staffer_uuid",
+        "easyweek_voucher_canary_account_uuid",
+    ):
+        assert defaults[name].default == ""
+
+
+def test_exactly_one_alembic_head_and_one_new_canary_migration() -> None:
+    versions = REPO_ROOT / "alembic" / "versions"
+    canary = [path for path in versions.glob("*.py") if "voucher_canary" in path.read_text()]
+    assert len(canary) == 1
+    text = canary[0].read_text()
+    # A migration that cannot be undone is a migration nobody will apply.
+    assert "def downgrade()" in text
+    assert "op.drop_table" in text

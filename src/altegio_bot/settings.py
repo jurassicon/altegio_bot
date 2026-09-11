@@ -737,6 +737,28 @@ class Settings(BaseSettings):
     # approved templates, and must not inherit an Altegio branch's language.
     easyweek_default_language: str = "de"
 
+    # --- §35: controlled voucher mutation canary -----------------------------
+    # An operator-only, one-off research flow that creates, pays for and refunds
+    # exactly ONE real EasyWeek voucher order. Nothing in the running
+    # application reads these: they are consumed by a manually invoked script
+    # and by nothing else. No worker, no endpoint and no scheduler can reach it.
+    #
+    # The fence is false by default and stays false in every deployed
+    # environment until the owner turns it on for the duration of one canary.
+    # With it false the canary command performs no HTTP request at all — not
+    # even the read-only plan.
+    easyweek_voucher_canary_enabled: bool = False
+    # The three runtime identities the owner named, supplied at run time and
+    # deliberately NOT committed anywhere: a production customer, staffer and
+    # payment-account UUID have no business in a repository. They are validated
+    # as canonical UUIDs, used in memory to build one request, and survive into
+    # the report and the ledger only as salted SHA-256 fingerprints.
+    #
+    # Empty by default so that an unset variable is a refusal, never a guess.
+    easyweek_voucher_canary_customer_uuid: str = ""
+    easyweek_voucher_canary_staffer_uuid: str = ""
+    easyweek_voucher_canary_account_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

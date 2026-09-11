@@ -38,3 +38,39 @@ SUPPORTED_VOUCHER_PRICE_MINOR: Final = 1500
 # One voucher line, one unit. Not a parameter anywhere: a caller able to set it
 # could preview a bulk purchase, and no bulk evidence exists.
 SUPPORTED_VOUCHER_QUANTITY: Final = 1
+
+# ---------------------------------------------------------------------------
+# Controlled voucher mutation canary (§35)
+# ---------------------------------------------------------------------------
+# One scope string, one canary, enforced by a unique constraint in PostgreSQL.
+# Running a second canary is deliberately a code change plus a review, not an
+# operator decision: the whole point of the ledger is that "has this workspace
+# already had its one-off voucher canary?" has exactly one durable answer.
+VOUCHER_CANARY_SCOPE: Final = "easyweek_voucher_canary_v1"
+
+# The request body shape the canary sends. Bumped whenever that shape changes,
+# so an old ledger row cannot vouch for a request we no longer send.
+VOUCHER_CANARY_REQUEST_SCHEMA_VERSION: Final = "1"
+
+# Template facts the owner froze for the duration of the canary, confirmed by a
+# read-only production probe on 11.09.2026. These are compared before every
+# mutation and after every verification; a difference stops the canary rather
+# than adapting to it.
+FROZEN_TEMPLATE_FACTS: Final = {
+    "is_enabled": True,
+    "is_online": False,
+    "is_single_charge": True,
+    "cost": SUPPORTED_VOUCHER_PRICE_MINOR,
+    "value": SUPPORTED_VOUCHER_PRICE_MINOR,
+    "validity": None,
+    "forces_activation": True,
+    "activate_after": 0,
+    "activate_at": None,
+    "is_connected_all_branches": True,
+    "branches_count": 3,
+    "all_branches_count": 3,
+    "is_connected_all_services": True,
+    "services_count": 43,
+    "all_services_count": 43,
+    "goods_count": 0,
+}

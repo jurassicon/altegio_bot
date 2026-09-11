@@ -2065,3 +2065,161 @@ class EasyWeekMigrationCanaryProof(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class EasyWeekVoucherCanaryLedger(Base):
+    """The one durable row of the controlled voucher mutation canary (§35).
+
+    The canary creates, pays for and refunds exactly one real EasyWeek voucher
+    order. Every one of those three steps is a mutation nobody can take back by
+    repeating it, and each may end with the request sent and the answer lost. So
+    the question "did we already claim this step, and could it have reached
+    EasyWeek?" lives in PostgreSQL under a unique constraint — not in a report
+    file, not in a marker on the remote order, and not in memory that dies with
+    the process.
+
+    One row, ever
+    -------------
+    Identity is the canary SCOPE, not the order: a target UUID is the *result*
+    of the first mutation and is unknown for exactly the rows that need the
+    guarantee most. ``canary_scope`` is unique, so a second operator, a rerun and
+    a resumed crash all collide on the same row rather than starting a second
+    canary. Running another canary is deliberately a code change (a new scope
+    constant) plus a review.
+
+    Claim before request
+    --------------------
+    Every stage writes its ``*_claimed_at`` and commits BEFORE the POST leaves.
+    A crash between that commit and the response is therefore recorded as
+    "claimed, outcome unknown" rather than as "nothing happened", which is the
+    only reading that cannot double-charge a real card.
+
+    Nothing here is PII
+    -------------------
+    No customer name, phone or e-mail; no staffer or account name; no Bearer
+    key; no headers; no request or response body; no voucher code; no
+    customer-facing URL; no free-text note; no raw EasyWeek payload. The three
+    operator-supplied identities survive only as salted SHA-256 fingerprints, and
+    the voucher artifact survives only as shape: a key, a JSON type, a presence
+    flag and a truncated fingerprint. ``target_order_uuid`` is the single
+    exception, and it is here because a refund and a manual cleanup are
+    impossible without it.
+    """
+
+    __tablename__ = "easyweek_voucher_canary_ledger"
+    __table_args__ = (
+        # The whole idempotency guarantee, arbitrated by the database rather
+        # than by a read-then-write race in the tool.
+        UniqueConstraint("canary_scope", name="uq_easyweek_voucher_canary_scope"),
+        Index("ix_easyweek_voucher_canary_status", "status"),
+        CheckConstraint(
+            "status IN ("
+            "'create_claimed','create_unknown','create_rejected','created',"
+            "'pay_claimed','pay_unknown','pay_rejected','paid',"
+            "'refund_claimed','refund_unknown','refund_rejected','refunded',"
+            "'ambiguous','manually_cleaned')",
+            name="ck_easyweek_voucher_canary_status",
+        ),
+        # A row that reached any post-create state must name the order it is
+        # talking about. Without this, a resumed run could report a payment
+        # against an order nobody can find, refund or cancel.
+        CheckConstraint(
+            "status IN ('create_claimed','create_unknown','create_rejected','ambiguous') "
+            "OR target_order_uuid IS NOT NULL",
+            name="ck_easyweek_voucher_canary_target_required",
+        ),
+        # An attempt that was never claimed would mean a request left without a
+        # durable record in front of it — the exact failure the claim exists to
+        # prevent. Likewise a verification with no attempt behind it.
+        CheckConstraint(
+            "(create_attempted_at IS NULL OR create_claimed_at IS NOT NULL) AND "
+            "(pay_attempted_at IS NULL OR pay_claimed_at IS NOT NULL) AND "
+            "(refund_attempted_at IS NULL OR refund_claimed_at IS NOT NULL)",
+            name="ck_easyweek_voucher_canary_attempt_needs_claim",
+        ),
+        CheckConstraint(
+            "(create_verified_at IS NULL OR create_attempted_at IS NOT NULL) AND "
+            "(pay_verified_at IS NULL OR pay_attempted_at IS NOT NULL) AND "
+            "(refund_verified_at IS NULL OR refund_attempted_at IS NOT NULL)",
+            name="ck_easyweek_voucher_canary_verify_needs_attempt",
+        ),
+        # A later stage cannot be claimed before an earlier one was.
+        CheckConstraint(
+            "(pay_claimed_at IS NULL OR create_claimed_at IS NOT NULL) AND "
+            "(refund_claimed_at IS NULL OR pay_claimed_at IS NOT NULL)",
+            name="ck_easyweek_voucher_canary_stage_order",
+        ),
+        # Fingerprints are full SHA-256 hex digests, and the digests are too.
+        CheckConstraint(
+            "char_length(customer_fingerprint) = 64 AND "
+            "char_length(staffer_fingerprint) = 64 AND "
+            "char_length(account_fingerprint) = 64 AND "
+            "char_length(plan_digest) = 64 AND "
+            "char_length(template_snapshot_digest) = 64",
+            name="ck_easyweek_voucher_canary_digest_lengths",
+        ),
+        # The reconciliation window is what bounds an unresolved create search.
+        # An inverted or absent window would let that search widen silently.
+        CheckConstraint(
+            "create_window_end > create_window_start",
+            name="ck_easyweek_voucher_canary_window_ordered",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- identity ----------------------------------------------------------
+    canary_scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The plan an owner approved, and the template state that plan saw. Both are
+    # re-derived live before every stage; a difference stops the canary.
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    template_snapshot_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- who, as one-way digests only --------------------------------------
+    customer_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    staffer_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Non-personal slug written into the order comment. It is how an unresolved
+    # create is found again, by this tool and by a human in the dashboard.
+    reconciliation_marker: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- state -------------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_order_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+
+    # -- the bounded search window for an unresolved create ----------------
+    create_window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    create_window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- per-stage timestamps ---------------------------------------------
+    create_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set only when a human closed an open draft in the EasyWeek dashboard and a
+    # later reconcile OBSERVED that. The tool never claims it did the rollback.
+    manual_cleanup_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- safe evidence -----------------------------------------------------
+    # Shape facts only: stage, key path, JSON type, presence, truncated value
+    # fingerprint, bounded length. Never a value, never a body.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
