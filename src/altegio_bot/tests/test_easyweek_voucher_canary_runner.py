@@ -17,6 +17,7 @@ from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
     EasyWeekNotFoundError,
     EasyWeekPermanentError,
+    EasyWeekProtocolError,
     EasyWeekRetryableError,
 )
 from altegio_bot.easyweek_voucher_canary import ledger as ledger_module
@@ -73,6 +74,7 @@ from altegio_bot.easyweek_voucher_canary.runner import (
     run_refund,
     run_status,
 )
+from altegio_bot.easyweek_voucher_canary.voucher_line import QUANTITY_PROOF_SINGLETON
 from altegio_bot.easyweek_voucher_identity import EASYWEEK_VOUCHER_TEMPLATE_UUID, KARLSRUHE_LOCATION_UUID
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
 from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
@@ -88,6 +90,7 @@ from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
     TEMPLATE,
     WORKSPACE,
     cancelled_order,
+    issued_voucher,
     listed_order,
     open_order,
     orders_page,
@@ -157,18 +160,16 @@ class FakeReader:
 
     # -- POS surface -------------------------------------------------------
 
-    async def list_location_orders(
+    async def list_location_customer_orders(
         self,
         *,
         location_uuid: str,
         customer_uuid: str,
-        staffer_uuid: str,
         page: int,
         per_page: int = 100,
     ) -> dict[str, Any]:
         assert location_uuid == KARLSRUHE_LOCATION_UUID
         assert customer_uuid == CUSTOMER_UUID
-        assert staffer_uuid == STAFFER_UUID
         self.calls.append(f"list_orders:{page}")
         pages = self.order_pages if (self._claimed and self.order_pages is not None) else self.existing_orders
         index = page - 1
@@ -221,10 +222,12 @@ class FakeMutator:
         self.pay_effect = pay_effect
         self.refund_effect = refund_effect
         self.calls: list[str] = []
+        self.create_kwargs: list[dict[str, Any]] = []
         self.pay_kwargs: list[dict[str, Any]] = []
 
     async def create_voucher_order(self, **kwargs: Any) -> VoucherMutationResponse:
         self.calls.append("create")
+        self.create_kwargs.append(dict(kwargs))
         assert kwargs["location_uuid"] == KARLSRUHE_LOCATION_UUID
         assert kwargs["voucher_template_uuid"] == EASYWEEK_VOUCHER_TEMPLATE_UUID
         assert kwargs["price_minor"] == 1500
@@ -651,7 +654,7 @@ async def test_the_walk_follows_published_pagination(session_maker) -> None:
 @pytest.mark.asyncio
 async def test_an_incomplete_walk_is_unresolved_not_absent(session_maker) -> None:
     class Endless(FakeReader):
-        async def list_location_orders(self, **kwargs: Any) -> dict[str, Any]:
+        async def list_location_customer_orders(self, **kwargs: Any) -> dict[str, Any]:
             if not self._claimed:
                 return orders_page([])
             return {"data": [listed_order(marker="unrelated")]}
@@ -669,7 +672,7 @@ async def test_find_marker_orders_reports_an_incomplete_walk() -> None:
     from datetime import timedelta
 
     class Endless(FakeReader):
-        async def list_location_orders(self, **kwargs: Any) -> dict[str, Any]:
+        async def list_location_customer_orders(self, **kwargs: Any) -> dict[str, Any]:
             return {"data": [listed_order(marker="unrelated")]}
 
     now = utcnow()
@@ -677,7 +680,6 @@ async def test_find_marker_orders_reports_an_incomplete_walk() -> None:
         Endless(),
         location_uuid=KARLSRUHE_LOCATION_UUID,
         customer_uuid=CUSTOMER_UUID,
-        staffer_uuid=STAFFER_UUID,
         marker=MARKER,
         window_start=now - timedelta(days=1),
         window_end=now + timedelta(days=1),
@@ -1212,6 +1214,138 @@ async def test_an_unknown_payment_is_never_offered_a_retry(session_maker) -> Non
 
     assert again.outcome == OUTCOME_REFUSED
     assert mutator.calls == ["create", "pay"]
+
+
+@pytest.mark.asyncio
+async def test_the_order_production_actually_created_is_payable(session_maker) -> None:
+    """The blocked smoke test, end to end, on the shape production returned.
+
+    An order whose single `vouchers` element is an issued artifact — a code, the
+    template, `value` and `price` at 1500 — and which carries no `quantity` key
+    at all. Both production blockers met here at once: the listing has to find
+    it without a staffer filter, and the payment has to prove one voucher
+    without inventing a count.
+    """
+    created = open_order(marker=MARKER, vouchers=[issued_voucher(code=ARTIFACT_SENTINEL)])
+    listed = listed_order(
+        marker=MARKER,
+        created_at=utcnow().isoformat(),
+        vouchers=[issued_voucher(code=ARTIFACT_SENTINEL)],
+    )
+    reader = FakeReader(order=created, existing_orders=[orders_page([])])
+    mutator = FakeMutator(reader, create_response=created)
+    await _create(session_maker, reader, mutator)
+    reader.order = created
+    reader.existing_orders = [orders_page([listed])]
+
+    report = await _pay(session_maker, reader, mutator)
+
+    assert report.outcome == OUTCOME_PROVEN
+    assert mutator.calls == ["create", "pay"]
+    # The one payment addressed the ledger's order on the approved account.
+    snapshot = await ledger_module.load(session_maker)
+    assert mutator.pay_kwargs == [{"order_uuid": snapshot.target_order_uuid, "account_uuid": ACCOUNT_UUID}]
+    assert snapshot.status == ledger_module.STATUS_PAID
+
+
+@pytest.mark.asyncio
+async def test_a_pay_plan_over_the_production_shape_names_its_proof(session_maker) -> None:
+    """The report says HOW one was proven, not merely that it was."""
+    created = open_order(marker=MARKER, vouchers=[issued_voucher(code=ARTIFACT_SENTINEL)])
+    reader = FakeReader(order=created)
+    mutator = FakeMutator(reader, create_response=created)
+    await _create(session_maker, reader, mutator)
+    # The fake applies the effect a real API would; put the observed body back.
+    reader.order = created
+    reader.existing_orders = [orders_page([listed_order(marker=MARKER, created_at=utcnow().isoformat())])]
+
+    snapshot = await ledger_module.load(session_maker)
+    plan = await build_stage_plan(
+        reader,
+        stage=STAGE_PAY,
+        identity=IDENTITY,
+        enabled=True,
+        ledger_status=snapshot.status,
+        target_order_uuid=snapshot.target_order_uuid,
+        ledger_identity=snapshot.identity_fingerprints,
+        create_window_start=snapshot.create_window_start,
+        create_window_end=snapshot.create_window_end,
+    )
+
+    assert plan.ready is True
+    assert plan.snapshot["voucher_quantity_proof"] == QUANTITY_PROOF_SINGLETON
+    assert plan.snapshot["payable_order_proven"] is True
+    assert ARTIFACT_SENTINEL not in repr(plan.as_safe_dict())
+
+
+@pytest.mark.asyncio
+async def test_an_order_whose_count_is_unproven_never_reaches_the_mutator(session_maker) -> None:
+    """Two vouchers in the list is not one voucher, whatever else matches."""
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    reader.order = open_order(
+        marker=MARKER,
+        vouchers=[issued_voucher(code=ARTIFACT_SENTINEL), issued_voucher(code=ARTIFACT_SENTINEL + "b")],
+    )
+
+    report = await _pay(session_maker, reader, mutator)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert mutator.calls == ["create"]
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_CREATED
+
+
+@pytest.mark.asyncio
+async def test_an_exact_read_of_the_wrong_order_never_reaches_the_mutator(session_maker) -> None:
+    """The transport refuses it; the stage must then claim nothing."""
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    reader.order_error = EasyWeekProtocolError("order response identifies a different order", operation="get_order")
+
+    report = await _pay(session_maker, reader, mutator)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert mutator.calls == ["create"]
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == ledger_module.STATUS_CREATED
+    assert snapshot.stage_timestamps["pay_claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_target_order_outside_the_ledger_window_never_reaches_the_mutator(session_maker) -> None:
+    """An old order carrying the same marker is not the one we created.
+
+    The exact readback is held to the same bounded window as a listing row,
+    because a target can be reached from the ledger without passing the listing.
+    """
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    reader.order = open_order(marker=MARKER, created_at="2020-01-01T00:00:00+00:00")
+
+    report = await _pay(session_maker, reader, mutator)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert mutator.calls == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_the_create_request_still_states_an_exact_quantity(session_maker) -> None:
+    """What we ask for and what we can prove we received are different things."""
+    reader = FakeReader(order=open_order(marker=MARKER, vouchers=[issued_voucher(code=ARTIFACT_SENTINEL)]))
+    mutator = FakeMutator(reader)
+
+    await _create(session_maker, reader, mutator)
+
+    assert mutator.create_kwargs == [
+        {
+            "location_uuid": KARLSRUHE_LOCATION_UUID,
+            "customer_uuid": CUSTOMER_UUID,
+            "staffer_uuid": STAFFER_UUID,
+            "voucher_template_uuid": EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            "price_minor": 1500,
+            "marker": MARKER,
+        }
+    ]
 
 
 async def _paid(session_maker, reader: FakeReader, **mutator_kwargs: Any) -> FakeMutator:

@@ -19,7 +19,7 @@ owner, after merge and deployment, under a freshly approved plan digest.
 | Capability | Where |
 |---|---|
 | Reviewed GETs, including the POS reads used for reconciliation | the GET-only client |
-| `GET /orders?location_uuid&customer_uuid&staffer_uuid&page&per_page` | the GET-only client |
+| `GET /orders?location_uuid&customer_uuid&page&per_page` | the GET-only client |
 | `GET /locations/{uuid}/accounts` and `GET /locations/{uuid}/staffers` | the GET-only client |
 | `POST /orders/calculate` | the calculate-only client (§34 follow-up, untouched) |
 | `POST /orders`, `POST /orders/{uuid}/pay`, `POST /orders/{uuid}/refund` | the mutation client, and nowhere else |
@@ -93,9 +93,13 @@ What each one asserts:
   proven, exactly one marker order exists, it is still open, it is in the
   canary's own customer/template scope, and it is **exactly** the order §35
   authorises: one voucher line, the confirmed template, price 1500 as an
-  integer, quantity 1, no services or goods, and a published total that agrees.
-  A payment settles whatever the order contains, so "is this our order?" is not
-  the same question as "is this the order we approved?";
+  integer, its count proven (see below), no services or goods, and at least one
+  published total, every published total being exactly 1500 — read at the order
+  root AND inside `invoice`, with a present-but-unreadable `invoice` refused
+  rather than skipped. A payment settles
+  whatever the order contains, so "is this our order?" is not the same question
+  as "is this the order we approved?" — and a sum nobody could read is not a
+  small gap, it is the whole amount being unproven;
 * **refund** — the ledger is `paid` (or `refund_rejected`) and the target order
   reads as paid. The refund deliberately does **not** inspect the voucher
   contents: an unreadable artifact must never leave a real payment standing.
@@ -198,9 +202,26 @@ Reads only, and safe to repeat. For an unresolved create it walks this
 customer's orders in this branch completely and matches the exact marker inside
 the bounded window the ledger recorded.
 
-The branch, the customer and the staffer are proven by the documented request
-filters, not by fields in the response: the observed order body carries neither a
-top-level `location_uuid` nor a `staffer_uuid`. An unfamiliar voucher shape is
+The branch and the customer are proven by the request filters, not by fields in
+the response: the observed order body carries neither a top-level
+`location_uuid` nor a `staffer_uuid`.
+
+**The listing sends no `staffer_uuid`.** A production probe ran the same listing
+twice against a real, confirmed voucher order. With the staffer filter the
+completed walk did not contain it; without the staffer filter the completed walk
+did. That is the proven fact — why the provider behaves that way was not
+established and is not guessed at — and it is enough: a filter that hides the
+order we must find is not sent. The honest consequence is that this listing
+proves branch and customer scope and does **not** prove a remote staffer
+attribution. The staffer stays mandatory everywhere it IS provable: runtime
+identity, live Karlsruhe membership, the CREATE request, the identity
+fingerprint and the durable ledger binding, re-checked under the row lock.
+
+**The listing sends no date filter.** Passing the ledger window as
+`created_at_from`/`created_at_to` was answered 422, consistently — so that
+server-side date form is not used here, and the bounded create window is proven
+locally instead, against each row's own timezone-aware `created_at`. A missing,
+unparseable, naive or out-of-window timestamp means "not our order". An unfamiliar voucher shape is
 recorded as a contract observation and is never read as "this order belongs to
 somebody else".
 
@@ -263,6 +284,38 @@ takes no amount, and it does not need one: the sum is already fixed by the exact
 open order and its one voucher line. A real card is charged here.
 
 Stop and look at the report.
+
+### How "exactly one voucher" is proven
+
+Two proofs are accepted, and the report names which one was used in
+`voucher_quantity_proof`:
+
+| Label | What the body actually said |
+|---|---|
+| `explicit_quantity` | one voucher line, our template, `price` exactly 1500, and a `quantity` key holding exactly the integer 1 |
+| `singleton_issued_artifact` | `vouchers` is a list of exactly one object, it has no `quantity` key at all, and that object is an ISSUED voucher: a non-empty `code`, our template, `price` and `value` both exactly 1500 |
+| `unproven` | anything else — and the payment is refused |
+
+The second exists because the order production created carries no `quantity`
+field. Writing `quantity` in as 1 when it is missing would have unblocked that
+payment and every other one: an order for ten vouchers whose count arrives in a
+field we do not know about would look identical. What the body does prove is a
+count in a different place — the list holds one issued artifact, with one code —
+and that is a fact about the list rather than a guess about a missing key.
+
+A `quantity` that IS present decides by itself. `null`, `true`, `1.0`, `"1"`, 0
+and 2 all refuse, and none of them falls back to the singleton proof: the field
+was readable and it did not say one. `true` is called out because in Python
+`True == 1`, so a truthiness check would have accepted a boolean as a count.
+
+Either proof needs exactly one container. An order naming both `vouchers` and
+`voucher` is `unproven`, even when one of them is null: two containers is a body
+we do not understand, and reading whichever we looked at first would be choosing
+an answer rather than finding one. `vouchers: null` is likewise not the same as
+no `vouchers` key, and never falls back to the singular form.
+
+The CREATE request is unchanged: it still sends an exact integer `quantity: 1`.
+What we ask for and what we can prove we received are different things.
 
 ## 8. Reconcile after pay
 
@@ -371,7 +424,32 @@ exactly as they are.
 Revisiting any of them requires the actual production transcript of a successful
 canary, reviewed separately, in its own PR.
 
-## 15. Development boundary
+## 15. Where this canary stands, and the only next step
+
+A CREATE has already been performed once in production and proven. The durable
+ledger says `created`, it holds the target order UUID, and no payment has been
+attempted. This deployment fixes the two things that blocked the payment — the
+listing that could not find the order, and the voucher proof that demanded a
+`quantity` the order does not carry.
+
+Nothing about that row changes: no new migration, no new canary scope, no schema
+version bump, no repeated CREATE. The old failed plan digest is spent and is not
+reused.
+
+After deployment, in this order and no other:
+
+1. `status` — database only, to confirm the ledger still reads `created` and
+   still names the target;
+2. `plan --stage pay` — read-only, producing a **fresh** digest, `plan_issued_at`
+   and confirmation phrase;
+3. the owner approves that exact digest, separately and explicitly;
+4. one `pay --apply` with those fresh values, and then a stop;
+5. if the result is UNKNOWN: `reconcile` only, repeatedly. The payment is never
+   re-sent;
+6. once the payment is proven: a separate `plan --stage refund`, a separate
+   approval, and then the refund.
+
+## 16. Development boundary
 
 Do not run production commands, SSH, authenticated probes, a real create, a real
 pay or a real refund while developing or reviewing this work, and do not edit

@@ -11,7 +11,12 @@ from typing import Any
 
 import pytest
 
-from altegio_bot.easyweek_client import EasyWeekAuthError, EasyWeekNotFoundError, EasyWeekRetryableError
+from altegio_bot.easyweek_client import (
+    EasyWeekAuthError,
+    EasyWeekNotFoundError,
+    EasyWeekPermanentError,
+    EasyWeekRetryableError,
+)
 from altegio_bot.easyweek_voucher_canary import plan as plan_module
 from altegio_bot.easyweek_voucher_canary.artifact import (
     ARTIFACT_EMPTY_COLLECTION,
@@ -24,6 +29,7 @@ from altegio_bot.easyweek_voucher_canary.orders import (
     CANARY_VOUCHER_LINE_UNPROVEN,
     ORDER_OPEN,
     ORDER_PAID,
+    find_marker_orders,
     matches_canary_order,
     page_meta,
     payable_order_reasons,
@@ -122,7 +128,7 @@ class FakeReader:
         order_pages: list[dict[str, Any]] | None = None,
         order: Any = None,
         raise_on: Exception | None = None,
-        scope: tuple[str, str] = (CUSTOMER_UUID, STAFFER_UUID),
+        scope: str = CUSTOMER_UUID,
     ) -> None:
         self.workspace = WORKSPACE if workspace is None else workspace
         self.locations = LOCATIONS if locations is None else locations
@@ -134,9 +140,9 @@ class FakeReader:
         self.order_pages = order_pages if order_pages is not None else [orders_page([])]
         self.order = order
         self.raise_on = raise_on
-        # The customer and staffer the order listing is expected to be scoped
-        # to. The documented endpoint takes both as filters, and the observed
-        # body echoes neither, so the REQUEST is where that scope is proven.
+        # The customer the order listing is expected to be scoped to. The
+        # observed body echoes neither a location nor a staffer, so the REQUEST
+        # is where branch and customer scope are proven.
         self.scope = scope
         self.calls: list[str] = []
 
@@ -170,17 +176,18 @@ class FakeReader:
         self.calls.append("list_accounts")
         return self.accounts
 
-    async def list_location_orders(
+    async def list_location_customer_orders(
         self,
         *,
         location_uuid: str,
         customer_uuid: str,
-        staffer_uuid: str,
         page: int,
         per_page: int = 100,
     ) -> dict[str, Any]:
         assert location_uuid == KARLSRUHE_LOCATION_UUID
-        assert (customer_uuid, staffer_uuid) == self.scope
+        # The listing is scoped by branch and customer only. No staffer filter,
+        # because production proved it hides the order we created.
+        assert customer_uuid == self.scope
         self.calls.append(f"list_orders:{page}")
         index = page - 1
         return self.order_pages[index] if index < len(self.order_pages) else orders_page([])
@@ -537,6 +544,115 @@ def test_a_row_that_names_no_customer_is_matched_on_marker_and_window() -> None:
     assert _matches(row) is True
 
 
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        # Naive: no timezone, so "inside the window" is not a question we can
+        # answer — and the window is what separates our order from an older one
+        # carrying the same marker.
+        "2026-09-11T10:00:00",
+        "not-a-timestamp",
+        "",
+        None,
+        17,
+        [],
+    ],
+)
+def test_a_timestamp_we_cannot_place_in_the_window_never_matches(created_at) -> None:
+    """The window is proven here, because the server would not filter by it.
+
+    Passing the ledger window as `created_at_from`/`created_at_to` was answered
+    422 in production, so every row is placed locally or not at all.
+    """
+    row = listed_order(marker=MARKER, created_at=created_at)
+    assert _matches(row) is False
+
+
+def test_a_row_just_before_and_just_after_the_window_never_matches() -> None:
+    now = utcnow()
+    inside = listed_order(marker=MARKER, created_at=now.isoformat())
+    before = listed_order(marker=MARKER, created_at=(now - timedelta(days=3)).isoformat())
+    after = listed_order(marker=MARKER, created_at=(now + timedelta(days=3)).isoformat())
+
+    assert _matches(inside) is True
+    assert _matches(before) is False
+    assert _matches(after) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uuid_value",
+    [None, "", "not-a-uuid", 17, ORDER_UUID.upper(), f"{{{ORDER_UUID}}}", f" {ORDER_UUID} "],
+)
+async def test_a_row_without_a_canonical_uuid_is_not_a_usable_candidate(uuid_value) -> None:
+    """Matching on marker and window is not enough to ACT on a row.
+
+    The ledger, the payment and the refund all address the order by that exact
+    string, so a row we cannot address is not a candidate — and pretending it is
+    would put an unusable identifier into the durable record.
+    """
+    row = listed_order(marker=MARKER, created_at=utcnow().isoformat())
+    row["uuid"] = uuid_value
+    reader = FakeReader(order_pages=[orders_page([row])])
+    now = utcnow()
+
+    match = await find_marker_orders(
+        reader,
+        location_uuid=KARLSRUHE_LOCATION_UUID,
+        customer_uuid=CUSTOMER_UUID,
+        marker=MARKER,
+        window_start=now - timedelta(days=2),
+        window_end=now + timedelta(days=2),
+    )
+
+    assert match.count == 0
+    assert match.resolved is False
+
+
+@pytest.mark.asyncio
+async def test_the_listing_walk_sends_no_staffer_and_no_date_filter() -> None:
+    """The fix, at the transport boundary the canary actually calls."""
+    seen: list[dict[str, Any]] = []
+
+    class Recording(FakeReader):
+        async def list_location_customer_orders(self, **kwargs: Any) -> dict[str, Any]:
+            seen.append(kwargs)
+            return orders_page([])
+
+    now = utcnow()
+    await find_marker_orders(
+        Recording(),
+        location_uuid=KARLSRUHE_LOCATION_UUID,
+        customer_uuid=CUSTOMER_UUID,
+        marker=MARKER,
+        window_start=now - timedelta(days=2),
+        window_end=now + timedelta(days=2),
+    )
+
+    assert seen == [{"location_uuid": KARLSRUHE_LOCATION_UUID, "customer_uuid": CUSTOMER_UUID, "page": 1}]
+
+
+@pytest.mark.asyncio
+async def test_a_listing_that_errors_stops_the_plan_before_any_claim() -> None:
+    """A 422 is not "no orders". It is "we do not know"."""
+
+    class Refusing(FakeReader):
+        async def list_location_customer_orders(self, **kwargs: Any) -> dict[str, Any]:
+            raise EasyWeekPermanentError("rejected", operation="list", status_code=422)
+
+    plan = await build_stage_plan(
+        Refusing(order=open_order(marker=MARKER)),
+        stage=STAGE_PAY,
+        identity=IDENTITY,
+        enabled=True,
+        ledger_status="created",
+        target_order_uuid=ORDER_UUID,
+    )
+
+    assert plan.ready is False
+    assert CANARY_API_UNAVAILABLE in plan.reasons
+
+
 # ---------------------------------------------------------------------------
 # The create stage plan
 # ---------------------------------------------------------------------------
@@ -615,7 +731,7 @@ async def test_an_existing_marker_order_blocks_a_create_plan() -> None:
 @pytest.mark.asyncio
 async def test_an_incomplete_order_walk_blocks_a_create_plan() -> None:
     class Endless(FakeReader):
-        async def list_location_orders(self, **kwargs: Any) -> dict[str, Any]:
+        async def list_location_customer_orders(self, **kwargs: Any) -> dict[str, Any]:
             return {"data": [listed_order(marker="unrelated")]}
 
     plan = await build_stage_plan(Endless(), stage=STAGE_CREATE, identity=IDENTITY, enabled=True, ledger_status=None)
@@ -752,10 +868,241 @@ def test_the_authorised_order_produces_no_payment_objection() -> None:
     )
 
 
-def test_a_total_the_body_does_not_publish_is_not_invented() -> None:
-    """Absence is not a mismatch: not every read carries an invoice."""
+def test_an_order_that_publishes_no_total_at_all_is_not_payable() -> None:
+    """A payment settles the ORDER, so an unreadable sum is the whole amount.
+
+    Absence looked harmless while the voucher line carried the price. It is
+    not: the line is what we asked for, and the total is what will be charged.
+    An approval for fifteen euros must not be sent at a figure nobody read.
+    """
     order = open_order(marker=MARKER)
     del order["invoice"]
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_a_top_level_subtotal_is_a_published_total() -> None:
+    """The production body carries `subtotal` beside the order, not an invoice."""
+    order = open_order(marker=MARKER)
+    del order["invoice"]
+    order["subtotal"] = SUPPORTED_VOUCHER_PRICE_MINOR
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+def test_two_totals_that_disagree_block_the_payment() -> None:
+    """We would not know which of them the payment settles."""
+    order = open_order(marker=MARKER, invoice={"total": 1500, "subtotal": 1600, "amount_due": 1500})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Totals live at two levels, and BOTH of them are checked
+# ---------------------------------------------------------------------------
+
+
+def _totals_order(**changes: Any) -> dict[str, Any]:
+    """An otherwise payable order whose published sums are under test."""
+    order = open_order(marker=MARKER)
+    del order["invoice"]
+    order.update(changes)
+    return order
+
+
+def test_a_wrong_top_level_total_is_not_hidden_by_a_correct_invoice() -> None:
+    """The review finding: an `invoice` used to switch the root level off.
+
+    A body publishing `subtotal: 9999` beside `invoice.total: 1500` passed,
+    because the check looked at the invoice *instead of* the order rather than
+    at both. Whichever of the two the provider actually settles, one of them is
+    not fifteen euros, and that is enough to refuse.
+    """
+    order = _totals_order(subtotal=9999, invoice={"total": SUPPORTED_VOUCHER_PRICE_MINOR})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_a_wrong_invoice_total_is_not_hidden_by_a_correct_root_total() -> None:
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice={"total": 9999})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_the_same_nominal_published_at_both_levels_is_accepted() -> None:
+    """Agreeing is not duplication to be refused; it is two proofs of one sum."""
+    order = _totals_order(
+        subtotal=SUPPORTED_VOUCHER_PRICE_MINOR,
+        total=SUPPORTED_VOUCHER_PRICE_MINOR,
+        invoice={
+            "total": SUPPORTED_VOUCHER_PRICE_MINOR,
+            "subtotal": SUPPORTED_VOUCHER_PRICE_MINOR,
+            "amount_due": SUPPORTED_VOUCHER_PRICE_MINOR,
+        },
+    )
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+def test_only_the_production_top_level_subtotal_is_enough() -> None:
+    """The body the canary actually has to pay for carries no invoice at all."""
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR)
+
+    assert "invoice" not in order
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("invoice", [None, "1500", [1500], 1500, True])
+def test_an_invoice_that_is_not_an_object_fails_closed(invoice) -> None:
+    """A container we cannot read is not a container we may ignore.
+
+    Falling back to the root level here would mean a malformed invoice makes
+    the order *easier* to pay for than a well-formed one.
+    """
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice=invoice)
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_an_empty_invoice_object_alongside_a_root_total_is_accepted() -> None:
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice={})
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("bad", [None, True, False, 1500.0, "1500", 1499, 0, [1500]])
+@pytest.mark.parametrize("level", ["root", "invoice"])
+@pytest.mark.parametrize("key", ["total", "subtotal", "amount_due"])
+def test_a_total_of_the_wrong_type_or_value_blocks_at_either_level(bad, level, key) -> None:
+    """Exact integers only: no coercion, no rounding, no truthiness.
+
+    `True` matters here — in Python `True == 1`, so an equality check alone
+    would read a boolean as a sum.
+    """
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR)
+    if level == "root":
+        order[key] = bad
+    else:
+        order["invoice"] = {key: bad}
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_no_total_anywhere_blocks() -> None:
+    order = _totals_order()
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+@pytest.mark.parametrize("key", ["amount_paid", "account_paid_amount"])
+def test_a_settled_amount_is_never_read_as_the_payable_sum(key) -> None:
+    """What was paid is not what is owed, and only one of them may authorise."""
+    order = _totals_order(**{key: SUPPORTED_VOUCHER_PRICE_MINOR})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pay_plan_over_conflicting_totals_is_not_ready() -> None:
+    plan = await _pay_plan(
+        order=open_order(
+            marker=MARKER,
+            subtotal=9999,
+            invoice={"total": SUPPORTED_VOUCHER_PRICE_MINOR},
+        )
+    )
+
+    assert plan.ready is False
+    assert CANARY_ORDER_TOTAL_UNPROVEN in plan.reasons
+    assert plan.snapshot["payable_order_proven"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_pay_plan_over_a_malformed_invoice_is_not_ready() -> None:
+    plan = await _pay_plan(order=open_order(marker=MARKER, subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice=None))
+
+    assert plan.ready is False
+    assert CANARY_ORDER_TOTAL_UNPROVEN in plan.reasons
+
+
+@pytest.mark.parametrize("key", ["services", "goods", "products", "items"])
+@pytest.mark.parametrize("value", [[{"uuid": OTHER_UUID}], {"a": 1}, "none", 0, None])
+def test_any_other_line_collection_that_is_not_proven_empty_blocks(key, value) -> None:
+    """Present and empty is a proven "none of these". Present and anything else
+    is a shape we cannot price."""
+    order = open_order(marker=MARKER)
+    order[key] = value
+
+    assert CANARY_ORDER_EXTRA_ITEMS in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+@pytest.mark.parametrize("empty", [[], {}])
+def test_a_proven_empty_collection_does_not_block(empty) -> None:
+    order = open_order(marker=MARKER, services=empty, goods=empty)
 
     assert (
         payable_order_reasons(
@@ -1026,7 +1373,7 @@ async def test_another_real_account_of_the_same_branch_gives_no_ready_pay_plan()
 async def test_another_customer_gives_no_ready_pay_plan() -> None:
     plan = await _pay_plan(
         identity=OTHER_CUSTOMER_IDENTITY,
-        scope=(OTHER_UUID, STAFFER_UUID),
+        scope=OTHER_UUID,
         customer={**CUSTOMER, "uuid": OTHER_UUID},
         ledger_identity=_stored(IDENTITY),
     )
@@ -1039,7 +1386,6 @@ async def test_another_customer_gives_no_ready_pay_plan() -> None:
 async def test_another_staffer_gives_no_ready_pay_plan() -> None:
     plan = await _pay_plan(
         identity=OTHER_STAFFER_IDENTITY,
-        scope=(CUSTOMER_UUID, OTHER_UUID),
         staffers={"data": [{"uuid": OTHER_UUID}], "meta": {"current_page": 1, "last_page": 1, "per_page": 100}},
         ledger_identity=_stored(IDENTITY),
     )

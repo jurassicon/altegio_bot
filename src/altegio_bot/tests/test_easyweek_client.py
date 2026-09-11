@@ -1457,6 +1457,7 @@ _POS_LOCATION = "8395fab6-7ee8-4702-88d9-fd78f92539c1"
 _POS_CUSTOMER = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
 _POS_STAFFER = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
 _POS_ORDER = "dddddddd-4444-4444-8444-dddddddddddd"
+_OTHER_ORDER = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
 
 
 @pytest.mark.asyncio
@@ -1518,7 +1519,14 @@ async def test_the_workspace_wide_accounts_and_staffers_filters_are_gone() -> No
 
 
 @pytest.mark.asyncio
-async def test_orders_require_all_three_documented_filters() -> None:
+async def test_the_order_listing_sends_exactly_four_parameters() -> None:
+    """Branch and customer scope the listing. Nothing else is sent.
+
+    A production probe ran this listing twice against a real, confirmed voucher
+    order. With `staffer_uuid` added, the completed walk did not contain it;
+    without it, the completed walk did. So the filter is not merely unnecessary
+    here — sending it hides the order the canary has to find.
+    """
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1526,10 +1534,9 @@ async def test_orders_require_all_three_documented_filters() -> None:
         return httpx.Response(200, json={"data": [], "meta": {"last_page": 1}})
 
     async with _client(handler) as client:
-        await client.list_location_orders(
+        await client.list_location_customer_orders(
             location_uuid=_POS_LOCATION,
             customer_uuid=_POS_CUSTOMER,
-            staffer_uuid=_POS_STAFFER,
             page=1,
         )
 
@@ -1537,14 +1544,40 @@ async def test_orders_require_all_three_documented_filters() -> None:
     assert dict(seen[0].url.params) == {
         "location_uuid": _POS_LOCATION,
         "customer_uuid": _POS_CUSTOMER,
-        "staffer_uuid": _POS_STAFFER,
         "page": "1",
         "per_page": "100",
     }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["location_uuid", "customer_uuid", "staffer_uuid"])
+@pytest.mark.parametrize(
+    "field",
+    ["staffer_uuid", "created_at_from", "created_at_to", "status", "per_page_override", "params"],
+)
+async def test_the_order_listing_accepts_no_further_filter(field) -> None:
+    """Not "does not send it" — cannot be asked to.
+
+    `created_at_from`/`created_at_to` built from the ledger window were answered
+    422 in production, so the bounded window is proven locally instead. Neither
+    those nor any other filter has a parameter here: there is no params mapping
+    and no keyword passthrough to smuggle one through.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the request must be refused before the wire")
+
+    async with _client(handler) as client:
+        with pytest.raises(TypeError):
+            await client.list_location_customer_orders(
+                location_uuid=_POS_LOCATION,
+                customer_uuid=_POS_CUSTOMER,
+                page=1,
+                **{field: "anything"},  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["location_uuid", "customer_uuid"])
 async def test_a_noncanonical_order_filter_never_reaches_the_wire(field) -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         raise AssertionError("the request must be refused before the wire")
@@ -1552,14 +1585,68 @@ async def test_a_noncanonical_order_filter_never_reaches_the_wire(field) -> None
     kwargs: dict[str, Any] = {
         "location_uuid": _POS_LOCATION,
         "customer_uuid": _POS_CUSTOMER,
-        "staffer_uuid": _POS_STAFFER,
         "page": 1,
     }
     kwargs[field] = "not-a-uuid"
 
     async with _client(handler) as client:
         with pytest.raises(EasyWeekPermanentError):
-            await client.list_location_orders(**kwargs)
+            await client.list_location_customer_orders(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", [True, False, 0, -1, 1.0, "1", None])
+async def test_an_order_listing_page_must_be_an_exact_positive_int(page) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the request must be refused before the wire")
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_location_customer_orders(
+                location_uuid=_POS_LOCATION,
+                customer_uuid=_POS_CUSTOMER,
+                page=page,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("per_page", [50, 101, True, 100.0, "100"])
+async def test_an_order_listing_page_size_is_the_fixed_one(per_page) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the request must be refused before the wire")
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_location_customer_orders(
+                location_uuid=_POS_LOCATION,
+                customer_uuid=_POS_CUSTOMER,
+                page=1,
+                per_page=per_page,
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_order_listing_returns_its_pagination_envelope_intact() -> None:
+    """The caller proves a complete walk from this metadata."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"uuid": _POS_ORDER}],
+                "meta": {"current_page": 2, "last_page": 3, "per_page": 100, "total": 5},
+            },
+        )
+
+    async with _client(handler) as client:
+        payload = await client.list_location_customer_orders(
+            location_uuid=_POS_LOCATION,
+            customer_uuid=_POS_CUSTOMER,
+            page=2,
+        )
+
+    assert payload["meta"] == {"current_page": 2, "last_page": 3, "per_page": 100, "total": 5}
+    assert payload["data"] == [{"uuid": _POS_ORDER}]
 
 
 @pytest.mark.asyncio
@@ -1579,6 +1666,54 @@ async def test_one_exact_order_uses_the_documented_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_exact_order_read_proves_it_got_the_order_it_asked_for() -> None:
+    """Both shapes: a bare body and a `data` envelope."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"uuid": _POS_ORDER, "status": "open"}})
+
+    async with _client(handler) as client:
+        assert (await client.get_order(_POS_ORDER))["uuid"] == _POS_ORDER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": "open"},
+        {"uuid": None, "status": "open"},
+        {"uuid": "", "status": "open"},
+        {"uuid": 17, "status": "open"},
+        {"uuid": "not-a-uuid", "status": "open"},
+        {"uuid": _POS_ORDER.upper(), "status": "open"},
+        {"uuid": f"{{{_POS_ORDER}}}", "status": "open"},
+        {"uuid": _OTHER_ORDER, "status": "open"},
+    ],
+)
+async def test_an_order_body_that_is_not_the_one_requested_is_refused(body) -> None:
+    """Everything downstream reads whatever body came back.
+
+    The marker, the customer, the open state and the voucher line are all proven
+    against the response — so a body for a different order would have every one
+    of those proofs answer about somebody else's order, while the ledger, the
+    claim and the payment still name ours.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekProtocolError) as excinfo:
+            await client.get_order(_POS_ORDER)
+
+    # A transport error message reaches logs; neither UUID may be in it.
+    message = str(excinfo.value)
+    assert _POS_ORDER not in message
+    assert _OTHER_ORDER not in message
+    assert str(body.get("uuid", "")) not in message or not body.get("uuid")
+
+
+@pytest.mark.asyncio
 async def test_the_pos_reads_are_still_gets_only() -> None:
     methods: list[str] = []
 
@@ -1588,10 +1723,9 @@ async def test_the_pos_reads_are_still_gets_only() -> None:
 
     async with _client(handler) as client:
         await client.list_location_staffers(_POS_LOCATION, page=1)
-        await client.list_location_orders(
+        await client.list_location_customer_orders(
             location_uuid=_POS_LOCATION,
             customer_uuid=_POS_CUSTOMER,
-            staffer_uuid=_POS_STAFFER,
             page=1,
         )
 

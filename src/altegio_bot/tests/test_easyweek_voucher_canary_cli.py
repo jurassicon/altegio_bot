@@ -98,7 +98,15 @@ class Recorder:
         if path == f"/locations/{KARLSRUHE_LOCATION_UUID}/accounts":
             return httpx.Response(200, json=ACCOUNTS)
         if path == "/orders":
-            assert request.url.params.get("staffer_uuid") == STAFFER_UUID
+            # Branch and customer scope the listing, and nothing else is sent:
+            # production proved the staffer filter hides the created order, and
+            # the date filters were answered 422.
+            assert dict(request.url.params) == {
+                "location_uuid": KARLSRUHE_LOCATION_UUID,
+                "customer_uuid": CUSTOMER_UUID,
+                "page": request.url.params.get("page"),
+                "per_page": "100",
+            }
             return httpx.Response(200, json=self.orders_page)
         if path == f"/orders/{ORDER_UUID}":
             return httpx.Response(200, json=self.order or open_order(marker="x"))

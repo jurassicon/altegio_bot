@@ -13,7 +13,7 @@ operations and no generic request escape hatch::
     GET /workspace
     GET /voucher-templates
     GET /voucher-templates/{voucher_template_uuid}
-    GET /orders?location_uuid&customer_uuid&staffer_uuid&page&per_page=100
+    GET /orders?location_uuid&customer_uuid&page&per_page=100
     GET /orders/{order_uuid}
     GET /locations/{location_uuid}/accounts
     GET /locations/{location_uuid}/staffers?page&per_page=100
@@ -777,49 +777,64 @@ class EasyWeekClient:
     # arbitrary endpoint. Everything they return is handed to a caller that
     # projects safe facts out of it; this client still never logs a body.
 
-    async def list_location_orders(
+    async def list_location_customer_orders(
         self,
         *,
         location_uuid: str,
         customer_uuid: str,
-        staffer_uuid: str,
         page: int,
         per_page: int = POS_PER_PAGE,
     ) -> dict[str, Any]:
-        """``GET /orders`` — one page, scoped by the documented required filters.
+        """``GET /orders`` — one page, scoped to one branch and one customer.
 
-        All three UUIDs are mandatory and validated before the wire. That is not
-        defensiveness: the documented endpoint takes ``location_uuid``,
-        ``customer_uuid`` and ``staffer_uuid`` as its filters, and the observed
-        order body does NOT echo a location or a staffer back. So the request is
-        where that scope is proven — a caller cannot re-derive it from the
-        response, and an unscoped walk would page through other customers'
-        orders.
+        Exactly four query parameters leave this method: ``location_uuid``,
+        ``customer_uuid``, ``page`` and the fixed ``per_page``. There is no way
+        to add a fifth: no params mapping, no keyword passthrough, no caller
+        URL.
+
+        **No ``staffer_uuid``.** A production probe on 11.09.2026 ran the same
+        listing twice against a real, confirmed-existing voucher order. With
+        ``location_uuid`` + ``customer_uuid`` + ``staffer_uuid`` the walk
+        completed and returned one unrelated row: the target was not in it. With
+        ``location_uuid`` + ``customer_uuid`` alone the walk completed and
+        returned the target, matching on marker, customer and the local window.
+        Why the provider excludes it is not something the probe established, and
+        nothing here guesses — what was proven is that adding the filter hides
+        the order this canary must find, so the canary does not send it.
+
+        The consequence is stated rather than hidden: this listing proves the
+        branch and the customer, and it does **not** prove a remote staffer
+        attribution. The staffer is still mandatory everywhere it is actually
+        provable — runtime identity, live Karlsruhe membership, the CREATE
+        request, the identity fingerprint and the durable ledger binding.
+
+        **No server-side date filters.** Two probe calls passing
+        ``created_at_from``/``created_at_to`` built from the ledger window with
+        ``datetime.isoformat()`` were answered 422, consistently. That proves
+        this date form is unusable here, and nothing more general — so the
+        bounded create window is checked locally, against each row's own
+        timezone-aware ``created_at``.
 
         Pagination completeness is the caller's contract, not this method's — it
         returns one page verbatim, ``meta`` included, so the reconciler can prove
         it walked all of them rather than guessing from an empty page.
         """
         canonical_location = _canonical_resource_uuid(
-            location_uuid, operation="list_location_orders", label="location_uuid"
+            location_uuid, operation="list_location_customer_orders", label="location_uuid"
         )
-        canonical_customer = _canonical_customer_uuid(customer_uuid, operation="list_location_orders")
-        canonical_staffer = _canonical_resource_uuid(
-            staffer_uuid, operation="list_location_orders", label="staffer_uuid"
-        )
-        exact_page = _positive_page(page, operation="list_location_orders")
+        canonical_customer = _canonical_customer_uuid(customer_uuid, operation="list_location_customer_orders")
+        exact_page = _positive_page(page, operation="list_location_customer_orders")
         if type(per_page) is not int or per_page != POS_PER_PAGE:
             raise EasyWeekPermanentError(
                 "per_page must equal the fixed POS page size",
-                operation="list_location_orders",
+                operation="list_location_customer_orders",
             )
         payload = await self._get_json(
             _PATH_ORDERS,
-            operation="list_location_orders",
+            operation="list_location_customer_orders",
             params={
                 "location_uuid": canonical_location,
                 "customer_uuid": canonical_customer,
-                "staffer_uuid": canonical_staffer,
                 "page": exact_page,
                 "per_page": per_page,
             },
@@ -827,7 +842,7 @@ class EasyWeekClient:
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError(
                 "orders response is not a JSON object",
-                operation="list_location_orders",
+                operation="list_location_customer_orders",
             )
         return payload
 
@@ -835,8 +850,17 @@ class EasyWeekClient:
         """``GET /orders/{uuid}`` for one exact POS order.
 
         The response may carry customer PII and, after a voucher sale, whatever
-        an issued voucher looks like. Nothing is interpreted here: the caller
-        projects safe facts, and this client never logs the body.
+        an issued voucher looks like. Nothing is interpreted here beyond one
+        thing: the body has to be the order that was asked for.
+
+        That check belongs at the transport, not at the caller. Every later
+        proof — the marker, the customer, the open state, the voucher line —
+        reads whatever body came back, so a body for a different order would
+        have all of those proofs answer about somebody else's order while the
+        ledger, the claim and the payment still name ours.
+
+        The refusal carries neither the requested nor the observed UUID: it is a
+        transport error whose message ends up in logs.
         """
         canonical = _canonical_resource_uuid(order_uuid, operation="get_order", label="order_uuid")
         payload = await self._get_json(_PATH_ORDERS, canonical, operation="get_order")
@@ -847,6 +871,20 @@ class EasyWeekClient:
             payload = inner
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError("order response is not a JSON object", operation="get_order")
+
+        body_uuid = payload.get("uuid")
+        if not isinstance(body_uuid, str) or not body_uuid:
+            raise EasyWeekProtocolError("order response carries no uuid", operation="get_order")
+        try:
+            body_canonical = str(uuid_module.UUID(body_uuid))
+        except (ValueError, AttributeError, TypeError):
+            raise EasyWeekProtocolError("order response uuid is not a uuid", operation="get_order") from None
+        if body_canonical != body_uuid:
+            # An upper-case or otherwise non-canonical spelling is not this
+            # order proven; it is a body we cannot compare reliably.
+            raise EasyWeekProtocolError("order response uuid is not canonical", operation="get_order")
+        if body_canonical != canonical:
+            raise EasyWeekProtocolError("order response identifies a different order", operation="get_order")
         return payload
 
     async def list_location_accounts(self, location_uuid: str) -> Any:

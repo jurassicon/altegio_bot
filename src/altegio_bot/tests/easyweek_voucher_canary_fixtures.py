@@ -21,6 +21,7 @@ from altegio_bot.easyweek_voucher_identity import (
     KARLSRUHE_LOCATION_UUID,
     SUPPORTED_VOUCHER_PRICE_MINOR,
 )
+from altegio_bot.utils import utcnow
 
 # Synthetic runtime identities. Version-4 shaped and unmistakably fake.
 CUSTOMER_UUID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
@@ -60,7 +61,17 @@ STAFFERS: dict[str, Any] = {
 }
 ACCOUNTS: list[dict[str, Any]] = [{"uuid": ACCOUNT_UUID, "name": "Synthetic Card"}]
 
-CREATED_AT = "2026-09-11T10:00:00+00:00"
+
+def created_now() -> str:
+    """A timezone-aware `created_at` inside the canary's bounded window.
+
+    Deliberately relative to the run, not a frozen literal: the window is
+    checked locally against the real clock — the provider answered 422 to the
+    server-side date filters — so a fixture pinned to a past instant would fall
+    outside it and test a rejection instead of the path it means to test. Tests
+    that need a specific instant pass `created_at=` explicitly.
+    """
+    return utcnow().isoformat()
 
 
 def orders_page(rows: list[dict[str, Any]], *, page: int = 1, last_page: int = 1) -> dict[str, Any]:
@@ -72,10 +83,31 @@ def orders_page(rows: list[dict[str, Any]], *, page: int = 1, last_page: int = 1
 
 
 def voucher_line(**changes: Any) -> dict[str, Any]:
+    """A line that states its own quantity explicitly."""
     return {
         "voucher_template_uuid": EASYWEEK_VOUCHER_TEMPLATE_UUID,
         "price": SUPPORTED_VOUCHER_PRICE_MINOR,
         "quantity": 1,
+        **changes,
+    }
+
+
+def issued_voucher(*, code: str, **changes: Any) -> dict[str, Any]:
+    """One ISSUED voucher, in the shape the created order really returned.
+
+    No ``quantity`` key — that is the point. The production smoke test showed
+    this element carrying ``code``, ``voucher_template_uuid``, ``value`` and
+    ``price`` and nothing resembling a count, so the count has to come from the
+    cardinality of the list rather than from a default nobody was told.
+
+    The code is a synthetic sentinel: no production artifact value belongs in
+    this repository.
+    """
+    return {
+        "code": code,
+        "voucher_template_uuid": EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        "value": SUPPORTED_VOUCHER_PRICE_MINOR,
+        "price": SUPPORTED_VOUCHER_PRICE_MINOR,
         **changes,
     }
 
@@ -93,7 +125,7 @@ def open_order(*, marker: str, **changes: Any) -> dict[str, Any]:
         "status": "open",
         "is_paid": False,
         "is_reverted": False,
-        "created_at": CREATED_AT,
+        "created_at": created_now(),
         "comment": marker,
         "customer": {"uuid": CUSTOMER_UUID, "first_name": "Synthetic", "last_name": "Fixture"},
         "vouchers": [voucher_line()],
@@ -109,7 +141,7 @@ def listed_order(*, marker: str, **changes: Any) -> dict[str, Any]:
         "uuid": ORDER_UUID,
         "status": "open",
         "is_reverted": False,
-        "created_at": CREATED_AT,
+        "created_at": created_now(),
         "comment": marker,
         "customer": {"uuid": CUSTOMER_UUID},
         "vouchers": [voucher_line()],

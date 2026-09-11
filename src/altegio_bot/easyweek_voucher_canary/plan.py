@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final, Protocol
@@ -75,12 +74,14 @@ from altegio_bot.easyweek_voucher_canary.orders import (
     ORDER_MALFORMED,
     ORDER_OPEN,
     ORDER_PAID,
+    canonical_uuid,
     classify_order,
     find_marker_orders,
     order_object,
     payable_order_reasons,
     rows,
     walk_pages,
+    within_window,
 )
 from altegio_bot.easyweek_voucher_identity import (
     EASYWEEK_VOUCHER_TEMPLATE_UUID,
@@ -193,12 +194,11 @@ class CanaryReader(Protocol):
 
     async def list_location_accounts(self, location_uuid: str) -> Any: ...
 
-    async def list_location_orders(
+    async def list_location_customer_orders(
         self,
         *,
         location_uuid: str,
         customer_uuid: str,
-        staffer_uuid: str,
         page: int,
         per_page: int = ...,
     ) -> dict[str, Any]: ...
@@ -251,19 +251,15 @@ class RuntimeIdentity:
         }
 
 
-def _canonical_uuid(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        canonical = str(uuid_module.UUID(value))
-    except (ValueError, AttributeError, TypeError):
-        return None
-    return canonical if canonical == value else None
-
-
 def canonical_order_uuid(value: object) -> str | None:
-    """A canonical lowercase order UUID, or ``None``. Never echoes the input."""
-    return _canonical_uuid(value)
+    """A canonical lowercase order UUID, or ``None``. Never echoes the input.
+
+    One implementation, shared with the listing matcher in ``orders``: two
+    spellings of "canonical" could disagree about the same identifier, and every
+    comparison downstream — ledger target, listing match, exact readback — is a
+    string comparison.
+    """
+    return canonical_uuid(value)
 
 
 def resolve_runtime_identity(
@@ -284,7 +280,7 @@ def resolve_runtime_identity(
         if not isinstance(raw, str) or not raw.strip():
             reasons.append(CANARY_RUNTIME_IDENTITY_MISSING)
             continue
-        canonical = _canonical_uuid(raw.strip())
+        canonical = canonical_uuid(raw.strip())
         if canonical is None:
             reasons.append(CANARY_RUNTIME_IDENTITY_INVALID)
             continue
@@ -757,7 +753,6 @@ async def _stage_preconditions(
             reader,
             location_uuid=KARLSRUHE_LOCATION_UUID,
             customer_uuid=identity.customer_uuid,
-            staffer_uuid=identity.staffer_uuid,
             marker=marker,
             window_start=window_start,
             window_end=window_end,
@@ -791,6 +786,9 @@ async def _stage_preconditions(
     observations.append(observation.as_safe_dict())
     facts["order_customer_binding_proven"] = observation.order_customer_binding_proven
     facts["voucher_line_proven"] = observation.voucher_line_proven
+    # The label travels into the stage snapshot, so the digest an owner approves
+    # names WHICH proof of "one voucher" this plan was built on.
+    facts["voucher_quantity_proof"] = observation.voucher_quantity_proof
     facts["individual_voucher_artifact_observed"] = observation.individual_voucher_artifact_observed
 
     if order.get("comment") != marker:
@@ -803,6 +801,14 @@ async def _stage_preconditions(
             reasons.append(CANARY_CUSTOMER_UNPROVEN)
         if state != ORDER_OPEN:
             reasons.append(CANARY_TARGET_ORDER_NOT_OPEN)
+        # The exact readback is held to the same bounded window as a listing
+        # row. The window is the only thing separating the order this canary
+        # created from an older order that happens to carry the same marker,
+        # and the listing is no longer the only way a target can be reached.
+        window_start = create_window_start or (utcnow() - CREATE_WINDOW_BEFORE)
+        window_end = create_window_end or (utcnow() + CREATE_WINDOW_AFTER)
+        if not within_window(order, start=window_start, end=window_end):
+            reasons.append(CANARY_TARGET_ORDER_UNPROVEN)
         # A payment settles whatever the order happens to contain, so the order
         # itself is the amount. Before one euro moves, this has to be EXACTLY
         # the order §35 authorises: one voucher line, the confirmed template,
@@ -818,13 +824,10 @@ async def _stage_preconditions(
         facts["payable_order_proven"] = not proof_reasons
         reasons.extend(proof_reasons)
         # Exactly one marker order must exist, and it must be the target.
-        window_start = create_window_start or (utcnow() - CREATE_WINDOW_BEFORE)
-        window_end = create_window_end or (utcnow() + CREATE_WINDOW_AFTER)
         match = await find_marker_orders(
             reader,
             location_uuid=KARLSRUHE_LOCATION_UUID,
             customer_uuid=identity.customer_uuid,
-            staffer_uuid=identity.staffer_uuid,
             marker=marker,
             window_start=window_start,
             window_end=window_end,
