@@ -39,6 +39,11 @@ The two accepted proofs are therefore:
     ``code``, the confirmed template, ``price`` and ``value`` both exactly 1500
     — and the ``quantity`` key is wholly absent.
 
+Either proof needs exactly one container. An order naming both ``vouchers`` and
+``voucher`` proves nothing at all, even when one of them is null: two
+containers is a body we do not understand, and reading whichever we happen to
+look at first would be choosing an answer rather than finding one.
+
 Anything else is ``unproven``. A ``quantity`` that IS present but wrong — null,
 ``true``, ``1.0``, ``"1"``, 0, 2 — never falls through to the singleton proof:
 the field was readable and it did not say one.
@@ -97,20 +102,37 @@ def _single_line(order: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
     """The one voucher node, and whether it came from the ``vouchers`` list.
 
     Returns ``(None, False)`` for every shape that is not exactly one voucher
-    node: an empty list, two entries, a scalar, a malformed container.
+    node under exactly one container.
+
+    An order may name ``vouchers`` or ``voucher``, never both. Two containers
+    is not one order described twice: it is a body we do not understand, and
+    the one we happened to read first says nothing about the one we ignored.
+    Even a null second container counts, because the KEY is what makes the body
+    ambiguous.
+
+    Presence is decided by the key, not by the value. ``vouchers: null`` is the
+    provider saying something about the collection; it is not permission to go
+    and read a different field instead, so it never falls back to the singular
+    form.
     """
-    collection = order.get(VOUCHER_COLLECTION_KEY)
-    if isinstance(collection, list):
+    has_collection = VOUCHER_COLLECTION_KEY in order
+    has_single = VOUCHER_OBJECT_KEY in order
+    if has_collection and has_single:
+        return None, False
+
+    if has_collection:
+        collection = order[VOUCHER_COLLECTION_KEY]
+        if not isinstance(collection, list):
+            # Present but not a list: a shape we will not interpret.
+            return None, False
         if len(collection) != 1 or not isinstance(collection[0], dict):
             return None, False
         return collection[0], True
-    if collection is not None:
-        # `vouchers` present but not a list: a shape we will not interpret.
-        return None, False
 
-    single = order.get(VOUCHER_OBJECT_KEY)
-    if isinstance(single, dict):
-        return single, False
+    if has_single:
+        single = order[VOUCHER_OBJECT_KEY]
+        if isinstance(single, dict):
+            return single, False
     return None, False
 
 

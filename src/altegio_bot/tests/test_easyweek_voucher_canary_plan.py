@@ -912,6 +912,179 @@ def test_two_totals_that_disagree_block_the_payment() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Totals live at two levels, and BOTH of them are checked
+# ---------------------------------------------------------------------------
+
+
+def _totals_order(**changes: Any) -> dict[str, Any]:
+    """An otherwise payable order whose published sums are under test."""
+    order = open_order(marker=MARKER)
+    del order["invoice"]
+    order.update(changes)
+    return order
+
+
+def test_a_wrong_top_level_total_is_not_hidden_by_a_correct_invoice() -> None:
+    """The review finding: an `invoice` used to switch the root level off.
+
+    A body publishing `subtotal: 9999` beside `invoice.total: 1500` passed,
+    because the check looked at the invoice *instead of* the order rather than
+    at both. Whichever of the two the provider actually settles, one of them is
+    not fifteen euros, and that is enough to refuse.
+    """
+    order = _totals_order(subtotal=9999, invoice={"total": SUPPORTED_VOUCHER_PRICE_MINOR})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_a_wrong_invoice_total_is_not_hidden_by_a_correct_root_total() -> None:
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice={"total": 9999})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_the_same_nominal_published_at_both_levels_is_accepted() -> None:
+    """Agreeing is not duplication to be refused; it is two proofs of one sum."""
+    order = _totals_order(
+        subtotal=SUPPORTED_VOUCHER_PRICE_MINOR,
+        total=SUPPORTED_VOUCHER_PRICE_MINOR,
+        invoice={
+            "total": SUPPORTED_VOUCHER_PRICE_MINOR,
+            "subtotal": SUPPORTED_VOUCHER_PRICE_MINOR,
+            "amount_due": SUPPORTED_VOUCHER_PRICE_MINOR,
+        },
+    )
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+def test_only_the_production_top_level_subtotal_is_enough() -> None:
+    """The body the canary actually has to pay for carries no invoice at all."""
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR)
+
+    assert "invoice" not in order
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("invoice", [None, "1500", [1500], 1500, True])
+def test_an_invoice_that_is_not_an_object_fails_closed(invoice) -> None:
+    """A container we cannot read is not a container we may ignore.
+
+    Falling back to the root level here would mean a malformed invoice makes
+    the order *easier* to pay for than a well-formed one.
+    """
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice=invoice)
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_an_empty_invoice_object_alongside_a_root_total_is_accepted() -> None:
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice={})
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("bad", [None, True, False, 1500.0, "1500", 1499, 0, [1500]])
+@pytest.mark.parametrize("level", ["root", "invoice"])
+@pytest.mark.parametrize("key", ["total", "subtotal", "amount_due"])
+def test_a_total_of_the_wrong_type_or_value_blocks_at_either_level(bad, level, key) -> None:
+    """Exact integers only: no coercion, no rounding, no truthiness.
+
+    `True` matters here — in Python `True == 1`, so an equality check alone
+    would read a boolean as a sum.
+    """
+    order = _totals_order(subtotal=SUPPORTED_VOUCHER_PRICE_MINOR)
+    if level == "root":
+        order[key] = bad
+    else:
+        order["invoice"] = {key: bad}
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+def test_no_total_anywhere_blocks() -> None:
+    order = _totals_order()
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+@pytest.mark.parametrize("key", ["amount_paid", "account_paid_amount"])
+def test_a_settled_amount_is_never_read_as_the_payable_sum(key) -> None:
+    """What was paid is not what is owed, and only one of them may authorise."""
+    order = _totals_order(**{key: SUPPORTED_VOUCHER_PRICE_MINOR})
+
+    assert CANARY_ORDER_TOTAL_UNPROVEN in payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pay_plan_over_conflicting_totals_is_not_ready() -> None:
+    plan = await _pay_plan(
+        order=open_order(
+            marker=MARKER,
+            subtotal=9999,
+            invoice={"total": SUPPORTED_VOUCHER_PRICE_MINOR},
+        )
+    )
+
+    assert plan.ready is False
+    assert CANARY_ORDER_TOTAL_UNPROVEN in plan.reasons
+    assert plan.snapshot["payable_order_proven"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_pay_plan_over_a_malformed_invoice_is_not_ready() -> None:
+    plan = await _pay_plan(order=open_order(marker=MARKER, subtotal=SUPPORTED_VOUCHER_PRICE_MINOR, invoice=None))
+
+    assert plan.ready is False
+    assert CANARY_ORDER_TOTAL_UNPROVEN in plan.reasons
+
+
 @pytest.mark.parametrize("key", ["services", "goods", "products", "items"])
 @pytest.mark.parametrize("value", [[{"uuid": OTHER_UUID}], {"a": 1}, "none", 0, None])
 def test_any_other_line_collection_that_is_not_proven_empty_blocks(key, value) -> None:

@@ -94,7 +94,9 @@ What each one asserts:
   canary's own customer/template scope, and it is **exactly** the order §35
   authorises: one voucher line, the confirmed template, price 1500 as an
   integer, its count proven (see below), no services or goods, and at least one
-  published total, every published total being exactly 1500. A payment settles
+  published total, every published total being exactly 1500 — read at the order
+  root AND inside `invoice`, with a present-but-unreadable `invoice` refused
+  rather than skipped. A payment settles
   whatever the order contains, so "is this our order?" is not the same question
   as "is this the order we approved?" — and a sum nobody could read is not a
   small gap, it is the whole amount being unproven;
@@ -305,6 +307,12 @@ A `quantity` that IS present decides by itself. `null`, `true`, `1.0`, `"1"`, 0
 and 2 all refuse, and none of them falls back to the singleton proof: the field
 was readable and it did not say one. `true` is called out because in Python
 `True == 1`, so a truthiness check would have accepted a boolean as a count.
+
+Either proof needs exactly one container. An order naming both `vouchers` and
+`voucher` is `unproven`, even when one of them is null: two containers is a body
+we do not understand, and reading whichever we looked at first would be choosing
+an answer rather than finding one. `vouchers: null` is likewise not the same as
+no `vouchers` key, and never falls back to the singular form.
 
 The CREATE request is unchanged: it still sends an exact integer `quantity: 1`.
 What we ask for and what we can prove we received are different things.

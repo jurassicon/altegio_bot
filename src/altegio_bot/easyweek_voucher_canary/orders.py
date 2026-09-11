@@ -293,6 +293,51 @@ def classify_order(payload: object) -> tuple[str, str]:
     return ORDER_UNKNOWN, PAYMENT_PROOF_NONE
 
 
+def _total_levels(order: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Both places a total may be published, or ``None`` if one is unreadable.
+
+    The order root is always one of them. ``invoice`` is the other, WHEN it is
+    an object — and when the key is present but holds something else, this
+    returns ``None`` rather than quietly dropping it. A malformed invoice must
+    not make an order easier to pay for than a well-formed one.
+    """
+    if "invoice" not in order:
+        return [order]
+    invoice = order["invoice"]
+    if not isinstance(invoice, dict):
+        return None
+    return [order, invoice]
+
+
+def _order_total_reasons(order: dict[str, Any], *, expected_price_minor: int) -> tuple[str, ...]:
+    """Why this order's published sum is not provably the nominal.
+
+    Every level is read, not one instead of the other. An order publishing
+    ``subtotal: 9999`` beside ``invoice.total: 1500`` is refused: whichever of
+    the two the provider actually settles, one of them is not the sum that was
+    approved, and choosing the convenient one is not a proof.
+
+    Each published value must be an exact integer — ``True`` is not 1 here, and
+    ``1500.0`` and ``"1500"`` are not 1500. Nothing is coerced, rounded or
+    defaulted. "Conflicting totals" needs no separate rule: values that disagree
+    cannot all be the nominal, so one of them already fails.
+
+    ``amount_paid`` and ``account_paid_amount`` are deliberately not consulted.
+    What was paid is not what is owed, and only the second may authorise a
+    payment.
+    """
+    levels = _total_levels(order)
+    if levels is None:
+        return (CANARY_ORDER_TOTAL_UNPROVEN,)
+
+    published = [level[key] for level in levels for key in _TOTAL_KEYS if key in level]
+    if not published:
+        return (CANARY_ORDER_TOTAL_UNPROVEN,)
+    if any(_exact_int(value) != expected_price_minor for value in published):
+        return (CANARY_ORDER_TOTAL_UNPROVEN,)
+    return ()
+
+
 def _empty_collection(value: object) -> bool:
     """A collection this order proves it has nothing in.
 
@@ -314,8 +359,8 @@ def payable_order_reasons(
     An empty tuple means all three of these hold: the order carries exactly one
     voucher for the confirmed template at the exact nominal, with its count
     proven (see ``voucher_line``); it carries no other line items; and it
-    publishes at least one total, with every published total exactly the
-    nominal.
+    publishes at least one total, with every published total — at the order
+    root AND inside ``invoice`` — exactly the nominal.
 
     A missing total blocks. The payment settles the ORDER, so "we could not
     find a sum anywhere" is not a small gap — it is the whole amount being
@@ -347,14 +392,9 @@ def payable_order_reasons(
             reasons.append(CANARY_ORDER_EXTRA_ITEMS)
             break
 
-    # Every published total must be the nominal, and at least one must exist.
-    # Two totals disagreeing is itself a refusal: we would not know which one
-    # the payment settles.
-    invoice = order.get("invoice")
-    invoice = invoice if isinstance(invoice, dict) else order
-    published = [_exact_int(invoice.get(key)) for key in _TOTAL_KEYS if key in invoice]
-    if not published or any(value != expected_price_minor for value in published):
-        reasons.append(CANARY_ORDER_TOTAL_UNPROVEN)
+    # Every published total, at BOTH levels, must be the nominal — and at least
+    # one must exist.
+    reasons.extend(_order_total_reasons(order, expected_price_minor=expected_price_minor))
 
     return tuple(dict.fromkeys(reasons))
 

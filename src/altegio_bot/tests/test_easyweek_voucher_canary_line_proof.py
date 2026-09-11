@@ -126,6 +126,132 @@ def test_a_singular_voucher_object_without_quantity_proves_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# One container, or none: `voucher` and `vouchers` are never merged
+# ---------------------------------------------------------------------------
+
+
+def _two_containers(vouchers: object, voucher: object) -> dict:
+    order = open_order(marker=MARKER)
+    order["vouchers"] = vouchers
+    order["voucher"] = voucher
+    return order
+
+
+@pytest.mark.parametrize(
+    "voucher",
+    [
+        # A duplicate of the same thing, a contradiction, and an empty slot.
+        issued_voucher(code=CODE_SENTINEL),
+        voucher_line(),
+        voucher_line(price=9999),
+        issued_voucher(code=CODE_SENTINEL, value=9999),
+        None,
+        {},
+        "",
+        [],
+    ],
+)
+def test_an_order_naming_both_containers_proves_nothing(voucher) -> None:
+    """The review finding: a good `vouchers` used to silence `voucher` entirely.
+
+    Two containers is not one order described twice — it is a body we do not
+    understand, and the one we happened to read first is not evidence about the
+    one we ignored. Even a null second container counts: the key is there.
+    """
+    order = _two_containers([issued_voucher(code=CODE_SENTINEL)], voucher)
+
+    proof = _prove(order)
+
+    assert proof.proven is False
+    assert proof.quantity_proof == QUANTITY_PROOF_UNPROVEN
+    # And it is reported as a shape we could not establish, not as a wrong one.
+    assert proof.shape_recognised is False
+    assert CANARY_VOUCHER_LINE_UNPROVEN in _payable(order)
+
+
+def test_a_null_vouchers_key_is_not_an_absent_one() -> None:
+    """The second review finding: `.get()` conflated absent with null.
+
+    `vouchers: null` is the provider saying something about the collection. It
+    is not permission to go and read a different field instead.
+    """
+    order = open_order(marker=MARKER)
+    order["vouchers"] = None
+    order["voucher"] = voucher_line()
+
+    proof = _prove(order)
+
+    assert proof.proven is False
+    assert proof.quantity_proof == QUANTITY_PROOF_UNPROVEN
+
+
+@pytest.mark.parametrize(
+    "vouchers",
+    [None, {}, {"code": CODE_SENTINEL}, "vouchers", 1, [], [voucher_line(), voucher_line()], [None]],
+)
+def test_a_malformed_vouchers_container_never_falls_back_to_the_singular_form(vouchers) -> None:
+    order = open_order(marker=MARKER)
+    order["vouchers"] = vouchers
+    order["voucher"] = voucher_line()
+
+    assert _prove(order).proven is False
+
+
+def test_the_singular_form_is_read_only_when_vouchers_is_wholly_absent() -> None:
+    order = open_order(marker=MARKER)
+    del order["vouchers"]
+    order["voucher"] = voucher_line()
+
+    proof = _prove(order)
+
+    assert proof.proven is True
+    assert proof.quantity_proof == QUANTITY_PROOF_EXPLICIT
+
+
+def test_the_known_production_shape_is_unaffected_by_the_stricter_contract() -> None:
+    """One container, one element, no `voucher` key anywhere."""
+    order = open_order(marker=MARKER, vouchers=[issued_voucher(code=CODE_SENTINEL)])
+
+    assert "voucher" not in order
+    assert _prove(order).quantity_proof == QUANTITY_PROOF_SINGLETON
+
+
+@pytest.mark.parametrize(
+    "vouchers,voucher",
+    [
+        ([issued_voucher(code=CODE_SENTINEL)], voucher_line()),
+        ([issued_voucher(code=CODE_SENTINEL)], None),
+        (None, voucher_line()),
+        ("vouchers", voucher_line()),
+        ([voucher_line(), voucher_line()], voucher_line()),
+    ],
+)
+def test_the_observation_agrees_with_the_gate_on_an_ambiguous_body(vouchers, voucher) -> None:
+    """One decision, two callers — including when the answer is "we cannot tell"."""
+    order = _two_containers(vouchers, voucher)
+
+    observation = _observe(order)
+
+    assert observation.voucher_line_proven is False
+    assert observation.voucher_quantity_proof == QUANTITY_PROOF_UNPROVEN
+    # Honest about the structure rather than calling it a recognised shape.
+    assert observation.voucher_line_shape_unknown is True
+    assert CANARY_VOUCHER_LINE_UNPROVEN in _payable(order)
+
+
+def test_an_ambiguous_body_still_reports_nothing_but_the_proof_label() -> None:
+    order = _two_containers(
+        [issued_voucher(code=CODE_SENTINEL)],
+        issued_voucher(code=CODE_SENTINEL + "-second"),
+    )
+
+    safe = _observe(order).as_safe_dict()
+
+    assert safe["voucher_quantity_proof"] == QUANTITY_PROOF_UNPROVEN
+    assert CODE_SENTINEL not in str(safe)
+
+
+# ---------------------------------------------------------------------------
 # A present quantity decides, and never falls back
 # ---------------------------------------------------------------------------
 
