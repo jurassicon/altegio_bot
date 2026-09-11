@@ -184,7 +184,7 @@ def test_the_create_signature_offers_no_line_item_parameters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pay_posts_the_exact_account_and_amount_to_the_pay_path() -> None:
+async def test_pay_posts_exactly_one_account_uuid_and_nothing_else() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -192,16 +192,16 @@ async def test_pay_posts_the_exact_account_and_amount_to_the_pay_path() -> None:
         return _ok(request)
 
     async with _client(handler) as client:
-        await client.pay_voucher_order(
-            order_uuid=ORDER_UUID,
-            account_uuid=ACCOUNT_UUID,
-            amount_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
-        )
+        await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID)
 
     assert len(seen) == 1
     assert seen[0].method == "POST"
     assert seen[0].url.path == PAY_PATH
-    assert json.loads(seen[0].content.decode()) == {"account_uuid": ACCOUNT_UUID, "amount": 1500}
+    # The documented endpoint takes no amount, and neither do we: the sum is
+    # already fixed by the exact open order and its one voucher line.
+    body = json.loads(seen[0].content.decode())
+    assert body == {"account_uuid": ACCOUNT_UUID}
+    assert list(body) == ["account_uuid"]
 
 
 @pytest.mark.asyncio
@@ -221,6 +221,12 @@ async def test_refund_posts_the_documented_empty_body_to_the_refund_path() -> No
     # Truly no body: `json=None` sends nothing, so there is no field of ours,
     # no amount and no reason string in a real financial record.
     assert seen[0].content == b""
+
+
+def test_pay_takes_no_amount() -> None:
+    parameters = set(inspect.signature(EasyWeekVoucherMutationClient.pay_voucher_order).parameters)
+    assert parameters == {"self", "order_uuid", "account_uuid"}
+    assert "amount" not in mutation_module.PAY_REQUEST_FIELDS
 
 
 def test_refund_takes_no_amount_or_reason() -> None:
@@ -387,7 +393,7 @@ async def test_every_redirect_is_one_request_and_an_unknown_outcome(status, oper
             if operation == "create":
                 await _create(client)
             elif operation == "pay":
-                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID, amount_minor=1500)
+                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID)
             else:
                 await client.refund_voucher_order(order_uuid=ORDER_UUID)
 
@@ -417,7 +423,7 @@ async def test_rate_limit_and_every_server_error_are_unknown_after_one_request(s
             if operation == "create":
                 await _create(client)
             elif operation == "pay":
-                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID, amount_minor=1500)
+                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID)
             else:
                 await client.refund_voucher_order(order_uuid=ORDER_UUID)
 
@@ -450,7 +456,7 @@ async def test_timeout_and_transport_failure_are_unknown_after_one_request(failu
             if operation == "create":
                 await _create(client)
             elif operation == "pay":
-                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID, amount_minor=1500)
+                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID)
             else:
                 await client.refund_voucher_order(order_uuid=ORDER_UUID)
 
@@ -480,7 +486,7 @@ async def test_a_malformed_2xx_is_unknown_not_success(response_factory, operatio
             if operation == "create":
                 await _create(client)
             elif operation == "pay":
-                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID, amount_minor=1500)
+                await client.pay_voucher_order(order_uuid=ORDER_UUID, account_uuid=ACCOUNT_UUID)
             else:
                 await client.refund_voucher_order(order_uuid=ORDER_UUID)
 

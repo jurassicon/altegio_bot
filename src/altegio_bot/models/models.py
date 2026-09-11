@@ -2149,14 +2149,24 @@ class EasyWeekVoucherCanaryLedger(Base):
             "(refund_claimed_at IS NULL OR pay_claimed_at IS NOT NULL)",
             name="ck_easyweek_voucher_canary_stage_order",
         ),
-        # Fingerprints are full SHA-256 hex digests, and the digests are too.
+        # Fingerprints are full SHA-256 hex digests, and so is every stage
+        # authorisation. The later two are nullable because a canary that never
+        # reached them legitimately has none.
         CheckConstraint(
             "char_length(customer_fingerprint) = 64 AND "
             "char_length(staffer_fingerprint) = 64 AND "
             "char_length(account_fingerprint) = 64 AND "
-            "char_length(plan_digest) = 64 AND "
-            "char_length(template_snapshot_digest) = 64",
+            "char_length(template_config_digest) = 64 AND "
+            "char_length(create_plan_digest) = 64 AND "
+            "(pay_plan_digest IS NULL OR char_length(pay_plan_digest) = 64) AND "
+            "(refund_plan_digest IS NULL OR char_length(refund_plan_digest) = 64)",
             name="ck_easyweek_voucher_canary_digest_lengths",
+        ),
+        # A stage that was claimed must name the plan that authorised it.
+        CheckConstraint(
+            "(pay_claimed_at IS NULL) = (pay_plan_digest IS NULL) AND "
+            "(refund_claimed_at IS NULL) = (refund_plan_digest IS NULL)",
+            name="ck_easyweek_voucher_canary_stage_plan_recorded",
         ),
         # The reconciliation window is what bounds an unresolved create search.
         # An inverted or absent window would let that search widen silently.
@@ -2171,10 +2181,16 @@ class EasyWeekVoucherCanaryLedger(Base):
     # -- identity ----------------------------------------------------------
     canary_scope: Mapped[str] = mapped_column(String(64), nullable=False)
     request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
-    # The plan an owner approved, and the template state that plan saw. Both are
-    # re-derived live before every stage; a difference stops the canary.
-    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    template_snapshot_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The FROZEN product configuration — price, flags, branch and service counts
+    # — and nothing that legitimately moves. Re-derived live before every stage;
+    # a difference is a template edit and stops the canary.
+    template_config_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # One approved plan per stage. A single digest could only ever authorise the
+    # first mutation: after `create` succeeds, the plan that required no marker
+    # order to exist can never be satisfied again.
+    create_plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    pay_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refund_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # -- who, as one-way digests only --------------------------------------
     customer_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -2208,9 +2224,13 @@ class EasyWeekVoucherCanaryLedger(Base):
     manual_cleanup_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # -- safe evidence -----------------------------------------------------
-    # Shape facts only: stage, key path, JSON type, presence, truncated value
-    # fingerprint, bounded length. Never a value, never a body.
+    # Shape facts only: stage, key path, JSON type, presence, bounded structural
+    # length. Never a value, never a digest of a value, never a body.
     evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    # The voucher counters observed at each stage, as a per-stage baseline. They
+    # are evidence, not authority: a counter that moved because a voucher was
+    # issued is the product working, and is never read as a template edit.
+    stage_counters: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

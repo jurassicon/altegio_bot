@@ -105,7 +105,7 @@ CREATE_REQUEST_FIELDS: Final = frozenset(
         "quantity",
     }
 )
-PAY_REQUEST_FIELDS: Final = frozenset({"account_uuid", "amount"})
+PAY_REQUEST_FIELDS: Final = frozenset({"account_uuid"})
 REFUND_REQUEST_FIELDS: Final = frozenset()
 
 # A marker has to be findable in the EasyWeek dashboard and carry nothing about
@@ -474,28 +474,26 @@ class EasyWeekVoucherMutationClient:
             allowed_fields=CREATE_REQUEST_FIELDS,
         )
 
-    async def pay_voucher_order(
-        self,
-        *,
-        order_uuid: str,
-        account_uuid: str,
-        amount_minor: int,
-    ) -> VoucherMutationResponse:
+    async def pay_voucher_order(self, *, order_uuid: str, account_uuid: str) -> VoucherMutationResponse:
         """``POST /orders/{uuid}/pay`` — one payment, on one account, once.
 
+        The body is exactly ``{"account_uuid": ...}`` and nothing else. The
+        documented endpoint takes no amount, and it should not: the sum is
+        already fixed by the exact open order and its one voucher line, so a
+        second place to state it would be a second place to state it *wrongly* —
+        and a canary that could name an arbitrary sum would be a payment tool.
+
         The order UUID must come from the ledger and the account UUID from the
-        same approved plan. The amount is the pinned nominal: a canary that could
-        pay an arbitrary sum would be a payment tool.
+        same approved plan.
         """
         canonical_order = _canonical_uuid(order_uuid, label="order_uuid", operation=PAY_OPERATION)
         canonical_account = _canonical_uuid(account_uuid, label="account_uuid", operation=PAY_OPERATION)
-        exact_amount = _pinned_price(amount_minor, operation=PAY_OPERATION)
 
         return await self._post_once(
             _PATH_ORDERS,
             canonical_order,
             _PATH_PAY,
-            body={"account_uuid": canonical_account, "amount": exact_amount},
+            body={"account_uuid": canonical_account},
             operation=PAY_OPERATION,
             allowed_fields=PAY_REQUEST_FIELDS,
         )

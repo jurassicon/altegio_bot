@@ -61,9 +61,10 @@ BASE = "https://my.easyweek.io/api/public/v2"
 class Recorder:
     """One MockTransport handler serving both clients."""
 
-    def __init__(self, *, order: dict[str, Any] | None = None) -> None:
+    def __init__(self, *, order: dict[str, Any] | None = None, orders_page: dict[str, Any] | None = None) -> None:
         self.seen: list[tuple[str, str]] = []
         self.order = order
+        self.orders_page = orders_page if orders_page is not None else {"data": [], "meta": {"last_page": 1}}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/api/public/v2")
@@ -81,14 +82,15 @@ class Recorder:
             return httpx.Response(200, json=TEMPLATE)
         if path == f"/customers/{CUSTOMER_UUID}":
             return httpx.Response(200, json=CUSTOMER)
-        if path == "/staffers":
+        # The documented nested paths, not a workspace-wide filter.
+        if path == f"/locations/{KARLSRUHE_LOCATION_UUID}/staffers":
             page = int(request.url.params.get("page", "1"))
-            return httpx.Response(200, json=STAFFERS if page == 1 else {"data": []})
-        if path == "/accounts":
-            page = int(request.url.params.get("page", "1"))
-            return httpx.Response(200, json=ACCOUNTS if page == 1 else {"data": []})
+            return httpx.Response(200, json=STAFFERS if page == 1 else {"data": [], "meta": {"last_page": 1}})
+        if path == f"/locations/{KARLSRUHE_LOCATION_UUID}/accounts":
+            return httpx.Response(200, json=ACCOUNTS)
         if path == "/orders":
-            return httpx.Response(200, json={"data": []})
+            assert request.url.params.get("staffer_uuid") == STAFFER_UUID
+            return httpx.Response(200, json=self.orders_page)
         if path == f"/orders/{ORDER_UUID}":
             return httpx.Response(200, json=self.order or open_order(marker="x"))
         raise AssertionError(f"unexpected request: {request.method} {path}")
@@ -214,7 +216,7 @@ def test_a_missing_runtime_identity_blocks_without_leaking_a_value(monkeypatch, 
     monkeypatch.setattr(settings, "easyweek_voucher_canary_account_uuid", ACCOUNT_UUID, raising=False)
     _forbid_clients(monkeypatch)
 
-    assert main(["plan"]) == EXIT_ARGUMENTS
+    assert main(["plan", "--stage", "create"]) == EXIT_ARGUMENTS
 
     out = capsys.readouterr().out
     assert "canary_runtime_identity_missing" in out
@@ -248,34 +250,43 @@ def test_no_default_enables_a_mutation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_plan_issues_reads_only_and_prints_three_phrases(monkeypatch, capsys, configured) -> None:
+@pytest.mark.asyncio
+async def test_plan_issues_reads_only_and_prints_one_stage_phrase(
+    monkeypatch, capsys, session_maker, configured
+) -> None:
     recorder = Recorder()
-    _install(monkeypatch, recorder)
+    _install(monkeypatch, recorder, session_maker)
 
-    assert main(["plan"]) == EXIT_OK
+    assert await asyncio.to_thread(main, ["plan", "--stage", "create"]) == EXIT_OK
 
     assert all(method == "GET" for method, _ in recorder.seen)
     report = _output(capsys)
     assert report["ready"] is True
-    assert set(report["confirmation_phrases"]) == {"create", "pay", "refund"}
-    assert len(set(report["confirmation_phrases"].values())) == 3
+    assert report["stage"] == "create"
+    assert report["confirmation_phrase"].startswith("create-voucher-canary-")
+    # Configuration, counters, ledger state and the authorisation are separate.
+    assert report["immutable_template_digest"] != report["plan_digest"]
+    assert report["counters_observed"] == {"vouchers_count": 0, "activated_vouchers_count": 0}
+    assert report["ledger_state"]["status"] is None
     assert report["ready_for_send"] is False
 
 
-def test_an_unready_plan_is_a_contract_mismatch_not_a_success(monkeypatch, capsys) -> None:
+@pytest.mark.asyncio
+async def test_an_unready_plan_is_a_contract_mismatch_not_a_success(monkeypatch, capsys, session_maker) -> None:
     monkeypatch.setattr(settings, "easyweek_voucher_canary_enabled", False, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_canary_customer_uuid", CUSTOMER_UUID, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_canary_staffer_uuid", STAFFER_UUID, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_canary_account_uuid", ACCOUNT_UUID, raising=False)
-    _install(monkeypatch, Recorder())
+    _install(monkeypatch, Recorder(), session_maker)
 
-    assert main(["plan"]) == EXIT_CONTRACT_MISMATCH
+    assert await asyncio.to_thread(main, ["plan", "--stage", "create"]) == EXIT_CONTRACT_MISMATCH
     assert CANARY_DISABLED_BY_ENV in _output(capsys)["reasons"]
 
 
-def test_the_plan_output_carries_no_identity(monkeypatch, capsys, configured) -> None:
-    _install(monkeypatch, Recorder())
-    main(["plan"])
+@pytest.mark.asyncio
+async def test_the_plan_output_carries_no_identity(monkeypatch, capsys, session_maker, configured) -> None:
+    _install(monkeypatch, Recorder(), session_maker)
+    await asyncio.to_thread(main, ["plan", "--stage", "create"])
 
     out = capsys.readouterr().out
     for forbidden in (
@@ -329,8 +340,8 @@ async def test_reconcile_reports_a_manual_cleanup_for_an_open_draft(
     now = utcnow()
     await ledger_module.claim_create(
         session_maker,
-        plan_digest="a" * 64,
-        template_snapshot_digest="b" * 64,
+        create_plan_digest="a" * 64,
+        template_config_digest="b" * 64,
         customer_fingerprint="c" * 64,
         staffer_fingerprint="d" * 64,
         account_fingerprint="e" * 64,
@@ -341,6 +352,7 @@ async def test_reconcile_reports_a_manual_cleanup_for_an_open_draft(
     await ledger_module.record_outcome(
         session_maker,
         status=ledger_module.STATUS_CREATED,
+        expected_statuses=frozenset({ledger_module.STATUS_CREATE_CLAIMED}),
         target_order_uuid=ORDER_UUID,
         verified_field="create_verified_at",
     )
@@ -410,14 +422,17 @@ def test_the_cli_writes_no_file() -> None:
         assert forbidden not in code, forbidden
 
 
-def test_the_cli_silences_url_logging_before_any_client_exists(monkeypatch, caplog, configured) -> None:
+@pytest.mark.asyncio
+async def test_the_cli_silences_url_logging_before_any_client_exists(
+    monkeypatch, caplog, session_maker, configured
+) -> None:
     """The shared test conftest pins httpx to WARNING, which would hide this."""
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.INFO)
     caplog.set_level(logging.INFO)
 
-    _install(monkeypatch, Recorder())
-    assert main(["plan"]) == EXIT_OK
+    _install(monkeypatch, Recorder(), session_maker)
+    assert await asyncio.to_thread(main, ["plan", "--stage", "create"]) == EXIT_OK
 
     recorded = "\n".join(record.getMessage() for record in caplog.records)
     for forbidden in ("my.easyweek.io", "/voucher-templates", "/customers", KEY, SLUG, "Bearer"):

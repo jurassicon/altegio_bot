@@ -13,10 +13,10 @@ operations and no generic request escape hatch::
     GET /workspace
     GET /voucher-templates
     GET /voucher-templates/{voucher_template_uuid}
-    GET /orders?location_uuid&customer_uuid&page&per_page=100
+    GET /orders?location_uuid&customer_uuid&staffer_uuid&page&per_page=100
     GET /orders/{order_uuid}
-    GET /accounts?location_uuid&page&per_page=100
-    GET /staffers?location_uuid&page&per_page=100
+    GET /locations/{location_uuid}/accounts
+    GET /locations/{location_uuid}/staffers?page&per_page=100
 
 Everything here is built around two threats:
 
@@ -782,23 +782,31 @@ class EasyWeekClient:
         *,
         location_uuid: str,
         customer_uuid: str,
+        staffer_uuid: str,
         page: int,
         per_page: int = POS_PER_PAGE,
     ) -> dict[str, Any]:
-        """``GET /orders?location_uuid&customer_uuid&page&per_page`` — one page.
+        """``GET /orders`` — one page, scoped by the documented required filters.
 
-        Both UUIDs are required and validated before the wire: a workspace-wide
-        order listing is not something this integration has any reason to pull,
-        and an unscoped walk would page through other customers' orders.
+        All three UUIDs are mandatory and validated before the wire. That is not
+        defensiveness: the documented endpoint takes ``location_uuid``,
+        ``customer_uuid`` and ``staffer_uuid`` as its filters, and the observed
+        order body does NOT echo a location or a staffer back. So the request is
+        where that scope is proven — a caller cannot re-derive it from the
+        response, and an unscoped walk would page through other customers'
+        orders.
 
         Pagination completeness is the caller's contract, not this method's — it
-        returns one page verbatim so the reconciler can prove it walked all of
-        them.
+        returns one page verbatim, ``meta`` included, so the reconciler can prove
+        it walked all of them rather than guessing from an empty page.
         """
         canonical_location = _canonical_resource_uuid(
             location_uuid, operation="list_location_orders", label="location_uuid"
         )
         canonical_customer = _canonical_customer_uuid(customer_uuid, operation="list_location_orders")
+        canonical_staffer = _canonical_resource_uuid(
+            staffer_uuid, operation="list_location_orders", label="staffer_uuid"
+        )
         exact_page = _positive_page(page, operation="list_location_orders")
         if type(per_page) is not int or per_page != POS_PER_PAGE:
             raise EasyWeekPermanentError(
@@ -811,6 +819,7 @@ class EasyWeekClient:
             params={
                 "location_uuid": canonical_location,
                 "customer_uuid": canonical_customer,
+                "staffer_uuid": canonical_staffer,
                 "page": exact_page,
                 "per_page": per_page,
             },
@@ -840,38 +849,49 @@ class EasyWeekClient:
             raise EasyWeekProtocolError("order response is not a JSON object", operation="get_order")
         return payload
 
-    async def list_location_accounts(self, location_uuid: str, *, page: int) -> dict[str, Any]:
-        """``GET /accounts?location_uuid&page&per_page`` — one page of POS accounts.
+    async def list_location_accounts(self, location_uuid: str) -> Any:
+        """``GET /locations/{location_uuid}/accounts`` — the branch's POS accounts.
 
-        Used only to prove that the operator-supplied payment account really
-        exists in the confirmed branch before a payment is claimed.
+        The documented path nests the account collection under the location;
+        there is no workspace-wide ``/accounts?location_uuid=`` endpoint, and
+        building one would have been a URL this API does not serve.
+
+        Deliberately takes no page: the documented response is a plain
+        collection, not a paginated one. Asking for a page it does not implement
+        would either be ignored or change the meaning of the answer, and neither
+        is something a payment pre-check should rely on. The payload is returned
+        verbatim — bare list or ``data`` envelope — and the caller decides.
         """
         canonical = _canonical_resource_uuid(location_uuid, operation="list_location_accounts", label="location_uuid")
-        exact_page = _positive_page(page, operation="list_location_accounts")
         payload = await self._get_json(
+            _PATH_LOCATIONS,
+            canonical,
             _PATH_ACCOUNTS,
             operation="list_location_accounts",
-            params={"location_uuid": canonical, "page": exact_page, "per_page": POS_PER_PAGE},
         )
-        if not isinstance(payload, dict):
+        if not isinstance(payload, (dict, list)):
             raise EasyWeekProtocolError(
-                "accounts response is not a JSON object",
+                "accounts response is neither a list nor an object",
                 operation="list_location_accounts",
             )
         return payload
 
     async def list_location_staffers(self, location_uuid: str, *, page: int) -> dict[str, Any]:
-        """``GET /staffers?location_uuid&page&per_page`` — one page of staffers.
+        """``GET /locations/{location_uuid}/staffers`` — one page of staffers.
 
-        Used only to prove that the operator-supplied staffer really exists in
-        the confirmed branch before an order is claimed.
+        The documented path nests staffers under the location, and this response
+        DOES carry pagination metadata. The page is returned verbatim, ``meta``
+        included, so a caller can prove a complete walk from ``last_page``
+        instead of inferring the end from one empty page.
         """
         canonical = _canonical_resource_uuid(location_uuid, operation="list_location_staffers", label="location_uuid")
         exact_page = _positive_page(page, operation="list_location_staffers")
         payload = await self._get_json(
+            _PATH_LOCATIONS,
+            canonical,
             _PATH_STAFFERS,
             operation="list_location_staffers",
-            params={"location_uuid": canonical, "page": exact_page, "per_page": POS_PER_PAGE},
+            params={"page": exact_page, "per_page": POS_PER_PAGE},
         )
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError(

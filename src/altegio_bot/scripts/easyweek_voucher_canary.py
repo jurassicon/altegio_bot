@@ -2,7 +2,9 @@
 
 Six commands, each a deliberate stop::
 
-    python -m altegio_bot.scripts.easyweek_voucher_canary plan
+    python -m altegio_bot.scripts.easyweek_voucher_canary plan --stage create
+    python -m altegio_bot.scripts.easyweek_voucher_canary plan --stage pay
+    python -m altegio_bot.scripts.easyweek_voucher_canary plan --stage refund
     python -m altegio_bot.scripts.easyweek_voucher_canary status
     python -m altegio_bot.scripts.easyweek_voucher_canary reconcile
     python -m altegio_bot.scripts.easyweek_voucher_canary create    --apply ...
@@ -20,7 +22,7 @@ A mutation command runs only when ALL of these hold at once:
 * ``EASYWEEK_VOUCHER_CANARY_ENABLED`` is true (false by default, everywhere);
 * the exact subcommand was typed — no default does anything;
 * ``--apply`` was passed explicitly;
-* ``--plan-digest`` matches a plan recomputed live, seconds earlier;
+* ``--plan-digest`` matches THIS STAGE's plan recomputed live, seconds earlier;
 * ``--plan-issued-at`` is within the plan's short max age;
 * ``--confirm`` is the exact stage phrase that plan prints;
 * the durable ledger state allows this stage;
@@ -30,6 +32,11 @@ Argparse abbreviation is off, so a half-typed flag authorises nothing, and every
 argparse exit — ``--help`` included — returns the argument code rather than the
 success code. A mistyped invocation must never be mistaken for a canary that
 worked.
+
+Each stage has its OWN plan, digest and phrase. One plan cannot cover the whole
+canary: the moment ``create`` succeeds, a plan that required no marker order to
+exist can never be satisfied again, so a create digest is never reusable for a
+payment or a refund.
 
 ``plan``, ``status`` and ``reconcile`` never mutate. ``reconcile`` and ``status``
 are safe to repeat as often as an operator likes.
@@ -51,6 +58,7 @@ from typing import Any, Final
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError
+from altegio_bot.easyweek_voucher_canary import ledger as ledger_module
 from altegio_bot.easyweek_voucher_canary import runner as runner_module
 from altegio_bot.easyweek_voucher_canary.plan import (
     CANARY_DISABLED_BY_ENV,
@@ -59,7 +67,7 @@ from altegio_bot.easyweek_voucher_canary.plan import (
     STAGE_PAY,
     STAGE_REFUND,
     RuntimeIdentity,
-    build_plan,
+    build_stage_plan,
     resolve_runtime_identity,
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationClient
@@ -120,7 +128,16 @@ def _build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(COMMAND_PLAN, help="Read-only. Build and print the plan and its digest.")
+    plan_parser = subparsers.add_parser(
+        COMMAND_PLAN,
+        help="Read-only. Build and print ONE stage's plan and its digest.",
+    )
+    plan_parser.add_argument(
+        "--stage",
+        required=True,
+        choices=list(MUTATION_STAGES),
+        help="Which stage to plan. Each has its own digest and phrase.",
+    )
     subparsers.add_parser(COMMAND_STATUS, help="Database only. Print the durable canary state.")
     subparsers.add_parser(COMMAND_RECONCILE, help="Reads only. Resolve an unknown stage by looking.")
 
@@ -182,9 +199,20 @@ def _identity_or_refusal(stage: str) -> tuple[RuntimeIdentity | None, dict[str, 
     return identity, None
 
 
-async def _run_plan(identity: RuntimeIdentity) -> tuple[dict[str, Any], int]:
+async def _run_plan(identity: RuntimeIdentity, stage: str) -> tuple[dict[str, Any], int]:
+    """Read-only. Reads the ledger too, because a stage plan asserts where we are."""
+    snapshot = await ledger_module.load(SessionLocal)
     async with EasyWeekClient() as reader:
-        plan = await build_plan(reader, identity=identity, enabled=settings.easyweek_voucher_canary_enabled)
+        plan = await build_stage_plan(
+            reader,
+            stage=stage,
+            identity=identity,
+            enabled=settings.easyweek_voucher_canary_enabled,
+            ledger_status=snapshot.status,
+            target_order_uuid=snapshot.target_order_uuid,
+            create_window_start=snapshot.create_window_start,
+            create_window_end=snapshot.create_window_end,
+        )
     return plan.as_safe_dict(), (EXIT_OK if plan.ready else EXIT_CONTRACT_MISMATCH)
 
 
@@ -261,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == COMMAND_PLAN:
-            report, code = asyncio.run(_run_plan(identity))
+            report, code = asyncio.run(_run_plan(identity, args.stage))
         elif command == COMMAND_STATUS:
             report, code = asyncio.run(_run_status())
         elif command == COMMAND_RECONCILE:

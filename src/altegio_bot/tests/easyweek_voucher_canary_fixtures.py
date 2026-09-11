@@ -52,10 +52,23 @@ CUSTOMER: dict[str, Any] = {
     "email": "fixture@example.invalid",
     "phone": "+490000000000",
 }
-STAFFERS: dict[str, Any] = {"data": [{"uuid": STAFFER_UUID, "name": "Synthetic Staffer"}]}
-ACCOUNTS: dict[str, Any] = {"data": [{"uuid": ACCOUNT_UUID, "name": "Synthetic Card"}]}
+# Staffers are paginated and publish a `last_page`; accounts are served whole
+# under the location. Two shapes, because the documented API has two.
+STAFFERS: dict[str, Any] = {
+    "data": [{"uuid": STAFFER_UUID, "name": "Synthetic Staffer"}],
+    "meta": {"current_page": 1, "last_page": 1, "per_page": 100, "total": 1},
+}
+ACCOUNTS: list[dict[str, Any]] = [{"uuid": ACCOUNT_UUID, "name": "Synthetic Card"}]
 
 CREATED_AT = "2026-09-11T10:00:00+00:00"
+
+
+def orders_page(rows: list[dict[str, Any]], *, page: int = 1, last_page: int = 1) -> dict[str, Any]:
+    """One page of `GET /orders`, with the pagination metadata the API publishes."""
+    return {
+        "data": rows,
+        "meta": {"current_page": page, "last_page": last_page, "per_page": 100, "total": len(rows)},
+    }
 
 
 def voucher_line(**changes: Any) -> dict[str, Any]:
@@ -68,22 +81,41 @@ def voucher_line(**changes: Any) -> dict[str, Any]:
 
 
 def open_order(*, marker: str, **changes: Any) -> dict[str, Any]:
-    """A freshly created, unpaid POS order carrying one voucher line."""
+    """A freshly created, unpaid POS order, in the shape EasyWeek really returns.
+
+    Deliberately WITHOUT a top-level ``location_uuid`` or ``staffer_uuid``: the
+    observed body carries neither, and a fixture that invented them would have
+    let a matcher requiring them pass here and fail against production. The
+    customer arrives as a nested object, which is also what was observed.
+    """
     order = {
         "uuid": ORDER_UUID,
-        "location_uuid": KARLSRUHE_LOCATION_UUID,
-        "customer_uuid": CUSTOMER_UUID,
-        "staffer_uuid": STAFFER_UUID,
-        "comment": marker,
-        "created_at": CREATED_AT,
+        "status": "open",
         "is_paid": False,
         "is_reverted": False,
-        "status": "open",
+        "created_at": CREATED_AT,
+        "comment": marker,
+        "customer": {"uuid": CUSTOMER_UUID, "first_name": "Synthetic", "last_name": "Fixture"},
         "vouchers": [voucher_line()],
         "invoice": {"total": 1500, "amount_due": 1500, "amount_paid": 0},
     }
     order.update(changes)
     return order
+
+
+def listed_order(*, marker: str, **changes: Any) -> dict[str, Any]:
+    """A row as it appears in `GET /orders`, with no scope fields echoed back."""
+    row = {
+        "uuid": ORDER_UUID,
+        "status": "open",
+        "is_reverted": False,
+        "created_at": CREATED_AT,
+        "comment": marker,
+        "customer": {"uuid": CUSTOMER_UUID},
+        "vouchers": [voucher_line()],
+    }
+    row.update(changes)
+    return row
 
 
 def paid_order(*, marker: str, **changes: Any) -> dict[str, Any]:

@@ -1441,3 +1441,158 @@ async def test_one_bad_timezone_fails_the_whole_list() -> None:
             await client.list_locations()
 
     assert exc_info.value.operation == "list_locations"
+
+
+# ---------------------------------------------------------------------------
+# POS reads for the §35 voucher canary
+# ---------------------------------------------------------------------------
+#
+# These assert the LITERAL documented paths and the exact query, rather than
+# re-stating whatever the implementation happens to build. An earlier version
+# called `/accounts?location_uuid=...` and `/staffers?location_uuid=...`, which
+# are URLs this API does not serve — and a fixture that mirrored the code would
+# have agreed with it all the way to production.
+
+_POS_LOCATION = "8395fab6-7ee8-4702-88d9-fd78f92539c1"
+_POS_CUSTOMER = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+_POS_STAFFER = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+_POS_ORDER = "dddddddd-4444-4444-8444-dddddddddddd"
+
+
+@pytest.mark.asyncio
+async def test_accounts_use_the_nested_location_path_and_no_query() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        # The documented response is a plain collection, not a paginated one.
+        return httpx.Response(200, json=[{"uuid": "11111111-2222-4333-8444-555555555555"}])
+
+    async with _client(handler) as client:
+        payload = await client.list_location_accounts(_POS_LOCATION)
+
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert seen[0].url.path == f"/api/public/v2/locations/{_POS_LOCATION}/accounts"
+    # No page, no per_page, no location filter: the path already scopes it.
+    assert not seen[0].url.query
+    assert isinstance(payload, list)
+
+
+@pytest.mark.asyncio
+async def test_a_bare_accounts_list_is_returned_verbatim() -> None:
+    rows = [{"uuid": "11111111-2222-4333-8444-555555555555", "name": "Card"}]
+
+    async with _client(lambda request: httpx.Response(200, json=rows)) as client:
+        assert await client.list_location_accounts(_POS_LOCATION) == rows
+
+
+@pytest.mark.asyncio
+async def test_staffers_use_the_nested_location_path_with_pagination() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [], "meta": {"last_page": 1}})
+
+    async with _client(handler) as client:
+        payload = await client.list_location_staffers(_POS_LOCATION, page=2)
+
+    assert len(seen) == 1
+    assert seen[0].url.path == f"/api/public/v2/locations/{_POS_LOCATION}/staffers"
+    assert dict(seen[0].url.params) == {"page": "2", "per_page": "100"}
+    # The pagination metadata survives, so a caller can prove a complete walk.
+    assert payload["meta"]["last_page"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_workspace_wide_accounts_and_staffers_filters_are_gone() -> None:
+    """A filter-style call would be a URL this API does not serve."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no request expected")
+
+    async with _client(handler) as client:
+        with pytest.raises(TypeError):
+            await client.list_location_accounts(_POS_LOCATION, page=1)  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+async def test_orders_require_all_three_documented_filters() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [], "meta": {"last_page": 1}})
+
+    async with _client(handler) as client:
+        await client.list_location_orders(
+            location_uuid=_POS_LOCATION,
+            customer_uuid=_POS_CUSTOMER,
+            staffer_uuid=_POS_STAFFER,
+            page=1,
+        )
+
+    assert seen[0].url.path == "/api/public/v2/orders"
+    assert dict(seen[0].url.params) == {
+        "location_uuid": _POS_LOCATION,
+        "customer_uuid": _POS_CUSTOMER,
+        "staffer_uuid": _POS_STAFFER,
+        "page": "1",
+        "per_page": "100",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["location_uuid", "customer_uuid", "staffer_uuid"])
+async def test_a_noncanonical_order_filter_never_reaches_the_wire(field) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the request must be refused before the wire")
+
+    kwargs: dict[str, Any] = {
+        "location_uuid": _POS_LOCATION,
+        "customer_uuid": _POS_CUSTOMER,
+        "staffer_uuid": _POS_STAFFER,
+        "page": 1,
+    }
+    kwargs[field] = "not-a-uuid"
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekPermanentError):
+            await client.list_location_orders(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_one_exact_order_uses_the_documented_path() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"uuid": _POS_ORDER, "status": "open"})
+
+    async with _client(handler) as client:
+        order = await client.get_order(_POS_ORDER)
+
+    assert seen[0].url.path == f"/api/public/v2/orders/{_POS_ORDER}"
+    assert not seen[0].url.query
+    assert order["uuid"] == _POS_ORDER
+
+
+@pytest.mark.asyncio
+async def test_the_pos_reads_are_still_gets_only() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(200, json={"data": [], "meta": {"last_page": 1}})
+
+    async with _client(handler) as client:
+        await client.list_location_staffers(_POS_LOCATION, page=1)
+        await client.list_location_orders(
+            location_uuid=_POS_LOCATION,
+            customer_uuid=_POS_CUSTOMER,
+            staffer_uuid=_POS_STAFFER,
+            page=1,
+        )
+
+    assert set(methods) == {"GET"}

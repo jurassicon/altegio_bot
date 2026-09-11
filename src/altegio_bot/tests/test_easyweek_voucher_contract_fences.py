@@ -62,6 +62,7 @@ SHIPPED_CANARY_ARTIFACTS = (
     REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/ledger.py",
     REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/runner.py",
     REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/artifact.py",
+    REPO_ROOT / "src/altegio_bot/easyweek_voucher_canary/orders.py",
     REPO_ROOT / "src/altegio_bot/scripts/easyweek_voucher_canary.py",
     REPO_ROOT / "src/altegio_bot/tests/easyweek_voucher_canary_fixtures.py",
     REPO_ROOT / "docs/easyweek/voucher_canary_runbook.md",
@@ -431,3 +432,45 @@ def test_exactly_one_alembic_head_and_one_new_canary_migration() -> None:
     # A migration that cannot be undone is a migration nobody will apply.
     assert "def downgrade()" in text
     assert "op.drop_table" in text
+
+
+def test_the_canary_never_digests_an_artifact_or_a_person() -> None:
+    """A SHA-256 of a 12-character code is the code, not a safeguard."""
+    from altegio_bot.easyweek_voucher_canary import artifact as artifact_module
+    from altegio_bot.easyweek_voucher_canary import orders as orders_module
+
+    for module in (artifact_module, orders_module):
+        code = code_without_docstrings(module)
+        for forbidden in ("hashlib", "sha256", "md5", "blake2", "fingerprint"):
+            assert forbidden not in code, (module.__name__, forbidden)
+
+
+def test_only_runtime_uuids_are_fingerprinted_and_only_in_the_plan() -> None:
+    """122 bits of entropy survive a hash; a voucher code does not."""
+    from altegio_bot.easyweek_voucher_canary import plan as plan_module
+
+    code = code_without_docstrings(plan_module)
+    assert "identity_fingerprint" in code
+    # The digests the plan computes are over identities and the frozen
+    # configuration, never over an order body or an artifact value.
+    assert "observe_artifact" in code
+
+
+def test_the_pos_reads_use_the_documented_nested_paths() -> None:
+    from altegio_bot import easyweek_client as client_module
+
+    code = code_without_docstrings(client_module)
+    assert "_PATH_LOCATIONS,\n            canonical,\n            _PATH_ACCOUNTS," in code or (
+        "_PATH_ACCOUNTS" in code and "_PATH_LOCATIONS" in code
+    )
+    # The workspace-wide filter form is gone.
+    assert '"location_uuid": canonical, "page"' not in code
+
+
+def test_the_pay_request_carries_no_amount() -> None:
+    from altegio_bot import easyweek_voucher_mutation as mutation_module
+
+    assert "amount" not in mutation_module.PAY_REQUEST_FIELDS
+    code = code_without_docstrings(mutation_module)
+    assert '"amount"' not in code
+    assert "amount_minor" not in code

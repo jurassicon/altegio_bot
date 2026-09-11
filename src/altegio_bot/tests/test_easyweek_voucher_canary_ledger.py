@@ -46,7 +46,9 @@ from altegio_bot.models.models import EasyWeekVoucherCanaryLedger
 from altegio_bot.tests.easyweek_voucher_canary_fixtures import ORDER_UUID, OTHER_UUID
 from altegio_bot.utils import utcnow
 
-PLAN_DIGEST = "a" * 64
+CREATE_PLAN_DIGEST = "a" * 64
+PAY_PLAN_DIGEST = "f" * 64
+REFUND_PLAN_DIGEST = "9" * 64
 TEMPLATE_DIGEST = "b" * 64
 CUSTOMER_FP = "c" * 64
 STAFFER_FP = "d" * 64
@@ -57,8 +59,8 @@ MARKER = "ewvc1-000000000000"
 async def _claim_create(session_maker, **changes: Any):
     now = utcnow()
     kwargs: dict[str, Any] = {
-        "plan_digest": PLAN_DIGEST,
-        "template_snapshot_digest": TEMPLATE_DIGEST,
+        "create_plan_digest": CREATE_PLAN_DIGEST,
+        "template_config_digest": TEMPLATE_DIGEST,
         "customer_fingerprint": CUSTOMER_FP,
         "staffer_fingerprint": STAFFER_FP,
         "account_fingerprint": ACCOUNT_FP,
@@ -74,6 +76,8 @@ async def _claim_create(session_maker, **changes: Any):
 # where a later stage was claimed before an earlier one, and a fixture fighting
 # that constraint would be asserting against a row the application can never
 # produce — so the helper backfills the claims a real run would have made.
+_STAGE_PLAN_DIGESTS = {"pay": PAY_PLAN_DIGEST, "refund": REFUND_PLAN_DIGEST}
+
 _STAGES_UP_TO = {
     "create_claimed": ("create",),
     "create_unknown": ("create",),
@@ -109,6 +113,8 @@ async def _force_status(session_maker, status: str, **values: Any) -> None:
                 if getattr(row, f"{stage}_claimed_at") is None:
                     setattr(row, f"{stage}_claimed_at", now)
                     setattr(row, f"{stage}_attempted_at", now)
+                    if stage != "create":
+                        setattr(row, f"{stage}_plan_digest", _STAGE_PLAN_DIGESTS[stage])
             for name, value in values.items():
                 setattr(row, name, value)
 
@@ -163,8 +169,8 @@ async def test_a_second_canary_for_the_same_scope_is_impossible(session_maker) -
             EasyWeekVoucherCanaryLedger(
                 canary_scope=VOUCHER_CANARY_SCOPE,
                 request_schema_version="1",
-                plan_digest=PLAN_DIGEST,
-                template_snapshot_digest=TEMPLATE_DIGEST,
+                create_plan_digest=CREATE_PLAN_DIGEST,
+                template_config_digest=TEMPLATE_DIGEST,
                 customer_fingerprint=CUSTOMER_FP,
                 staffer_fingerprint=STAFFER_FP,
                 account_fingerprint=ACCOUNT_FP,
@@ -230,7 +236,7 @@ async def test_a_re_claim_under_a_drifted_plan_is_refused(session_maker) -> None
     await _claim_create(session_maker)
     await _force_status(session_maker, STATUS_CREATE_REJECTED)
 
-    outcome = await _claim_create(session_maker, plan_digest="9" * 64)
+    outcome = await _claim_create(session_maker, template_config_digest="7" * 64)
 
     assert outcome.granted is False
     assert outcome.reason == CLAIM_REFUSED_PLAN_DRIFT
@@ -241,11 +247,11 @@ async def test_a_pay_is_only_claimable_from_a_proven_created_order(session_maker
     await _claim_create(session_maker)
 
     # An unresolved create cannot be paid for.
-    refused = await claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    refused = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
     assert refused.granted is False
 
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
-    granted = await claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    granted = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
     assert granted.granted is True
 
     snapshot = await load(session_maker)
@@ -259,7 +265,7 @@ async def test_a_pay_is_never_repeated_once_claimed(session_maker, status) -> No
     await _claim_create(session_maker)
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
-    outcome = await claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    outcome = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
 
     assert outcome.granted is False
     assert outcome.reason == CLAIM_REFUSED_STATE
@@ -270,11 +276,15 @@ async def test_a_refund_is_only_claimable_from_a_proven_paid_order(session_maker
     await _claim_create(session_maker)
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
 
-    refused = await claim_refund(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    refused = await claim_refund(
+        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+    )
     assert refused.granted is False
 
     await _force_status(session_maker, STATUS_PAID, target_order_uuid=ORDER_UUID)
-    granted = await claim_refund(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    granted = await claim_refund(
+        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+    )
     assert granted.granted is True
     assert (await load(session_maker)).status == STATUS_REFUND_CLAIMED
 
@@ -285,9 +295,17 @@ async def test_a_refund_is_never_repeated_once_claimed(session_maker, status) ->
     await _claim_create(session_maker)
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
-    outcome = await claim_refund(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    outcome = await claim_refund(
+        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+    )
 
     assert outcome.granted is False
+
+
+CLAIM_KWARGS = {
+    claim_pay: {"pay_plan_digest": PAY_PLAN_DIGEST},
+    claim_refund: {"refund_plan_digest": REFUND_PLAN_DIGEST},
+}
 
 
 @pytest.mark.asyncio
@@ -300,7 +318,7 @@ async def test_a_provably_rejected_stage_may_be_re_claimed(session_maker, status
     await _claim_create(session_maker)
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
-    outcome = await claimer(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    outcome = await claimer(session_maker, **CLAIM_KWARGS[claimer], template_config_digest=TEMPLATE_DIGEST)
 
     assert outcome.granted is True
 
@@ -311,8 +329,8 @@ async def test_two_simultaneous_pay_claims_yield_exactly_one(session_maker) -> N
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
 
     first, second = await asyncio.gather(
-        claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST),
-        claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST),
+        claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST),
+        claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST),
     )
 
     assert sorted([first.granted, second.granted]) == [False, True]
@@ -320,7 +338,7 @@ async def test_two_simultaneous_pay_claims_yield_exactly_one(session_maker) -> N
 
 @pytest.mark.asyncio
 async def test_a_stage_cannot_be_claimed_before_the_row_exists(session_maker) -> None:
-    outcome = await claim_pay(session_maker, plan_digest=PLAN_DIGEST, template_snapshot_digest=TEMPLATE_DIGEST)
+    outcome = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
 
     assert outcome.granted is False
     assert outcome.status is None
@@ -337,26 +355,31 @@ async def test_evidence_is_merged_so_a_later_stage_never_erases_an_earlier_one(s
     await record_outcome(
         session_maker,
         status=STATUS_CREATED,
+        expected_statuses=frozenset({STATUS_CREATE_CLAIMED}),
         target_order_uuid=ORDER_UUID,
         verified_field="create_verified_at",
         evidence={"create_response": {"stage": "create_response"}},
     )
     await _force_status(session_maker, STATUS_PAY_CLAIMED)
-    snapshot = await record_outcome(
+    result = await record_outcome(
         session_maker,
         status=STATUS_PAID,
+        expected_statuses=frozenset({STATUS_PAY_CLAIMED}),
         verified_field="pay_verified_at",
         evidence={"pay_response": {"stage": "pay_response"}},
     )
 
-    assert set(snapshot.evidence) == {"create_response", "pay_response"}
+    assert result.applied is True
+    assert set(result.snapshot.evidence) == {"create_response", "pay_response"}
 
 
 @pytest.mark.asyncio
 async def test_an_unknown_status_is_refused_by_the_module_not_only_the_database(session_maker) -> None:
     await _claim_create(session_maker)
     with pytest.raises(ValueError):
-        await record_outcome(session_maker, status="something_else")
+        await record_outcome(
+            session_maker, status="something_else", expected_statuses=frozenset({STATUS_CREATE_CLAIMED})
+        )
 
 
 @pytest.mark.asyncio
@@ -365,6 +388,7 @@ async def test_the_target_order_uuid_is_the_only_identifier_the_snapshot_exposes
     await record_outcome(
         session_maker,
         status=STATUS_CREATED,
+        expected_statuses=frozenset({STATUS_CREATE_CLAIMED}),
         target_order_uuid=ORDER_UUID,
         verified_field="create_verified_at",
     )
@@ -387,8 +411,8 @@ def _row(**changes: Any) -> EasyWeekVoucherCanaryLedger:
     values: dict[str, Any] = {
         "canary_scope": VOUCHER_CANARY_SCOPE,
         "request_schema_version": "1",
-        "plan_digest": PLAN_DIGEST,
-        "template_snapshot_digest": TEMPLATE_DIGEST,
+        "create_plan_digest": CREATE_PLAN_DIGEST,
+        "template_config_digest": TEMPLATE_DIGEST,
         "customer_fingerprint": CUSTOMER_FP,
         "staffer_fingerprint": STAFFER_FP,
         "account_fingerprint": ACCOUNT_FP,
@@ -424,9 +448,9 @@ def _row(**changes: Any) -> EasyWeekVoucherCanaryLedger:
         # A later stage claimed before an earlier one.
         {"status": STATUS_CREATE_CLAIMED, "pay_claimed_at": utcnow(), "create_claimed_at": None},
         # Digest and fingerprint lengths.
-        {"plan_digest": "short"},
+        {"create_plan_digest": "short"},
         {"customer_fingerprint": "short"},
-        {"template_snapshot_digest": "short"},
+        {"template_config_digest": "short"},
         # An inverted reconciliation window.
         {"create_window_start": utcnow() + timedelta(hours=2)},
     ],
@@ -449,9 +473,11 @@ async def test_a_complete_row_is_accepted(session_maker) -> None:
                 create_claimed_at=now,
                 create_attempted_at=now,
                 create_verified_at=now,
+                pay_plan_digest=PAY_PLAN_DIGEST,
                 pay_claimed_at=now,
                 pay_attempted_at=now,
                 pay_verified_at=now,
+                refund_plan_digest=REFUND_PLAN_DIGEST,
                 refund_claimed_at=now,
                 refund_attempted_at=now,
                 refund_verified_at=now,
@@ -481,8 +507,10 @@ async def test_the_state_vocabulary_matches_the_database_constraint(session_make
                         target_order_uuid=ORDER_UUID if needs_target else None,
                         create_claimed_at=utcnow(),
                         create_attempted_at=utcnow(),
+                        pay_plan_digest=PAY_PLAN_DIGEST,
                         pay_claimed_at=utcnow(),
                         pay_attempted_at=utcnow(),
+                        refund_plan_digest=REFUND_PLAN_DIGEST,
                         refund_claimed_at=utcnow(),
                         refund_attempted_at=utcnow(),
                     )
@@ -495,14 +523,17 @@ async def test_manual_cleanup_is_recorded_as_observed_not_as_our_rollback(sessio
     await record_outcome(
         session_maker,
         status=STATUS_CREATED,
+        expected_statuses=frozenset({STATUS_CREATE_CLAIMED}),
         target_order_uuid=ORDER_UUID,
         verified_field="create_verified_at",
     )
-    snapshot = await record_outcome(
+    result = await record_outcome(
         session_maker,
         status=STATUS_MANUALLY_CLEANED,
+        expected_statuses=frozenset({STATUS_CREATED}),
         manual_cleanup_observed=True,
     )
+    snapshot = result.snapshot
 
     assert snapshot.status == STATUS_MANUALLY_CLEANED
     assert snapshot.manual_cleanup_observed_at is not None
@@ -514,11 +545,12 @@ async def test_manual_cleanup_is_recorded_as_observed_not_as_our_rollback(sessio
 @pytest.mark.asyncio
 async def test_a_foreign_order_uuid_is_still_just_one_identifier(session_maker) -> None:
     await _claim_create(session_maker)
-    snapshot = await record_outcome(
+    result = await record_outcome(
         session_maker,
         status=STATUS_CREATED,
+        expected_statuses=frozenset({STATUS_CREATE_CLAIMED}),
         target_order_uuid=OTHER_UUID,
         verified_field="create_verified_at",
     )
-    assert snapshot.target_order_uuid == OTHER_UUID
-    assert OTHER_UUID not in repr(snapshot.as_safe_dict())
+    assert result.snapshot.target_order_uuid == OTHER_UUID
+    assert OTHER_UUID not in repr(result.snapshot.as_safe_dict())
