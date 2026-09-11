@@ -52,10 +52,19 @@ from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
     imported_modules,
     open_order,
 )
+from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
+    orders_page as build_orders_page,
+)
+from altegio_bot.utils import utcnow
 
 KEY = "SENTINEL_CLIKEY_ggg111"
 SLUG = "SENTINEL_CLISLUG_ggg222"
 BASE = "https://my.easyweek.io/api/public/v2"
+
+
+def empty_orders_page(*, page: int = 1) -> dict[str, Any]:
+    """A page whose metadata agrees with the request that asked for it."""
+    return build_orders_page([], page=page, last_page=page)
 
 
 class Recorder:
@@ -64,7 +73,7 @@ class Recorder:
     def __init__(self, *, order: dict[str, Any] | None = None, orders_page: dict[str, Any] | None = None) -> None:
         self.seen: list[tuple[str, str]] = []
         self.order = order
-        self.orders_page = orders_page if orders_page is not None else {"data": [], "meta": {"last_page": 1}}
+        self.orders_page = orders_page if orders_page is not None else empty_orders_page()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/api/public/v2")
@@ -85,7 +94,7 @@ class Recorder:
         # The documented nested paths, not a workspace-wide filter.
         if path == f"/locations/{KARLSRUHE_LOCATION_UUID}/staffers":
             page = int(request.url.params.get("page", "1"))
-            return httpx.Response(200, json=STAFFERS if page == 1 else {"data": [], "meta": {"last_page": 1}})
+            return httpx.Response(200, json=STAFFERS if page == 1 else empty_orders_page(page=page))
         if path == f"/locations/{KARLSRUHE_LOCATION_UUID}/accounts":
             return httpx.Response(200, json=ACCOUNTS)
         if path == "/orders":
@@ -320,6 +329,63 @@ async def test_status_is_database_only(monkeypatch, capsys, session_maker, confi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"customer": "", "staffer": "", "account": ""},
+        {"customer": None, "staffer": None, "account": None},
+        {"customer": "not-a-uuid", "staffer": STAFFER_UUID, "account": ACCOUNT_UUID},
+    ],
+)
+async def test_status_answers_from_the_database_with_no_identity_at_all(
+    monkeypatch, capsys, session_maker, identity
+) -> None:
+    """The moment an operator most needs `status` is the moment env is broken.
+
+    An expired key, a cleared environment, a canary fence somebody switched
+    off — a state report that refuses to print because the customer UUID is
+    missing is useless exactly when it is needed. So this command reads the
+    ledger and nothing else: no client, no key, no identity, no fence.
+    """
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_customer_uuid", identity["customer"], raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_staffer_uuid", identity["staffer"], raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_account_uuid", identity["account"], raising=False)
+    # No API key either: constructing a client would fail outright.
+    monkeypatch.setattr(settings, "easyweek_api_key", None, raising=False)
+    _forbid_clients(monkeypatch)
+    monkeypatch.setattr(cli, "SessionLocal", session_maker)
+
+    assert await asyncio.to_thread(main, ["status"]) == EXIT_OK
+
+    report = _output(capsys)
+    assert report["mutation_stage"] == "status"
+    assert report["ledger"]["ledger_row_exists"] is False
+    assert report["outcome"] == "proven"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["plan", "reconcile", "create", "pay", "refund"])
+async def test_every_other_command_still_needs_its_identity(monkeypatch, capsys, session_maker, command) -> None:
+    """Only `status` is exempt. Nothing else loosened."""
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_customer_uuid", "", raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_staffer_uuid", "", raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_canary_account_uuid", "", raising=False)
+    _forbid_clients(monkeypatch)
+    monkeypatch.setattr(cli, "SessionLocal", session_maker)
+
+    argv = [command]
+    if command == "plan":
+        argv += ["--stage", STAGE_CREATE]
+    elif command in {"create", "pay", "refund"}:
+        argv += ["--apply", "--plan-digest", "a" * 64, "--plan-issued-at", utcnow().isoformat(), "--confirm", "x"]
+
+    assert await asyncio.to_thread(main, argv) == EXIT_ARGUMENTS
+    assert _output(capsys)["outcome"] == "refused"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_with_no_row_refuses(monkeypatch, capsys, session_maker, configured) -> None:
     _install(monkeypatch, Recorder(), session_maker)
 
@@ -334,7 +400,7 @@ async def test_reconcile_reports_a_manual_cleanup_for_an_open_draft(
     # Put the ledger into `created` with an open draft, without any mutation.
     from datetime import timedelta
 
-    from altegio_bot.easyweek_voucher_canary.plan import canary_marker
+    from altegio_bot.easyweek_voucher_canary.plan import canary_marker, identity_fingerprint
     from altegio_bot.utils import utcnow
 
     now = utcnow()
@@ -342,9 +408,11 @@ async def test_reconcile_reports_a_manual_cleanup_for_an_open_draft(
         session_maker,
         create_plan_digest="a" * 64,
         template_config_digest="b" * 64,
-        customer_fingerprint="c" * 64,
-        staffer_fingerprint="d" * 64,
-        account_fingerprint="e" * 64,
+        # The real fingerprints of the configured environment: a reconcile run
+        # under any other identity refuses before it reads anything.
+        customer_fingerprint=identity_fingerprint("customer", CUSTOMER_UUID),
+        staffer_fingerprint=identity_fingerprint("staffer", STAFFER_UUID),
+        account_fingerprint=identity_fingerprint("account", ACCOUNT_UUID),
         reconciliation_marker=canary_marker(),
         create_window_start=now - timedelta(minutes=10),
         create_window_end=now + timedelta(hours=6),

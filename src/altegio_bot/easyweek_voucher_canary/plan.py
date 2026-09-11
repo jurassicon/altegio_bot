@@ -20,10 +20,19 @@ and each asserts what is true at *that* point in the sequence:
 
 ``create``   no ledger row, no marker order, frozen configuration and readable
              counters;
-``pay``      the ledger is exactly ``created``, the target order is proven,
-             exactly one marker order exists, it is still open, and it is in the
-             canary's own customer/template scope;
-``refund``   the ledger is exactly ``paid`` and the target order reads as paid.
+``pay``      the ledger is ``created`` (or ``pay_rejected``, for a manual retry
+             after a rejection that provably did not act), the target order is
+             proven, exactly one marker order exists, it is still open, it is in
+             the canary's own customer/template scope, and it is EXACTLY the
+             one-voucher order §35 authorises — because a payment settles
+             whatever the order contains;
+``refund``   the ledger is ``paid`` (or ``refund_rejected``) and the target
+             order reads as paid.
+
+Every stage after the first also re-proves that the runtime identity in the
+environment is still the one the ledger row was opened with. A different
+customer, staffer or account of the same branch passes every other check and
+would still be a real mutation on somebody else.
 
 Four different things, kept apart
 ---------------------------------
@@ -60,12 +69,16 @@ from typing import Any, Final, Protocol
 
 from altegio_bot.easyweek_client import EasyWeekError
 from altegio_bot.easyweek_voucher_canary.orders import (
+    CANARY_ORDER_EXTRA_ITEMS,
+    CANARY_ORDER_TOTAL_UNPROVEN,
+    CANARY_VOUCHER_LINE_UNPROVEN,
     ORDER_MALFORMED,
     ORDER_OPEN,
     ORDER_PAID,
     classify_order,
     find_marker_orders,
     order_object,
+    payable_order_reasons,
     rows,
     walk_pages,
 )
@@ -112,6 +125,9 @@ CANARY_LEDGER_STATE_UNEXPECTED: Final = "canary_ledger_state_unexpected"
 CANARY_TARGET_ORDER_UNPROVEN: Final = "canary_target_order_unproven"
 CANARY_TARGET_ORDER_NOT_OPEN: Final = "canary_target_order_not_open"
 CANARY_TARGET_ORDER_NOT_PAID: Final = "canary_target_order_not_paid"
+# The runtime identity in the environment is not the one this ledger row was
+# opened with. Never says WHICH — only that they differ.
+CANARY_IDENTITY_BINDING_MISMATCH: Final = "canary_identity_binding_mismatch"
 CANARY_API_UNAVAILABLE: Final = "canary_api_unavailable"
 CANARY_API_UNCERTAIN: Final = "canary_api_uncertain"
 CANARY_PLAN_EXPIRED: Final = "canary_plan_expired"
@@ -124,13 +140,38 @@ STAGE_PAY: Final = "pay"
 STAGE_REFUND: Final = "refund"
 MUTATION_STAGES: Final = (STAGE_CREATE, STAGE_PAY, STAGE_REFUND)
 
-# The ledger status each stage requires. `None` means "no row at all".
+# The ledger status each stage normally starts from. `None` means "no row".
 STAGE_REQUIRED_LEDGER_STATUS: Final = {
     STAGE_CREATE: None,
     STAGE_PAY: "created",
     STAGE_REFUND: "paid",
 }
 
+# Every ledger status a stage may be planned FROM. Besides the normal source
+# state, each stage accepts its own ``*_rejected``: a rejection this transport
+# proved did not act leaves the canary exactly where it was, and the operator
+# must be able to fix the cause and try once more. That retry is manual all the
+# way through — a fresh plan, a fresh digest, a fresh issued_at, a fresh phrase
+# and another `--apply` — and nothing here ever re-sends anything by itself.
+#
+# Deliberately NOT here: `*_claimed`, `*_unknown`, `ambiguous`,
+# `manually_cleaned` and the completed states. Those are exactly the cases where
+# a request may have acted, and a second one could duplicate it.
+STAGE_SOURCE_LEDGER_STATUSES: Final = {
+    STAGE_CREATE: frozenset({None, "create_rejected"}),
+    STAGE_PAY: frozenset({"created", "pay_rejected"}),
+    STAGE_REFUND: frozenset({"paid", "refund_rejected"}),
+}
+
+# The proofs a payable order must produce, kept in one place so the CLI, the
+# tests and the runbook name the same codes.
+PAY_ORDER_PROOF_REASONS: Final = (
+    CANARY_VOUCHER_LINE_UNPROVEN,
+    CANARY_ORDER_TOTAL_UNPROVEN,
+    CANARY_ORDER_EXTRA_ITEMS,
+)
+
+_IDENTITY_ROLES: Final = ("customer", "staffer", "account")
 _COUNTER_FIELDS: Final = ("vouchers_count", "activated_vouchers_count")
 _MAX_LISTING_PAGES: Final = 20
 
@@ -360,15 +401,37 @@ class StagePlan:
     def expires_at(self) -> datetime:
         return self.issued_at + PLAN_MAX_AGE
 
+    def digest_for(self, issued_at: datetime) -> str:
+        """This plan's digest AS IF it had been issued at ``issued_at``.
+
+        The authorisation check needs this because the plan it verifies against
+        is rebuilt seconds before the claim and therefore carries a new
+        ``issued_at`` of its own. Recomputing with the operator's timestamp is
+        what makes that timestamp part of what was signed: a digest approved for
+        one moment does not authorise the same stage at another, and an operator
+        cannot keep an old digest alive by pairing it with a fresh timestamp
+        they typed themselves.
+        """
+        return _stage_digest(
+            stage=self.stage,
+            snapshot=self.snapshot,
+            ledger_state=self.ledger_state,
+            issued_at=issued_at,
+        )
+
+    def phrase_for(self, digest: str) -> str:
+        return f"{self.stage}-voucher-canary-{digest[:12]}"
+
     @property
     def confirmation_phrase(self) -> str:
         """The exact phrase an operator must type for THIS stage of THIS plan.
 
-        Bound to the stage digest, so a phrase cannot be prepared before the
-        plan exists, reused after the workspace drifted, or carried from one
-        stage to the next.
+        Bound to the stage digest — which is itself bound to the stage and to
+        the moment the plan was issued — so a phrase cannot be prepared before
+        the plan exists, reused after the workspace drifted, carried from one
+        stage to the next, or revived once the approval has aged out.
         """
-        return f"{self.stage}-voucher-canary-{self.digest[:12]}"
+        return self.phrase_for(self.digest)
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -403,6 +466,38 @@ def _digest_over(material: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
+def _stage_digest(
+    *,
+    stage: str,
+    snapshot: dict[str, Any],
+    ledger_state: dict[str, Any],
+    issued_at: datetime,
+) -> str:
+    """The authorisation digest of one stage, at one exact moment.
+
+    ``issued_at`` is canonical material, not a label printed beside the digest.
+    An approval is a statement about a workspace AT A MOMENT, and a digest that
+    did not cover the moment could be replayed indefinitely by pairing it with
+    any fresh timestamp — the age check alone cannot stop that, because the age
+    check only ever sees the timestamp the operator typed.
+
+    Microsecond resolution is deliberate: two plans built in the same second are
+    two different approvals.
+
+    The counters stay out, as they always have. A counter that moved because a
+    voucher was issued is the product working, and folding it in here would make
+    the refund unreachable exactly when it matters most.
+    """
+    return _digest_over(
+        {
+            "stage": stage,
+            "snapshot": snapshot,
+            "ledger_state": ledger_state,
+            "plan_issued_at": issued_at.isoformat(),
+        }
+    )
+
+
 async def _listed_uuids(
     fetch: Any,
     *,
@@ -428,6 +523,26 @@ async def _listed_uuids(
     return found, walk.complete
 
 
+def identity_binding_matches(
+    identity: RuntimeIdentity,
+    stored: dict[str, str | None] | None,
+) -> bool:
+    """Is the environment's identity the one this ledger row was opened with?
+
+    ``None`` — no row yet — matches: there is nothing to contradict. A row that
+    exists must agree on all three roles.
+
+    This is what stops a canary from being pointed at a different customer, a
+    different staffer or a different account of the SAME branch half-way
+    through. Every one of those would still pass the branch, template and
+    workspace proofs, and would still be a real mutation on somebody else.
+    """
+    if stored is None:
+        return True
+    current = identity.fingerprints
+    return all(stored.get(role) == current[role] for role in _IDENTITY_ROLES)
+
+
 async def build_stage_plan(
     reader: CanaryReader,
     *,
@@ -436,6 +551,7 @@ async def build_stage_plan(
     enabled: bool,
     ledger_status: str | None = None,
     target_order_uuid: str | None = None,
+    ledger_identity: dict[str, str | None] | None = None,
     create_window_start: datetime | None = None,
     create_window_end: datetime | None = None,
     now: datetime | None = None,
@@ -462,16 +578,24 @@ async def build_stage_plan(
         "reconciliation_marker": marker,
         "identity_fingerprints": identity.fingerprints,
     }
+    # The runtime identity must be the one the ledger row was opened with. The
+    # comparison is over fingerprints and the result is a boolean; neither the
+    # stored digest nor the runtime UUID is reported by it.
+    identity_bound = identity_binding_matches(identity, ledger_identity)
     ledger_state: dict[str, Any] = {
         "status": ledger_status,
         "target_order_known": target_order_uuid is not None,
         "required_status": STAGE_REQUIRED_LEDGER_STATUS.get(stage),
+        "identity_binding_proven": identity_bound,
     }
+    snapshot["identity_binding_proven"] = identity_bound
 
     if stage not in MUTATION_STAGES:
         reasons.append(CANARY_UNKNOWN_STAGE)
     if not enabled:
         reasons.append(CANARY_DISABLED_BY_ENV)
+    if not identity_bound:
+        reasons.append(CANARY_IDENTITY_BINDING_MISMATCH)
 
     counters: dict[str, int] | None = None
     config_digest = ""
@@ -571,14 +695,15 @@ async def build_stage_plan(
     snapshot["immutable_template_digest"] = config_digest
     ledger_state["order_state"] = order_state
 
-    # The authorisation digest covers the frozen configuration, the identities,
-    # the proven prerequisites and where the canary is — and deliberately NOT the
-    # counters, which legitimately move when the product does its job.
-    digest = _digest_over(
-        {
-            "snapshot": snapshot,
-            "ledger_state": ledger_state,
-        }
+    # The authorisation digest covers the stage, the moment, the frozen
+    # configuration, the identities, the proven prerequisites and where the
+    # canary is — and deliberately NOT the counters, which legitimately move
+    # when the product does its job.
+    digest = _stage_digest(
+        stage=stage,
+        snapshot=snapshot,
+        ledger_state=ledger_state,
+        issued_at=issued_at,
     )
     unique = tuple(dict.fromkeys(reasons))
     return StagePlan(
@@ -613,9 +738,15 @@ async def _stage_preconditions(
     facts: dict[str, Any] = {}
     observations: list[dict[str, Any]] = []
 
-    required = STAGE_REQUIRED_LEDGER_STATUS.get(stage, "__unknown__")
-    if ledger_status != required:
+    # The normal source state, or this stage's own proven-rejected state. A
+    # rejection that provably did not act is the one thing an operator may fix
+    # and try again — with a whole new plan, digest, issued_at, phrase and
+    # `--apply`. Everything else stays unclaimable and goes to reconciliation.
+    allowed = STAGE_SOURCE_LEDGER_STATUSES.get(stage, frozenset())
+    if ledger_status not in allowed:
         reasons.append(CANARY_LEDGER_STATE_UNEXPECTED)
+    normal_source = STAGE_REQUIRED_LEDGER_STATUS.get(stage)
+    facts["retry_after_proven_rejection"] = ledger_status in allowed and ledger_status != normal_source
 
     if stage == STAGE_CREATE:
         # Nothing of ours may exist yet — neither a ledger row nor a marker
@@ -672,6 +803,20 @@ async def _stage_preconditions(
             reasons.append(CANARY_CUSTOMER_UNPROVEN)
         if state != ORDER_OPEN:
             reasons.append(CANARY_TARGET_ORDER_NOT_OPEN)
+        # A payment settles whatever the order happens to contain, so the order
+        # itself is the amount. Before one euro moves, this has to be EXACTLY
+        # the order §35 authorises: one voucher line, the confirmed template,
+        # price 1500 as an integer, quantity 1 as an integer, no services, no
+        # goods, no second line, and a published total that agrees. An open
+        # order with our marker and our customer but an empty `vouchers` list
+        # and some other sum is somebody else's money.
+        proof_reasons = payable_order_reasons(
+            payload,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        facts["payable_order_proven"] = not proof_reasons
+        reasons.extend(proof_reasons)
         # Exactly one marker order must exist, and it must be the target.
         window_start = create_window_start or (utcnow() - CREATE_WINDOW_BEFORE)
         window_end = create_window_end or (utcnow() + CREATE_WINDOW_AFTER)
@@ -717,13 +862,26 @@ def verify_plan_authorisation(
     An empty tuple means the operator's digest, the operator's phrase and the
     live workspace all still agree, and the approval is not stale. Anything else
     stops the command before a claim exists.
+
+    The digest is recomputed over the freshly rebuilt plan USING THE OPERATOR'S
+    OWN ``issued_at``. That is what binds the moment into the approval: the
+    timestamp is not metadata travelling next to a digest that would have been
+    valid whenever, it is part of what was signed. Supply the digest from an
+    old plan with a newly invented timestamp and the two no longer agree.
     """
     moment = now or utcnow()
     reasons: list[str] = list(plan.reasons)
-    if supplied_digest != plan.digest:
+
+    if supplied_issued_at is None:
+        # With no timestamp there is nothing to recompute against, so the
+        # digest and the phrase cannot be checked at all. Everything fails.
+        return tuple(dict.fromkeys([*reasons, CANARY_PLAN_EXPIRED, CANARY_PLAN_DIGEST_MISMATCH]))
+
+    expected_digest = plan.digest_for(supplied_issued_at)
+    if supplied_digest != expected_digest:
         reasons.append(CANARY_PLAN_DIGEST_MISMATCH)
-    if supplied_phrase != plan.confirmation_phrase:
+    if supplied_phrase != plan.phrase_for(expected_digest):
         reasons.append(CANARY_CONFIRMATION_MISMATCH)
-    if supplied_issued_at is None or moment - supplied_issued_at > PLAN_MAX_AGE or supplied_issued_at > moment:
+    if moment - supplied_issued_at > PLAN_MAX_AGE or supplied_issued_at > moment:
         reasons.append(CANARY_PLAN_EXPIRED)
     return tuple(dict.fromkeys(reasons))

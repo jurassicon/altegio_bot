@@ -87,12 +87,29 @@ payment or a refund.
 Every plan performs GETs only. It creates no ledger row and sends no mutation.
 What each one asserts:
 
-* **create** — no ledger row, no existing marker order, frozen configuration and
-  readable counters;
-* **pay** — the ledger is exactly `created`, the target order is proven, exactly
-  one marker order exists, it is still open and in the canary's own
-  customer/template scope;
-* **refund** — the ledger is exactly `paid` and the target order reads as paid.
+* **create** — no ledger row (or a proven-rejected one, see section 4a), no
+  existing marker order, frozen configuration and readable counters;
+* **pay** — the ledger is `created` (or `pay_rejected`), the target order is
+  proven, exactly one marker order exists, it is still open, it is in the
+  canary's own customer/template scope, and it is **exactly** the order §35
+  authorises: one voucher line, the confirmed template, price 1500 as an
+  integer, quantity 1, no services or goods, and a published total that agrees.
+  A payment settles whatever the order contains, so "is this our order?" is not
+  the same question as "is this the order we approved?";
+* **refund** — the ledger is `paid` (or `refund_rejected`) and the target order
+  reads as paid. The refund deliberately does **not** inspect the voucher
+  contents: an unreadable artifact must never leave a real payment standing.
+
+Every stage after the first also re-proves that the customer, staffer and
+account in `easyweek.env` are still the ones the ledger row was opened with. A
+different account of the same branch passes every other check there is and would
+still be a real payment on somebody else, so the comparison is part of the
+signed plan and is checked again under the database row lock at claim time. The
+report says only `identity_binding_proven: true|false`.
+
+An order whose state is missing, empty, unfamiliar, or self-contradictory is
+`unknown` — never `open`. `open` is the one state a payment may be sent from, so
+anything we cannot name is fail-closed out of it.
 
 The output separates four different things, and the separation matters:
 
@@ -123,6 +140,31 @@ claimed.
 
 An approval also goes stale: `plan_issued_at` must be within the plan's short
 maximum age. Re-run `plan` and get a fresh approval if it has expired.
+
+`plan_issued_at` is part of the digest itself, not a label printed beside it. An
+old digest cannot be revived by typing a fresh timestamp next to it: the two are
+verified together, and two plans one microsecond apart are two different
+approvals. The voucher counters stay out of the digest, so a voucher that was
+issued never invalidates an approval.
+
+## 4a. Trying again after a rejection
+
+A stage that was rejected **by the endpoint's own validation** — its refusal
+envelope, on a status decided before the handler acts — leaves the ledger in
+`create_rejected`, `pay_rejected` or `refund_rejected`. That is the one state an
+operator may deliberately try again from, and it exists so a fixable 422 does
+not strand an open draft order.
+
+Trying again is manual from end to end: fix the cause, run `plan --stage ...`
+again, have the owner approve the **new** digest, and pass the new
+`--plan-digest`, `--plan-issued-at`, `--confirm` and `--apply`. The previous
+approval is spent and will be refused. Nothing is ever re-sent automatically.
+
+Every other failure — a timeout, a transport error, a 429 or 5xx, a 2xx whose
+body could not be read, a redirect, and every 4xx that does **not** prove the
+endpoint declined before acting (a 402, a 409, a 423, a bodiless 405 from an
+edge) — is UNKNOWN, not rejected. Those go to `reconcile` and are never
+retried.
 
 ## 5. Create
 
@@ -158,8 +200,19 @@ The branch, the customer and the staffer are proven by the documented request
 filters, not by fields in the response: the observed order body carries neither a
 top-level `location_uuid` nor a `staffer_uuid`. An unfamiliar voucher shape is
 recorded as a contract observation and is never read as "this order belongs to
-somebody else". Completeness comes from the published `meta.last_page`, not from
-the first empty page.
+somebody else".
+
+Completeness is proven, not assumed. A page counts only when its own metadata
+agrees with the request that produced it: `current_page` is the page that was
+asked for, `last_page` is consistent across the walk, and `per_page` is the fixed
+size. Missing, malformed or repeated metadata — a server answering page 2 with
+page 1 — makes the walk **incomplete**, and an incomplete walk is unresolved,
+never "there is nothing there". An empty page is not an end marker either.
+
+`reconcile` refuses before its first GET if the environment's identity is not
+the one the ledger row was opened with. Searching a different customer's orders
+for our marker, and then judging what it found against this row, is worse than
+not looking at all.
 
 * exactly one match → a *candidate*, which still has to pass the same exact
   readback as a fresh create before the ledger says `created`;
@@ -168,11 +221,25 @@ the first empty page.
   marker;
 * two or more matches → **ambiguous**. Stop completely and involve the owner.
 
-Reconciliation is monotonic. A read taken while a POST is still in flight can
-move a stage forward or leave it alone, but it can never move it back to a state
-the same POST could be claimed from: a `pay_claimed` order that still reads open
-becomes `pay_unknown`, never `created`, and a `refund_claimed` order that still
-reads paid stays exactly where it is.
+Reconciliation is monotonic and complete. Every combination of ledger state and
+remote order state has a defined answer, and a read taken while a POST is still
+in flight can move a stage forward or leave it alone — never back to a state the
+same POST could be claimed from:
+
+| The order reads | What the ledger does |
+|---|---|
+| refunded | any unfinished stage after `created` advances to `refunded`. A payment that never came back does not stay unknown over an order that was refunded |
+| paid | `created`, `pay_claimed`, `pay_unknown` and `pay_rejected` advance to `paid`. A refund stage does **not** move: that would make the order payable again |
+| open | only `pay_claimed` moves, and only to `pay_unknown` — a payment in flight reads open, and calling that "not paid" would send it twice |
+| cancelled | `created` and `pay_rejected` record **manual cleanup observed**. Nothing where a payment of ours may still be outstanding |
+| unknown or malformed | nothing at all, and the outcome is never `proven` |
+
+A verification timestamp is written only where this canary actually attempted
+that stage. Somebody settling or cancelling the order in the dashboard is
+recorded as an observation, never as our own proof. And when the ledger and the
+order contradict each other — a `refunded` row over an order that reads paid —
+the report says so instead of `proven`, because the expensive possibility is
+that the money is still out.
 
 ## 7. Pay
 
@@ -181,6 +248,12 @@ docker compose -p altegio_bot run --rm --no-deps --entrypoint /app/.venv/bin/pyt
 ```
 
 Only a proven created order may be paid for, once, on the approved Card account.
+Proven means the whole of the pay plan above, including the exact contents of
+the order: our marker and our customer are not enough, because the payment
+settles the order's own sum. An open order carrying our marker but an empty
+voucher list and some other total is refused before the claim is taken and
+before anything is sent.
+
 The request body is exactly `{"account_uuid": ...}` — the documented endpoint
 takes no amount, and it does not need one: the sum is already fixed by the exact
 open order and its one voucher line. A real card is charged here.
@@ -229,7 +302,10 @@ refunded/reverted, and the report says `remote_rollback_proven: true`. The
 report also shows the template counters before and after, so an unexplained
 drift is visible rather than assumed away.
 
-Then run `status` (database only, no network) for the final durable record.
+Then run `status` for the final durable record. `status` reads the ledger and
+nothing else: no HTTP client, no API key, no runtime identity and no canary
+fence. It answers even when `easyweek.env` is empty or wrong, which is exactly
+when an operator needs to know where the canary stands.
 
 ## 11. Manual cleanup of an open draft
 
@@ -251,6 +327,8 @@ observed**. It does not claim it performed the rollback, because it did not.
 
 An UNKNOWN outcome means the request left this process and its effect is not
 known. It is never retried automatically, and it must never be wired to one.
+This is not the same as a proven rejection — see section 4a, which is the only
+case an operator may deliberately attempt again.
 
 1. **Do not re-run the mutation command.** The ledger will refuse it anyway;
    that refusal is the design, not an obstacle to work around.
@@ -270,7 +348,7 @@ known. It is never retried automatically, and it must never be wired to one.
 | `0` | The requested stage was proven. **Not** a permission to send anything |
 | `2` | Bad arguments, `--help`, missing `--apply`, env fence off, or unusable configuration |
 | `3` | **UNKNOWN — do not auto-retry.** A request went out and its effect is unproven |
-| `4` | Contract mismatch or refusal — a fact did not hold, a stage plan did not authorise it, or a stage was rejected |
+| `4` | Contract mismatch or refusal — a fact did not hold, a stage plan did not authorise it, a stage was rejected, or the ledger and the order disagree |
 | `5` | Ambiguous reconciliation — more than one candidate order |
 | `6` | Manual dashboard cleanup required |
 | `7` | Final rollback unproven — the order does not read as refunded |

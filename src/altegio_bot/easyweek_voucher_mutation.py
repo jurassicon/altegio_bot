@@ -39,6 +39,14 @@ twice. They are raised as :class:`EasyWeekVoucherMutationUnknown`, which is
 deliberately NOT a subclass of the generic retryable error, so that no "is it
 retryable?" sweep can pick one up and repeat it.
 
+A rejection has to be PROVEN, too. Only this API's own refusal envelope, on a
+status that is decided before the handler acts (400, 401, 403, 404, 422), is
+reported as a permanent rejection — because that is the one outcome the caller
+is allowed to deliberately try again from. Every other 4xx, and any refusal
+whose body did not come from this API, is UNKNOWN and goes to reconciliation: a
+402 may be a declined payment attempt, a 409 may be "already paid", and a
+bodiless 405 may be an edge that never reached the endpoint at all.
+
 A redirect is a refusal. ``follow_redirects`` is off and the client is always
 built and owned here, because a 307/308 preserves method and body: following one
 would re-send this POST, Authorization header included, wherever the response
@@ -90,6 +98,20 @@ REFUND_OPERATION: Final = "refund_voucher_order"
 
 # Every redirect status. None is followed; each is a fail-closed refusal.
 _REDIRECT_STATUSES: Final = frozenset({301, 302, 303, 307, 308})
+
+# The only statuses that may be recorded as a PROVEN rejection, and then only
+# when the body is this API's own refusal envelope. Each of them is a decision
+# taken before the handler could act: the request was unauthenticated (401),
+# forbidden (403), addressed to something that does not exist (404), or refused
+# by request validation (400/422).
+#
+# Everything else in the 4xx range stays UNKNOWN on purpose. A 402 can mean a
+# payment was attempted and declined, a 409 can mean "already paid", a 423 can
+# mean a lock taken while something was in progress, and 405/410/415/451 with
+# no envelope are typically an edge speaking, not the endpoint. None of them
+# proves nothing happened — and `*_rejected` is the one state from which an
+# operator may deliberately try again.
+_PROVEN_REJECTION_STATUSES: Final = frozenset({400, 401, 403, 404, 422})
 
 # The only field names a 4xx may echo back, per operation. Never a value, never
 # the server's prose, never the body.
@@ -202,6 +224,27 @@ def _safe_marker(value: object, *, operation: str) -> str:
     if not set(value) <= _MARKER_ALPHABET:
         raise EasyWeekPermanentError("marker contains unsupported characters", operation=operation)
     return value
+
+
+def _carries_api_refusal_envelope(response: httpx.Response) -> bool:
+    """Did THIS API answer, rather than something in front of it?
+
+    The documented refusal is a JSON object — the Laravel validation envelope
+    with ``message`` and/or ``errors``. An HTML error page, an empty body or a
+    bare string is what an edge, a proxy or a WAF returns, and that tells us
+    nothing about whether the request ever reached the handler.
+
+    Only the SHAPE is inspected. No value, no key and no prose from the body is
+    read here, kept or reported.
+    """
+    content_type = response.headers.get("content-type", "")
+    if "json" not in content_type.casefold():
+        return False
+    try:
+        payload: Any = response.json()
+    except Exception:
+        return False
+    return isinstance(payload, dict)
 
 
 def _safe_validation_fields(response: httpx.Response, *, allowed: frozenset[str]) -> list[str]:
@@ -400,7 +443,27 @@ class EasyWeekVoucherMutationClient:
                 attempts=1,
             )
 
-        # Permanent 4xx: the server rejected the request before acting.
+        if status not in _PROVEN_REJECTION_STATUSES or not _carries_api_refusal_envelope(response):
+            # A 4xx we cannot attribute to THIS API's own request validation.
+            # A 409 may mean "already paid", a 402 may mean a payment was tried
+            # and declined, and a bodiless 405 or 451 may have come from an edge
+            # in front of the handler — or from behind it. None of those proves
+            # nothing happened, and only something that proves nothing happened
+            # may be recorded as rejected, because `*_rejected` is the one state
+            # an operator is allowed to retry from.
+            logger.error(
+                "easyweek_voucher_mutation: %s unattributable rejection status=%s — outcome UNKNOWN, no retry",
+                operation,
+                status,
+            )
+            raise EasyWeekVoucherMutationUnknown(
+                "mutation rejected without proof that it did not act",
+                operation=operation,
+                status_code=status,
+                attempts=1,
+            )
+
+        # A validation refusal from the endpoint itself: declined before acting.
         fields = _safe_validation_fields(response, allowed=allowed_fields)
         named = ",".join(fields) if fields else "no recognised field named"
         logger.error("easyweek_voucher_mutation: %s rejected status=%s fields=%s", operation, status, named)

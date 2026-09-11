@@ -54,6 +54,9 @@ CUSTOMER_FP = "c" * 64
 STAFFER_FP = "d" * 64
 ACCOUNT_FP = "e" * 64
 MARKER = "ewvc1-000000000000"
+# The identity this row is opened with. Every later claim has to present the
+# same three fingerprints, or it is acting on somebody else.
+IDENTITY_FP = {"customer": CUSTOMER_FP, "staffer": STAFFER_FP, "account": ACCOUNT_FP}
 
 
 async def _claim_create(session_maker, **changes: Any):
@@ -247,11 +250,21 @@ async def test_a_pay_is_only_claimable_from_a_proven_created_order(session_maker
     await _claim_create(session_maker)
 
     # An unresolved create cannot be paid for.
-    refused = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
+    refused = await claim_pay(
+        session_maker,
+        pay_plan_digest=PAY_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
+    )
     assert refused.granted is False
 
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
-    granted = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
+    granted = await claim_pay(
+        session_maker,
+        pay_plan_digest=PAY_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
+    )
     assert granted.granted is True
 
     snapshot = await load(session_maker)
@@ -265,7 +278,12 @@ async def test_a_pay_is_never_repeated_once_claimed(session_maker, status) -> No
     await _claim_create(session_maker)
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
-    outcome = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
+    outcome = await claim_pay(
+        session_maker,
+        pay_plan_digest=PAY_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
+    )
 
     assert outcome.granted is False
     assert outcome.reason == CLAIM_REFUSED_STATE
@@ -277,13 +295,19 @@ async def test_a_refund_is_only_claimable_from_a_proven_paid_order(session_maker
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
 
     refused = await claim_refund(
-        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+        session_maker,
+        refund_plan_digest=REFUND_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
     )
     assert refused.granted is False
 
     await _force_status(session_maker, STATUS_PAID, target_order_uuid=ORDER_UUID)
     granted = await claim_refund(
-        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+        session_maker,
+        refund_plan_digest=REFUND_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
     )
     assert granted.granted is True
     assert (await load(session_maker)).status == STATUS_REFUND_CLAIMED
@@ -296,7 +320,10 @@ async def test_a_refund_is_never_repeated_once_claimed(session_maker, status) ->
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
     outcome = await claim_refund(
-        session_maker, refund_plan_digest=REFUND_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST
+        session_maker,
+        refund_plan_digest=REFUND_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
     )
 
     assert outcome.granted is False
@@ -309,6 +336,63 @@ CLAIM_KWARGS = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["customer", "staffer", "account"])
+@pytest.mark.parametrize(
+    "status,claimer",
+    [(STATUS_CREATED, claim_pay), (STATUS_PAID, claim_refund)],
+)
+async def test_a_claim_under_another_identity_is_refused_under_the_lock(session_maker, role, status, claimer) -> None:
+    """The plan checked this too — before the lock existed.
+
+    Between building a plan and taking the row lock, the environment can be
+    edited. The claim is the last moment anything can still refuse, so the
+    comparison happens again with the row held.
+    """
+    await _claim_create(session_maker)
+    await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
+
+    foreign = dict(IDENTITY_FP)
+    foreign[role] = "f" * 64
+
+    outcome = await claimer(
+        session_maker,
+        **CLAIM_KWARGS[claimer],
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=foreign,
+    )
+
+    assert outcome.granted is False
+    assert outcome.reason == ledger_module.CLAIM_REFUSED_IDENTITY_DRIFT
+    # Refused, and nothing about the row moved.
+    assert (await load(session_maker)).status == status
+
+
+@pytest.mark.asyncio
+async def test_a_create_re_claim_under_another_identity_is_refused(session_maker) -> None:
+    await _claim_create(session_maker)
+    await _force_status(session_maker, STATUS_CREATE_REJECTED)
+
+    outcome = await _claim_create(session_maker, account_fingerprint="f" * 64)
+
+    assert outcome.granted is False
+    assert outcome.reason == ledger_module.CLAIM_REFUSED_IDENTITY_DRIFT
+
+
+@pytest.mark.asyncio
+async def test_the_recorded_identity_is_reported_as_a_boolean_only(session_maker) -> None:
+    await _claim_create(session_maker)
+
+    snapshot = await load(session_maker)
+
+    assert snapshot.identity_fingerprints == IDENTITY_FP
+    safe = snapshot.as_safe_dict()
+    assert safe["identity_fingerprints_recorded"] is True
+    printed = str(safe)
+    for fingerprint in IDENTITY_FP.values():
+        assert fingerprint not in printed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status,claimer",
     [(STATUS_PAY_REJECTED, claim_pay), (STATUS_REFUND_REJECTED, claim_refund)],
@@ -318,7 +402,12 @@ async def test_a_provably_rejected_stage_may_be_re_claimed(session_maker, status
     await _claim_create(session_maker)
     await _force_status(session_maker, status, target_order_uuid=ORDER_UUID)
 
-    outcome = await claimer(session_maker, **CLAIM_KWARGS[claimer], template_config_digest=TEMPLATE_DIGEST)
+    outcome = await claimer(
+        session_maker,
+        **CLAIM_KWARGS[claimer],
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
+    )
 
     assert outcome.granted is True
 
@@ -329,8 +418,18 @@ async def test_two_simultaneous_pay_claims_yield_exactly_one(session_maker) -> N
     await _force_status(session_maker, STATUS_CREATED, target_order_uuid=ORDER_UUID)
 
     first, second = await asyncio.gather(
-        claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST),
-        claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST),
+        claim_pay(
+            session_maker,
+            pay_plan_digest=PAY_PLAN_DIGEST,
+            template_config_digest=TEMPLATE_DIGEST,
+            identity_fingerprints=IDENTITY_FP,
+        ),
+        claim_pay(
+            session_maker,
+            pay_plan_digest=PAY_PLAN_DIGEST,
+            template_config_digest=TEMPLATE_DIGEST,
+            identity_fingerprints=IDENTITY_FP,
+        ),
     )
 
     assert sorted([first.granted, second.granted]) == [False, True]
@@ -338,7 +437,12 @@ async def test_two_simultaneous_pay_claims_yield_exactly_one(session_maker) -> N
 
 @pytest.mark.asyncio
 async def test_a_stage_cannot_be_claimed_before_the_row_exists(session_maker) -> None:
-    outcome = await claim_pay(session_maker, pay_plan_digest=PAY_PLAN_DIGEST, template_config_digest=TEMPLATE_DIGEST)
+    outcome = await claim_pay(
+        session_maker,
+        pay_plan_digest=PAY_PLAN_DIGEST,
+        template_config_digest=TEMPLATE_DIGEST,
+        identity_fingerprints=IDENTITY_FP,
+    )
 
     assert outcome.granted is False
     assert outcome.status is None

@@ -41,6 +41,12 @@ payment or a refund.
 ``plan``, ``status`` and ``reconcile`` never mutate. ``reconcile`` and ``status``
 are safe to repeat as often as an operator likes.
 
+``status`` is narrower still: it reads the durable ledger and nothing else. No
+HTTP client, no API key, no runtime identity, no canary fence — because the
+moment an operator most needs to know where the canary stands is the moment the
+environment is broken, and a state report that refuses to print without a valid
+customer UUID would be useless exactly then.
+
 Nothing printed here carries a customer, a staffer, an account, a name, a phone
 number, an e-mail, a voucher code, a customer-facing URL, a request body, a
 response body, a header or a key.
@@ -210,6 +216,7 @@ async def _run_plan(identity: RuntimeIdentity, stage: str) -> tuple[dict[str, An
             enabled=settings.easyweek_voucher_canary_enabled,
             ledger_status=snapshot.status,
             target_order_uuid=snapshot.target_order_uuid,
+            ledger_identity=snapshot.identity_fingerprints if snapshot.exists else None,
             create_window_start=snapshot.create_window_start,
             create_window_end=snapshot.create_window_end,
         )
@@ -281,6 +288,22 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(_refusal_report(command, ["canary_plan_authorisation_missing"]))
             return EXIT_ARGUMENTS
 
+    if command == COMMAND_STATUS:
+        # Answered from the durable ledger alone, deliberately BEFORE the
+        # runtime identity is even looked at. `status` is the command an
+        # operator reaches for when something is wrong — an expired key, a
+        # cleared environment, a canary fence someone switched off — and a
+        # state report that refuses to print because the environment is
+        # incomplete is exactly no use at that moment. It constructs no HTTP
+        # client, needs no API key and sends nothing.
+        try:
+            report, code = asyncio.run(_run_status())
+        except EasyWeekConfigError:  # pragma: no cover - status touches no client
+            _print_json(_refusal_report(command, ["canary_api_unavailable"]))
+            return EXIT_ARGUMENTS
+        _print_json(report)
+        return code
+
     identity, refusal = _identity_or_refusal(command)
     if identity is None:
         assert refusal is not None
@@ -290,8 +313,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == COMMAND_PLAN:
             report, code = asyncio.run(_run_plan(identity, args.stage))
-        elif command == COMMAND_STATUS:
-            report, code = asyncio.run(_run_status())
         elif command == COMMAND_RECONCILE:
             report, code = asyncio.run(_run_reconcile(identity))
         else:

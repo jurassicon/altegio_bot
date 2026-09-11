@@ -512,11 +512,11 @@ def test_an_unknown_outcome_is_not_a_generic_retryable_error() -> None:
         (401, EasyWeekAuthError),
         (403, EasyWeekAuthError),
         (404, EasyWeekNotFoundError),
-        (409, EasyWeekPermanentError),
         (422, EasyWeekPermanentError),
     ],
 )
 async def test_permanent_statuses_are_typed_and_sent_once(status, expected) -> None:
+    """A refusal this endpoint decided BEFORE acting, in its own envelope."""
     calls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -529,6 +529,66 @@ async def test_permanent_statuses_are_typed_and_sent_once(status, expected) -> N
 
     assert len(calls) == 1
     assert ERROR_MARKER not in str(excinfo.value)
+    assert excinfo.value.retryable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [402, 405, 409, 410, 415, 423, 428, 451])
+async def test_a_4xx_that_does_not_prove_inaction_stays_unknown(status) -> None:
+    """Only a proven-no-effect refusal may become a state we can retry from.
+
+    A 409 can mean "already paid", a 402 can mean a payment was attempted and
+    declined, a 423 can mean a lock taken while something was in progress.
+    Recording any of them as *rejected* would put the canary back into a state
+    an operator is allowed to send from — on top of a mutation that may already
+    have happened.
+    """
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(status, json={"message": ERROR_MARKER})
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekVoucherMutationUnknown) as excinfo:
+            await _create(client)
+
+    assert len(calls) == 1
+    assert ERROR_MARKER not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"content": b"", "headers": {}},
+        {"text": "<html><body>Forbidden</body></html>", "headers": {"content-type": "text/html"}},
+        {"json": ["not", "an", "object"], "headers": {}},
+    ],
+)
+async def test_a_refusal_that_did_not_come_from_this_api_stays_unknown(body) -> None:
+    """An edge, a proxy or a WAF cannot tell us whether the endpoint acted."""
+    headers = body.pop("headers")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers=headers, **body)
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekVoucherMutationUnknown):
+            await _create(client)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_rejection_is_never_a_retryable_error() -> None:
+    """`retryable` invites a sweep to send the same mutation again."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"message": ERROR_MARKER})
+
+    async with _client(handler) as client:
+        with pytest.raises(EasyWeekVoucherMutationUnknown) as excinfo:
+            await _create(client)
+
     assert excinfo.value.retryable is False
 
 

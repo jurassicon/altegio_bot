@@ -28,10 +28,21 @@ ever cleared.
 
 Re-claiming
 -----------
-A stage may be re-claimed from exactly one state: ``*_rejected``. A permanent
-4xx means the server declined before acting, so nothing happened and a fresh
-attempt cannot duplicate anything. Everything else — claimed, unknown, done —
-refuses, and the way forward is reconciliation by reading, never another POST.
+A stage may be re-claimed from exactly one state: ``*_rejected``. That state is
+reserved for the responses this API's own transport proved did not act — its
+validation refusals — and a fresh attempt after one cannot duplicate anything.
+Everything else — claimed, unknown, done — refuses, and the way forward is
+reconciliation by reading, never another POST. A re-claim is never automatic: it
+needs a new plan, a new digest, a new confirmation and another ``--apply``.
+
+Bound to one identity
+---------------------
+The row records the salted fingerprints of the customer, staffer and account it
+was opened with, and every claim re-checks them UNDER THE ROW LOCK. The plan
+checks them too, but the plan was built before the lock existed. Pointing the
+environment at a different customer, staffer or account of the same branch
+passes every branch, template and workspace proof there is, and would still be
+a real payment on somebody else.
 """
 
 from __future__ import annotations
@@ -126,6 +137,11 @@ UNRESOLVED_STATUSES: Final = frozenset(
 CLAIM_GRANTED: Final = "granted"
 CLAIM_REFUSED_STATE: Final = "refused_state"
 CLAIM_REFUSED_PLAN_DRIFT: Final = "refused_plan_drift"
+# The environment's identity is not the one this row was opened with. Says only
+# that; never which role, never a fingerprint, never a UUID.
+CLAIM_REFUSED_IDENTITY_DRIFT: Final = "refused_identity_drift"
+
+IDENTITY_ROLES: Final = ("customer", "staffer", "account")
 
 RECORD_APPLIED: Final = "applied"
 RECORD_STALE_STATE: Final = "stale_state"
@@ -156,6 +172,11 @@ class LedgerSnapshot:
     target_order_uuid: str | None
     template_config_digest: str | None
     stage_plan_digests: dict[str, str | None]
+    # The salted fingerprints this row was opened with, for comparison against
+    # the runtime identity. Held so every later stage can prove it is still
+    # acting on the same customer, staffer and account — and reported only as
+    # the boolean below, because a comparison result is all an operator needs.
+    identity_fingerprints: dict[str, str | None]
     reconciliation_marker: str | None
     create_window_start: datetime | None
     create_window_end: datetime | None
@@ -174,6 +195,7 @@ class LedgerSnapshot:
             "target_order_uuid_known": self.target_order_uuid is not None,
             "template_config_digest": self.template_config_digest,
             "stage_plan_digests": dict(self.stage_plan_digests),
+            "identity_fingerprints_recorded": all(self.identity_fingerprints.get(role) for role in IDENTITY_ROLES),
             "reconciliation_marker": self.reconciliation_marker,
             "create_window_start": self.create_window_start.isoformat() if self.create_window_start else None,
             "create_window_end": self.create_window_end.isoformat() if self.create_window_end else None,
@@ -202,6 +224,7 @@ def _snapshot(row: EasyWeekVoucherCanaryLedger | None) -> LedgerSnapshot:
             target_order_uuid=None,
             template_config_digest=None,
             stage_plan_digests={},
+            identity_fingerprints={},
             reconciliation_marker=None,
             create_window_start=None,
             create_window_end=None,
@@ -225,6 +248,11 @@ def _snapshot(row: EasyWeekVoucherCanaryLedger | None) -> LedgerSnapshot:
             "pay": row.pay_plan_digest,
             "refund": row.refund_plan_digest,
         },
+        identity_fingerprints={
+            "customer": row.customer_fingerprint,
+            "staffer": row.staffer_fingerprint,
+            "account": row.account_fingerprint,
+        },
         reconciliation_marker=row.reconciliation_marker,
         create_window_start=row.create_window_start,
         create_window_end=row.create_window_end,
@@ -243,6 +271,22 @@ def _snapshot(row: EasyWeekVoucherCanaryLedger | None) -> LedgerSnapshot:
         manual_cleanup_observed_at=_iso(row.manual_cleanup_observed_at),
         evidence=dict(row.evidence or {}),
     )
+
+
+def _identity_matches(row: EasyWeekVoucherCanaryLedger, fingerprints: dict[str, str]) -> bool:
+    """Is this row's recorded identity the one the caller is acting with?
+
+    Re-checked here, under the row lock, and not only in the plan: the plan was
+    built before the lock existed, and a claim is the last moment at which the
+    process can still refuse. The comparison is over salted fingerprints, and
+    its only output is this boolean.
+    """
+    stored = {
+        "customer": row.customer_fingerprint,
+        "staffer": row.staffer_fingerprint,
+        "account": row.account_fingerprint,
+    }
+    return all(stored[role] == fingerprints.get(role) for role in IDENTITY_ROLES)
 
 
 async def _row(session: AsyncSession, *, for_update: bool = False) -> EasyWeekVoucherCanaryLedger | None:
@@ -324,6 +368,15 @@ async def claim_create(
             # rejected create under a drifted template is a new decision.
             if row.template_config_digest != template_config_digest:
                 return ClaimOutcome(granted=False, reason=CLAIM_REFUSED_PLAN_DRIFT, status=row.status)
+            if not _identity_matches(
+                row,
+                {
+                    "customer": customer_fingerprint,
+                    "staffer": staffer_fingerprint,
+                    "account": account_fingerprint,
+                },
+            ):
+                return ClaimOutcome(granted=False, reason=CLAIM_REFUSED_IDENTITY_DRIFT, status=row.status)
             row.status = STATUS_CREATE_CLAIMED
             row.reason_code = None
             row.create_plan_digest = create_plan_digest
@@ -341,6 +394,7 @@ async def _claim_stage(
     claimable_from: frozenset[str],
     next_status: str,
     template_config_digest: str,
+    identity_fingerprints: dict[str, str],
     stage_plan_digest: str,
     digest_field: str,
     claimed_field: str,
@@ -357,6 +411,8 @@ async def _claim_stage(
                 return ClaimOutcome(granted=False, reason=CLAIM_REFUSED_STATE, status=row.status)
             if row.template_config_digest != template_config_digest:
                 return ClaimOutcome(granted=False, reason=CLAIM_REFUSED_PLAN_DRIFT, status=row.status)
+            if not _identity_matches(row, identity_fingerprints):
+                return ClaimOutcome(granted=False, reason=CLAIM_REFUSED_IDENTITY_DRIFT, status=row.status)
             setattr(row, digest_field, stage_plan_digest)
             setattr(row, claimed_field, now)
             setattr(row, attempted_field, now)
@@ -371,6 +427,7 @@ async def claim_pay(
     *,
     pay_plan_digest: str,
     template_config_digest: str,
+    identity_fingerprints: dict[str, str],
 ) -> ClaimOutcome:
     """Reserve the ONE payment. Only a proven created order may be paid for."""
     return await _claim_stage(
@@ -378,6 +435,7 @@ async def claim_pay(
         claimable_from=PAY_CLAIMABLE_FROM,
         next_status=STATUS_PAY_CLAIMED,
         template_config_digest=template_config_digest,
+        identity_fingerprints=identity_fingerprints,
         stage_plan_digest=pay_plan_digest,
         digest_field="pay_plan_digest",
         claimed_field="pay_claimed_at",
@@ -390,6 +448,7 @@ async def claim_refund(
     *,
     refund_plan_digest: str,
     template_config_digest: str,
+    identity_fingerprints: dict[str, str],
 ) -> ClaimOutcome:
     """Reserve the ONE refund. Only a proven paid order may be refunded."""
     return await _claim_stage(
@@ -397,6 +456,7 @@ async def claim_refund(
         claimable_from=REFUND_CLAIMABLE_FROM,
         next_status=STATUS_REFUND_CLAIMED,
         template_config_digest=template_config_digest,
+        identity_fingerprints=identity_fingerprints,
         stage_plan_digest=refund_plan_digest,
         digest_field="refund_plan_digest",
         claimed_field="refund_claimed_at",

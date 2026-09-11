@@ -19,10 +19,14 @@ from altegio_bot.easyweek_voucher_canary.artifact import (
     observe_artifact,
 )
 from altegio_bot.easyweek_voucher_canary.orders import (
+    CANARY_ORDER_EXTRA_ITEMS,
+    CANARY_ORDER_TOTAL_UNPROVEN,
+    CANARY_VOUCHER_LINE_UNPROVEN,
     ORDER_OPEN,
     ORDER_PAID,
-    last_page,
     matches_canary_order,
+    page_meta,
+    payable_order_reasons,
     walk_pages,
 )
 from altegio_bot.easyweek_voucher_canary.plan import (
@@ -32,6 +36,7 @@ from altegio_bot.easyweek_voucher_canary.plan import (
     CANARY_CUSTOMER_UNPROVEN,
     CANARY_DISABLED_BY_ENV,
     CANARY_EXISTING_MARKER_ORDER,
+    CANARY_IDENTITY_BINDING_MISMATCH,
     CANARY_LEDGER_STATE_UNEXPECTED,
     CANARY_LOCATION_UNPROVEN,
     CANARY_MARKER_ORDER_AMBIGUOUS,
@@ -57,6 +62,7 @@ from altegio_bot.easyweek_voucher_canary.plan import (
     build_stage_plan,
     canary_marker,
     frozen_template_mismatches,
+    identity_binding_matches,
     identity_fingerprint,
     immutable_template_digest,
     resolve_runtime_identity,
@@ -85,6 +91,7 @@ from altegio_bot.tests.easyweek_voucher_canary_fixtures import (
     open_order,
     orders_page,
     paid_order,
+    voucher_line,
 )
 from altegio_bot.utils import utcnow
 
@@ -115,6 +122,7 @@ class FakeReader:
         order_pages: list[dict[str, Any]] | None = None,
         order: Any = None,
         raise_on: Exception | None = None,
+        scope: tuple[str, str] = (CUSTOMER_UUID, STAFFER_UUID),
     ) -> None:
         self.workspace = WORKSPACE if workspace is None else workspace
         self.locations = LOCATIONS if locations is None else locations
@@ -126,6 +134,10 @@ class FakeReader:
         self.order_pages = order_pages if order_pages is not None else [orders_page([])]
         self.order = order
         self.raise_on = raise_on
+        # The customer and staffer the order listing is expected to be scoped
+        # to. The documented endpoint takes both as filters, and the observed
+        # body echoes neither, so the REQUEST is where that scope is proven.
+        self.scope = scope
         self.calls: list[str] = []
 
     async def get_workspace(self) -> dict[str, Any]:
@@ -168,8 +180,7 @@ class FakeReader:
         per_page: int = 100,
     ) -> dict[str, Any]:
         assert location_uuid == KARLSRUHE_LOCATION_UUID
-        assert customer_uuid == CUSTOMER_UUID
-        assert staffer_uuid == STAFFER_UUID
+        assert (customer_uuid, staffer_uuid) == self.scope
         self.calls.append(f"list_orders:{page}")
         index = page - 1
         return self.order_pages[index] if index < len(self.order_pages) else orders_page([])
@@ -181,15 +192,20 @@ class FakeReader:
         return self.order
 
 
+_PLAN_ONLY_KWARGS = {"ledger_status", "target_order_uuid", "ledger_identity", "identity", "now"}
+
+
 async def _plan(stage: str = STAGE_CREATE, **kwargs: Any):
-    reader_kwargs = {k: v for k, v in kwargs.items() if k not in {"ledger_status", "target_order_uuid"}}
+    reader_kwargs = {k: v for k, v in kwargs.items() if k not in _PLAN_ONLY_KWARGS}
     return await build_stage_plan(
         FakeReader(**reader_kwargs),
         stage=stage,
-        identity=IDENTITY,
+        identity=kwargs.get("identity") or IDENTITY,
         enabled=True,
         ledger_status=kwargs.get("ledger_status"),
         target_order_uuid=kwargs.get("target_order_uuid"),
+        ledger_identity=kwargs.get("ledger_identity"),
+        now=kwargs.get("now"),
     )
 
 
@@ -324,10 +340,52 @@ def test_unusable_counters_are_not_evidence(counters) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_published_last_page_is_preferred_over_an_empty_page() -> None:
-    assert last_page(orders_page([], last_page=3)) == 3
-    assert last_page({"data": []}) is None
-    assert last_page({"last_page": 2}) == 2
+def test_metadata_is_only_trusted_when_it_answers_the_page_we_asked_for() -> None:
+    page_one = orders_page([], page=1, last_page=3)
+
+    meta = page_meta(page_one, expected_page=1, expected_per_page=100)
+    assert meta is not None
+    assert (meta.current_page, meta.last_page, meta.per_page) == (1, 3, 100)
+
+    # The same body, offered as the answer to a request for page 2.
+    assert page_meta(page_one, expected_page=2, expected_per_page=100) is None
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        None,
+        [],
+        "meta",
+        {},
+        {"last_page": 2},
+        {"current_page": 1},
+        {"current_page": "1", "last_page": 2},
+        {"current_page": 1, "last_page": "2"},
+        {"current_page": True, "last_page": 2},
+        {"current_page": 1, "last_page": True},
+        {"current_page": 2, "last_page": 1},
+        {"current_page": 1, "last_page": 0},
+        {"current_page": 1, "last_page": 1, "per_page": 50},
+        {"current_page": 1, "last_page": 1, "per_page": "100"},
+    ],
+)
+def test_malformed_or_disagreeing_metadata_proves_nothing(meta) -> None:
+    payload: dict[str, Any] = {"data": []}
+    if meta is not None:
+        payload["meta"] = meta
+
+    assert page_meta(payload, expected_page=1, expected_per_page=100) is None
+
+
+def test_a_page_size_the_response_omits_is_not_invented() -> None:
+    meta = page_meta(
+        {"data": [], "meta": {"current_page": 1, "last_page": 1}},
+        expected_page=1,
+        expected_per_page=100,
+    )
+    assert meta is not None
+    assert meta.per_page is None
 
 
 @pytest.mark.asyncio
@@ -347,15 +405,56 @@ async def test_a_walk_follows_last_page_even_past_an_empty_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_walk_without_metadata_ends_at_the_first_empty_page() -> None:
+async def test_a_walk_without_metadata_is_never_complete() -> None:
+    """An empty page is not an end marker. Only a published `last_page` is.
+
+    A listing that stops answering — an edge serving a cached empty body, a
+    filter the server quietly ignored — looks exactly like "there is nothing
+    more". Treating that as a finished walk is how an unresolved create gets
+    closed as "no order exists" while a real one sits in the dashboard.
+    """
     pages = {1: {"data": [listed_order(marker="a")]}, 2: {"data": []}}
 
     async def fetch(page: int) -> Any:
         return pages[page]
 
     walk = await walk_pages(fetch)
-    assert walk.complete is True
-    assert len(walk.rows) == 1
+    assert walk.complete is False
+    assert len(walk.rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_answers_page_two_with_page_one_never_completes() -> None:
+    """The current reproduction: page 1 says 1 of 2, and so does page 2.
+
+    Without a `current_page` check the walk counts that repeat as the final
+    page, "completes", and reports whatever page 1 happened to contain as the
+    whole of this customer's orders.
+    """
+    first = orders_page([listed_order(marker="a")], page=1, last_page=2)
+    calls: list[int] = []
+
+    async def fetch(page: int) -> Any:
+        calls.append(page)
+        # Page 2 is requested; page 1 comes back, metadata and all.
+        return first
+
+    walk = await walk_pages(fetch)
+
+    assert walk.complete is False
+    assert calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_page_size_other_than_the_fixed_one_is_not_a_proven_page() -> None:
+    async def fetch(page: int) -> Any:
+        return {
+            "data": [listed_order(marker="a")],
+            "meta": {"current_page": page, "last_page": 1, "per_page": 25},
+        }
+
+    walk = await walk_pages(fetch)
+    assert walk.complete is False
 
 
 @pytest.mark.asyncio
@@ -588,6 +687,100 @@ async def test_a_pay_plan_refuses_an_order_that_is_no_longer_open() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_open_order_with_our_marker_but_no_voucher_line_is_not_payable() -> None:
+    """The current reproduction: right marker, right customer, wrong contents.
+
+    A payment settles whatever the order happens to hold, so "is this OUR
+    order?" is not the same question as "is this the order we authorised?".
+    Without the second question this plan came back ready, and the €15 approval
+    would have settled a sum nobody approved.
+    """
+    wrong = open_order(
+        marker=MARKER,
+        vouchers=[],
+        invoice={"total": 9900, "subtotal": 9900, "amount_due": 9900, "amount_paid": 0},
+    )
+
+    plan = await _pay_plan(order=wrong)
+
+    assert plan.ready is False
+    assert CANARY_VOUCHER_LINE_UNPROVEN in plan.reasons
+    assert CANARY_ORDER_TOTAL_UNPROVEN in plan.reasons
+    assert plan.snapshot["payable_order_proven"] is False
+
+
+@pytest.mark.parametrize(
+    "order_changes,expected",
+    [
+        ({"vouchers": []}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(), voucher_line()]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(voucher_template_uuid=OTHER_UUID)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(price=1501)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(price="1500")]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        # `True == 1` in Python, and a boolean price is not a price.
+        ({"vouchers": [voucher_line(price=True)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(quantity=2)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(quantity=True)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"vouchers": [voucher_line(quantity=1.0)]}, CANARY_VOUCHER_LINE_UNPROVEN),
+        ({"services": [{"uuid": OTHER_UUID}]}, CANARY_ORDER_EXTRA_ITEMS),
+        ({"goods": [{"uuid": OTHER_UUID}]}, CANARY_ORDER_EXTRA_ITEMS),
+        ({"invoice": {"total": 3000, "amount_due": 3000, "amount_paid": 0}}, CANARY_ORDER_TOTAL_UNPROVEN),
+        ({"invoice": {"total": 1500, "subtotal": 1600, "amount_due": 1500}}, CANARY_ORDER_TOTAL_UNPROVEN),
+        ({"invoice": {"total": "1500", "amount_due": 1500}}, CANARY_ORDER_TOTAL_UNPROVEN),
+    ],
+)
+def test_only_the_exact_one_voucher_order_is_payable(order_changes, expected) -> None:
+    order = open_order(marker=MARKER)
+    order.update(order_changes)
+
+    reasons = payable_order_reasons(
+        order,
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+    assert expected in reasons
+
+
+def test_the_authorised_order_produces_no_payment_objection() -> None:
+    assert (
+        payable_order_reasons(
+            open_order(marker=MARKER),
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+def test_a_total_the_body_does_not_publish_is_not_invented() -> None:
+    """Absence is not a mismatch: not every read carries an invoice."""
+    order = open_order(marker=MARKER)
+    del order["invoice"]
+
+    assert (
+        payable_order_reasons(
+            order,
+            expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refund_plan_never_consults_the_voucher_contents() -> None:
+    """An unreadable artifact is a research disappointment, not a reason to
+    leave a real payment standing."""
+    odd = paid_order(marker=MARKER, vouchers=[], invoice={"total": 9900, "amount_due": 0, "amount_paid": 1500})
+
+    plan = await _refund_plan(order=odd)
+
+    assert plan.ready is True
+    for reason in (CANARY_VOUCHER_LINE_UNPROVEN, CANARY_ORDER_TOTAL_UNPROVEN, CANARY_ORDER_EXTRA_ITEMS):
+        assert reason not in plan.reasons
+
+
+@pytest.mark.asyncio
 async def test_a_pay_plan_refuses_a_missing_marker_order() -> None:
     plan = await _pay_plan(order_pages=[orders_page([])])
     assert CANARY_MARKER_ORDER_MISSING in plan.reasons
@@ -693,6 +886,188 @@ async def test_a_template_edit_still_blocks_a_refund_plan() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trying again after a rejection that provably did not act
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_proven_rejection_can_be_planned_again() -> None:
+    """Otherwise a fixable 422 is a dead end with a draft order left behind."""
+    plan = await _pay_plan(ledger_status="pay_rejected")
+
+    assert plan.ready is True
+    assert CANARY_LEDGER_STATE_UNEXPECTED not in plan.reasons
+    assert plan.snapshot["retry_after_proven_rejection"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_normal_first_attempt_is_not_marked_as_a_retry() -> None:
+    plan = await _pay_plan()
+
+    assert plan.ready is True
+    assert plan.snapshot["retry_after_proven_rejection"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_refund_can_be_planned_again() -> None:
+    plan = await _refund_plan(ledger_status="refund_rejected")
+
+    assert plan.ready is True
+    assert plan.snapshot["retry_after_proven_rejection"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_create_can_be_planned_again() -> None:
+    plan = await _plan(STAGE_CREATE, ledger_status="create_rejected", ledger_identity=None)
+
+    assert plan.ready is True
+    assert plan.snapshot["retry_after_proven_rejection"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        "pay_claimed",
+        "pay_unknown",
+        "paid",
+        "refund_claimed",
+        "refund_unknown",
+        "refunded",
+        "ambiguous",
+        "manually_cleaned",
+        "create_unknown",
+        "refund_rejected",
+    ],
+)
+async def test_nothing_but_this_stages_own_rejection_reopens_a_pay(status) -> None:
+    """A claimed or unknown stage may already have acted. It stays shut."""
+    plan = await _pay_plan(ledger_status=status)
+
+    assert plan.ready is False
+    assert CANARY_LEDGER_STATE_UNEXPECTED in plan.reasons
+
+
+@pytest.mark.asyncio
+async def test_a_retry_still_has_to_prove_everything_a_first_attempt_does() -> None:
+    """ "Rejected" reopens the door; it does not walk through it."""
+    plan = await _pay_plan(ledger_status="pay_rejected", order=paid_order(marker=MARKER))
+
+    assert plan.ready is False
+    assert CANARY_TARGET_ORDER_NOT_OPEN in plan.reasons
+
+
+# ---------------------------------------------------------------------------
+# One canary, one identity
+# ---------------------------------------------------------------------------
+
+
+def _stored(identity: RuntimeIdentity) -> dict[str, str]:
+    return dict(identity.fingerprints)
+
+
+OTHER_ACCOUNT_IDENTITY = RuntimeIdentity(
+    customer_uuid=CUSTOMER_UUID,
+    staffer_uuid=STAFFER_UUID,
+    account_uuid=OTHER_UUID,
+)
+OTHER_CUSTOMER_IDENTITY = RuntimeIdentity(
+    customer_uuid=OTHER_UUID,
+    staffer_uuid=STAFFER_UUID,
+    account_uuid=ACCOUNT_UUID,
+)
+OTHER_STAFFER_IDENTITY = RuntimeIdentity(
+    customer_uuid=CUSTOMER_UUID,
+    staffer_uuid=OTHER_UUID,
+    account_uuid=ACCOUNT_UUID,
+)
+
+
+def test_no_stored_identity_yet_is_not_a_mismatch() -> None:
+    assert identity_binding_matches(IDENTITY, None) is True
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [OTHER_ACCOUNT_IDENTITY, OTHER_CUSTOMER_IDENTITY, OTHER_STAFFER_IDENTITY],
+)
+def test_any_role_differing_breaks_the_binding(identity) -> None:
+    assert identity_binding_matches(identity, _stored(IDENTITY)) is False
+
+
+def test_a_partially_recorded_identity_never_matches() -> None:
+    stored = _stored(IDENTITY)
+    stored["account"] = None  # type: ignore[assignment]
+    assert identity_binding_matches(IDENTITY, stored) is False
+
+
+@pytest.mark.asyncio
+async def test_another_real_account_of_the_same_branch_gives_no_ready_pay_plan() -> None:
+    """The most dangerous near-miss: everything real, everything wrong.
+
+    A second Karlsruhe account passes the branch proof, the account proof, the
+    template freeze and the workspace check. Only the binding to the row this
+    canary opened can tell it from the approved one.
+    """
+    plan = await _pay_plan(
+        identity=OTHER_ACCOUNT_IDENTITY,
+        accounts=[{"uuid": ACCOUNT_UUID}, {"uuid": OTHER_UUID}],
+        ledger_identity=_stored(IDENTITY),
+    )
+
+    assert plan.ready is False
+    assert CANARY_IDENTITY_BINDING_MISMATCH in plan.reasons
+    assert CANARY_ACCOUNT_UNPROVEN not in plan.reasons
+    assert plan.snapshot["identity_binding_proven"] is False
+    assert plan.ledger_state["identity_binding_proven"] is False
+
+
+@pytest.mark.asyncio
+async def test_another_customer_gives_no_ready_pay_plan() -> None:
+    plan = await _pay_plan(
+        identity=OTHER_CUSTOMER_IDENTITY,
+        scope=(OTHER_UUID, STAFFER_UUID),
+        customer={**CUSTOMER, "uuid": OTHER_UUID},
+        ledger_identity=_stored(IDENTITY),
+    )
+
+    assert plan.ready is False
+    assert CANARY_IDENTITY_BINDING_MISMATCH in plan.reasons
+
+
+@pytest.mark.asyncio
+async def test_another_staffer_gives_no_ready_pay_plan() -> None:
+    plan = await _pay_plan(
+        identity=OTHER_STAFFER_IDENTITY,
+        scope=(CUSTOMER_UUID, OTHER_UUID),
+        staffers={"data": [{"uuid": OTHER_UUID}], "meta": {"current_page": 1, "last_page": 1, "per_page": 100}},
+        ledger_identity=_stored(IDENTITY),
+    )
+
+    assert plan.ready is False
+    assert CANARY_IDENTITY_BINDING_MISMATCH in plan.reasons
+
+
+@pytest.mark.asyncio
+async def test_a_matching_identity_is_reported_as_a_boolean_and_nothing_else() -> None:
+    plan = await _pay_plan(ledger_identity=_stored(IDENTITY))
+
+    assert plan.ready is True
+    printed = repr(plan.as_safe_dict())
+    for uuid in (CUSTOMER_UUID, STAFFER_UUID, ACCOUNT_UUID, ORDER_UUID):
+        assert uuid not in printed
+
+
+@pytest.mark.asyncio
+async def test_the_binding_changes_the_stage_digest() -> None:
+    """Not merely reported: signed. An approval is for one identity."""
+    bound = await _pay_plan(ledger_identity=_stored(IDENTITY))
+    broken = await _pay_plan(ledger_identity=_stored(OTHER_ACCOUNT_IDENTITY))
+
+    assert bound.digest_for(bound.issued_at) != broken.digest_for(bound.issued_at)
+
+
+# ---------------------------------------------------------------------------
 # Plan authorisation
 # ---------------------------------------------------------------------------
 
@@ -751,6 +1126,107 @@ async def test_an_unready_plan_never_authorises_even_with_a_matching_digest() ->
         supplied_phrase=plan.confirmation_phrase,
     )
     assert CANARY_DISABLED_BY_ENV in reasons
+
+
+# ---------------------------------------------------------------------------
+# The moment is part of the approval
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_issue_time_is_signed_not_merely_printed() -> None:
+    """A microsecond apart is a different approval."""
+    plan = await _plan(STAGE_CREATE)
+    moment = plan.issued_at
+
+    assert plan.digest == plan.digest_for(moment)
+    assert plan.digest_for(moment + timedelta(microseconds=1)) != plan.digest
+
+
+@pytest.mark.asyncio
+async def test_an_old_digest_cannot_be_revived_with_a_freshly_typed_timestamp() -> None:
+    """The attack the age check alone cannot see.
+
+    An operator (or a script) holding yesterday's approved digest only has to
+    type today's timestamp next to it for the freshness test to pass. Binding
+    the timestamp INTO the digest is what makes the pair inseparable.
+    """
+    old = await _plan(STAGE_CREATE, now=utcnow() - timedelta(hours=3))
+    live = await _plan(STAGE_CREATE)
+
+    reasons = verify_plan_authorisation(
+        live,
+        supplied_digest=old.digest,
+        supplied_issued_at=utcnow(),
+        supplied_phrase=old.confirmation_phrase,
+    )
+
+    assert CANARY_PLAN_DIGEST_MISMATCH in reasons
+    assert plan_module.CANARY_CONFIRMATION_MISMATCH in reasons
+
+
+@pytest.mark.asyncio
+async def test_the_same_approval_still_works_when_the_plan_is_rebuilt_seconds_later() -> None:
+    """The legitimate path: the mutation command recomputes the plan itself."""
+    issued = await _plan(STAGE_CREATE)
+    rebuilt = await _plan(STAGE_CREATE, now=issued.issued_at + timedelta(seconds=4))
+
+    assert (
+        verify_plan_authorisation(
+            rebuilt,
+            supplied_digest=issued.digest,
+            supplied_issued_at=issued.issued_at,
+            supplied_phrase=issued.confirmation_phrase,
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_approval_with_no_timestamp_authorises_nothing() -> None:
+    plan = await _plan(STAGE_CREATE)
+
+    reasons = verify_plan_authorisation(
+        plan,
+        supplied_digest=plan.digest,
+        supplied_issued_at=None,
+        supplied_phrase=plan.confirmation_phrase,
+    )
+
+    assert CANARY_PLAN_EXPIRED in reasons
+    assert CANARY_PLAN_DIGEST_MISMATCH in reasons
+
+
+@pytest.mark.asyncio
+async def test_a_create_digest_is_invalid_for_a_pay_and_for_a_refund() -> None:
+    create = await _plan(STAGE_CREATE)
+
+    for rebuilt in (await _pay_plan(now=create.issued_at), await _refund_plan(now=create.issued_at)):
+        reasons = verify_plan_authorisation(
+            rebuilt,
+            supplied_digest=create.digest,
+            supplied_issued_at=create.issued_at,
+            supplied_phrase=create.confirmation_phrase,
+        )
+        assert CANARY_PLAN_DIGEST_MISMATCH in reasons
+        assert plan_module.CANARY_CONFIRMATION_MISMATCH in reasons
+
+
+@pytest.mark.asyncio
+async def test_counters_that_moved_do_not_invalidate_an_approval() -> None:
+    """A voucher being issued is the product working, not a template edit.
+
+    If the counters were signed, the refund would become unreachable at exactly
+    the moment a payment succeeded — which is when it matters most.
+    """
+    issued = await _refund_plan()
+    after_issuance = await _refund_plan(
+        template={**TEMPLATE, "vouchers_count": 1, "activated_vouchers_count": 1},
+        now=issued.issued_at,
+    )
+
+    assert after_issuance.counters_observed != issued.counters_observed
+    assert after_issuance.digest_for(issued.issued_at) == issued.digest
 
 
 @pytest.mark.asyncio

@@ -8,11 +8,17 @@ question when the durable state is real.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 import pytest
 
-from altegio_bot.easyweek_client import EasyWeekAuthError, EasyWeekNotFoundError, EasyWeekRetryableError
+from altegio_bot.easyweek_client import (
+    EasyWeekAuthError,
+    EasyWeekNotFoundError,
+    EasyWeekPermanentError,
+    EasyWeekRetryableError,
+)
 from altegio_bot.easyweek_voucher_canary import ledger as ledger_module
 from altegio_bot.easyweek_voucher_canary.orders import (
     ORDER_CANCELLED,
@@ -20,6 +26,7 @@ from altegio_bot.easyweek_voucher_canary.orders import (
     ORDER_OPEN,
     ORDER_PAID,
     ORDER_REFUNDED,
+    ORDER_UNKNOWN,
     PAYMENT_PROOF_AMOUNTS,
     PAYMENT_PROOF_NONE,
     PAYMENT_PROOF_STATUS,
@@ -45,6 +52,7 @@ from altegio_bot.easyweek_voucher_canary.runner import (
     OUTCOME_REFUSED,
     OUTCOME_ROLLBACK_UNPROVEN,
     OUTCOME_UNKNOWN_MUTATION,
+    REASON_IDENTITY_BINDING_MISMATCH,
     REASON_MUTATION_REJECTED,
     REASON_MUTATION_UNKNOWN,
     REASON_ORDER_CUSTOMER_UNPROVEN,
@@ -771,6 +779,143 @@ def test_the_transition_table_never_walks_a_stage_backwards() -> None:
     assert reconcile_transition(ledger_module.STATUS_PAID, ORDER_MALFORMED).status is None
 
 
+# Every (ledger status, remote state) pair, and what it is allowed to do. This
+# is the whole contract in one place: a transition absent from here must be a
+# no-op, and a transition present here must land exactly where it says.
+#
+# `None` = observe and leave the row alone. The third column is the verification
+# timestamp, which is only ever stamped where THIS canary attempted that stage —
+# somebody settling the order in the dashboard is an observation, not our proof.
+_EXPECTED_TRANSITIONS: dict[tuple[str, str], tuple[str | None, str | None]] = {
+    # --- created ----------------------------------------------------------
+    (ledger_module.STATUS_CREATED, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_CREATED, ORDER_PAID): (ledger_module.STATUS_PAID, None),
+    (ledger_module.STATUS_CREATED, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
+    (ledger_module.STATUS_CREATED, ORDER_CANCELLED): (ledger_module.STATUS_MANUALLY_CLEANED, None),
+    # --- a payment that may be in flight -----------------------------------
+    (ledger_module.STATUS_PAY_CLAIMED, ORDER_OPEN): (ledger_module.STATUS_PAY_UNKNOWN, None),
+    (ledger_module.STATUS_PAY_CLAIMED, ORDER_PAID): (ledger_module.STATUS_PAID, "pay_verified_at"),
+    (ledger_module.STATUS_PAY_CLAIMED, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
+    (ledger_module.STATUS_PAY_CLAIMED, ORDER_CANCELLED): (None, None),
+    (ledger_module.STATUS_PAY_UNKNOWN, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_PAY_UNKNOWN, ORDER_PAID): (ledger_module.STATUS_PAID, "pay_verified_at"),
+    # The one the review called out: an unknown payment over an order that has
+    # since been refunded must not stay unknown forever.
+    (ledger_module.STATUS_PAY_UNKNOWN, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
+    (ledger_module.STATUS_PAY_UNKNOWN, ORDER_CANCELLED): (None, None),
+    # --- a payment that provably did not happen ----------------------------
+    (ledger_module.STATUS_PAY_REJECTED, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_PAY_REJECTED, ORDER_PAID): (ledger_module.STATUS_PAID, "pay_verified_at"),
+    (ledger_module.STATUS_PAY_REJECTED, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
+    (ledger_module.STATUS_PAY_REJECTED, ORDER_CANCELLED): (ledger_module.STATUS_MANUALLY_CLEANED, None),
+    # --- paid --------------------------------------------------------------
+    (ledger_module.STATUS_PAID, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_PAID, ORDER_PAID): (None, None),
+    (ledger_module.STATUS_PAID, ORDER_REFUNDED): (ledger_module.STATUS_REFUNDED, None),
+    (ledger_module.STATUS_PAID, ORDER_CANCELLED): (None, None),
+    # --- a refund that may be in flight ------------------------------------
+    (ledger_module.STATUS_REFUND_CLAIMED, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_REFUND_CLAIMED, ORDER_PAID): (None, None),
+    (ledger_module.STATUS_REFUND_CLAIMED, ORDER_REFUNDED): (
+        ledger_module.STATUS_REFUNDED,
+        "refund_verified_at",
+    ),
+    (ledger_module.STATUS_REFUND_CLAIMED, ORDER_CANCELLED): (None, None),
+    (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_PAID): (None, None),
+    (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_REFUNDED): (
+        ledger_module.STATUS_REFUNDED,
+        "refund_verified_at",
+    ),
+    (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_CANCELLED): (None, None),
+    # --- a refund that provably did not happen -----------------------------
+    (ledger_module.STATUS_REFUND_REJECTED, ORDER_OPEN): (None, None),
+    (ledger_module.STATUS_REFUND_REJECTED, ORDER_PAID): (None, None),
+    (ledger_module.STATUS_REFUND_REJECTED, ORDER_REFUNDED): (
+        ledger_module.STATUS_REFUNDED,
+        "refund_verified_at",
+    ),
+    (ledger_module.STATUS_REFUND_REJECTED, ORDER_CANCELLED): (None, None),
+}
+
+_TERMINAL_STATUSES = (
+    ledger_module.STATUS_REFUNDED,
+    ledger_module.STATUS_MANUALLY_CLEANED,
+    ledger_module.STATUS_AMBIGUOUS,
+)
+_REMOTE_STATES = (ORDER_OPEN, ORDER_PAID, ORDER_REFUNDED, ORDER_CANCELLED, ORDER_UNKNOWN, ORDER_MALFORMED)
+
+
+@pytest.mark.parametrize("pair,expected", sorted(_EXPECTED_TRANSITIONS.items()))
+def test_every_declared_transition_lands_exactly_where_it_says(pair, expected) -> None:
+    status, remote = pair
+    target, verified = expected
+
+    transition = reconcile_transition(status, remote)
+
+    assert transition.status == target
+    assert transition.verified_field == verified
+    if target is not None:
+        # A compare-and-set, always: the write is valid only from the state it
+        # was decided on, so a row that moved meanwhile is not overwritten.
+        assert transition.expected_from == frozenset({status})
+        assert ledger_module.STATUS_RANK[target] > ledger_module.STATUS_RANK[status]
+
+
+@pytest.mark.parametrize("status", ledger_module.ALL_STATUSES)
+@pytest.mark.parametrize("remote", _REMOTE_STATES)
+def test_no_transition_outside_the_declared_table_exists(status, remote) -> None:
+    """Whatever is not written down above must do nothing at all."""
+    expected = _EXPECTED_TRANSITIONS.get((status, remote), (None, None))
+    assert reconcile_transition(status, remote).status == expected[0]
+
+
+@pytest.mark.parametrize("status", _TERMINAL_STATUSES)
+@pytest.mark.parametrize("remote", _REMOTE_STATES)
+def test_nothing_moves_out_of_a_terminal_state(status, remote) -> None:
+    assert reconcile_transition(status, remote).status is None
+
+
+@pytest.mark.parametrize("status", ledger_module.ALL_STATUSES)
+@pytest.mark.parametrize("remote", _REMOTE_STATES)
+def test_no_reading_ever_returns_a_stage_to_a_claimable_state(status, remote) -> None:
+    """The invariant the whole table exists for: no second POST, ever.
+
+    A row whose payment may already have gone out must never land back where
+    that same payment could be claimed again. Moving FORWARD into a state that
+    opens the NEXT stage is the opposite thing and exactly what should happen:
+    a proven payment has to leave the refund reachable.
+    """
+    target = reconcile_transition(status, remote).status
+    if target is None:
+        return
+
+    reclaimable = {
+        "create": ledger_module.CREATE_CLAIMABLE_FROM,
+        "pay": ledger_module.PAY_CLAIMABLE_FROM,
+        "refund": ledger_module.REFUND_CLAIMABLE_FROM,
+    }
+    for stage, claimable in reclaimable.items():
+        if status.startswith(stage):
+            assert target not in claimable
+
+
+@pytest.mark.parametrize("status", ledger_module.ALL_STATUSES)
+@pytest.mark.parametrize("remote", _REMOTE_STATES)
+def test_a_verification_stamp_only_appears_where_we_attempted_that_stage(status, remote) -> None:
+    """`pay_verified_at` means "the pay WE sent is confirmed" and nothing else.
+
+    Stamping it because somebody settled the order in the dashboard would
+    attribute a stranger's action to this canary in the durable record.
+    """
+    field = reconcile_transition(status, remote).verified_field
+    if field is None:
+        return
+
+    stage = field.removesuffix("_verified_at")
+    assert status.startswith(stage), f"{status} never attempted a {stage}"
+
+
 @pytest.mark.asyncio
 async def test_a_reconcile_during_an_in_flight_pay_never_makes_pay_claimable(session_maker) -> None:
     """The POST is out; the order still reads open. A retry must stay impossible."""
@@ -782,6 +927,7 @@ async def test_a_reconcile_during_an_in_flight_pay_never_makes_pay_claimable(ses
         session_maker,
         pay_plan_digest="a" * 64,
         template_config_digest=(await ledger_module.load(session_maker)).template_config_digest or "",
+        identity_fingerprints=IDENTITY.fingerprints,
     )
     reader.order = open_order(marker=MARKER)
 
@@ -793,7 +939,10 @@ async def test_a_reconcile_during_an_in_flight_pay_never_makes_pay_claimable(ses
     # The attempt is still on the record, and pay is not claimable again.
     assert snapshot.stage_timestamps["pay_attempted_at"] is not None
     refused = await ledger_module.claim_pay(
-        session_maker, pay_plan_digest="a" * 64, template_config_digest=snapshot.template_config_digest or ""
+        session_maker,
+        pay_plan_digest="a" * 64,
+        template_config_digest=snapshot.template_config_digest or "",
+        identity_fingerprints=IDENTITY.fingerprints,
     )
     assert refused.granted is False
 
@@ -804,7 +953,12 @@ async def test_a_reconcile_during_an_in_flight_refund_never_makes_refund_claimab
     await _paid(session_maker, reader)
 
     config = (await ledger_module.load(session_maker)).template_config_digest or ""
-    await ledger_module.claim_refund(session_maker, refund_plan_digest="b" * 64, template_config_digest=config)
+    await ledger_module.claim_refund(
+        session_maker,
+        refund_plan_digest="b" * 64,
+        template_config_digest=config,
+        identity_fingerprints=IDENTITY.fingerprints,
+    )
 
     # The refund POST is in flight; the order still reads paid.
     report = await run_reconcile(session_maker, reader, identity=IDENTITY)
@@ -814,7 +968,10 @@ async def test_a_reconcile_during_an_in_flight_refund_never_makes_refund_claimab
     assert report.outcome == OUTCOME_ROLLBACK_UNPROVEN
     assert report.remote_rollback_proven is False
     refused = await ledger_module.claim_refund(
-        session_maker, refund_plan_digest="b" * 64, template_config_digest=config
+        session_maker,
+        refund_plan_digest="b" * 64,
+        template_config_digest=config,
+        identity_fingerprints=IDENTITY.fingerprints,
     )
     assert refused.granted is False
 
@@ -825,7 +982,12 @@ async def test_a_stale_original_response_cannot_overwrite_a_newer_state(session_
     reader = FakeReader()
     await _created(session_maker, reader)
     config = (await ledger_module.load(session_maker)).template_config_digest or ""
-    await ledger_module.claim_pay(session_maker, pay_plan_digest="a" * 64, template_config_digest=config)
+    await ledger_module.claim_pay(
+        session_maker,
+        pay_plan_digest="a" * 64,
+        template_config_digest=config,
+        identity_fingerprints=IDENTITY.fingerprints,
+    )
 
     stale = await ledger_module.record_outcome(
         session_maker,
@@ -844,7 +1006,12 @@ async def test_a_write_that_would_lower_the_rank_is_refused(session_maker) -> No
     reader = FakeReader()
     await _created(session_maker, reader)
     config = (await ledger_module.load(session_maker)).template_config_digest or ""
-    await ledger_module.claim_pay(session_maker, pay_plan_digest="a" * 64, template_config_digest=config)
+    await ledger_module.claim_pay(
+        session_maker,
+        pay_plan_digest="a" * 64,
+        template_config_digest=config,
+        identity_fingerprints=IDENTITY.fingerprints,
+    )
 
     regressive = await ledger_module.record_outcome(
         session_maker,
@@ -864,8 +1031,18 @@ async def test_two_processes_together_send_at_most_one_pay(session_maker) -> Non
     config = (await ledger_module.load(session_maker)).template_config_digest or ""
 
     first, second = await asyncio.gather(
-        ledger_module.claim_pay(session_maker, pay_plan_digest="a" * 64, template_config_digest=config),
-        ledger_module.claim_pay(session_maker, pay_plan_digest="a" * 64, template_config_digest=config),
+        ledger_module.claim_pay(
+            session_maker,
+            pay_plan_digest="a" * 64,
+            template_config_digest=config,
+            identity_fingerprints=IDENTITY.fingerprints,
+        ),
+        ledger_module.claim_pay(
+            session_maker,
+            pay_plan_digest="a" * 64,
+            template_config_digest=config,
+            identity_fingerprints=IDENTITY.fingerprints,
+        ),
     )
     assert sorted([first.granted, second.granted]) == [False, True]
 
@@ -906,6 +1083,92 @@ async def test_a_refund_timeout_then_reconcile_paid_never_sends_a_second_refund(
 # ---------------------------------------------------------------------------
 # Refund
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_order_that_is_not_the_authorised_one_is_refused_before_the_claim(session_maker) -> None:
+    """Our marker, our customer, the wrong contents. Nothing may be sent.
+
+    The refusal has to land before the claim, not after: a claim taken on an
+    order we then decline to pay for would burn the one payment this canary is
+    allowed to attempt.
+    """
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    reader.order = open_order(
+        marker=MARKER,
+        vouchers=[],
+        invoice={"total": 9900, "subtotal": 9900, "amount_due": 9900, "amount_paid": 0},
+    )
+
+    report = await _pay(session_maker, reader, mutator)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert report.external_mutation_attempted is False
+    assert mutator.calls == ["create"]
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == ledger_module.STATUS_CREATED
+    assert snapshot.stage_timestamps["pay_claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_payment_rejected_by_the_endpoint_can_be_tried_again_by_hand(session_maker) -> None:
+    """A fixable rejection must not strand an open draft order.
+
+    The retry is manual all the way: a new plan, a new digest, a new issued_at
+    and a new phrase. What this proves is that the path EXISTS — that a proven
+    rejection leaves the ledger somewhere a fresh authorisation can act on.
+    """
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    mutator.pay_error = EasyWeekPermanentError("rejected", status_code=422, attempts=1)
+
+    first = await _pay(session_maker, reader, mutator)
+
+    assert first.outcome == OUTCOME_CONTRACT_MISMATCH
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_PAY_REJECTED
+
+    # The operator fixes the cause and authorises the stage again, from scratch.
+    mutator.pay_error = None
+    second = await _pay(session_maker, reader, mutator)
+
+    assert second.outcome == OUTCOME_PROVEN
+    assert mutator.calls == ["create", "pay", "pay"]
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_PAID
+
+
+@pytest.mark.asyncio
+async def test_a_retry_still_needs_its_own_fresh_authorisation(session_maker) -> None:
+    """The first attempt's approval is spent. Nothing is retried by itself."""
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    spent = await _authorised(reader, STAGE_PAY, session_maker)
+    mutator.pay_error = EasyWeekPermanentError("rejected", status_code=422, attempts=1)
+    await _pay(session_maker, reader, mutator, **spent)
+
+    mutator.pay_error = None
+    replayed = await run_pay(session_maker, reader, mutator, identity=IDENTITY, enabled=True, **spent)
+
+    assert replayed.outcome == OUTCOME_REFUSED
+    assert CANARY_PLAN_DIGEST_MISMATCH in replayed.reasons
+    assert mutator.calls == ["create", "pay"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_payment_is_never_offered_a_retry(session_maker) -> None:
+    """The difference the whole rejection classification exists to keep."""
+    reader = FakeReader()
+    mutator = await _created(session_maker, reader)
+    mutator.pay_error = EasyWeekVoucherMutationUnknown("lost", attempts=1)
+
+    await _pay(session_maker, reader, mutator)
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_PAY_UNKNOWN
+
+    mutator.pay_error = None
+    again = await _pay(session_maker, reader, mutator)
+
+    assert again.outcome == OUTCOME_REFUSED
+    assert mutator.calls == ["create", "pay"]
 
 
 async def _paid(session_maker, reader: FakeReader, **mutator_kwargs: Any) -> FakeMutator:
@@ -1056,6 +1319,191 @@ async def test_a_reconcile_read_failure_is_unknown_not_a_verdict(session_maker) 
     assert report.reconciliation_required is True
 
 
+async def _claim_pay(session_maker, outcome_status: str) -> None:
+    """Take the pay claim the way a real run does, then record its outcome.
+
+    Going through the claim matters: it is what stamps `pay_attempted_at`, and
+    the database refuses a verification timestamp on a stage that was never
+    attempted — which is the whole point of that constraint.
+    """
+    snapshot = await ledger_module.load(session_maker)
+    await ledger_module.claim_pay(
+        session_maker,
+        pay_plan_digest="a" * 64,
+        template_config_digest=snapshot.template_config_digest or "",
+        identity_fingerprints=IDENTITY.fingerprints,
+    )
+    await ledger_module.record_outcome(
+        session_maker,
+        status=outcome_status,
+        expected_statuses=frozenset({ledger_module.STATUS_PAY_CLAIMED}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_under_another_identity_reads_nothing_at_all(session_maker) -> None:
+    """Not "finds nothing" — reads nothing.
+
+    Reconciling under a different customer or staffer would walk a stranger's
+    orders looking for our marker, and would then judge whatever it found
+    against this ledger row. The refusal has to come before the first GET.
+    """
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    before = list(reader.calls)
+
+    foreign = RuntimeIdentity(customer_uuid=OTHER_UUID, staffer_uuid=OTHER_UUID, account_uuid=ACCOUNT_UUID)
+    report = await run_reconcile(session_maker, reader, identity=foreign)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert report.reasons == [REASON_IDENTITY_BINDING_MISMATCH]
+    assert reader.calls == before
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_CREATED
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_under_another_identity_still_refuses_while_unresolved(session_maker) -> None:
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    await _claim_pay(session_maker, ledger_module.STATUS_PAY_UNKNOWN)
+    before = list(reader.calls)
+
+    foreign = RuntimeIdentity(customer_uuid=CUSTOMER_UUID, staffer_uuid=STAFFER_UUID, account_uuid=OTHER_UUID)
+    report = await run_reconcile(session_maker, reader, identity=foreign)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert report.reconciliation_required is True
+    assert reader.calls == before
+
+
+@pytest.mark.asyncio
+async def test_a_refunded_order_resolves_a_payment_that_never_came_back(session_maker) -> None:
+    """`pay_unknown` over a refunded order must not stay unknown forever."""
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    await _claim_pay(session_maker, ledger_module.STATUS_PAY_UNKNOWN)
+    reader.order = refunded_order(marker=MARKER)
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+    snapshot = await ledger_module.load(session_maker)
+
+    assert snapshot.status == ledger_module.STATUS_REFUNDED
+    assert report.outcome == OUTCOME_PROVEN
+    assert report.remote_rollback_proven is True
+    # The refund was somebody else's doing, so it carries no verification of ours.
+    assert snapshot.stage_timestamps["refund_verified_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_payment_that_turns_out_to_have_landed_becomes_paid(session_maker) -> None:
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    await _claim_pay(session_maker, ledger_module.STATUS_PAY_REJECTED)
+    reader.order = paid_order(marker=MARKER)
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+    snapshot = await ledger_module.load(session_maker)
+
+    assert snapshot.status == ledger_module.STATUS_PAID
+    assert report.outcome == OUTCOME_PROVEN
+    assert report.remote_rollback_proven is False
+
+
+@pytest.mark.asyncio
+async def test_a_ledger_that_contradicts_the_order_is_never_reported_as_proven(session_maker) -> None:
+    """A refunded ledger over an order that still reads paid is not resolved.
+
+    One of the two is wrong, and the expensive possibility — the money is still
+    out — is the one that has to win.
+    """
+    reader = FakeReader()
+    mutator = await _paid(session_maker, reader)
+    await _refund(session_maker, reader, mutator)
+    # The order now reads paid again: a reversal that did not stick, or a
+    # dashboard edit. The ledger still says refunded.
+    reader.order = paid_order(marker=MARKER)
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+
+    assert report.outcome != OUTCOME_PROVEN
+    assert report.outcome == OUTCOME_CONTRACT_MISMATCH
+    assert report.remote_rollback_proven is False
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_REFUNDED
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognisable_order_state_is_never_reported_as_proven(session_maker) -> None:
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    unfamiliar = open_order(marker=MARKER)
+    unfamiliar["status"] = "awaiting_settlement"
+    reader.order = unfamiliar
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+
+    assert report.order_state == ORDER_UNKNOWN
+    assert report.outcome == OUTCOME_UNKNOWN_MUTATION
+    assert report.remote_rollback_proven is False
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_CREATED
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_canary_stays_ambiguous_whatever_an_order_reads(session_maker) -> None:
+    """Which order is ours was never established. Reading one settles nothing."""
+    reader = FakeReader()
+    await _created(session_maker, reader)
+    await ledger_module.record_outcome(
+        session_maker,
+        status=ledger_module.STATUS_AMBIGUOUS,
+        expected_statuses=frozenset({ledger_module.STATUS_CREATED}),
+    )
+    reader.order = refunded_order(marker=MARKER)
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+
+    assert report.outcome == OUTCOME_AMBIGUOUS
+    assert report.manual_cleanup_required is True
+    assert report.remote_rollback_proven is False
+    assert (await ledger_module.load(session_maker)).status == ledger_module.STATUS_AMBIGUOUS
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_during_an_in_flight_create_never_makes_create_claimable(session_maker) -> None:
+    """The create POST is out and nothing has been seen. Claiming again is not
+    an option, and neither is deciding the order does not exist."""
+    reader = FakeReader()
+    config = "c" * 64
+    await ledger_module.claim_create(
+        session_maker,
+        create_plan_digest="a" * 64,
+        template_config_digest=config,
+        customer_fingerprint=IDENTITY.fingerprints["customer"],
+        staffer_fingerprint=IDENTITY.fingerprints["staffer"],
+        account_fingerprint=IDENTITY.fingerprints["account"],
+        reconciliation_marker=MARKER,
+        create_window_start=utcnow() - timedelta(minutes=10),
+        create_window_end=utcnow() + timedelta(hours=6),
+    )
+
+    report = await run_reconcile(session_maker, reader, identity=IDENTITY)
+    snapshot = await ledger_module.load(session_maker)
+
+    assert report.reconciliation_required is True
+    assert snapshot.status in {ledger_module.STATUS_CREATE_CLAIMED, ledger_module.STATUS_CREATE_UNKNOWN}
+    again = await ledger_module.claim_create(
+        session_maker,
+        create_plan_digest="a" * 64,
+        template_config_digest=config,
+        customer_fingerprint=IDENTITY.fingerprints["customer"],
+        staffer_fingerprint=IDENTITY.fingerprints["staffer"],
+        account_fingerprint=IDENTITY.fingerprints["account"],
+        reconciliation_marker=MARKER,
+        create_window_start=utcnow() - timedelta(minutes=10),
+        create_window_end=utcnow() + timedelta(hours=6),
+    )
+    assert again.granted is False
+
+
 # ---------------------------------------------------------------------------
 # Order classification
 # ---------------------------------------------------------------------------
@@ -1088,6 +1536,85 @@ def test_the_opaque_bookkeeping_figure_never_proves_a_payment() -> None:
 
 def test_a_reverted_order_is_refunded_even_when_it_still_says_paid() -> None:
     assert classify_order(paid_order(marker=MARKER, is_reverted=True))[0] == ORDER_REFUNDED
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "draft",
+        "pending",
+        "processing",
+        "partially_paid",
+        "on_hold",
+        "expired",
+        "",
+        "   ",
+        None,
+        123,
+        True,
+        ["open"],
+        {"value": "open"},
+    ],
+)
+def test_a_status_we_do_not_recognise_is_never_read_as_open(status) -> None:
+    """An unrecognised state is the one thing that must not become "payable".
+
+    `open` is the single state a payment may be sent from, so any status that
+    falls through to it is a state we never reasoned about authorising a real
+    payment from — a half-settled order, a draft in some workflow nobody
+    documented, a field the API renamed.
+    """
+    order = open_order(marker=MARKER)
+    order["status"] = status
+
+    assert classify_order(order) == (ORDER_UNKNOWN, PAYMENT_PROOF_NONE)
+
+
+def test_an_order_with_no_status_field_at_all_is_unknown() -> None:
+    order = open_order(marker=MARKER)
+    del order["status"]
+
+    assert classify_order(order) == (ORDER_UNKNOWN, PAYMENT_PROOF_NONE)
+
+
+def test_an_empty_uuid_is_as_malformed_as_a_missing_one() -> None:
+    assert classify_order({"uuid": "", "status": "open"}) == (ORDER_MALFORMED, PAYMENT_PROOF_NONE)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"is_canceled": True, "is_paid": True},
+        {"is_cancelled": True, "status": "open"},
+        {"is_canceled": True, "invoice": {"amount_due": 0, "amount_paid": 1500}},
+        {"is_reverted": True, "is_canceled": True},
+    ],
+)
+def test_an_order_whose_own_signals_disagree_is_unknown(changes) -> None:
+    """Two contradicting facts are not a state, and not something to act on."""
+    order = open_order(marker=MARKER)
+    order.update(changes)
+
+    assert classify_order(order)[0] == ORDER_UNKNOWN
+
+
+def test_payment_evidence_outranks_an_open_label() -> None:
+    """The safe reading of "open but paid" is PAID, not OPEN.
+
+    Calling it open would offer it to the pay stage; calling it unknown would
+    put the refund out of reach. Both of those lose real money; this does not.
+    """
+    flagged = open_order(marker=MARKER, is_paid=True)
+    assert classify_order(flagged) == (ORDER_PAID, PAYMENT_PROOF_STATUS)
+
+    settled = open_order(marker=MARKER, invoice={"amount_due": 0, "amount_paid": 1500})
+    assert classify_order(settled) == (ORDER_PAID, PAYMENT_PROOF_AMOUNTS)
+
+
+@pytest.mark.parametrize("state", [ORDER_UNKNOWN, ORDER_MALFORMED])
+def test_an_unreadable_state_never_moves_the_ledger(state) -> None:
+    for status in ledger_module.ALL_STATUSES:
+        assert reconcile_transition(status, state).status is None
 
 
 # ---------------------------------------------------------------------------

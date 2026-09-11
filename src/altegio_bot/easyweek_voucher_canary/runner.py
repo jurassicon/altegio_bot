@@ -47,6 +47,7 @@ from altegio_bot.easyweek_voucher_canary.orders import (
     ORDER_OPEN,
     ORDER_PAID,
     ORDER_REFUNDED,
+    ORDER_UNKNOWN,
     PAYMENT_PROOF_NONE,
     classify_order,
     find_marker_orders,
@@ -65,6 +66,7 @@ from altegio_bot.easyweek_voucher_canary.plan import (
     StagePlan,
     build_stage_plan,
     canonical_order_uuid,
+    identity_binding_matches,
     immutable_template_digest,
     template_counters,
     verify_plan_authorisation,
@@ -107,6 +109,11 @@ REASON_TEMPLATE_READBACK_FAILED: Final = "canary_template_readback_failed"
 REASON_TEMPLATE_CONFIG_DRIFT: Final = "canary_template_configuration_drift"
 REASON_MANUAL_CLEANUP_REQUIRED: Final = "canary_manual_cleanup_required"
 REASON_ROLLBACK_UNPROVEN: Final = "canary_rollback_unproven"
+# The environment's runtime identity is not the one the ledger row was opened
+# with. A boolean's worth of information, and no more.
+REASON_IDENTITY_BINDING_MISMATCH: Final = "canary_identity_binding_mismatch"
+# The order is readable but its state is not one we recognise.
+REASON_ORDER_STATE_UNKNOWN: Final = "canary_order_state_unknown"
 
 
 class VoucherMutator(Protocol):
@@ -348,6 +355,7 @@ async def authorise(
         enabled=enabled,
         ledger_status=ledger.status,
         target_order_uuid=ledger.target_order_uuid,
+        ledger_identity=ledger.identity_fingerprints if ledger.exists else None,
         create_window_start=ledger.create_window_start,
         create_window_end=ledger.create_window_end,
         now=now,
@@ -584,6 +592,7 @@ async def run_pay(
         session_maker,
         pay_plan_digest=plan.digest,
         template_config_digest=plan.immutable_template_digest,
+        identity_fingerprints=identity.fingerprints,
     )
     if not claim.granted:
         report = _refusal(STAGE_PAY, [claim.reason], (await ledger_module.load(session_maker)).as_safe_dict())
@@ -738,6 +747,7 @@ async def run_refund(
         session_maker,
         refund_plan_digest=plan.digest,
         template_config_digest=plan.immutable_template_digest,
+        identity_fingerprints=identity.fingerprints,
     )
     if not claim.granted:
         report = _refusal(STAGE_REFUND, [claim.reason], (await ledger_module.load(session_maker)).as_safe_dict())
@@ -857,57 +867,124 @@ class _Transition:
     manual_cleanup_observed: bool = False
 
 
-# The monotonic reconciliation table. `None` means "observe and say so, but do
-# not touch the ledger" — which is what stops a read taken while a POST is still
-# in flight from handing that POST back to be claimed again.
-_RECONCILE_TRANSITIONS: Final[dict[tuple[str, str], _Transition]] = {
-    # A refunded order is the most advanced state there is; any reading of it
-    # may be recorded, and only a claimed refund gets a verification stamp.
-    (ledger_module.STATUS_REFUND_CLAIMED, ORDER_REFUNDED): _Transition(
-        ledger_module.STATUS_REFUNDED,
-        frozenset({ledger_module.STATUS_REFUND_CLAIMED}),
-        "refund_verified_at",
-    ),
-    (ledger_module.STATUS_REFUND_UNKNOWN, ORDER_REFUNDED): _Transition(
-        ledger_module.STATUS_REFUNDED,
-        frozenset({ledger_module.STATUS_REFUND_UNKNOWN}),
-        "refund_verified_at",
-    ),
-    (ledger_module.STATUS_PAID, ORDER_REFUNDED): _Transition(
-        ledger_module.STATUS_REFUNDED, frozenset({ledger_module.STATUS_PAID})
-    ),
-    (ledger_module.STATUS_CREATED, ORDER_REFUNDED): _Transition(
-        ledger_module.STATUS_REFUNDED, frozenset({ledger_module.STATUS_CREATED})
-    ),
-    # A payment is recordable from a claimed or unknown pay, and from `created`
-    # when somebody settled the draft in the dashboard. Never from a refund
-    # stage: that would walk the state back to somewhere refund is claimable.
-    (ledger_module.STATUS_PAY_CLAIMED, ORDER_PAID): _Transition(
-        ledger_module.STATUS_PAID, frozenset({ledger_module.STATUS_PAY_CLAIMED}), "pay_verified_at"
-    ),
-    (ledger_module.STATUS_PAY_UNKNOWN, ORDER_PAID): _Transition(
-        ledger_module.STATUS_PAID, frozenset({ledger_module.STATUS_PAY_UNKNOWN}), "pay_verified_at"
-    ),
-    (ledger_module.STATUS_CREATED, ORDER_PAID): _Transition(
-        ledger_module.STATUS_PAID, frozenset({ledger_module.STATUS_CREATED})
-    ),
-    # A pay whose POST is still in flight reads the order as open. That is not
-    # evidence the payment failed — it becomes `pay_unknown`, never `created`.
-    (ledger_module.STATUS_PAY_CLAIMED, ORDER_OPEN): _Transition(
+# Every post-create ledger state a reconciliation of one exact order can see.
+# The create stages are not here: they are resolved by the marker walk instead,
+# because there may not be an order UUID to read yet.
+_POST_CREATE_STATUSES: Final = (
+    ledger_module.STATUS_CREATED,
+    ledger_module.STATUS_PAY_CLAIMED,
+    ledger_module.STATUS_PAY_UNKNOWN,
+    ledger_module.STATUS_PAY_REJECTED,
+    ledger_module.STATUS_PAID,
+    ledger_module.STATUS_REFUND_CLAIMED,
+    ledger_module.STATUS_REFUND_UNKNOWN,
+    ledger_module.STATUS_REFUND_REJECTED,
+)
+
+# States in which THIS canary actually sent a payment, and a refund. Only these
+# may carry a verification timestamp for that stage: `pay_verified_at` means
+# "the pay we sent is confirmed", and stamping it because somebody settled the
+# order in the dashboard would invent an attribution the ledger cannot support.
+_PAY_ATTEMPTED_STATUSES: Final = frozenset(
+    {
+        ledger_module.STATUS_PAY_CLAIMED,
+        ledger_module.STATUS_PAY_UNKNOWN,
+        ledger_module.STATUS_PAY_REJECTED,
+    }
+)
+_REFUND_ATTEMPTED_STATUSES: Final = frozenset(
+    {
+        ledger_module.STATUS_REFUND_CLAIMED,
+        ledger_module.STATUS_REFUND_UNKNOWN,
+        ledger_module.STATUS_REFUND_REJECTED,
+    }
+)
+
+# A cancelled order may only END the canary from states where no payment of ours
+# is outstanding. From `pay_unknown` a cancellation proves nothing about a
+# payment that may have landed, so that combination stays unresolved.
+_CANCELLABLE_FROM: Final = frozenset({ledger_module.STATUS_CREATED, ledger_module.STATUS_PAY_REJECTED})
+
+
+def _build_reconcile_transitions() -> dict[tuple[str, str], _Transition]:
+    """The complete monotonic table over post-create ledger × remote states.
+
+    Built rather than typed out so no combination is silently missing — an
+    absent pair would mean "do nothing", which is safe but leaves an operator
+    stuck; the point here is to be exhaustive AND monotonic at once.
+
+    The rules, in the order they are applied:
+
+    ``remote refunded``
+        the money is back, which is the most advanced thing that can be true of
+        this order, so any unfinished post-create state may record it. The
+        verification stamp is only for states where WE sent the refund.
+
+    ``remote paid``
+        recordable from `created` and from every state where our payment may
+        have landed. Never from a refund state: that would walk the ledger back
+        to somewhere a refund can be claimed again.
+
+    ``remote open``
+        only `pay_claimed` moves, and only to `pay_unknown`: a payment whose
+        POST may still be in flight reads as open, and calling that "not paid"
+        would hand the same payment back to be sent twice.
+
+    ``remote cancelled``
+        somebody cleaned up by hand. Recorded as an observation, without
+        attributing it to this canary, and only where no payment of ours is
+        still outstanding.
+
+    ``remote unknown`` / ``remote malformed``
+        nothing at all. An unreadable or unrecognised order is not evidence.
+    """
+    table: dict[tuple[str, str], _Transition] = {}
+    for status in _POST_CREATE_STATUSES:
+        table[(status, ORDER_REFUNDED)] = _Transition(
+            status=ledger_module.STATUS_REFUNDED,
+            expected_from=frozenset({status}),
+            verified_field="refund_verified_at" if status in _REFUND_ATTEMPTED_STATUSES else None,
+        )
+        if status in _PAY_ATTEMPTED_STATUSES or status == ledger_module.STATUS_CREATED:
+            table[(status, ORDER_PAID)] = _Transition(
+                status=ledger_module.STATUS_PAID,
+                expected_from=frozenset({status}),
+                verified_field="pay_verified_at" if status in _PAY_ATTEMPTED_STATUSES else None,
+            )
+        if status in _CANCELLABLE_FROM:
+            table[(status, ORDER_CANCELLED)] = _Transition(
+                status=ledger_module.STATUS_MANUALLY_CLEANED,
+                expected_from=frozenset({status}),
+                manual_cleanup_observed=True,
+            )
+    table[(ledger_module.STATUS_PAY_CLAIMED, ORDER_OPEN)] = _Transition(
         status=ledger_module.STATUS_PAY_UNKNOWN,
         expected_from=frozenset({ledger_module.STATUS_PAY_CLAIMED}),
-    ),
-    # Somebody closed the draft by hand. Observed, never attributed to us.
-    (ledger_module.STATUS_CREATED, ORDER_CANCELLED): _Transition(
-        ledger_module.STATUS_MANUALLY_CLEANED,
-        frozenset({ledger_module.STATUS_CREATED}),
-        manual_cleanup_observed=True,
-    ),
-    (ledger_module.STATUS_PAY_REJECTED, ORDER_CANCELLED): _Transition(
-        ledger_module.STATUS_MANUALLY_CLEANED,
-        frozenset({ledger_module.STATUS_PAY_REJECTED}),
-        manual_cleanup_observed=True,
-    ),
+    )
+    return table
+
+
+# `None` means "observe and say so, but do not touch the ledger" — which is what
+# stops a read taken while a POST is still in flight from handing that POST back
+# to be claimed again. The terminal states (`refunded`, `manually_cleaned`,
+# `ambiguous`) appear nowhere as a source: nothing moves out of them.
+_RECONCILE_TRANSITIONS: Final[dict[tuple[str, str], _Transition]] = _build_reconcile_transitions()
+
+# What the ledger and the remote order may consistently say at the same time.
+# Used to refuse the word "proven" when they disagree — a ledger that says
+# refunded over an order that reads paid is not a resolved canary, whichever of
+# the two turns out to be right.
+_CONSISTENT_REMOTE_STATES: Final[dict[str, frozenset[str]]] = {
+    ledger_module.STATUS_CREATED: frozenset({ORDER_OPEN}),
+    ledger_module.STATUS_PAY_CLAIMED: frozenset({ORDER_OPEN, ORDER_PAID}),
+    ledger_module.STATUS_PAY_UNKNOWN: frozenset({ORDER_OPEN, ORDER_PAID}),
+    ledger_module.STATUS_PAY_REJECTED: frozenset({ORDER_OPEN}),
+    ledger_module.STATUS_PAID: frozenset({ORDER_PAID}),
+    ledger_module.STATUS_REFUND_CLAIMED: frozenset({ORDER_PAID, ORDER_REFUNDED}),
+    ledger_module.STATUS_REFUND_UNKNOWN: frozenset({ORDER_PAID, ORDER_REFUNDED}),
+    ledger_module.STATUS_REFUND_REJECTED: frozenset({ORDER_PAID}),
+    ledger_module.STATUS_REFUNDED: frozenset({ORDER_REFUNDED}),
+    ledger_module.STATUS_MANUALLY_CLEANED: frozenset({ORDER_CANCELLED, ORDER_REFUNDED}),
 }
 
 
@@ -915,9 +992,10 @@ def reconcile_transition(current_status: str, remote_state: str) -> _Transition:
     """The ledger change one remote reading justifies, if any.
 
     Everything absent from the table is deliberately a no-op: a refund stage
-    reading `paid`, a pay stage reading `open` after it already went unknown, a
-    malformed body. Those are reported and left alone, because writing them
-    would be a regression and a regression is a second POST waiting to happen.
+    reading `paid`, a pay stage reading `open` after it already went unknown, an
+    unrecognised state, a malformed body. Those are reported and left alone,
+    because writing them would be a regression and a regression is a second POST
+    waiting to happen.
     """
     return _RECONCILE_TRANSITIONS.get((current_status, remote_state), _Transition(status=None))
 
@@ -939,6 +1017,17 @@ async def run_reconcile(
             stage="reconcile",
             outcome=OUTCOME_REFUSED,
             reasons=[REASON_LEDGER_STATE_INVALID],
+            ledger=snapshot.as_safe_dict(),
+        )
+    if not identity_binding_matches(identity, snapshot.identity_fingerprints):
+        # Refused BEFORE any GET. Reconciling under a different identity would
+        # walk somebody else's orders looking for our marker and would judge
+        # another customer's order against this ledger row.
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_REFUSED,
+            reasons=[REASON_IDENTITY_BINDING_MISMATCH],
+            reconciliation_required=snapshot.status in ledger_module.UNRESOLVED_STATUSES,
             ledger=snapshot.as_safe_dict(),
         )
 
@@ -1119,43 +1208,78 @@ async def _reconcile_order(
         outcome=_reconcile_outcome(status_now, state),
         reasons=_reconcile_reasons(status_now, state),
         reconciliation_required=status_now in ledger_module.UNRESOLVED_STATUSES,
-        manual_cleanup_required=state == ORDER_OPEN and status_now not in ledger_module.UNRESOLVED_STATUSES,
+        manual_cleanup_required=(
+            status_now == ledger_module.STATUS_AMBIGUOUS
+            or (state == ORDER_OPEN and status_now not in ledger_module.UNRESOLVED_STATUSES)
+        ),
         ledger=current.as_safe_dict(),
         observations=[observation.as_safe_dict()] if observation else [],
         template_counters=counters,
         order_state=state,
         payment_proof=proof,
-        remote_rollback_proven=state == ORDER_REFUNDED,
+        # The rollback is proven only when BOTH agree it happened. A remote
+        # `refunded` under a ledger that could not record it is a disagreement,
+        # and a disagreement is not a proof.
+        remote_rollback_proven=state == ORDER_REFUNDED and status_now == ledger_module.STATUS_REFUNDED,
     )
 
 
+def _ledger_agrees_with_remote(status: str, remote_state: str) -> bool:
+    consistent = _CONSISTENT_REMOTE_STATES.get(status)
+    if consistent is None:
+        # `ambiguous` has no consistent reading by definition: it exists because
+        # we could not tell which order, if any, is ours.
+        return False
+    return remote_state in consistent
+
+
 def _reconcile_outcome(status: str, remote_state: str) -> str:
-    if status == ledger_module.STATUS_REFUNDED or status == ledger_module.STATUS_MANUALLY_CLEANED:
-        return OUTCOME_PROVEN
+    """What this reading means, as one of the closed outcome codes.
+
+    Never ``proven`` while something is unresolved, while the remote state is
+    unrecognisable, or while the ledger and the order contradict each other.
+    """
+    if status == ledger_module.STATUS_AMBIGUOUS:
+        # A full stop. Which order is ours was never established, so no reading
+        # of any order resolves it.
+        return OUTCOME_AMBIGUOUS
+    if remote_state in {ORDER_MALFORMED, ORDER_UNKNOWN}:
+        # Nothing was established, so nothing is proven — including a rollback.
+        if status in _REFUND_ATTEMPTED_STATUSES or status == ledger_module.STATUS_PAID:
+            return OUTCOME_ROLLBACK_UNPROVEN
+        return OUTCOME_UNKNOWN_MUTATION
     if status in ledger_module.UNRESOLVED_STATUSES:
         # A refund whose effect is still unknown is not merely "unknown": the
         # money is still out, so it reports as an unproven rollback.
         if status in {ledger_module.STATUS_REFUND_CLAIMED, ledger_module.STATUS_REFUND_UNKNOWN}:
             return OUTCOME_ROLLBACK_UNPROVEN
         return OUTCOME_UNKNOWN_MUTATION
+    if not _ledger_agrees_with_remote(status, remote_state):
+        return OUTCOME_CONTRACT_MISMATCH
+    if status in {ledger_module.STATUS_REFUNDED, ledger_module.STATUS_MANUALLY_CLEANED}:
+        return OUTCOME_PROVEN
     if remote_state == ORDER_OPEN:
         return OUTCOME_MANUAL_CLEANUP
-    if remote_state == ORDER_MALFORMED:
-        return OUTCOME_UNKNOWN_MUTATION
     return OUTCOME_PROVEN
 
 
 def _reconcile_reasons(status: str, remote_state: str) -> list[str]:
+    if status == ledger_module.STATUS_AMBIGUOUS:
+        return [REASON_RECONCILE_AMBIGUOUS]
+    if remote_state == ORDER_MALFORMED:
+        return [REASON_ORDER_SHAPE_UNPROVEN]
+    if remote_state == ORDER_UNKNOWN:
+        return [REASON_ORDER_STATE_UNKNOWN]
     if status in {ledger_module.STATUS_REFUND_CLAIMED, ledger_module.STATUS_REFUND_UNKNOWN}:
         return [REASON_ROLLBACK_UNPROVEN]
     if status in ledger_module.UNRESOLVED_STATUSES:
         return [REASON_RECONCILE_UNRESOLVED]
-    if status == ledger_module.STATUS_REFUNDED or status == ledger_module.STATUS_MANUALLY_CLEANED:
+    if not _ledger_agrees_with_remote(status, remote_state):
+        return [REASON_LEDGER_STATE_CONFLICT]
+    if status in {ledger_module.STATUS_REFUNDED, ledger_module.STATUS_MANUALLY_CLEANED}:
         return []
     if remote_state == ORDER_OPEN:
         return [REASON_MANUAL_CLEANUP_REQUIRED]
-    if remote_state == ORDER_MALFORMED:
-        return [REASON_ORDER_SHAPE_UNPROVEN]
     return []
 
 
