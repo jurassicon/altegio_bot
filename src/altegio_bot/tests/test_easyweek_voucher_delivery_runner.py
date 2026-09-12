@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -24,6 +25,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     DELIVERY_ALREADY_ATTEMPTED,
     DELIVERY_OUTCOME_UNKNOWN,
     HMAC_KEY_MISSING,
+    MANUAL_CLEANUP_REQUIRED,
     MUTATION_UNKNOWN,
     RECIPIENT_IDENTITY_UNPROVEN,
     REFUND_FORBIDDEN_AFTER_SEND,
@@ -56,8 +58,14 @@ from altegio_bot.models.models import (
     VOUCHER_DELIVERY_SEND_REJECTED,
     VOUCHER_DELIVERY_SEND_UNKNOWN,
 )
+from altegio_bot.scripts.easyweek_voucher_delivery_canary import (
+    _OUTCOME_EXIT_CODES,
+    EXIT_MANUAL_CLEANUP,
+    EXIT_OK,
+)
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: F401 - fixtures
+    NOW,
     OTHER_UUID,
     PROVIDER_MESSAGE_ID,
     UNKNOWN_OUTCOME,
@@ -69,13 +77,14 @@ from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: F401
     RefusingSender,
     booking_payload,
     canary_request,
+    create_window,
     history_page,
+    marker_order,
     orders_page,
     seed_recipient,
     seed_template_and_sender,
     voucher_order,
 )
-from altegio_bot.utils import utcnow
 
 BOOKING_LINK = "https://karlsruhe.example.invalid/"
 
@@ -870,12 +879,11 @@ async def test_two_marker_orders_durably_stop_the_canary(session_maker, enabled)
         create_error=EasyWeekVoucherMutationUnknown("lost"),
     )
     await _create(session_maker, request, reader, mutator)
-    now = utcnow().isoformat()
     reader.order_pages = [
         orders_page(
             [
-                voucher_order(marker=request.marker, created_at=now),
-                voucher_order(marker=request.marker, created_at=now, uuid=str(OTHER_UUID)),
+                await marker_order(session_maker, marker=request.marker),
+                await marker_order(session_maker, marker=request.marker, uuid=str(OTHER_UUID)),
             ]
         )
     ]
@@ -899,13 +907,15 @@ async def test_a_manually_closed_draft_becomes_durably_manually_cleaned(session_
     # come back, and the ledger has no order UUID to read.
     mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
     await _create(session_maker, request, reader, mutator)
-    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    closed = await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)
     reader.order = closed
     reader.order_pages = [orders_page([closed])]
 
     report = await _reconcile(session_maker, request, reader)
 
     assert report.outcome == OUTCOME_PROVEN
+    assert _OUTCOME_EXIT_CODES[report.outcome] == EXIT_OK
+    assert report.manual_cleanup_required is False
     snapshot = await ledger_module.load(session_maker)
     assert snapshot.status == "manually_cleaned"
     assert snapshot.manual_cleanup_required is False
@@ -920,7 +930,7 @@ async def test_a_paid_order_with_no_payment_provenance_stops_the_canary(session_
     request, reader = await _ready(session_maker)
     mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
     await _create(session_maker, request, reader, mutator)
-    paid = voucher_order(marker=request.marker, status="paid")
+    paid = await marker_order(session_maker, marker=request.marker, status="paid")
     reader.order = paid
     reader.order_pages = [orders_page([paid])]
 
@@ -1186,11 +1196,23 @@ async def test_a_manual_dashboard_refund_settles_the_ledger_without_a_post(sessi
 
     assert mutator.calls == calls_before
     assert report.external_mutation_attempted is False
+    # The operation finished. The informational reason explains why no POST went
+    # out; it does not make a completed transition look like a failure.
+    assert report.outcome == OUTCOME_PROVEN
     assert VOUCHER_ORDER_ALREADY_REFUNDED in report.reasons
+    assert report.manual_cleanup_required is False
+    assert report.reconciliation_required is False
+    assert _OUTCOME_EXIT_CODES[report.outcome] == EXIT_OK
     snapshot = await ledger_module.load(session_maker)
     assert snapshot.status == VOUCHER_DELIVERY_MANUALLY_CLEANED
     assert snapshot.reconciliation_required is False
     assert snapshot.manual_cleanup_required is False
+    assert snapshot.stage_timestamps["manual_cleanup_observed_at"] is not None
+    # No refund provenance is claimed anywhere on the row.
+    assert snapshot.stage_timestamps["refund_claimed_at"] is None
+    assert snapshot.stage_timestamps["refund_attempted_at"] is None
+    assert snapshot.stage_timestamps["refund_verified_at"] is None
+    assert snapshot.stage_plan_digests["refund"] is None
 
 
 @pytest.mark.asyncio
@@ -1282,7 +1304,10 @@ async def test_reconcile_closes_a_paid_ledger_whose_order_was_refunded_by_hand(s
     report = await _reconcile(session_maker, request, reader)
 
     assert mutator.calls == calls_before
-    assert report.outcome != OUTCOME_CONTRACT_MISMATCH
+    assert report.outcome == OUTCOME_PROVEN
+    assert _OUTCOME_EXIT_CODES[report.outcome] == EXIT_OK
+    assert report.manual_cleanup_required is False
+    assert report.reconciliation_required is False
     snapshot = await ledger_module.load(session_maker)
     assert snapshot.status == VOUCHER_DELIVERY_MANUALLY_CLEANED
     assert snapshot.reconciliation_required is False
@@ -1336,7 +1361,9 @@ async def test_a_candidate_whose_exact_read_carries_another_marker_stays_unresol
     actually compared — and a foreign order must not close this canary.
     """
     request, reader = await _lost_create(session_maker)
-    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="canceled", is_canceled=True)])]
+    reader.order_pages = [
+        orders_page([await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)])
+    ]
     # What the exact read returns is a different order entirely.
     reader.order = voucher_order(marker="somebody-elses-marker", status="canceled", is_canceled=True)
 
@@ -1352,7 +1379,7 @@ async def test_a_candidate_whose_exact_read_carries_another_marker_stays_unresol
 @pytest.mark.asyncio
 async def test_a_candidate_bound_to_another_customer_stays_unresolved(session_maker, enabled) -> None:
     request, reader = await _lost_create(session_maker)
-    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    closed = await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)
     reader.order_pages = [orders_page([closed])]
     reader.order = voucher_order(
         marker=request.marker,
@@ -1372,7 +1399,9 @@ async def test_a_candidate_bound_to_another_customer_stays_unresolved(session_ma
 async def test_a_candidate_whose_exact_read_answers_with_another_uuid_stays_unresolved(session_maker, enabled) -> None:
     """The read must be of the order we asked about, not merely a valid one."""
     request, reader = await _lost_create(session_maker)
-    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="canceled", is_canceled=True)])]
+    reader.order_pages = [
+        orders_page([await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)])
+    ]
     reader.order = voucher_order(
         marker=request.marker,
         status="canceled",
@@ -1391,7 +1420,7 @@ async def test_a_candidate_whose_exact_read_answers_with_another_uuid_stays_unre
 async def test_a_foreign_paid_order_does_not_make_this_canary_ambiguous(session_maker, enabled) -> None:
     """`ambiguous` is a claim about OUR order being unattributable."""
     request, reader = await _lost_create(session_maker)
-    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="paid")])]
+    reader.order_pages = [orders_page([await marker_order(session_maker, marker=request.marker, status="paid")])]
     reader.order = voucher_order(marker="somebody-elses-marker", status="paid")
 
     report = await _reconcile(session_maker, request, reader)
@@ -1405,7 +1434,7 @@ async def test_a_foreign_paid_order_does_not_make_this_canary_ambiguous(session_
 async def test_the_create_reconciliation_still_closes_its_own_cancelled_order(session_maker, enabled) -> None:
     """Proving identity must not break the case identity actually holds."""
     request, reader = await _lost_create(session_maker)
-    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    closed = await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)
     reader.order_pages = [orders_page([closed])]
     reader.order = closed
 
@@ -1420,7 +1449,7 @@ async def test_the_create_reconciliation_still_closes_its_own_cancelled_order(se
 @pytest.mark.asyncio
 async def test_the_create_reconciliation_still_flags_its_own_unexplained_paid_order(session_maker, enabled) -> None:
     request, reader = await _lost_create(session_maker)
-    paid = voucher_order(marker=request.marker, status="paid")
+    paid = await marker_order(session_maker, marker=request.marker, status="paid")
     reader.order_pages = [orders_page([paid])]
     reader.order = paid
 
@@ -1438,7 +1467,7 @@ async def test_a_lost_compare_and_set_is_never_reported_as_ambiguous(session_mak
     transition that did not happen.
     """
     request, reader = await _lost_create(session_maker)
-    paid = voucher_order(marker=request.marker, status="paid")
+    paid = await marker_order(session_maker, marker=request.marker, status="paid")
     reader.order_pages = [orders_page([paid])]
     reader.order = paid
 
@@ -1453,3 +1482,176 @@ async def test_a_lost_compare_and_set_is_never_reported_as_ambiguous(session_mak
     report = await _reconcile(session_maker, request, reader)
 
     assert report.outcome == OUTCOME_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_cleanup_that_is_still_pending_never_reports_success(session_maker, enabled) -> None:
+    """The mirror image of the blocker, and just as wrong.
+
+    A rejected pay leaves a real draft in EasyWeek that a human has to close by
+    hand. The ledger and the order agree about that, but "agreeing" is not the
+    same as "finished", and a zero exit code would tell a wrapper there is
+    nothing left to do.
+    """
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker)
+    await _create(session_maker, request, reader, mutator)
+    reader.order = voucher_order(marker=request.marker)
+    mutator.pay_error = EasyWeekPermanentError("rejected", status_code=422)
+    await _pay(session_maker, request, reader, mutator)
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.manual_cleanup_required is True
+    assert report.outcome == runner_module.OUTCOME_MANUAL_CLEANUP
+    assert _OUTCOME_EXIT_CODES[report.outcome] == EXIT_MANUAL_CLEANUP
+    assert MANUAL_CLEANUP_REQUIRED in report.reasons
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_send_never_reports_success(session_maker, enabled) -> None:
+    """The customer may be holding the code. Nothing about that is `proven`."""
+    request, reader, _ = await _paid(session_maker)
+    await _deliver(session_maker, request, reader, FakeSender(outcome=UNKNOWN_OUTCOME))
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert _OUTCOME_EXIT_CODES[report.outcome] != EXIT_OK
+    assert report.manual_cleanup_required is True
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_SEND_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_settlement_that_loses_the_race_reports_no_success(session_maker, enabled, monkeypatch) -> None:
+    """Another writer moved first, so this call settled nothing."""
+    request, reader, mutator = await _paid(session_maker)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    real = ledger_module.record_outcome
+
+    async def refused(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        return ledger_module.RecordOutcome(applied=False, reason="lost_race", snapshot=result.snapshot)
+
+    monkeypatch.setattr(ledger_module, "record_outcome", refused)
+
+    report = await _refund(session_maker, request, reader, mutator)
+
+    assert report.outcome != OUTCOME_PROVEN
+    assert _OUTCOME_EXIT_CODES[report.outcome] != EXIT_OK
+    assert mutator.calls == ["create", "pay"]
+    # The snapshot that comes back is the live row, not an invented ending.
+    assert report.ledger["status"] == (await ledger_module.load(session_maker)).status
+
+
+# ---------------------------------------------------------------------------
+# The create window is bounded, and the tests say so without consulting a clock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_order_inside_the_proven_window_is_recognised(session_maker, enabled) -> None:
+    """Whatever the calendar says today, the middle of the window is inside it."""
+    request, reader = await _lost_create(session_maker)
+    start, end = await create_window(session_maker)
+    assert start < end
+    closed = await marker_order(session_maker, marker=request.marker, status="canceled", is_canceled=True)
+    reader.order_pages = [orders_page([closed])]
+    reader.order = closed
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_PROVEN
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_MANUALLY_CLEANED
+
+
+@pytest.mark.asyncio
+async def test_an_order_created_before_the_window_is_not_ours(session_maker, enabled) -> None:
+    """An older order carrying the same comment is not this canary's order."""
+    request, reader = await _lost_create(session_maker)
+    start, _ = await create_window(session_maker)
+    early = await marker_order(
+        session_maker,
+        marker=request.marker,
+        status="canceled",
+        is_canceled=True,
+        at=start - timedelta(seconds=1),
+    )
+    reader.order_pages = [orders_page([early])]
+    reader.order = early
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_an_order_created_after_the_window_is_not_ours(session_maker, enabled) -> None:
+    request, reader = await _lost_create(session_maker)
+    _, end = await create_window(session_maker)
+    late = await marker_order(
+        session_maker,
+        marker=request.marker,
+        status="canceled",
+        is_canceled=True,
+        at=end + timedelta(seconds=1),
+    )
+    reader.order_pages = [orders_page([late])]
+    reader.order = late
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("", id="empty"),
+        pytest.param("2026-09-12 12:00:00", id="no_timezone"),
+        pytest.param("the twelfth", id="unparseable"),
+    ],
+)
+async def test_a_created_at_that_cannot_be_trusted_is_fail_closed(session_maker, enabled, created_at) -> None:
+    """No usable timestamp is not "inside the window"; it is not a match."""
+    request, reader = await _lost_create(session_maker)
+    row = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    if created_at is None:
+        row.pop("created_at")
+    else:
+        row["created_at"] = created_at
+    reader.order_pages = [orders_page([row])]
+    reader.order = row
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_the_window_tests_never_consult_the_wall_clock(session_maker, enabled) -> None:
+    """Structural: the window comes from the ledger, not from today's date.
+
+    The bug this replaces was a fixture constant that sat inside the window on
+    the afternoon it was written and outside it by teatime.
+    """
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
+    await _create(session_maker, request, reader, mutator)
+    start, end = await create_window(session_maker)
+    row = await marker_order(session_maker, marker=request.marker)
+
+    moment = datetime.fromisoformat(row["created_at"])
+    assert start < moment < end
+    # Comfortably inside, not clinging to an edge.
+    assert moment - start > timedelta(minutes=1)
+    assert end - moment > timedelta(minutes=1)
+    assert moment != NOW

@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from altegio_bot.campaigns.easyweek_voucher_delivery import runner as runner_module
 from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     APPLY_FLAG_MISSING,
     CANARY_DISABLED,
@@ -212,3 +213,86 @@ def test_the_recipient_can_only_be_named_by_run_and_recipient_id() -> None:
     assert "--campaign-recipient-id" in flags
     for forbidden in ("--phone", "--customer-uuid", "--to", "--name"):
         assert forbidden not in flags
+
+
+# ---------------------------------------------------------------------------
+# A finished cleanup exits zero
+# ---------------------------------------------------------------------------
+
+
+class _NoClient:
+    """Constructible, but reaches nothing: no stage here may use it."""
+
+    async def __aenter__(self) -> "_NoClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
+def _settled_report(stage: str, reasons: list[str]) -> runner_module.StageReport:
+    """Exactly the shape the runner returns once an external cleanup is proven.
+
+    The durable state is terminal: the order was closed or reversed by somebody
+    else, this application sent nothing, and neither flag is asking for a human.
+    """
+    return runner_module.StageReport(
+        stage=stage,
+        outcome=runner_module.OUTCOME_PROVEN,
+        reasons=reasons,
+        external_mutation_attempted=False,
+        reconciliation_required=False,
+        manual_cleanup_required=False,
+        ledger={"status": "manually_cleaned", "manual_cleanup_required": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refund_that_only_records_an_external_refund_exits_zero(
+    monkeypatch, capsys, session_maker, configuration
+) -> None:
+    """No POST went out and none was needed. That is a success, not a code 6."""
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_canary_enabled", True, raising=False)
+    monkeypatch.setattr(cli, "SessionLocal", session_maker)
+    monkeypatch.setattr(cli, "EasyWeekClient", _NoClient)
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", _NoClient)
+
+    async def settled(*args: Any, **kwargs: Any):
+        return _settled_report("refund", ["voucher_order_already_refunded"])
+
+    monkeypatch.setattr(cli.runner_module, "run_refund", settled)
+
+    assert await asyncio.to_thread(main, _stage_argv("refund")) == EXIT_OK
+
+    report = _output(capsys)
+    assert report["outcome"] == "proven"
+    assert report["manual_cleanup_required"] is False
+    # The operator can still see why nothing was sent and who did the refund.
+    assert "voucher_order_already_refunded" in report["reasons"]
+    assert report["external_mutation_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_that_records_a_manual_cleanup_exits_zero(
+    monkeypatch, capsys, session_maker, configuration
+) -> None:
+    monkeypatch.setattr(cli, "SessionLocal", session_maker)
+    monkeypatch.setattr(cli, "EasyWeekClient", _NoClient)
+
+    async def settled(*args: Any, **kwargs: Any):
+        return _settled_report("reconcile", [])
+
+    monkeypatch.setattr(cli.runner_module, "run_reconcile", settled)
+
+    argv = ["reconcile", "--preview-run-id", "1", "--campaign-recipient-id", "2"]
+
+    assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+    assert _output(capsys)["ledger"]["status"] == "manually_cleaned"
+
+
+def test_the_manual_cleanup_exit_code_is_reserved_for_unfinished_work() -> None:
+    """The mapping an operator's wrapper reads, asserted where it is defined."""
+    assert cli._OUTCOME_EXIT_CODES[runner_module.OUTCOME_PROVEN] == EXIT_OK
+    assert cli._OUTCOME_EXIT_CODES[runner_module.OUTCOME_MANUAL_CLEANUP] == EXIT_MANUAL_CLEANUP
+    assert EXIT_MANUAL_CLEANUP != EXIT_OK

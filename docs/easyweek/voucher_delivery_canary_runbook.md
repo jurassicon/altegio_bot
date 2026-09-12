@@ -146,7 +146,7 @@ before any external effect.
 | `provider_accepted` | Meta took the message — NOT delivered | Wait for webhooks |
 | `delivered` / `read` | A webhook for this exact message id said so | Record the outcome |
 | `refunded` | The money came back; nothing was ever sent | Done |
-| `manually_cleaned` | Somebody else closed or reversed the order; we sent nothing | Done |
+| `manually_cleaned` | Proven and recorded: somebody else closed or reversed the order, we sent nothing | Done — no further cleanup |
 
 `provider_accepted` is not delivery. `delivered` and `read` are written only by
 a webhook naming this exact `provider_message_id`, and they are monotonic: a
@@ -200,6 +200,14 @@ The same ending is reachable with `reconcile` alone, and settlement is refused
 if the order cannot be proven ours, if the money is not actually back, or if
 anything was ever sent from this row. A refund that a customer's message has
 already made irreversible is not something to tidy away.
+
+**Such a run succeeds.** Once the cleanup is proven and the row is written, the
+operation is finished: the outcome is `proven` and the exit code is `0`, for
+`refund --apply` and for `reconcile` alike. `voucher_order_already_refunded`
+stays in `reasons` so you can see why no POST went out and that the refund was
+not ours — an informational reason on a completed transition, not a failure.
+If the compare-and-set is lost to a concurrent process, the run says so instead:
+it reports an unresolved outcome with the live snapshot and claims nothing.
 
 ## 7. An unknown result
 
@@ -281,7 +289,14 @@ intentionally omitted."*
 | `3` | **UNKNOWN — do not auto-retry.** Something left this process unproven |
 | `4` | Contract mismatch or refusal — a fact did not hold |
 | `5` | Ambiguous reconciliation |
-| `6` | Manual dashboard cleanup required |
+| `6` | Manual dashboard cleanup **still outstanding** — a human has something to do |
+
+Code `6` is about work that has NOT been done. A cleanup somebody already
+performed and this tool has proven and written down is a completed operation and
+exits `0`: the row reads `manually_cleaned`, both flags are false, and sending an
+operator to the dashboard for it would be sending them after nothing. The case
+code `6` is for is the opposite one — for example a rejected pay that leaves a
+real draft behind with `manual_cleanup_required=true` still on the row.
 
 ## 11. What a successful canary does and does not unlock
 

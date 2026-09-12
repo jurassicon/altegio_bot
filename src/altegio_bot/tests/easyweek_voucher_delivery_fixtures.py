@@ -65,6 +65,14 @@ BOOKING_LINK = "https://karlsruhe.example.invalid/"
 # The one string every secrecy test hunts for.
 VOUCHER_CODE_SENTINEL = "SENTINEL-VOUCHER-CODE-zzz999"
 
+# The fixed business context: a first visit that is finished, inside a campaign
+# period that is over. All of it sits in the past and stays there, so it means
+# the same thing whenever the suite runs.
+#
+# It is NOT a substitute for the create window. That window is anchored on the
+# real ``utcnow()`` at claim time, so a listing row that has to fall inside it
+# must be built from the window the ledger actually recorded — see
+# ``marker_order`` — and never from this constant.
 NOW = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
 PERIOD_START = NOW - timedelta(days=40)
 PERIOD_END = NOW - timedelta(days=1)
@@ -191,6 +199,42 @@ def voucher_order(*, marker: str, status: str = "open", **changes: Any) -> dict[
         order["invoice"] = {"total": SUPPORTED_VOUCHER_PRICE_MINOR, "amount_due": 0, "amount_paid": 1500}
     order.update(changes)
     return order
+
+
+async def create_window(session_maker: Any) -> tuple[datetime, datetime]:
+    """The create window this canary actually proved when it claimed its create.
+
+    Read back from the ledger rather than recomputed: the production code
+    anchors the window on the real ``utcnow()`` of the claim, and any test that
+    guesses the moment instead of asking is a time bomb waiting for the clock.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+
+    snapshot = await ledger_module.load(session_maker)
+    start, end = snapshot.create_window_start, snapshot.create_window_end
+    if start is None or end is None:
+        raise AssertionError("the ledger has no proven create window to place a listing row in")
+    return start, end
+
+
+async def marker_order(
+    session_maker: Any,
+    *,
+    marker: str,
+    status: str = "open",
+    at: datetime | None = None,
+    **changes: Any,
+) -> dict[str, Any]:
+    """A listing row the marker walk can see, built from the proven window.
+
+    ``at`` places the row at an exact moment — that is how the boundary tests
+    put an order just outside the window. By default the row lands in the middle
+    of the window, far from either edge, so the walk recognises it no matter
+    what the wall clock says today.
+    """
+    start, end = await create_window(session_maker)
+    moment = at if at is not None else start + (end - start) / 2
+    return voucher_order(marker=marker, status=status, created_at=moment.isoformat(), **changes)
 
 
 def orders_page(rows: list[dict[str, Any]], *, page: int = 1, last_page: int = 1) -> dict[str, Any]:

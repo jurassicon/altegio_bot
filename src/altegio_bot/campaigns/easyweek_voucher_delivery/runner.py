@@ -138,6 +138,12 @@ OUTCOME_PROVEN: Final = "proven"
 OUTCOME_REFUSED: Final = "refused"
 OUTCOME_UNKNOWN: Final = "unknown_result"
 OUTCOME_CONTRACT_MISMATCH: Final = "contract_mismatch"
+# A finished cleanup is not this. This value — and the exit code the CLI maps it
+# to — mean the operator still has something to do by hand. Once the cleanup is
+# proven and written down, the durable state is terminal and the answer is
+# OUTCOME_PROVEN: reporting "manual cleanup required" against a row that says
+# `manual_cleanup_required=false` would send an operator, and any wrapper
+# reading the exit code, looking for work that does not exist.
 OUTCOME_MANUAL_CLEANUP: Final = "manual_cleanup_required"
 OUTCOME_AMBIGUOUS: Final = "ambiguous"
 
@@ -1330,7 +1336,12 @@ async def _settle_externally_refunded(
         return None
     return StageReport(
         stage=STAGE_REFUND,
-        outcome=OUTCOME_MANUAL_CLEANUP if result.applied else OUTCOME_UNKNOWN,
+        # The operation finished: the money is back and the ledger says so.
+        # `voucher_order_already_refunded` stays in the reasons because the
+        # operator still needs to know WHY no POST went out and who performed
+        # the refund — but an informational reason on a completed transition
+        # must not turn it into a failing exit code.
+        outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
         reasons=[VOUCHER_ORDER_ALREADY_REFUNDED]
         if result.applied
         else [VOUCHER_ORDER_ALREADY_REFUNDED, LEDGER_STATE_UNEXPECTED],
@@ -1957,7 +1968,8 @@ async def _reconcile_terminal(
         settled = await settle_external_cleanup(session_maker, snapshot=snapshot, observation=safe)
         if settled is not None:
             return _reconcile_report(
-                outcome=OUTCOME_MANUAL_CLEANUP if settled.applied else OUTCOME_UNKNOWN,
+                # Proven and recorded: nothing is left for a human to do here.
+                outcome=OUTCOME_PROVEN if settled.applied else OUTCOME_UNKNOWN,
                 reasons=[] if settled.applied else [LEDGER_STATE_UNEXPECTED],
                 snapshot=settled.snapshot,
                 order_state=state,
@@ -1967,6 +1979,18 @@ async def _reconcile_terminal(
         return _reconcile_report(
             outcome=OUTCOME_CONTRACT_MISMATCH,
             reasons=[LEDGER_STATE_UNEXPECTED],
+            snapshot=snapshot,
+            order_state=state,
+            observation=safe,
+        )
+    if snapshot.manual_cleanup_required:
+        # The ledger and the order agree, and there is still a draft or a
+        # payment out there for a human to deal with — a rejected pay leaves
+        # exactly that. Saying `proven` here would be the same lie in the other
+        # direction: a zero exit code over work nobody has done yet.
+        return _reconcile_report(
+            outcome=OUTCOME_MANUAL_CLEANUP,
+            reasons=[MANUAL_CLEANUP_REQUIRED],
             snapshot=snapshot,
             order_state=state,
             observation=safe,
