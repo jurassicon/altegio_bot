@@ -146,7 +146,7 @@ before any external effect.
 | `provider_accepted` | Meta took the message — NOT delivered | Wait for webhooks |
 | `delivered` / `read` | A webhook for this exact message id said so | Record the outcome |
 | `refunded` | The money came back; nothing was ever sent | Done |
-| `manually_cleaned` | A human closed an open draft | Done |
+| `manually_cleaned` | Somebody else closed or reversed the order; we sent nothing | Done |
 
 `provider_accepted` is not delivery. `delivered` and `read` are written only by
 a webhook naming this exact `provider_message_id`, and they are monotonic: a
@@ -181,10 +181,25 @@ and phrase, the ledger identity, the exact order, our marker, our customer, the
 live guard, that nothing has been sent — and that the order reads **strictly
 paid** immediately before the claim.
 
-**An order that is already refunded.** If the last read before the claim shows
-the money is already back — somebody refunded it in the dashboard between the
-plan and the apply — no POST is sent at all. The state is settled by reading,
-and the report says `voucher_order_already_refunded`.
+**An order that is already refunded.** If the read before the claim shows the
+money is already back — somebody refunded it in the dashboard between the plan
+and the apply — no POST is sent at all. The state is settled by reading, and the
+report says `voucher_order_already_refunded`.
+
+This also covers the case where the refund plan itself refuses for that reason,
+which it does whenever the dashboard refund happened before you rebuilt the plan.
+A refusal there used to be a dead end: no POST, but the ledger stayed `paid`
+against a refunded order and every later `reconcile` answered
+`contract_mismatch`. Now `refund --apply` re-reads the exact order, proves it is
+ours, and settles it to **`manually_cleaned`** — never to `refunded`, because
+this application refunded nothing. No claim, no attempt, no verification
+timestamp and no plan digest are back-filled: each would record a request that
+never went out.
+
+The same ending is reachable with `reconcile` alone, and settlement is refused
+if the order cannot be proven ours, if the money is not actually back, or if
+anything was ever sent from this row. A refund that a customer's message has
+already made irreversible is not something to tidy away.
 
 ## 7. An unknown result
 
@@ -207,7 +222,15 @@ next one becomes reachable:
 * a paid order the canary cannot account for also becomes `ambiguous`: no
   payment is invented on our behalf, and `deliver` does not open;
 * an order somebody closed or reversed by hand becomes `manually_cleaned`, as an
-  observation — the tool never claims it performed the rollback.
+  observation — the tool never claims it performed the rollback. This includes a
+  ledger that still reads `created` or `paid` while the order reads cancelled or
+  refunded, provided nothing was ever sent from that row;
+* an order the exact read cannot prove is ours — a different UUID, a different
+  comment, a different customer — resolves to nothing at all. It stays
+  unresolved with `voucher_order_unproven`, and no state is written. A listing
+  hit is a lead, not an identity: the listing was scoped by branch and customer,
+  and the exact read is where the order, the marker and the customer are
+  compared.
 
 `reconcile` never creates, pays, refunds or sends. Its only external calls are
 GETs, and it refuses before the first one if the ledger names a different

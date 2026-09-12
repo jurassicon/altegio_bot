@@ -34,6 +34,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
     VOUCHER_ORDER_ALREADY_REFUNDED,
+    VOUCHER_ORDER_UNPROVEN,
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.runner import (
     OUTCOME_CONTRACT_MISMATCH,
@@ -44,7 +45,9 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.runner import (
 from altegio_bot.easyweek_client import EasyWeekPermanentError
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown
 from altegio_bot.models.models import (
+    VOUCHER_DELIVERY_CREATE_UNKNOWN,
     VOUCHER_DELIVERY_CREATED,
+    VOUCHER_DELIVERY_MANUALLY_CLEANED,
     VOUCHER_DELIVERY_PAID,
     VOUCHER_DELIVERY_PAY_UNKNOWN,
     VOUCHER_DELIVERY_PROVIDER_ACCEPTED,
@@ -1160,3 +1163,293 @@ async def test_a_refunded_canary_asks_for_no_cleanup(session_maker, enabled) -> 
 
     status = await runner_module.run_status(session_maker)
     assert status.manual_cleanup_required is False
+
+
+# ---------------------------------------------------------------------------
+# A refund somebody else performed still has to close this ledger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_manual_dashboard_refund_settles_the_ledger_without_a_post(session_maker, enabled) -> None:
+    """The blocker: no POST, but the ledger stayed `paid` forever.
+
+    The rebuilt plan refuses — correctly — because the order is already
+    refunded. Refusing and stopping there left `paid` against a refunded order,
+    which every later reconcile answered with `contract_mismatch` and no way out.
+    """
+    request, reader, mutator = await _paid(session_maker)
+    calls_before = list(mutator.calls)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    report = await _refund(session_maker, request, reader, mutator)
+
+    assert mutator.calls == calls_before
+    assert report.external_mutation_attempted is False
+    assert VOUCHER_ORDER_ALREADY_REFUNDED in report.reasons
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_MANUALLY_CLEANED
+    assert snapshot.reconciliation_required is False
+    assert snapshot.manual_cleanup_required is False
+
+
+@pytest.mark.asyncio
+async def test_an_external_refund_is_never_recorded_as_our_refund(session_maker, enabled) -> None:
+    """`manually_cleaned`, not `refunded`: this application refunded nothing.
+
+    Nothing is back-filled either. A claim timestamp, an attempt, a verification
+    or a plan digest would each be a record of a request that never went out.
+    """
+    request, reader, mutator = await _paid(session_maker)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    await _refund(session_maker, request, reader, mutator)
+
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status != VOUCHER_DELIVERY_REFUNDED
+    assert snapshot.stage_timestamps["refund_claimed_at"] is None
+    assert snapshot.stage_timestamps["refund_attempted_at"] is None
+    assert snapshot.stage_timestamps["refund_verified_at"] is None
+    assert snapshot.stage_timestamps["manual_cleanup_observed_at"] is not None
+    assert snapshot.stage_plan_digests["refund"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_stale_refund_plan_over_an_externally_refunded_order_still_settles(session_maker, enabled) -> None:
+    """The plan→apply race, followed through to the durable state.
+
+    The approval was issued while the order was paid, so it cannot match the
+    world any more. That is precisely the case that must still end somewhere.
+    """
+    request, reader, mutator = await _paid(session_maker)
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_REFUND)
+    assert plan.ready is True
+    calls_before = list(mutator.calls)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    async with session_maker() as session:
+        report = await runner_module.run_refund(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            plan_digest=plan.digest,
+            plan_issued_at=plan.issued_at,
+            confirmation_phrase=plan.confirmation_phrase,
+            apply=True,
+        )
+
+    assert mutator.calls == calls_before
+    assert report.external_mutation_attempted is False
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_MANUALLY_CLEANED
+
+
+@pytest.mark.asyncio
+async def test_a_settlement_refuses_a_refunded_order_that_is_not_ours(session_maker, enabled) -> None:
+    """A refunded order with a stranger's marker closes nothing."""
+    request, reader, mutator = await _paid(session_maker)
+    calls_before = list(mutator.calls)
+    reader.order = voucher_order(marker="somebody-elses-marker", status="refunded")
+
+    report = await _refund(session_maker, request, reader, mutator)
+
+    assert mutator.calls == calls_before
+    assert report.outcome == OUTCOME_REFUSED
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_PAID
+
+
+@pytest.mark.asyncio
+async def test_a_refund_without_apply_settles_nothing(session_maker, enabled) -> None:
+    """A preview reads and reports. It does not move the durable state."""
+    request, reader, mutator = await _paid(session_maker)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    report = await _refund(session_maker, request, reader, mutator, apply=False)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_PAID
+
+
+@pytest.mark.asyncio
+async def test_reconcile_closes_a_paid_ledger_whose_order_was_refunded_by_hand(session_maker, enabled) -> None:
+    """The same ending must be reachable without running the refund command."""
+    request, reader, mutator = await _paid(session_maker)
+    calls_before = list(mutator.calls)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert mutator.calls == calls_before
+    assert report.outcome != OUTCOME_CONTRACT_MISMATCH
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_MANUALLY_CLEANED
+    assert snapshot.reconciliation_required is False
+    assert snapshot.stage_timestamps["refund_attempted_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_canary_is_never_settled_by_an_external_refund(session_maker, enabled) -> None:
+    """A message reached a customer. Nothing about that is "cleaned up"."""
+    request, reader, _ = await _paid(session_maker)
+    await _deliver(session_maker, request, reader, FakeSender())
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_PROVIDER_ACCEPTED
+    assert report.outcome == OUTCOME_CONTRACT_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_the_settlement_helper_cannot_reach_a_mutation_client() -> None:
+    """Structural: no settlement path has a mutator or a sender to call."""
+    import inspect
+
+    for function in (runner_module.settle_external_cleanup, runner_module._settle_externally_refunded):
+        parameters = inspect.signature(function).parameters
+        assert "mutator" not in parameters
+        assert "sender" not in parameters
+
+
+# ---------------------------------------------------------------------------
+# The create reconciliation proves identity before it closes anything
+# ---------------------------------------------------------------------------
+
+
+async def _lost_create(session_maker):
+    """A create whose answer never came back: no order UUID in the ledger."""
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
+    await _create(session_maker, request, reader, mutator)
+    return request, reader
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_whose_exact_read_carries_another_marker_stays_unresolved(session_maker, enabled) -> None:
+    """The blocker: a listing hit was treated as identity.
+
+    The listing was scoped by branch and customer, which is not the same
+    question as "is this our order?". The exact read is where the marker is
+    actually compared — and a foreign order must not close this canary.
+    """
+    request, reader = await _lost_create(session_maker)
+    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="canceled", is_canceled=True)])]
+    # What the exact read returns is a different order entirely.
+    reader.order = voucher_order(marker="somebody-elses-marker", status="canceled", is_canceled=True)
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+    assert snapshot.reconciliation_required is True
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_bound_to_another_customer_stays_unresolved(session_maker, enabled) -> None:
+    request, reader = await _lost_create(session_maker)
+    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    reader.order_pages = [orders_page([closed])]
+    reader.order = voucher_order(
+        marker=request.marker,
+        status="canceled",
+        is_canceled=True,
+        customer={"uuid": str(OTHER_UUID)},
+    )
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_whose_exact_read_answers_with_another_uuid_stays_unresolved(session_maker, enabled) -> None:
+    """The read must be of the order we asked about, not merely a valid one."""
+    request, reader = await _lost_create(session_maker)
+    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="canceled", is_canceled=True)])]
+    reader.order = voucher_order(
+        marker=request.marker,
+        status="canceled",
+        is_canceled=True,
+        uuid=str(OTHER_UUID),
+    )
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_paid_order_does_not_make_this_canary_ambiguous(session_maker, enabled) -> None:
+    """`ambiguous` is a claim about OUR order being unattributable."""
+    request, reader = await _lost_create(session_maker)
+    reader.order_pages = [orders_page([voucher_order(marker=request.marker, status="paid")])]
+    reader.order = voucher_order(marker="somebody-elses-marker", status="paid")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome != runner_module.OUTCOME_AMBIGUOUS
+    assert VOUCHER_ORDER_UNPROVEN in report.reasons
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_CREATE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_the_create_reconciliation_still_closes_its_own_cancelled_order(session_maker, enabled) -> None:
+    """Proving identity must not break the case identity actually holds."""
+    request, reader = await _lost_create(session_maker)
+    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    reader.order_pages = [orders_page([closed])]
+    reader.order = closed
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_PROVEN
+    assert "get_order" in reader.calls
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_MANUALLY_CLEANED
+
+
+@pytest.mark.asyncio
+async def test_the_create_reconciliation_still_flags_its_own_unexplained_paid_order(session_maker, enabled) -> None:
+    request, reader = await _lost_create(session_maker)
+    paid = voucher_order(marker=request.marker, status="paid")
+    reader.order_pages = [orders_page([paid])]
+    reader.order = paid
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == runner_module.OUTCOME_AMBIGUOUS
+    assert (await ledger_module.load(session_maker)).status == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_compare_and_set_is_never_reported_as_ambiguous(session_maker, enabled, monkeypatch) -> None:
+    """Another writer moved first, so THIS attempt proved nothing.
+
+    Reporting `ambiguous` after a refused compare-and-set would describe a
+    transition that did not happen.
+    """
+    request, reader = await _lost_create(session_maker)
+    paid = voucher_order(marker=request.marker, status="paid")
+    reader.order_pages = [orders_page([paid])]
+    reader.order = paid
+
+    real = ledger_module.record_outcome
+
+    async def refused(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        return ledger_module.RecordOutcome(applied=False, reason="lost_race", snapshot=result.snapshot)
+
+    monkeypatch.setattr(ledger_module, "record_outcome", refused)
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN

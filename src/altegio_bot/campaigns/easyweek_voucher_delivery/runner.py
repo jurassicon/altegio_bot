@@ -488,6 +488,21 @@ async def _order_preconditions(
     return reasons, state, observations
 
 
+def _binding_matches(snapshot: ledger_module.LedgerSnapshot, request: CanaryRequest) -> bool:
+    """Is this ledger row the one THIS request is allowed to speak for?
+
+    The immutable half of the identity: the run, the recipient, the branch and
+    the voucher template. Judging somebody else's order against this row, or
+    this row against somebody else's request, is the mistake this prevents.
+    """
+    return (
+        snapshot.campaign_run_id == request.preview_run_id
+        and snapshot.campaign_recipient_id == request.campaign_recipient_id
+        and snapshot.location_uuid == request.location_uuid
+        and snapshot.voucher_template_uuid == request.voucher_template_uuid
+    )
+
+
 def _binding_holds(payload: object, snapshot: ledger_module.LedgerSnapshot) -> bool:
     """Is the code in this body the one this ledger row was bound to?
 
@@ -1151,6 +1166,23 @@ async def run_refund(
     )
     snapshot = await ledger_module.load(session_maker)
     if refusals or plan is None or proof is None:
+        # One refusal is not a dead end. When the rebuilt plan says the order is
+        # already refunded, the refund has nothing left to do AND the ledger has
+        # something left to learn: left alone it stays `paid` forever and every
+        # later reconcile answers `contract_mismatch`.
+        #
+        # That very refusal also invalidates the operator's digest — the world
+        # moved under the approval — so demanding a matching phrase here would
+        # make the dead end permanent. Instead this settles at exactly the
+        # authority `reconcile` already has and no more: the immutable identity
+        # binding, an exact read, a proven order, and writes that move no money.
+        # The real refund below is untouched; it still needs the full plan.
+        if apply and VOUCHER_ORDER_ALREADY_REFUNDED in refusals:
+            settled = await _settle_externally_refunded(
+                session_maker, request=request, order_reader=order_reader, snapshot=snapshot
+            )
+            if settled is not None:
+                return settled
         return _refusal(STAGE_REFUND, refusals, snapshot)
     if snapshot.status in ledger_module.SEND_TOUCHED_STATUSES:
         return _refusal(STAGE_REFUND, [REFUND_FORBIDDEN_AFTER_SEND], snapshot)
@@ -1268,16 +1300,72 @@ async def run_refund(
 # ---------------------------------------------------------------------------
 
 
-async def _exact_order(order_reader: Any, snapshot: ledger_module.LedgerSnapshot):
-    """Read the one order the ledger names and say whether it is ours.
+async def _settle_externally_refunded(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    request: CanaryRequest,
+    order_reader: Any,
+    snapshot: ledger_module.LedgerSnapshot,
+) -> StageReport | None:
+    """Write down a refund THIS canary did not perform. Sends nothing.
+
+    ``None`` means the caller must fall back to its ordinary refusal: the order
+    could not be proven ours, it is not actually refunded, or the ledger is not
+    in a state an outside cleanup may close.
+
+    The read is exact and the identity is proven before anything is written —
+    a stranger's refunded order must not be able to close this row.
+    """
+    if not _binding_matches(snapshot, request):
+        return None
+    try:
+        payload, state, observation, identity_ok = await _exact_order(order_reader, snapshot)
+    except EasyWeekError:
+        return None
+    if payload is None or not identity_ok or state != ORDER_REFUNDED:
+        return None
+    safe = observation.as_safe_dict() if observation else None
+    result = await settle_external_cleanup(session_maker, snapshot=snapshot, observation=safe)
+    if result is None:
+        return None
+    return StageReport(
+        stage=STAGE_REFUND,
+        outcome=OUTCOME_MANUAL_CLEANUP if result.applied else OUTCOME_UNKNOWN,
+        reasons=[VOUCHER_ORDER_ALREADY_REFUNDED]
+        if result.applied
+        else [VOUCHER_ORDER_ALREADY_REFUNDED, LEDGER_STATE_UNEXPECTED],
+        # Zero refund POSTs. That is the whole point of arriving here.
+        external_mutation_attempted=False,
+        reconciliation_required=result.snapshot.reconciliation_required,
+        manual_cleanup_required=result.snapshot.manual_cleanup_required,
+        ledger=result.snapshot.as_safe_dict(),
+        observations=[safe] if safe else [],
+        order_state=state,
+    )
+
+
+async def _exact_order(
+    order_reader: Any,
+    snapshot: ledger_module.LedgerSnapshot,
+    *,
+    expected_uuid: str | None = None,
+):
+    """Read one exact order and say whether it is ours.
 
     ``identity_ok`` covers the three things every stage needs and a refund needs
     ALONE: the exact order, our marker, our customer. The voucher's own shape is
     a separate question, asked only where it matters.
+
+    ``expected_uuid`` exists for the create reconciliation, where the order to
+    prove may be a candidate the marker walk produced rather than one the ledger
+    already names. Appearing in a filtered listing is not identity: the listing
+    was scoped by branch and customer, and the exact read is where the order,
+    the marker and the customer are actually compared.
     """
-    if snapshot.target_order_uuid is None:
+    target = expected_uuid if expected_uuid is not None else snapshot.target_order_uuid
+    if target is None:
         return None, None, None, False
-    payload = await order_reader.get_order(snapshot.target_order_uuid)
+    payload = await order_reader.get_order(target)
     order = order_object(payload) or {}
     state, _ = classify_order(payload)
     observation = observe_artifact(
@@ -1288,7 +1376,7 @@ async def _exact_order(order_reader: Any, snapshot: ledger_module.LedgerSnapshot
         expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
     )
     identity_ok = (
-        canonical_uuid(order.get("uuid")) == snapshot.target_order_uuid
+        canonical_uuid(order.get("uuid")) == target
         and order.get("comment") == snapshot.reconciliation_marker
         and observation.order_customer_binding_proven
     )
@@ -1337,6 +1425,67 @@ async def _record_manual_cleanup(
     )
 
 
+# The pre-send states an externally closed or reversed order may settle FROM.
+# Deliberately excludes every in-flight state: a claimed or unknown stage may
+# still act, and excludes every send-touched state, where the money staying put
+# is the whole point.
+_EXTERNAL_CLEANUP_FROM: Final = frozenset(
+    {
+        VOUCHER_DELIVERY_CREATED,
+        VOUCHER_DELIVERY_PAID,
+        VOUCHER_DELIVERY_PAY_REJECTED,
+        VOUCHER_DELIVERY_REFUND_REJECTED,
+    }
+)
+
+# Any of these means a message may exist, and no reading of an order may quietly
+# turn that into a tidy pre-send ending.
+_SEND_EVIDENCE_FIELDS: Final = (
+    "send_claimed_at",
+    "send_attempted_at",
+    "provider_accepted_at",
+    "delivered_at",
+    "read_at",
+)
+
+
+def _untouched_by_send(snapshot: ledger_module.LedgerSnapshot) -> bool:
+    return (
+        snapshot.send_attempt_count == 0
+        and snapshot.status not in ledger_module.SEND_TOUCHED_STATUSES
+        and not any(snapshot.stage_timestamps.get(field) for field in _SEND_EVIDENCE_FIELDS)
+    )
+
+
+async def settle_external_cleanup(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    snapshot: ledger_module.LedgerSnapshot,
+    observation: dict[str, Any] | None,
+) -> ledger_module.RecordOutcome | None:
+    """Close a canary whose order somebody else already closed or reversed.
+
+    ``None`` means "not applicable here" — the caller then falls through to its
+    ordinary handling rather than inventing an ending.
+
+    The result is ``manually_cleaned``, never ``refunded``. The difference is
+    provenance: this application did not send that refund, and a ledger that
+    said ``refunded`` would be claiming an action it never took. Nothing is
+    back-filled either — no claim, no attempt, no verification timestamp and no
+    plan digest — because every one of those would be a record of a request
+    that was never made.
+
+    Read-only by construction: the only thing it writes is the observation.
+    """
+    if snapshot.status not in _EXTERNAL_CLEANUP_FROM or not _untouched_by_send(snapshot):
+        return None
+    return await _record_manual_cleanup(
+        session_maker,
+        expected=frozenset({snapshot.status or ""}),
+        observation=observation,
+    )
+
+
 async def run_reconcile(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -1365,12 +1514,7 @@ async def run_reconcile(
     # The immutable identity is checked before anything is read, let alone
     # written: reconciling under a different recipient would judge somebody
     # else's order against this row.
-    if (
-        snapshot.campaign_run_id != request.preview_run_id
-        or snapshot.campaign_recipient_id != request.campaign_recipient_id
-        or snapshot.location_uuid != request.location_uuid
-        or snapshot.voucher_template_uuid != request.voucher_template_uuid
-    ):
+    if not _binding_matches(snapshot, request):
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_REFUSED,
@@ -1453,7 +1597,10 @@ async def _reconcile_create(
             )
             return StageReport(
                 stage="reconcile",
-                outcome=OUTCOME_AMBIGUOUS,
+                # A refused compare-and-set means somebody else moved first.
+                # This attempt then proved nothing, and saying otherwise would
+                # report a transition that did not happen.
+                outcome=OUTCOME_AMBIGUOUS if result.applied else OUTCOME_UNKNOWN,
                 reasons=[VOUCHER_STATE_UNATTRIBUTABLE],
                 reconciliation_required=True,
                 manual_cleanup_required=True,
@@ -1472,16 +1619,36 @@ async def _reconcile_create(
             )
         candidate = match.order_uuid
 
-    payload = await order_reader.get_order(candidate)
-    state, _ = classify_order(payload)
-    observation = observe_artifact(
-        payload,
-        stage="create_reconcile_readback",
-        expected_customer_uuid=snapshot.easyweek_customer_uuid or "",
-        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
-    )
+    # The exact read is where identity is decided, for a stored target and for a
+    # candidate alike. A listing row proves only that the branch-and-customer
+    # filter matched; the order UUID, our marker and our customer are compared
+    # HERE, before any terminal state can be written. Without this a stranger's
+    # cancelled order could close this canary and leave a real draft unwatched.
+    payload, state, observation, identity_ok = await _exact_order(order_reader, snapshot, expected_uuid=candidate)
+    safe = observation.as_safe_dict() if observation else None
 
+    if payload is None or not identity_ok:
+        result = await ledger_module.record_outcome(
+            session_maker,
+            status=VOUCHER_DELIVERY_CREATE_UNKNOWN,
+            expected_statuses=unresolved,
+            reason_code=VOUCHER_ORDER_UNPROVEN,
+            evidence={"create_reconcile_readback": safe},
+            manual_cleanup_required=True,
+            reconciliation_required=True,
+        )
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_UNKNOWN,
+            reasons=[VOUCHER_ORDER_UNPROVEN],
+            reconciliation_required=True,
+            manual_cleanup_required=True,
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[safe] if safe else [],
+            order_state=state,
+        )
+
+    assert observation is not None
     if state == ORDER_OPEN:
         # Exactly the proof a fresh create must pass, including the binding.
         identity = ledger_module.CanaryIdentity(
@@ -1510,15 +1677,13 @@ async def _reconcile_create(
 
     if state in (ORDER_CANCELLED, ORDER_REFUNDED):
         # The draft was closed or reversed by hand before anything was paid.
-        result = await _record_manual_cleanup(
-            session_maker, expected=unresolved, observation=observation.as_safe_dict()
-        )
+        result = await _record_manual_cleanup(session_maker, expected=unresolved, observation=safe)
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
             reasons=[] if result.applied else [LEDGER_STATE_UNEXPECTED],
             ledger=result.snapshot.as_safe_dict(),
-            observations=[observation.as_safe_dict()],
+            observations=[safe] if safe else [],
             order_state=state,
         )
 
@@ -1531,18 +1696,18 @@ async def _reconcile_create(
             expected_statuses=unresolved,
             reason_code=VOUCHER_STATE_UNATTRIBUTABLE,
             target_order_uuid=candidate,
-            evidence={"create_reconcile_readback": observation.as_safe_dict()},
+            evidence={"create_reconcile_readback": safe},
             manual_cleanup_required=True,
             reconciliation_required=True,
         )
         return StageReport(
             stage="reconcile",
-            outcome=OUTCOME_AMBIGUOUS,
+            outcome=OUTCOME_AMBIGUOUS if result.applied else OUTCOME_UNKNOWN,
             reasons=[VOUCHER_STATE_UNATTRIBUTABLE],
             reconciliation_required=True,
             manual_cleanup_required=True,
             ledger=result.snapshot.as_safe_dict(),
-            observations=[observation.as_safe_dict()],
+            observations=[safe] if safe else [],
             order_state=state,
         )
 
@@ -1552,7 +1717,7 @@ async def _reconcile_create(
         expected_statuses=unresolved,
         reason_code=VOUCHER_ORDER_UNPROVEN,
         target_order_uuid=candidate,
-        evidence={"create_reconcile_readback": observation.as_safe_dict()},
+        evidence={"create_reconcile_readback": safe},
         manual_cleanup_required=True,
         reconciliation_required=True,
     )
@@ -1563,7 +1728,7 @@ async def _reconcile_create(
         reconciliation_required=True,
         manual_cleanup_required=True,
         ledger=result.snapshot.as_safe_dict(),
-        observations=[observation.as_safe_dict()],
+        observations=[safe] if safe else [],
         order_state=state,
     )
 
@@ -1785,6 +1950,19 @@ async def _reconcile_terminal(
             order_state=state,
             observation=safe,
         )
+    if state in {ORDER_REFUNDED, ORDER_CANCELLED}:
+        # The order is closed out there and this row never sent anything. That
+        # is not a contract mismatch to report forever, it is an ending to
+        # record — as `manually_cleaned`, because somebody else did it.
+        settled = await settle_external_cleanup(session_maker, snapshot=snapshot, observation=safe)
+        if settled is not None:
+            return _reconcile_report(
+                outcome=OUTCOME_MANUAL_CLEANUP if settled.applied else OUTCOME_UNKNOWN,
+                reasons=[] if settled.applied else [LEDGER_STATE_UNEXPECTED],
+                snapshot=settled.snapshot,
+                order_state=state,
+                observation=safe,
+            )
     if state not in consistent:
         return _reconcile_report(
             outcome=OUTCOME_CONTRACT_MISMATCH,
