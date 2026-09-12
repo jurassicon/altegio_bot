@@ -44,11 +44,8 @@ Before anything is run in production, all of these must be true:
 2. the Meta template `kitilash_ka_new_client_voucher_v1` exists and is
    **APPROVED**, MARKETING, `de`, positional, one BODY, three parameters. This
    repository never creates it: that is a human action in the Business Manager;
-3. the stored template row matches it, proven by a live Meta read:
-   ```bash
-   docker compose -p altegio_bot run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_voucher_template --company-id <company>
-   ```
-   then the same command with `--apply` once the audit is green;
+3. the stored template row matches it, proven by a live Meta read — see
+   [§1a](#1a-aligning-the-stored-template-row) for the cycle;
 4. `EASYWEEK_VOUCHER_DELIVERY_CANARY_ENABLED=true` and a fresh
    `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY` (≥32 bytes) with an
    `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY_ID` are set in `easyweek.env`;
@@ -57,6 +54,54 @@ Before anything is run in production, all of these must be true:
 6. the owner has separately authorised a **non-refundable** €15 test payment for
    this recipient — once the message is sent, the refund path is closed;
 7. the owner authorises each of CREATE, PAY and DELIVER as its own decision.
+
+## 1a. Aligning the stored template row
+
+The send path resolves the message from the database, so the stored row has to
+agree with the approved Meta text. One command proves Meta live and, only then,
+aligns that one row. It creates no Meta template, sends nothing, touches no
+EasyWeek surface and is not a permission to CREATE, PAY or DELIVER.
+
+Dry-run first — it is the default, and `--apply` is the only way to reach a
+write:
+
+```bash
+docker compose -p altegio_bot run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_voucher_template --company-id <company>
+```
+
+Read the JSON, then run the same command with `--apply` **only** if the dry-run
+says the row can be fixed automatically:
+
+```bash
+docker compose -p altegio_bot run --rm --no-deps --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.reconcile_easyweek_voucher_template --company-id <company> --apply
+```
+
+Then run the dry-run once more. That final audit is what closes prerequisite 3.
+
+| Step | `db_row_blocker` | Exit | What it means |
+|---|---|---|---|
+| dry-run | `row_missing` | `1` | No row yet. `would_apply: true` — `--apply` will create exactly one |
+| dry-run | a mismatch reason | `1` | One row, wrong content. `would_apply: true` — `--apply` will correct that same row |
+| `--apply` | unchanged | `0` | `applied: true`, committed |
+| final audit | `null` | `0` | The row matches the approved template. Done |
+| dry-run or apply | `multiple_rows_for_one_code` | `1` | **Stop.** See below |
+| any | — | `1` with `voucher_template_database_unavailable` | **Stop.** See below |
+
+**`multiple_rows_for_one_code` cannot be fixed by this command.** Two rows carry
+one code, and `--apply` will not insert, update or delete anything — the report
+says `applied: false` and `would_apply: false`. Which row is the right one, and
+what happens to the other, is a decision a human makes against the database
+directly. Running `--apply` again changes nothing; it is not a retry.
+
+**A database error means rollback and stop.** The output is exactly
+`{"ok": false, "reason": "voucher_template_database_unavailable"}` with a
+non-zero exit code. The transaction rolled back in full, so there is no partial
+row — but do **not** repeat `--apply` blindly. Run the dry-run first and look at
+what the rows actually say.
+
+An aligned row is bookkeeping, not authorisation. The fence, the key, a fresh
+preview and preflight, the chosen recipient and the owner's approval of each
+stage are all proven separately, and the general EasyWeek send stays closed.
 
 ## 2. The command surface
 
