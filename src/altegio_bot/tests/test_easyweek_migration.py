@@ -85,10 +85,16 @@ _PROVIDER_TABLES = (
 # PR-13 extends durable provider identity to the two campaign-owned tables.
 # Keep the PR-3 tuple above unchanged because it describes that historical
 # migration's intentionally narrower scope.
+# §36 adds one more, deliberately. The voucher delivery ledger references a
+# campaign recipient through a COMPOSITE foreign key — id together with
+# provider — so that a row cannot name an EasyWeek recipient while claiming to
+# belong to Altegio. That reference is only expressible if the ledger carries
+# the provider itself, and a CHECK constraint pins it to `easyweek`.
 _CANONICAL_PROVIDER_TABLES = (
     *_PROVIDER_TABLES,
     "campaign_runs",
     "campaign_recipients",
+    "easyweek_campaign_voucher_delivery_ledger",
 )
 
 # (table, pre-PR-3 constraint, provider-scoped replacement)

@@ -160,3 +160,14 @@ async def session_maker(
             )
 
     yield SessionLocal
+
+
+# ---------------------------------------------------------------------------
+# §36 voucher delivery canary
+# ---------------------------------------------------------------------------
+# Re-exported here so the delivery suites can request them by name without each
+# module importing them and shadowing the import with its own parameter.
+from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: E402,F401
+    binding_key,
+    configuration,
+)
