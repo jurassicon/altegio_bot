@@ -759,6 +759,35 @@ class Settings(BaseSettings):
     easyweek_voucher_canary_staffer_uuid: str = ""
     easyweek_voucher_canary_account_uuid: str = ""
 
+    # --- §36: controlled voucher DELIVERY canary ------------------------------
+    # One recipient, one voucher, one message. Unlike §35 this canary does reach
+    # a real person, so its fence is separate: turning on the mutation canary
+    # must never be what turns on sending.
+    #
+    # False everywhere by default. With it false every stage refuses before any
+    # HTTP request — EasyWeek and Meta alike — including the read-only plan.
+    easyweek_voucher_delivery_canary_enabled: bool = False
+
+    # The voucher code is a bearer secret: whoever reads it can spend €15. It is
+    # never stored, so the only way to prove later that the code we are about to
+    # send is the code the paid order actually issued is a keyed MAC over it.
+    #
+    # A plain SHA-256 would not do. Voucher codes are short and drawn from a
+    # small alphabet, so a digest of one is brute-forceable — the same reasoning
+    # that keeps artifact values unhashed in §35. A secret key removes that
+    # option from anyone holding the database alone.
+    #
+    # SecretStr, like the EasyWeek key: a settings repr reaches tracebacks and
+    # debug endpoints, and this value must print as asterisks there.
+    #
+    # Empty by default, with no fallback. A missing key is a refusal the plan
+    # reports diagnostically, never a reason to fall back to an unkeyed digest —
+    # and the application, the workers and the API all start without it.
+    easyweek_voucher_delivery_hmac_key: SecretStr = SecretStr("")
+    # Names WHICH key produced a stored MAC, so a rotation invalidates old
+    # bindings loudly instead of silently comparing against the wrong secret.
+    easyweek_voucher_delivery_hmac_key_id: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

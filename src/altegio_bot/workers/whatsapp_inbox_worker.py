@@ -1658,6 +1658,31 @@ async def _advance_followup_statuses(
             recipient.followup_status = "delivered"
 
 
+async def _apply_voucher_delivery_status(session: AsyncSession, provider_message_id: str, kind: str) -> bool:
+    """Record a delivered/read callback for the §36 voucher delivery canary.
+
+    Returns whether this callback belonged to the canary. It runs inside the
+    caller's session and transaction rather than opening its own: two
+    connections racing over the same rows in one logical batch is exactly the
+    problem the row lock exists to prevent.
+
+    A callback for any other message returns ``False`` immediately.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as voucher_delivery_ledger
+
+    result = await voucher_delivery_ledger.apply_webhook_transition(
+        session,
+        provider_message_id=provider_message_id,
+        status=kind,
+    )
+    if result.applied:
+        logger.info("status_webhook: voucher delivery canary advanced to %s", kind)
+        return True
+    # A refused write is either "not ours" — fall through to the ordinary path —
+    # or "ours, and already at or past this status", which is handled and done.
+    return result.snapshot.provider_message_id == provider_message_id
+
+
 async def _handle_delivery_statuses(
     session: AsyncSession,
     event: WhatsAppEvent | None,
@@ -1669,6 +1694,15 @@ async def _handle_delivery_statuses(
     for status in statuses:
         kind = status["status"]
         provider_message_id = status["provider_message_id"]
+
+        # The §36 voucher delivery canary owns its message ids and deliberately
+        # has no OutboxMessage at all, so this is the only place its
+        # delivered/read can ever be observed. The lookup is by exact provider
+        # message id; every other callback falls straight through to the
+        # ordinary path below, untouched.
+        if kind in {"delivered", "read"} and await _apply_voucher_delivery_status(session, provider_message_id, kind):
+            continue
+
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
         if outbox is None:
             logger.info(

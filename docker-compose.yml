@@ -117,6 +117,14 @@ services:
     # identities, and `--no-deps` plus the replaced entrypoint mean the worker
     # itself never starts. The long-running service reads none of those
     # variables; see docs/easyweek/voucher_canary_runbook.md.
+    #
+    # The same container is how the §36 voucher DELIVERY canary runs:
+    #   docker compose run --rm --no-deps --entrypoint /app/.venv/bin/python \
+    #     altegio-outbox-worker -m altegio_bot.scripts.easyweek_voucher_delivery_canary ...
+    # It reads its own fence and its own HMAC key from the same easyweek.env,
+    # and the running worker reads neither. No new service, no new mount, and
+    # nothing the outbox worker can pick up: see
+    # docs/easyweek/voucher_delivery_canary_runbook.md.
     env_file:
       - .env
       - path: easyweek.env
