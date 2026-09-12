@@ -93,24 +93,28 @@ async def reconcile(*, company_id: int, apply: bool) -> tuple[dict[str, Any], in
         templates = await client.list_templates()
 
     async with SessionLocal() as session:
-        proof, row, blocker = await audit(session, company_id=company_id, templates=templates)
-        report: dict[str, Any] = {
-            "company_id": company_id,
-            "meta": proof.as_safe_dict(),
-            "db_row_blocker": blocker,
-            "applied": False,
-        }
-        if not proof.proven:
-            # Meta is the authority on what may be sent. Without its approval
-            # there is nothing to align the row TO.
-            return report, EXIT_BLOCKED
-        if blocker is None:
-            return report, EXIT_OK
-        if not apply:
-            report["would_apply"] = True
-            return report, EXIT_BLOCKED
-
+        # Keep the audit SELECT and the optional write in one explicit
+        # transaction.  AsyncSession autobegins on the first SELECT, so opening
+        # ``session.begin()`` only after ``audit()`` raises
+        # InvalidRequestError in production before any row can be written.
         async with session.begin():
+            proof, row, blocker = await audit(session, company_id=company_id, templates=templates)
+            report: dict[str, Any] = {
+                "company_id": company_id,
+                "meta": proof.as_safe_dict(),
+                "db_row_blocker": blocker,
+                "applied": False,
+            }
+            if not proof.proven:
+                # Meta is the authority on what may be sent. Without its
+                # approval there is nothing to align the row TO.
+                return report, EXIT_BLOCKED
+            if blocker is None:
+                return report, EXIT_OK
+            if not apply:
+                report["would_apply"] = True
+                return report, EXIT_BLOCKED
+
             if row is None:
                 session.add(
                     MessageTemplate(
@@ -127,8 +131,8 @@ async def reconcile(*, company_id: int, apply: bool) -> tuple[dict[str, Any], in
                 row.body = template_contract.VOUCHER_TEMPLATE_BODY
                 row.meta_template_name = template_contract.VOUCHER_META_TEMPLATE_NAME
                 row.is_active = True
-        report["applied"] = True
-        return report, EXIT_OK
+            report["applied"] = True
+            return report, EXIT_OK
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
