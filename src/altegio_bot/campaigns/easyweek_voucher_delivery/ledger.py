@@ -722,6 +722,10 @@ async def _apply_webhook_row(
         row.read_at = now
     row.status = status
     row.reconciliation_required = False
+    # A delivered or read message means the voucher reached its person: there is
+    # no open draft left for anybody to close by hand. Forced rather than left
+    # alone, because the flag was set back when the order was still a draft.
+    row.manual_cleanup_required = False
     row.updated_at = now
     await session.flush()
     return RecordOutcome(applied=True, reason=RECORD_APPLIED, snapshot=_snapshot(row))

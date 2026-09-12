@@ -77,9 +77,11 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     UNKNOWN_STAGE,
     VOUCHER_ARTIFACT_UNPROVEN,
     VOUCHER_BINDING_MISMATCH,
+    VOUCHER_ORDER_ALREADY_REFUNDED,
     VOUCHER_ORDER_NOT_PAID,
     VOUCHER_ORDER_NOT_PAYABLE,
     VOUCHER_ORDER_UNPROVEN,
+    VOUCHER_STATE_UNATTRIBUTABLE,
     delivery_marker,
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.readiness import (
@@ -89,6 +91,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.readiness import (
 from altegio_bot.easyweek_client import EasyWeekError
 from altegio_bot.easyweek_voucher_canary.artifact import observe_artifact
 from altegio_bot.easyweek_voucher_canary.orders import (
+    ORDER_CANCELLED,
     ORDER_OPEN,
     ORDER_PAID,
     ORDER_REFUNDED,
@@ -106,16 +109,20 @@ from altegio_bot.easyweek_voucher_identity import (
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
 from altegio_bot.models.models import (
+    VOUCHER_DELIVERY_AMBIGUOUS,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATE_REJECTED,
     VOUCHER_DELIVERY_CREATE_UNKNOWN,
     VOUCHER_DELIVERY_CREATED,
+    VOUCHER_DELIVERY_DELIVERED,
+    VOUCHER_DELIVERY_MANUALLY_CLEANED,
     VOUCHER_DELIVERY_PAID,
     VOUCHER_DELIVERY_PAY_CLAIMED,
     VOUCHER_DELIVERY_PAY_REJECTED,
     VOUCHER_DELIVERY_PAY_UNKNOWN,
     VOUCHER_DELIVERY_PLANNED,
     VOUCHER_DELIVERY_PROVIDER_ACCEPTED,
+    VOUCHER_DELIVERY_READ,
     VOUCHER_DELIVERY_REFUND_CLAIMED,
     VOUCHER_DELIVERY_REFUND_REJECTED,
     VOUCHER_DELIVERY_REFUND_UNKNOWN,
@@ -312,6 +319,7 @@ async def build_stage_plan(
 
     prerequisites = await prove_prerequisites(
         session,
+        stage=stage,
         company_id=request.company_id,
         sender_code=request.sender_code,
         enabled=enabled,
@@ -439,7 +447,11 @@ async def _order_preconditions(
         reasons.append(VOUCHER_ORDER_UNPROVEN)
     if not observation.order_customer_binding_proven:
         reasons.append(VOUCHER_ORDER_UNPROVEN)
-    if not observation.voucher_line_proven:
+    # The voucher's own shape matters to everything that spends money or sends a
+    # message. It deliberately does NOT matter to a refund: an artifact we
+    # cannot read is a reason to get the money back, not a reason to leave it
+    # out there. The observation is still recorded as evidence either way.
+    if stage != STAGE_REFUND and not observation.voucher_line_proven:
         reasons.append(VOUCHER_ARTIFACT_UNPROVEN)
 
     if stage == STAGE_PAY:
@@ -465,7 +477,12 @@ async def _order_preconditions(
         if not _binding_holds(payload, snapshot):
             reasons.append(VOUCHER_BINDING_MISMATCH)
     elif stage == STAGE_REFUND:
-        if state not in (ORDER_PAID, ORDER_REFUNDED):
+        # Strictly paid. An order that already reads refunded has nothing left
+        # to refund, and authorising a POST for it would be authorising a second
+        # real refund attempt against a provider with no idempotency key.
+        if state == ORDER_REFUNDED:
+            reasons.append(VOUCHER_ORDER_ALREADY_REFUNDED)
+        elif state != ORDER_PAID:
             reasons.append(VOUCHER_ORDER_NOT_PAID)
 
     return reasons, state, observations
@@ -1040,6 +1057,9 @@ async def run_deliver(
             provider_message_id=outcome.provider_message_id,
             verified_field="provider_accepted_at",
             evidence={"delivery": outcome.as_safe_dict()},
+            # The draft became a delivered voucher. There is no open order left
+            # for a human to close, so the flag that asks them to stops here.
+            manual_cleanup_required=False,
             reconciliation_required=False,
             attempt_outcome="provider_accepted",
         )
@@ -1137,6 +1157,28 @@ async def run_refund(
     if snapshot.target_order_uuid is None:
         return _refusal(STAGE_REFUND, [VOUCHER_ORDER_UNPROVEN], snapshot)
 
+    # The plan proved the order was paid a moment ago. Between then and the
+    # claim somebody could have refunded it in the dashboard, and a POST for an
+    # order that is already back is a second real refund attempt against a
+    # provider with no idempotency key. So the last word belongs to one more
+    # read, taken immediately before the claim.
+    try:
+        payload, state, _, identity_ok = await _exact_order(order_reader, snapshot)
+    except EasyWeekError:
+        return _refusal(STAGE_REFUND, [API_UNAVAILABLE], snapshot)
+    if payload is None or not identity_ok:
+        return _refusal(STAGE_REFUND, [VOUCHER_ORDER_UNPROVEN], snapshot)
+    if state == ORDER_REFUNDED:
+        # Nothing left to refund. Record what is already true through the same
+        # read-only path reconciliation uses, and send nothing.
+        settled = await _reconcile_refund(session_maker, order_reader=order_reader)
+        settled.stage = STAGE_REFUND
+        settled.reasons = [VOUCHER_ORDER_ALREADY_REFUNDED, *settled.reasons]
+        settled.external_mutation_attempted = False
+        return settled
+    if state != ORDER_PAID:
+        return _refusal(STAGE_REFUND, [VOUCHER_ORDER_NOT_PAID], snapshot)
+
     identity = _identity_from(request, proof)
     claim = await ledger_module.claim_refund(session_maker, identity=identity, plan_digest=plan.digest)
     if not claim.granted:
@@ -1226,18 +1268,90 @@ async def run_refund(
 # ---------------------------------------------------------------------------
 
 
+async def _exact_order(order_reader: Any, snapshot: ledger_module.LedgerSnapshot):
+    """Read the one order the ledger names and say whether it is ours.
+
+    ``identity_ok`` covers the three things every stage needs and a refund needs
+    ALONE: the exact order, our marker, our customer. The voucher's own shape is
+    a separate question, asked only where it matters.
+    """
+    if snapshot.target_order_uuid is None:
+        return None, None, None, False
+    payload = await order_reader.get_order(snapshot.target_order_uuid)
+    order = order_object(payload) or {}
+    state, _ = classify_order(payload)
+    observation = observe_artifact(
+        payload,
+        stage="reconcile_readback",
+        expected_customer_uuid=snapshot.easyweek_customer_uuid or "",
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+    identity_ok = (
+        canonical_uuid(order.get("uuid")) == snapshot.target_order_uuid
+        and order.get("comment") == snapshot.reconciliation_marker
+        and observation.order_customer_binding_proven
+    )
+    return payload, state, observation, identity_ok
+
+
+def _reconcile_report(
+    *,
+    outcome: str,
+    reasons: list[str],
+    snapshot: ledger_module.LedgerSnapshot,
+    order_state: str | None = None,
+    observation: dict[str, Any] | None = None,
+) -> StageReport:
+    return StageReport(
+        stage="reconcile",
+        outcome=outcome,
+        reasons=reasons,
+        reconciliation_required=snapshot.reconciliation_required,
+        manual_cleanup_required=snapshot.manual_cleanup_required,
+        ledger=snapshot.as_safe_dict(),
+        order_state=order_state,
+        observations=[observation] if observation else [],
+    )
+
+
+async def _record_manual_cleanup(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    expected: frozenset[str],
+    observation: dict[str, Any] | None,
+) -> ledger_module.RecordOutcome:
+    """Somebody closed or reversed the order by hand. Observed, not claimed.
+
+    No refund attempt is invented and no timestamp is back-filled: the ledger
+    has to keep saying that this application did not do it.
+    """
+    return await ledger_module.record_outcome(
+        session_maker,
+        status=VOUCHER_DELIVERY_MANUALLY_CLEANED,
+        expected_statuses=expected,
+        evidence={"reconcile_readback": observation} if observation else None,
+        manual_cleanup_required=False,
+        reconciliation_required=False,
+        manual_cleanup_observed=True,
+    )
+
+
 async def run_reconcile(
     session_maker: async_sessionmaker[AsyncSession],
     *,
     request: CanaryRequest,
     order_reader: Any,
 ) -> StageReport:
-    """Resolve what can be resolved by READING. Never sends anything.
+    """Resolve what can be resolved by READING, and write down what was proven.
 
-    An unknown EasyWeek mutation is resolved by looking at the order. An unknown
-    SEND is not resolvable here at all: Meta's messages endpoint does not answer
-    "did you accept this?", and guessing would be worse than saying so. Those
-    stay unknown, with the refund closed and a human in the loop.
+    Reconciliation that only reports is not reconciliation: a stage left
+    ``*_unknown`` blocks every stage after it forever, so a proven reading has
+    to reach the durable state or say honestly that it did not.
+
+    Every write here is a compare-and-set from an explicitly allowed source
+    state, under the row lock, monotonic by rank. Nothing in this function ever
+    creates, pays, refunds or sends: the only external calls are GETs.
     """
     snapshot = await ledger_module.load(session_maker)
     if not snapshot.exists or snapshot.status is None:
@@ -1248,7 +1362,27 @@ async def run_reconcile(
             ledger=snapshot.as_safe_dict(),
         )
 
+    # The immutable identity is checked before anything is read, let alone
+    # written: reconciling under a different recipient would judge somebody
+    # else's order against this row.
+    if (
+        snapshot.campaign_run_id != request.preview_run_id
+        or snapshot.campaign_recipient_id != request.campaign_recipient_id
+        or snapshot.location_uuid != request.location_uuid
+        or snapshot.voucher_template_uuid != request.voucher_template_uuid
+    ):
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_REFUSED,
+            reasons=[IDENTITY_BINDING_MISMATCH],
+            reconciliation_required=snapshot.reconciliation_required,
+            ledger=snapshot.as_safe_dict(),
+        )
+
     if snapshot.status in (VOUCHER_DELIVERY_SEND_CLAIMED, VOUCHER_DELIVERY_SEND_UNKNOWN):
+        # Meta's messages endpoint does not answer "did you accept this?", so
+        # there is nothing to resolve against and guessing would be worse than
+        # saying so. The refund stays closed and a human stays in the loop.
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_UNKNOWN,
@@ -1260,28 +1394,22 @@ async def run_reconcile(
         )
 
     try:
-        if snapshot.target_order_uuid is None:
+        if snapshot.status in (VOUCHER_DELIVERY_CREATE_CLAIMED, VOUCHER_DELIVERY_CREATE_UNKNOWN):
             return await _reconcile_create(session_maker, request=request, order_reader=order_reader)
-        payload = await order_reader.get_order(snapshot.target_order_uuid)
+        if snapshot.status in (VOUCHER_DELIVERY_PAY_CLAIMED, VOUCHER_DELIVERY_PAY_UNKNOWN):
+            return await _reconcile_pay(session_maker, order_reader=order_reader)
+        if snapshot.status in (VOUCHER_DELIVERY_REFUND_CLAIMED, VOUCHER_DELIVERY_REFUND_UNKNOWN):
+            return await _reconcile_refund(session_maker, order_reader=order_reader)
+        return await _reconcile_terminal(session_maker, order_reader=order_reader)
     except EasyWeekError:
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_UNKNOWN,
             reasons=[API_UNAVAILABLE],
             reconciliation_required=True,
+            manual_cleanup_required=snapshot.manual_cleanup_required,
             ledger=snapshot.as_safe_dict(),
         )
-
-    state, _ = classify_order(payload)
-    return StageReport(
-        stage="reconcile",
-        outcome=OUTCOME_PROVEN if state is not None else OUTCOME_UNKNOWN,
-        reasons=[],
-        reconciliation_required=snapshot.status in ledger_module.UNRESOLVED_STATUSES,
-        manual_cleanup_required=snapshot.manual_cleanup_required,
-        ledger=snapshot.as_safe_dict(),
-        order_state=state,
-    )
 
 
 async def _reconcile_create(
@@ -1290,67 +1418,382 @@ async def _reconcile_create(
     request: CanaryRequest,
     order_reader: Any,
 ) -> StageReport:
-    """Find an order this canary may have created, by its marker.
+    """Did the create reach EasyWeek, and what is the order now?
 
-    Scoped by branch and customer only, with the window proven locally — the
-    §35 contract, reused verbatim, including the rule that an incomplete walk is
-    unresolved rather than "no order exists".
+    When the ledger already names an order the exact read answers it; only an
+    unknown target needs the marker walk, scoped by branch and customer with the
+    window proven locally — the §35 contract, reused verbatim, including the
+    rule that an incomplete walk is unresolved rather than "no order exists".
     """
     snapshot = await ledger_module.load(session_maker)
-    if snapshot.create_window_start is None or snapshot.create_window_end is None:
+    unresolved = frozenset({VOUCHER_DELIVERY_CREATE_CLAIMED, VOUCHER_DELIVERY_CREATE_UNKNOWN})
+    candidate = snapshot.target_order_uuid
+
+    if candidate is None:
+        if snapshot.create_window_start is None or snapshot.create_window_end is None:
+            return _reconcile_report(outcome=OUTCOME_UNKNOWN, reasons=[LEDGER_STATE_UNEXPECTED], snapshot=snapshot)
+        match = await find_marker_orders(
+            order_reader,
+            location_uuid=request.location_uuid,
+            customer_uuid=snapshot.easyweek_customer_uuid or "",
+            marker=snapshot.reconciliation_marker or "",
+            window_start=snapshot.create_window_start,
+            window_end=snapshot.create_window_end,
+        )
+        if match.count > 1:
+            # Two orders carrying our marker. Which one is ours is not a
+            # question a machine may answer by picking.
+            result = await ledger_module.record_outcome(
+                session_maker,
+                status=VOUCHER_DELIVERY_AMBIGUOUS,
+                expected_statuses=unresolved,
+                reason_code=VOUCHER_STATE_UNATTRIBUTABLE,
+                manual_cleanup_required=True,
+                reconciliation_required=True,
+            )
+            return StageReport(
+                stage="reconcile",
+                outcome=OUTCOME_AMBIGUOUS,
+                reasons=[VOUCHER_STATE_UNATTRIBUTABLE],
+                reconciliation_required=True,
+                manual_cleanup_required=True,
+                ledger=result.snapshot.as_safe_dict(),
+            )
+        if not match.resolved:
+            # Zero matches, or a walk that could not prove it saw everything.
+            # UNRESOLVED — never "it was not created".
+            return StageReport(
+                stage="reconcile",
+                outcome=OUTCOME_UNKNOWN,
+                reasons=[VOUCHER_ORDER_UNPROVEN, MANUAL_CLEANUP_REQUIRED],
+                reconciliation_required=True,
+                manual_cleanup_required=True,
+                ledger=snapshot.as_safe_dict(),
+            )
+        candidate = match.order_uuid
+
+    payload = await order_reader.get_order(candidate)
+    state, _ = classify_order(payload)
+    observation = observe_artifact(
+        payload,
+        stage="create_reconcile_readback",
+        expected_customer_uuid=snapshot.easyweek_customer_uuid or "",
+        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
+    )
+
+    if state == ORDER_OPEN:
+        # Exactly the proof a fresh create must pass, including the binding.
+        identity = ledger_module.CanaryIdentity(
+            company_id=snapshot.company_id or 0,
+            campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
+            campaign_run_id=snapshot.campaign_run_id or 0,
+            campaign_recipient_id=snapshot.campaign_recipient_id or 0,
+            source_booking_uuid=snapshot.source_booking_uuid or "",
+            easyweek_customer_uuid=snapshot.easyweek_customer_uuid or "",
+            location_uuid=snapshot.location_uuid or "",
+            staffer_uuid=snapshot.staffer_uuid or "",
+            payment_account_uuid=snapshot.payment_account_uuid or "",
+            voucher_template_uuid=snapshot.voucher_template_uuid or "",
+            reconciliation_marker=snapshot.reconciliation_marker or "",
+        )
+        report = await _verify_created(
+            session_maker,
+            order_reader=order_reader,
+            identity=identity,
+            candidate=candidate,
+            marker=snapshot.reconciliation_marker or "",
+        )
+        report.stage = "reconcile"
+        report.external_mutation_attempted = False
+        return report
+
+    if state in (ORDER_CANCELLED, ORDER_REFUNDED):
+        # The draft was closed or reversed by hand before anything was paid.
+        result = await _record_manual_cleanup(
+            session_maker, expected=unresolved, observation=observation.as_safe_dict()
+        )
         return StageReport(
             stage="reconcile",
-            outcome=OUTCOME_UNKNOWN,
-            reasons=[LEDGER_STATE_UNEXPECTED],
-            reconciliation_required=True,
-            ledger=snapshot.as_safe_dict(),
+            outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
+            reasons=[] if result.applied else [LEDGER_STATE_UNEXPECTED],
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[observation.as_safe_dict()],
+            order_state=state,
         )
-    match = await find_marker_orders(
-        order_reader,
-        location_uuid=request.location_uuid,
-        customer_uuid=snapshot.easyweek_customer_uuid or "",
-        marker=snapshot.reconciliation_marker or "",
-        window_start=snapshot.create_window_start,
-        window_end=snapshot.create_window_end,
-    )
-    if match.count > 1:
+
+    if state == ORDER_PAID:
+        # Paid, with no payment this application can account for. Declaring it
+        # paid would invent provenance and open the delivery stage on it.
+        result = await ledger_module.record_outcome(
+            session_maker,
+            status=VOUCHER_DELIVERY_AMBIGUOUS,
+            expected_statuses=unresolved,
+            reason_code=VOUCHER_STATE_UNATTRIBUTABLE,
+            target_order_uuid=candidate,
+            evidence={"create_reconcile_readback": observation.as_safe_dict()},
+            manual_cleanup_required=True,
+            reconciliation_required=True,
+        )
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_AMBIGUOUS,
-            reasons=[VOUCHER_ORDER_UNPROVEN],
+            reasons=[VOUCHER_STATE_UNATTRIBUTABLE],
             reconciliation_required=True,
             manual_cleanup_required=True,
-            ledger=snapshot.as_safe_dict(),
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[observation.as_safe_dict()],
+            order_state=state,
         )
-    if not match.resolved:
+
+    result = await ledger_module.record_outcome(
+        session_maker,
+        status=VOUCHER_DELIVERY_CREATE_UNKNOWN,
+        expected_statuses=unresolved,
+        reason_code=VOUCHER_ORDER_UNPROVEN,
+        target_order_uuid=candidate,
+        evidence={"create_reconcile_readback": observation.as_safe_dict()},
+        manual_cleanup_required=True,
+        reconciliation_required=True,
+    )
+    return StageReport(
+        stage="reconcile",
+        outcome=OUTCOME_UNKNOWN,
+        reasons=[VOUCHER_ORDER_UNPROVEN],
+        reconciliation_required=True,
+        manual_cleanup_required=True,
+        ledger=result.snapshot.as_safe_dict(),
+        observations=[observation.as_safe_dict()],
+        order_state=state,
+    )
+
+
+async def _reconcile_pay(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    order_reader: Any,
+) -> StageReport:
+    """Did the payment land? Only the exact order the ledger names may say.
+
+    An order that still reads open is NOT proof the payment failed — the answer
+    may simply be in flight — so it stays unknown rather than becoming payable
+    again.
+    """
+    snapshot = await ledger_module.load(session_maker)
+    unresolved = frozenset({VOUCHER_DELIVERY_PAY_CLAIMED, VOUCHER_DELIVERY_PAY_UNKNOWN})
+    payload, state, observation, identity_ok = await _exact_order(order_reader, snapshot)
+    safe = observation.as_safe_dict() if observation else None
+
+    if payload is None or not identity_ok:
+        result = await ledger_module.record_outcome(
+            session_maker,
+            status=VOUCHER_DELIVERY_PAY_UNKNOWN,
+            expected_statuses=unresolved,
+            reason_code=VOUCHER_ORDER_UNPROVEN,
+            manual_cleanup_required=True,
+            reconciliation_required=True,
+        )
         return StageReport(
             stage="reconcile",
             outcome=OUTCOME_UNKNOWN,
-            reasons=[VOUCHER_ORDER_UNPROVEN, MANUAL_CLEANUP_REQUIRED],
+            reasons=[VOUCHER_ORDER_UNPROVEN],
             reconciliation_required=True,
             manual_cleanup_required=True,
-            ledger=snapshot.as_safe_dict(),
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[safe] if safe else [],
+            order_state=state,
         )
-    identity = ledger_module.CanaryIdentity(
-        company_id=snapshot.company_id or 0,
-        campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
-        campaign_run_id=snapshot.campaign_run_id or 0,
-        campaign_recipient_id=snapshot.campaign_recipient_id or 0,
-        source_booking_uuid=snapshot.source_booking_uuid or "",
-        easyweek_customer_uuid=snapshot.easyweek_customer_uuid or "",
-        location_uuid=snapshot.location_uuid or "",
-        staffer_uuid=snapshot.staffer_uuid or "",
-        payment_account_uuid=snapshot.payment_account_uuid or "",
-        voucher_template_uuid=snapshot.voucher_template_uuid or "",
-        reconciliation_marker=snapshot.reconciliation_marker or "",
-    )
-    return await _verify_created(
+
+    if state == ORDER_PAID:
+        # The same proofs the pay stage itself demands, including the binding:
+        # a paid order whose voucher changed is not our payment proven.
+        if not observation.voucher_line_proven or not _binding_holds(payload, snapshot):
+            result = await ledger_module.record_outcome(
+                session_maker,
+                status=VOUCHER_DELIVERY_PAY_UNKNOWN,
+                expected_statuses=unresolved,
+                reason_code=VOUCHER_BINDING_MISMATCH,
+                evidence={"pay_reconcile_readback": safe},
+                manual_cleanup_required=True,
+                reconciliation_required=True,
+            )
+            return StageReport(
+                stage="reconcile",
+                outcome=OUTCOME_UNKNOWN,
+                reasons=[VOUCHER_BINDING_MISMATCH],
+                reconciliation_required=True,
+                manual_cleanup_required=True,
+                ledger=result.snapshot.as_safe_dict(),
+                observations=[safe] if safe else [],
+                order_state=state,
+            )
+        result = await ledger_module.record_outcome(
+            session_maker,
+            status=VOUCHER_DELIVERY_PAID,
+            expected_statuses=unresolved,
+            verified_field="pay_verified_at",
+            evidence={"pay_reconcile_readback": safe},
+            manual_cleanup_required=True,
+            reconciliation_required=False,
+        )
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
+            reasons=[] if result.applied else [LEDGER_STATE_UNEXPECTED],
+            manual_cleanup_required=True,
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[safe] if safe else [],
+            order_state=state,
+        )
+
+    if state in (ORDER_CANCELLED, ORDER_REFUNDED):
+        # Somebody reversed or closed it outside this application. Recorded as
+        # an observation, with no refund attempt invented on our behalf.
+        result = await _record_manual_cleanup(session_maker, expected=unresolved, observation=safe)
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
+            reasons=[] if result.applied else [LEDGER_STATE_UNEXPECTED],
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[safe] if safe else [],
+            order_state=state,
+        )
+
+    # Still open, or a state we cannot name. The payment may be in flight.
+    result = await ledger_module.record_outcome(
         session_maker,
-        order_reader=order_reader,
-        identity=identity,
-        candidate=match.order_uuid,
-        marker=snapshot.reconciliation_marker or "",
+        status=VOUCHER_DELIVERY_PAY_UNKNOWN,
+        expected_statuses=unresolved,
+        reason_code=VOUCHER_ORDER_NOT_PAID,
+        evidence={"pay_reconcile_readback": safe},
+        manual_cleanup_required=True,
+        reconciliation_required=True,
     )
+    return StageReport(
+        stage="reconcile",
+        outcome=OUTCOME_UNKNOWN,
+        reasons=[VOUCHER_ORDER_NOT_PAID],
+        reconciliation_required=True,
+        manual_cleanup_required=True,
+        ledger=result.snapshot.as_safe_dict(),
+        observations=[safe] if safe else [],
+        order_state=state,
+    )
+
+
+async def _reconcile_refund(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    order_reader: Any,
+) -> StageReport:
+    """Did the refund land?
+
+    Deliberately does not consult the voucher's shape or its code: proving that
+    money came back is a question about the ORDER, and an unreadable artifact
+    must never be what keeps a refund unresolved.
+    """
+    snapshot = await ledger_module.load(session_maker)
+    unresolved = frozenset({VOUCHER_DELIVERY_REFUND_CLAIMED, VOUCHER_DELIVERY_REFUND_UNKNOWN})
+    payload, state, observation, identity_ok = await _exact_order(order_reader, snapshot)
+    safe = observation.as_safe_dict() if observation else None
+
+    if payload is None or not identity_ok or state != ORDER_REFUNDED:
+        result = await ledger_module.record_outcome(
+            session_maker,
+            status=VOUCHER_DELIVERY_REFUND_UNKNOWN,
+            expected_statuses=unresolved,
+            reason_code=VOUCHER_ORDER_UNPROVEN if not identity_ok else MUTATION_UNKNOWN,
+            evidence={"refund_reconcile_readback": safe},
+            manual_cleanup_required=True,
+            reconciliation_required=True,
+        )
+        return StageReport(
+            stage="reconcile",
+            outcome=OUTCOME_UNKNOWN,
+            reasons=[VOUCHER_ORDER_UNPROVEN if not identity_ok else MUTATION_UNKNOWN],
+            reconciliation_required=True,
+            manual_cleanup_required=True,
+            ledger=result.snapshot.as_safe_dict(),
+            observations=[safe] if safe else [],
+            order_state=state,
+        )
+
+    # A verification stamp says "the refund WE sent is confirmed", so it is only
+    # written where this application actually attempted one.
+    attempted = snapshot.stage_timestamps.get("refund_attempted_at") is not None
+    result = await ledger_module.record_outcome(
+        session_maker,
+        status=VOUCHER_DELIVERY_REFUNDED,
+        expected_statuses=unresolved,
+        verified_field="refund_verified_at" if attempted else None,
+        evidence={"refund_reconcile_readback": safe},
+        manual_cleanup_required=False,
+        reconciliation_required=False,
+    )
+    return StageReport(
+        stage="reconcile",
+        outcome=OUTCOME_PROVEN if result.applied else OUTCOME_UNKNOWN,
+        reasons=[] if result.applied else [LEDGER_STATE_UNEXPECTED],
+        ledger=result.snapshot.as_safe_dict(),
+        observations=[safe] if safe else [],
+        order_state=state,
+    )
+
+
+async def _reconcile_terminal(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    order_reader: Any,
+) -> StageReport:
+    """Report a settled canary against what the order says now.
+
+    Writes nothing: a settled state is not re-stamped because somebody ran
+    reconcile again. When the order contradicts the ledger the report says so
+    instead of claiming an unconditional success.
+    """
+    snapshot = await ledger_module.load(session_maker)
+    payload, state, observation, identity_ok = await _exact_order(order_reader, snapshot)
+    safe = observation.as_safe_dict() if observation else None
+
+    consistent = {
+        VOUCHER_DELIVERY_CREATED: {ORDER_OPEN},
+        VOUCHER_DELIVERY_PAID: {ORDER_PAID},
+        VOUCHER_DELIVERY_PROVIDER_ACCEPTED: {ORDER_PAID},
+        VOUCHER_DELIVERY_DELIVERED: {ORDER_PAID},
+        VOUCHER_DELIVERY_READ: {ORDER_PAID},
+        VOUCHER_DELIVERY_REFUNDED: {ORDER_REFUNDED},
+        VOUCHER_DELIVERY_MANUALLY_CLEANED: {ORDER_CANCELLED, ORDER_REFUNDED},
+        VOUCHER_DELIVERY_SEND_REJECTED: {ORDER_PAID},
+        VOUCHER_DELIVERY_CREATE_REJECTED: set(),
+        VOUCHER_DELIVERY_PAY_REJECTED: {ORDER_OPEN},
+        VOUCHER_DELIVERY_REFUND_REJECTED: {ORDER_PAID},
+    }.get(snapshot.status or "", set())
+
+    if payload is None or not identity_ok:
+        return _reconcile_report(
+            outcome=OUTCOME_UNKNOWN,
+            reasons=[VOUCHER_ORDER_UNPROVEN],
+            snapshot=snapshot,
+            order_state=state,
+            observation=safe,
+        )
+    if snapshot.status == VOUCHER_DELIVERY_AMBIGUOUS:
+        return _reconcile_report(
+            outcome=OUTCOME_AMBIGUOUS,
+            reasons=[VOUCHER_STATE_UNATTRIBUTABLE],
+            snapshot=snapshot,
+            order_state=state,
+            observation=safe,
+        )
+    if state not in consistent:
+        return _reconcile_report(
+            outcome=OUTCOME_CONTRACT_MISMATCH,
+            reasons=[LEDGER_STATE_UNEXPECTED],
+            snapshot=snapshot,
+            order_state=state,
+            observation=safe,
+        )
+    return _reconcile_report(outcome=OUTCOME_PROVEN, reasons=[], snapshot=snapshot, order_state=state, observation=safe)
 
 
 async def run_status(session_maker: async_sessionmaker[AsyncSession]) -> StageReport:

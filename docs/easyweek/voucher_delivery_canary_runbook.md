@@ -139,6 +139,7 @@ before any external effect.
 | `created` | One order exists, proven, with the code bound | Plan `pay` |
 | `pay_claimed` / `pay_unknown` | The payment may have happened | `reconcile` only |
 | `paid` | €15 is paid, proven | Plan `deliver` **or** plan `refund` |
+| `ambiguous` | Two marker orders, or a paid order this canary cannot account for | Stop. A human decides |
 | `send_claimed` | The message may have gone out | Stop. Investigate by hand |
 | `send_unknown` | **The customer may be holding the code** | Stop. No resend, no refund |
 | `send_rejected` | Meta refused before acting | Stop. The one attempt is spent |
@@ -151,6 +152,12 @@ before any external effect.
 a webhook naming this exact `provider_message_id`, and they are monotonic: a
 duplicate or out-of-order callback cannot move the row backwards.
 
+Once the voucher has reached its person there is no draft left to close, so
+`provider_accepted`, `delivered` and `read` all clear `manual_cleanup_required`
+— and so do `refunded` and `manually_cleaned`. A `status` after a successful
+delivery asks for nothing. `send_unknown` is the opposite and stays that way:
+cleanup required, reconciliation required, resend and refund both closed.
+
 ## 6. When the refund is forbidden
 
 A refund is the **pre-send** escape hatch and nothing else. It is refused — by
@@ -162,10 +169,49 @@ This is deliberate. Refunding a voucher whose code a customer already received
 would leave them holding a code that no longer works, which is worse than the
 €15.
 
+**What does NOT block a refund.** The refund reaches no customer, so it does not
+prove the machinery of a message it will never send. A paused or deleted Meta
+template, a switched-off sender, a missing or rotated HMAC key, a voucher body
+that stopped making sense — every one of those is a reason to get the money
+back, not a reason to leave it out there. The refund plan reports those checks
+as `not_required_for_refund` rather than as a comfortable `true`.
+
+What it still proves: the fence, its own `--apply`, its own digest, issued_at
+and phrase, the ledger identity, the exact order, our marker, our customer, the
+live guard, that nothing has been sent — and that the order reads **strictly
+paid** immediately before the claim.
+
+**An order that is already refunded.** If the last read before the claim shows
+the money is already back — somebody refunded it in the dashboard between the
+plan and the apply — no POST is sent at all. The state is settled by reading,
+and the report says `voucher_order_already_refunded`.
+
 ## 7. An unknown result
 
 An unknown outcome means the request left this process and its effect is not
 known. It is never retried automatically, and it must never be wired to one.
+
+`reconcile` is how an unknown EasyWeek stage ends. It reads — and then it
+**writes down what it proved**, so a resolved stage really is resolved and the
+next one becomes reachable:
+
+* an unknown pay over an order that reads paid becomes `paid`, and only then
+  does a fresh `deliver` or `refund` plan become possible;
+* an unknown pay over an order that still reads open stays unknown: an open
+  order is not proof the payment failed, and the answer may be in flight;
+* an unknown refund over an order that reads refunded becomes `refunded`;
+* an unknown create finds its order by marker — branch and customer scope, the
+  window proven locally — and an incomplete walk stays unresolved rather than
+  becoming "no order exists";
+* two marker orders become `ambiguous`, which stops the canary for a human;
+* a paid order the canary cannot account for also becomes `ambiguous`: no
+  payment is invented on our behalf, and `deliver` does not open;
+* an order somebody closed or reversed by hand becomes `manually_cleaned`, as an
+  observation — the tool never claims it performed the rollback.
+
+`reconcile` never creates, pays, refunds or sends. Its only external calls are
+GETs, and it refuses before the first one if the ledger names a different
+recipient.
 
 1. **Do not re-run the stage.** The ledger refuses it anyway; that refusal is the
    design;

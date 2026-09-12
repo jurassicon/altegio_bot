@@ -70,6 +70,12 @@ VOUCHER_ARTIFACT_UNPROVEN: Final = "voucher_artifact_unproven"
 VOUCHER_BINDING_MISMATCH: Final = "voucher_binding_mismatch"
 VOUCHER_ORDER_NOT_PAYABLE: Final = "voucher_order_not_payable"
 VOUCHER_ORDER_NOT_PAID: Final = "voucher_order_not_paid"
+# The money is already back. Not a failure — there is simply nothing left to
+# refund, and a second POST would be a second real refund attempt.
+VOUCHER_ORDER_ALREADY_REFUNDED: Final = "voucher_order_already_refunded"
+# The order is in a state this canary cannot attribute to itself. A human has to
+# look before anything else happens.
+VOUCHER_STATE_UNATTRIBUTABLE: Final = "voucher_state_unattributable"
 
 # -- the send ---------------------------------------------------------------
 DELIVERY_ALREADY_ATTEMPTED: Final = "delivery_already_attempted"

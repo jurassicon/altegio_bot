@@ -33,6 +33,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     STAGE_PAY,
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
+    VOUCHER_ORDER_ALREADY_REFUNDED,
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.runner import (
     OUTCOME_CONTRACT_MISMATCH,
@@ -45,13 +46,16 @@ from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown
 from altegio_bot.models.models import (
     VOUCHER_DELIVERY_CREATED,
     VOUCHER_DELIVERY_PAID,
+    VOUCHER_DELIVERY_PAY_UNKNOWN,
     VOUCHER_DELIVERY_PROVIDER_ACCEPTED,
+    VOUCHER_DELIVERY_REFUND_UNKNOWN,
     VOUCHER_DELIVERY_REFUNDED,
     VOUCHER_DELIVERY_SEND_REJECTED,
     VOUCHER_DELIVERY_SEND_UNKNOWN,
 )
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: F401 - fixtures
+    OTHER_UUID,
     PROVIDER_MESSAGE_ID,
     UNKNOWN_OUTCOME,
     VOUCHER_CODE_SENTINEL,
@@ -68,6 +72,7 @@ from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: F401
     seed_template_and_sender,
     voucher_order,
 )
+from altegio_bot.utils import utcnow
 
 BOOKING_LINK = "https://karlsruhe.example.invalid/"
 
@@ -736,3 +741,422 @@ async def test_status_is_database_only(session_maker, enabled) -> None:
 
     assert report.outcome == OUTCOME_PROVEN
     assert reader.calls == before
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation actually reconciles
+# ---------------------------------------------------------------------------
+
+
+async def _reconcile(session_maker, request, reader):
+    return await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+
+async def _force(session_maker, status, **kwargs):
+    """Put the ledger into an unresolved state the way a real run would."""
+    snapshot = await ledger_module.load(session_maker)
+    return await ledger_module.record_outcome(
+        session_maker,
+        status=status,
+        expected_statuses=frozenset({snapshot.status or ""}),
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_pay_that_really_landed_becomes_durably_paid(session_maker, enabled) -> None:
+    """The blocker: reconcile said "proven" and left the ledger unresolved.
+
+    An unknown pay blocks every stage after it forever, so a proven reading has
+    to reach the durable state — not just the operator's terminal.
+    """
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker)
+    await _create(session_maker, request, reader, mutator)
+    identity = runner_module._identity_from(
+        request,
+        (await _plan(session_maker, request, reader, STAGE_PAY))[1],
+    )
+    await ledger_module.claim_pay(session_maker, identity=identity, plan_digest="a" * 64)
+    await _force(session_maker, VOUCHER_DELIVERY_PAY_UNKNOWN, reason_code="x")
+    # EasyWeek did apply the payment; we simply never saw the answer.
+    reader.order = voucher_order(marker=request.marker, status="paid")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_PROVEN
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_PAID
+    assert snapshot.stage_timestamps["pay_verified_at"] is not None
+    assert snapshot.reconciliation_required is False
+    # And the next stage is genuinely open again.
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_DELIVER)
+    assert plan.ready is True
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_pay_over_a_still_open_order_stays_unknown(session_maker, enabled) -> None:
+    """An open order is not proof the payment failed; it may be in flight."""
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker)
+    await _create(session_maker, request, reader, mutator)
+    identity = runner_module._identity_from(request, (await _plan(session_maker, request, reader, STAGE_PAY))[1])
+    await ledger_module.claim_pay(session_maker, identity=identity, plan_digest="a" * 64)
+    await _force(session_maker, VOUCHER_DELIVERY_PAY_UNKNOWN, reason_code="x")
+    reader.order = voucher_order(marker=request.marker)
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_UNKNOWN
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_PAY_UNKNOWN
+    assert snapshot.reconciliation_required is True
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_refund_that_really_landed_becomes_durably_refunded(session_maker, enabled) -> None:
+    request, reader, mutator = await _paid(session_maker)
+    identity = runner_module._identity_from(request, (await _plan(session_maker, request, reader, STAGE_REFUND))[1])
+    await ledger_module.claim_refund(session_maker, identity=identity, plan_digest="b" * 64)
+    await _force(session_maker, VOUCHER_DELIVERY_REFUND_UNKNOWN, reason_code="x")
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_PROVEN
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_DELIVERY_REFUNDED
+    assert snapshot.stage_timestamps["refund_verified_at"] is not None
+    assert snapshot.manual_cleanup_required is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_reaches_a_mutation_client() -> None:
+    """Structural: reconcile has no mutator parameter to pass one through."""
+    import inspect
+
+    signature = inspect.signature(runner_module.run_reconcile)
+
+    assert "mutator" not in signature.parameters
+    assert "sender" not in signature.parameters
+
+
+@pytest.mark.asyncio
+async def test_a_known_state_with_the_wrong_marker_is_never_proven(session_maker, enabled) -> None:
+    """`classify_order` returning a familiar word proves nothing by itself."""
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker)
+    await _create(session_maker, request, reader, mutator)
+    identity = runner_module._identity_from(request, (await _plan(session_maker, request, reader, STAGE_PAY))[1])
+    await ledger_module.claim_pay(session_maker, identity=identity, plan_digest="a" * 64)
+    await _force(session_maker, VOUCHER_DELIVERY_PAY_UNKNOWN, reason_code="x")
+    reader.order = voucher_order(marker="somebody-elses-marker", status="paid")
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome != OUTCOME_PROVEN
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_PAY_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_two_marker_orders_durably_stop_the_canary(session_maker, enabled) -> None:
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(
+        reader,
+        marker=request.marker,
+        create_error=EasyWeekVoucherMutationUnknown("lost"),
+    )
+    await _create(session_maker, request, reader, mutator)
+    now = utcnow().isoformat()
+    reader.order_pages = [
+        orders_page(
+            [
+                voucher_order(marker=request.marker, created_at=now),
+                voucher_order(marker=request.marker, created_at=now, uuid=str(OTHER_UUID)),
+            ]
+        )
+    ]
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == runner_module.OUTCOME_AMBIGUOUS
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == "ambiguous"
+    assert snapshot.manual_cleanup_required is True
+    # And no further mutation stage is reachable.
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_PAY)
+    assert plan.ready is False
+
+
+@pytest.mark.asyncio
+async def test_a_manually_closed_draft_becomes_durably_manually_cleaned(session_maker, enabled) -> None:
+    """Observed, never claimed: the application did not close it."""
+    request, reader = await _ready(session_maker)
+    # The create left as an unknown: the request went out, the answer did not
+    # come back, and the ledger has no order UUID to read.
+    mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
+    await _create(session_maker, request, reader, mutator)
+    closed = voucher_order(marker=request.marker, status="canceled", is_canceled=True)
+    reader.order = closed
+    reader.order_pages = [orders_page([closed])]
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == OUTCOME_PROVEN
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == "manually_cleaned"
+    assert snapshot.manual_cleanup_required is False
+    assert snapshot.stage_timestamps["manual_cleanup_observed_at"] is not None
+    # No refund attempt was invented on our behalf.
+    assert snapshot.stage_timestamps["refund_attempted_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_paid_order_with_no_payment_provenance_stops_the_canary(session_maker, enabled) -> None:
+    """Paid, with no payment we can account for. Not ours to call proven."""
+    request, reader = await _ready(session_maker)
+    mutator = FakeMutator(reader, marker=request.marker, create_error=EasyWeekVoucherMutationUnknown("lost"))
+    await _create(session_maker, request, reader, mutator)
+    paid = voucher_order(marker=request.marker, status="paid")
+    reader.order = paid
+    reader.order_pages = [orders_page([paid])]
+
+    report = await _reconcile(session_maker, request, reader)
+
+    assert report.outcome == runner_module.OUTCOME_AMBIGUOUS
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == "ambiguous"
+    assert snapshot.stage_timestamps["pay_attempted_at"] is None
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_DELIVER)
+    assert plan.ready is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_under_another_recipient_reads_nothing(session_maker, enabled) -> None:
+    request, reader, _ = await _paid(session_maker)
+    before = list(reader.calls)
+    foreign = canary_request(run_id=request.preview_run_id, recipient_id=request.campaign_recipient_id + 7)
+
+    report = await _reconcile(session_maker, foreign, reader)
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert reader.calls == before
+
+
+# ---------------------------------------------------------------------------
+# An already-refunded order is never refunded again
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_already_refunded_order_gives_no_ready_refund_plan(session_maker, enabled) -> None:
+    request, reader, mutator = await _paid(session_maker)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_REFUND)
+
+    assert plan.ready is False
+    assert VOUCHER_ORDER_ALREADY_REFUNDED in plan.reasons
+    assert mutator.calls == ["create", "pay"]
+
+
+@pytest.mark.asyncio
+async def test_a_refund_that_becomes_redundant_between_plan_and_apply_sends_nothing(session_maker, enabled) -> None:
+    """The race the plan alone cannot close.
+
+    The plan was built while the order was paid; somebody refunded it in the
+    dashboard a second later. The last read before the claim is what stops a
+    second real refund against a provider with no idempotency key.
+    """
+    request, reader, mutator = await _paid(session_maker)
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_REFUND)
+    assert plan.ready is True
+    calls_before = list(mutator.calls)
+    reader.order = voucher_order(marker=request.marker, status="refunded")
+
+    async with session_maker() as session:
+        report = await runner_module.run_refund(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            plan_digest=plan.digest,
+            plan_issued_at=plan.issued_at,
+            confirmation_phrase=plan.confirmation_phrase,
+            apply=True,
+        )
+
+    assert mutator.calls == calls_before
+    assert report.external_mutation_attempted is False
+    assert VOUCHER_ORDER_ALREADY_REFUNDED in report.reasons
+
+
+# ---------------------------------------------------------------------------
+# The cleanup path does not depend on the delivery machinery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "break_it",
+    [
+        "hmac_key_missing",
+        "hmac_key_id_missing",
+        "hmac_key_rotated",
+        "template_missing",
+        "template_inactive",
+        "sender_missing",
+        "sender_inactive",
+        "voucher_code_missing",
+        "vouchers_missing",
+        "vouchers_malformed",
+        "artifact_unprovable",
+    ],
+)
+async def test_a_refund_stays_available_after_an_unreadable_artifact(
+    session_maker, enabled, monkeypatch, break_it
+) -> None:
+    """Every one of these is a reason to get the money BACK.
+
+    A template Meta paused, a sender switched off, a key rotated, a voucher body
+    that stopped making sense — none of them is a reason to leave a real €15
+    sitting in a paid order nobody will ever deliver.
+    """
+    from pydantic import SecretStr
+    from sqlalchemy import delete, update
+
+    from altegio_bot.models.models import MessageTemplate, WhatsAppSender
+
+    request, reader, mutator = await _paid(session_maker)
+
+    if break_it == "hmac_key_missing":
+        monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr(""), raising=False)
+    elif break_it == "hmac_key_id_missing":
+        monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "", raising=False)
+    elif break_it == "hmac_key_rotated":
+        monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("j" * 48), raising=False)
+        monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "rotated", raising=False)
+    elif break_it in {"template_missing", "template_inactive", "sender_missing", "sender_inactive"}:
+        async with session_maker() as session:
+            async with session.begin():
+                if break_it == "template_missing":
+                    await session.execute(delete(MessageTemplate))
+                elif break_it == "template_inactive":
+                    await session.execute(update(MessageTemplate).values(is_active=False))
+                elif break_it == "sender_missing":
+                    await session.execute(delete(WhatsAppSender))
+                else:
+                    await session.execute(update(WhatsAppSender).values(is_active=False))
+    else:
+        order = voucher_order(marker=request.marker, status="paid")
+        if break_it == "voucher_code_missing":
+            del order["vouchers"][0]["code"]
+        elif break_it == "vouchers_missing":
+            del order["vouchers"]
+        elif break_it == "vouchers_malformed":
+            order["vouchers"] = "not a list"
+        else:
+            order["vouchers"] = [{"voucher_template_uuid": str(OTHER_UUID), "price": 9999}]
+        reader.order = order
+
+    plan, _, prerequisites = await _plan(session_maker, request, reader, STAGE_REFUND)
+    assert plan.ready is True, plan.reasons
+    # The report is honest about what a refund did and did not check.
+    safe = prerequisites.as_safe_dict()
+    assert safe["delivery_checks_applied"] is False
+    for key in ("hmac_key_usable", "template_proven", "sender_proven"):
+        assert safe[key] == "not_required_for_refund"
+
+    report = await _refund(session_maker, request, reader, mutator)
+
+    assert report.outcome == OUTCOME_PROVEN
+    assert mutator.calls == ["create", "pay", "refund"]
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_DELIVERY_REFUNDED
+
+
+@pytest.mark.asyncio
+async def test_a_refund_still_needs_its_own_authorisation_and_identity(session_maker, enabled) -> None:
+    """Loosened prerequisites, not loosened authorisation."""
+    request, reader, mutator = await _paid(session_maker)
+
+    stale = await _refund(session_maker, request, reader, mutator, plan_digest="0" * 64)
+    unapplied = await _refund(session_maker, request, reader, mutator, apply=False)
+
+    assert stale.outcome == OUTCOME_REFUSED
+    assert unapplied.outcome == OUTCOME_REFUSED
+    assert mutator.calls == ["create", "pay"]
+
+
+@pytest.mark.asyncio
+async def test_a_refund_after_any_send_attempt_remains_forbidden(session_maker, enabled) -> None:
+    request, reader, mutator = await _paid(session_maker)
+    await _deliver(session_maker, request, reader, FakeSender(outcome=UNKNOWN_OUTCOME))
+
+    plan, _, _ = await _plan(session_maker, request, reader, STAGE_REFUND)
+    report = await _refund(session_maker, request, reader, RefusingMutator())
+
+    assert plan.ready is False
+    assert report.outcome == OUTCOME_REFUSED
+
+
+# ---------------------------------------------------------------------------
+# A delivered voucher leaves nothing to clean up
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_proven_delivery_clears_the_cleanup_flag(session_maker, enabled) -> None:
+    """The blocker: status asked for manual cleanup forever after success."""
+    request, reader, _ = await _paid(session_maker)
+    assert (await ledger_module.load(session_maker)).manual_cleanup_required is True
+
+    report = await _deliver(session_maker, request, reader, FakeSender())
+
+    assert report.manual_cleanup_required is False
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.manual_cleanup_required is False
+    status = await runner_module.run_status(session_maker)
+    assert status.manual_cleanup_required is False
+    assert status.ledger["manual_cleanup_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_webhook_ladder_keeps_the_cleanup_flag_down(session_maker, enabled) -> None:
+    request, reader, _ = await _paid(session_maker)
+    await _deliver(session_maker, request, reader, FakeSender())
+
+    for status in ("delivered", "read", "delivered"):
+        await ledger_module.record_webhook_transition(
+            session_maker, provider_message_id=PROVIDER_MESSAGE_ID, status=status
+        )
+        snapshot = await ledger_module.load(session_maker)
+        assert snapshot.manual_cleanup_required is False
+
+    # The duplicate, out-of-order callback did not walk the state back either.
+    assert (await ledger_module.load(session_maker)).status == "read"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_send_still_asks_for_a_human(session_maker, enabled) -> None:
+    request, reader, _ = await _paid(session_maker)
+
+    report = await _deliver(session_maker, request, reader, FakeSender(outcome=UNKNOWN_OUTCOME))
+
+    assert report.manual_cleanup_required is True
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.manual_cleanup_required is True
+    assert snapshot.reconciliation_required is True
+    status = await runner_module.run_status(session_maker)
+    assert status.reconciliation_required is True
+
+
+@pytest.mark.asyncio
+async def test_a_refunded_canary_asks_for_no_cleanup(session_maker, enabled) -> None:
+    request, reader, mutator = await _paid(session_maker)
+
+    await _refund(session_maker, request, reader, mutator)
+
+    status = await runner_module.run_status(session_maker)
+    assert status.manual_cleanup_required is False
