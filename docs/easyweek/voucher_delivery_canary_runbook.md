@@ -126,8 +126,46 @@ EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED=true
 EASYWEEK_VOUCHER_DELIVERY_TEST_CUSTOMER_UUID=<the test account's canonical UUID>
 ```
 
-Turn the second one back to `false` as soon as the recipient is added. Turning
-on the canary must never be what turns on the substitution.
+**Both stay on for the whole canary.** The test account is re-proven before
+every external step — CREATE, PAY, DELIVER and REFUND all call the same live
+check — and that check reads both fences. Switching the second one off after
+Add does not "lock in" the recipient; it stops the next stage.
+
+Turn `..._TEST_RECIPIENT_ENABLED` back to `false` only once the canary has
+reached a proven ending:
+
+* a successful DELIVER, or
+* a proven REFUND or manual cleanup, if nothing was ever sent.
+
+Then restart the service that serves the Ops Add screen, because a container
+that is already running does not re-read `easyweek.env`. Each
+`docker compose run` starts a new container and therefore sees the current
+value, which is why the CLI stages pick up a change immediately while the web
+app does not.
+
+Check what the file says now:
+
+```bash
+cd /opt/altegio_bot && grep -E '^EASYWEEK_VOUCHER_DELIVERY_(CANARY_ENABLED|TEST_RECIPIENT_ENABLED)=' easyweek.env
+```
+
+Check what the running web container actually has:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot exec altegio-api printenv EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED
+```
+
+Recreate only that service after editing the file:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot up -d --force-recreate --no-deps altegio-api
+```
+
+Confirm the new value took:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot exec altegio-api printenv EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED
+```
 
 **The UUID is a server setting, never a form field.** In Ops → the EasyWeek
 preview → **Add test recipient**, you type only the phone number. The customer
@@ -155,7 +193,8 @@ reactivated in place.
 
 **Every stage re-proves it.** The account, the fences, the configured UUID, the
 current number and the opt-out state are checked again before CREATE, before
-PAY, before REFUND and again immediately before the Meta send. Rotating
+PAY, before REFUND and again immediately before the Meta send — which is why
+both fences have to stay open until the canary is finished. Rotating
 `..._TEST_CUSTOMER_UUID` after the canary has opened its ledger is a mismatch,
 not a switch of account: the canary stops and does nothing externally.
 

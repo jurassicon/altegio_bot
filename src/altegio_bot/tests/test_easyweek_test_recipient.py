@@ -98,8 +98,12 @@ class _CustomerReader:
 @pytest.fixture
 def fences(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
     """Both fences open, one account configured, and the branch registry ready."""
-    # `configuration` also closes the canary fence, so it goes first.
+    # `configuration` also closes the canary fence, so it goes first. The MAC
+    # key comes with it: a stage plan is not ready without one, and the tests
+    # that drive a real CREATE need the whole prerequisite set, not just these
+    # two flags.
     request.getfixturevalue("configuration")
+    request.getfixturevalue("binding_key")
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_canary_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_test_recipient_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_test_customer_uuid", TEST_CUSTOMER_UUID, raising=False)
@@ -869,3 +873,282 @@ async def test_one_test_recipient_per_customer_per_preview(session_maker, fences
                         easyweek_test_customer_uuid=uuid_module.UUID(TEST_CUSTOMER_UUID),
                     )
                 )
+
+
+# ---------------------------------------------------------------------------
+# Rebuilding the identity from the durable ledger
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_with(**changes: Any):
+    """A complete, self-consistent earned snapshot, then whatever is overridden."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+    from altegio_bot.easyweek_voucher_identity import EASYWEEK_VOUCHER_TEMPLATE_UUID, KARLSRUHE_LOCATION_UUID
+    from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (
+        ACCOUNT_UUID,
+        BOOKING_UUID,
+        EW_CUSTOMER_UUID,
+        STAFFER_UUID,
+    )
+
+    fields: dict[str, Any] = {
+        "exists": True,
+        "status": "create_unknown",
+        "reason_code": None,
+        "recipient_basis": VOUCHER_DELIVERY_BASIS_EARNED,
+        "campaign_run_id": 1,
+        "campaign_recipient_id": 2,
+        "company_id": COMPANY_ID,
+        "target_order_uuid": None,
+        "reconciliation_marker": "ewvd1-abcdef012345",
+        "create_window_start": None,
+        "create_window_end": None,
+        "source_booking_uuid": str(BOOKING_UUID),
+        "easyweek_customer_uuid": str(EW_CUSTOMER_UUID),
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "staffer_uuid": STAFFER_UUID,
+        "payment_account_uuid": ACCOUNT_UUID,
+        "voucher_template_uuid": EASYWEEK_VOUCHER_TEMPLATE_UUID,
+        "voucher_code_hmac": None,
+        "hmac_key_id": None,
+        "outbound_intent_uuid": None,
+        "provider_message_id": None,
+        "send_attempt_count": 0,
+        "stage_plan_digests": {},
+        "stage_timestamps": {},
+        "manual_cleanup_required": False,
+        "reconciliation_required": True,
+        "evidence": {},
+    }
+    fields.update(changes)
+    return ledger_module.LedgerSnapshot(**fields)
+
+
+def test_an_earned_snapshot_rebuilds_into_an_earned_identity() -> None:
+    from altegio_bot.campaigns.easyweek_voucher_delivery.runner import _identity_from_snapshot
+    from altegio_bot.tests.easyweek_voucher_delivery_fixtures import BOOKING_UUID
+
+    identity = _identity_from_snapshot(_snapshot_with())
+
+    assert identity is not None
+    assert identity.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED
+    assert identity.source_booking_uuid == str(BOOKING_UUID)
+
+
+def test_a_test_snapshot_rebuilds_with_a_genuinely_null_booking() -> None:
+    """Not an empty string. The contract says NULL, and NULL is what it gets."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery.runner import _identity_from_snapshot
+
+    identity = _identity_from_snapshot(
+        _snapshot_with(recipient_basis=VOUCHER_DELIVERY_BASIS_TEST, source_booking_uuid=None)
+    )
+
+    assert identity is not None
+    assert identity.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
+    assert identity.source_booking_uuid is None
+
+
+@pytest.mark.parametrize(
+    "changes, why",
+    [
+        pytest.param({"recipient_basis": None}, "no basis at all", id="basis_missing"),
+        pytest.param({"recipient_basis": ""}, "an empty basis", id="basis_empty"),
+        pytest.param({"recipient_basis": "something_else"}, "a word nobody wrote", id="basis_unknown"),
+        pytest.param({"source_booking_uuid": None}, "earned with no booking", id="earned_without_booking"),
+        pytest.param({"source_booking_uuid": ""}, "earned with an empty booking", id="earned_empty_booking"),
+        pytest.param(
+            {"recipient_basis": VOUCHER_DELIVERY_BASIS_TEST},
+            "a test row carrying a booking",
+            id="test_with_booking",
+        ),
+        pytest.param({"company_id": None}, "no company", id="company_missing"),
+        pytest.param({"campaign_recipient_id": None}, "no recipient", id="recipient_missing"),
+        pytest.param({"easyweek_customer_uuid": None}, "no customer", id="customer_missing"),
+        pytest.param({"reconciliation_marker": "  "}, "a blank marker", id="marker_blank"),
+        pytest.param({"voucher_template_uuid": "not-a-uuid"}, "a template that is not a uuid", id="template_bad"),
+    ],
+)
+def test_an_incomplete_snapshot_rebuilds_into_nothing(changes: dict[str, Any], why: str) -> None:
+    """Filling the gaps with `or 0` and `or ""` is what this replaces."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery.runner import _identity_from_snapshot
+
+    assert _identity_from_snapshot(_snapshot_with(**changes)) is None, why
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_create_over_an_open_order_recovers_on_the_earned_basis(session_maker, fences) -> None:
+    """The blocker: this branch raised TypeError and could never reconcile."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+    from altegio_bot.tests import test_easyweek_voucher_delivery_runner as delivery_tests
+
+    request, reader = await delivery_tests._ready(session_maker)
+    mutator = delivery_tests.FakeMutator(
+        reader,
+        marker=request.marker,
+        create_error=delivery_tests.EasyWeekVoucherMutationUnknown("lost"),
+    )
+    await delivery_tests._create(session_maker, request, reader, mutator)
+    open_order = await delivery_tests.marker_order(session_maker, marker=request.marker)
+    reader.order_pages = [delivery_tests.orders_page([open_order])]
+    reader.order = open_order
+    calls_before = list(mutator.calls)
+
+    report = await delivery_tests._reconcile(session_maker, request, reader)
+
+    # Whatever it concludes, it concluded it — no TypeError, no mutation.
+    assert mutator.calls == calls_before
+    assert report.outcome in (
+        runner_module_outcomes().OUTCOME_PROVEN,
+        runner_module_outcomes().OUTCOME_UNKNOWN,
+    )
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED
+
+
+def runner_module_outcomes():
+    from altegio_bot.campaigns.easyweek_voucher_delivery import runner as voucher_runner
+
+    return voucher_runner
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_create_over_an_open_order_recovers_on_the_test_basis(session_maker, fences) -> None:
+    """The same recovery for a canary whose recipient has no booking at all."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+    from altegio_bot.campaigns.easyweek_voucher_delivery import runner as voucher_runner
+
+    run_id, _ = await _empty_preview(session_maker)
+    added = await _add(session_maker, run_id)
+    await _attach_canary(session_maker, run_id, added.recipient_id)
+    await ledger_module.record_outcome(
+        session_maker,
+        status="create_unknown",
+        expected_statuses=frozenset({"planned"}),
+        reason_code="x",
+        reconciliation_required=True,
+        manual_cleanup_required=True,
+    )
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
+    assert snapshot.source_booking_uuid is None
+
+    identity = voucher_runner._identity_from_snapshot(snapshot)
+
+    assert identity is not None
+    assert identity.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
+    assert identity.source_booking_uuid is None
+    # And it still matches the row it was rebuilt from.
+    assert identity.matches(snapshot) is True
+
+
+# ---------------------------------------------------------------------------
+# What the reports say, in refusal as well as in success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_empty_ledger_claims_no_first_visit_proof(session_maker) -> None:
+    """The blocker: no row at all reported `first_visit_proof: earned`."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+    from altegio_bot.campaigns.easyweek_voucher_delivery import runner as voucher_runner
+
+    snapshot = await ledger_module.load(session_maker)
+    safe = snapshot.as_safe_dict()
+
+    assert safe["ledger_row_exists"] is False
+    assert safe["recipient_basis"] is None
+    assert safe["first_visit_proof"] == "not_available"
+
+    status = await voucher_runner.run_status(session_maker)
+    assert status.ledger["first_visit_proof"] == "not_available"
+
+
+@pytest.mark.asyncio
+async def test_a_proven_test_canary_reports_not_applicable(session_maker, fences) -> None:
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+
+    run_id, _ = await _empty_preview(session_maker)
+    added = await _add(session_maker, run_id)
+    await _attach_canary(session_maker, run_id, added.recipient_id)
+
+    safe = (await ledger_module.load(session_maker)).as_safe_dict()
+
+    assert safe["recipient_basis"] == VOUCHER_DELIVERY_BASIS_TEST
+    assert safe["first_visit_proof"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_an_earned_canary_reports_earned(session_maker, fences) -> None:
+    from altegio_bot.campaigns.easyweek_voucher_delivery import ledger as ledger_module
+    from altegio_bot.tests import test_easyweek_voucher_delivery_runner as delivery_tests
+
+    request, reader = await delivery_tests._ready(session_maker)
+    mutator = delivery_tests.FakeMutator(reader, marker=request.marker)
+    await delivery_tests._create(session_maker, request, reader, mutator)
+
+    safe = (await ledger_module.load(session_maker)).as_safe_dict()
+
+    assert safe["recipient_basis"] == VOUCHER_DELIVERY_BASIS_EARNED
+    assert safe["first_visit_proof"] == "earned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("break_it", ["opt_out", "phone_change", "no_client", "malformed_binding"])
+async def test_a_refused_test_recipient_is_never_reported_as_earned(session_maker, fences, break_it: str) -> None:
+    """The blocker: early refusals fell back to the dataclass default.
+
+    A refusal that misdescribes what it is refusing is worse than no report:
+    it says the canary was about an entitlement somebody earned.
+    """
+    run_id, _ = await _empty_preview(session_maker)
+    added = await _add(session_maker, run_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(CampaignRecipient, added.recipient_id)
+            client = (await session.execute(select(Client).where(Client.phone_e164 == TEST_PHONE))).scalar_one()
+            if break_it == "opt_out":
+                client.wa_opted_out = True
+            elif break_it == "phone_change":
+                client.phone_e164 = "+4915100007777"
+            elif break_it == "no_client":
+                row.client_id = None
+            elif break_it == "malformed_binding":
+                row.easyweek_test_customer_uuid = None
+                row.status = "skipped"
+
+    proof = await _prove(session_maker, run_id, added.recipient_id)
+    safe = proof.as_safe_dict()
+
+    assert proof.proven is False
+    if break_it == "malformed_binding":
+        # No binding left, so this is no longer a test row — but it must not be
+        # reported as a PROVEN earned one either.
+        assert safe["first_visit_proof"] != "not_applicable"
+    else:
+        assert proof.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
+        assert safe["recipient_basis"] == VOUCHER_DELIVERY_BASIS_TEST
+        assert safe["first_visit_proof"] == "not_applicable"
+    for secret in (TEST_CUSTOMER_UUID, TEST_PHONE, "Synthetic Fixture"):
+        assert secret not in repr(safe)
+
+
+@pytest.mark.asyncio
+async def test_a_proof_without_a_recipient_names_no_basis(session_maker, fences) -> None:
+    """Nothing was read, so nothing may be claimed about it."""
+    proof = await _prove(session_maker, 999_999, 999_998)
+
+    assert proof.proven is False
+    assert proof.recipient_basis is None
+    assert proof.as_safe_dict()["first_visit_proof"] == "not_available"
+
+
+@pytest.mark.asyncio
+async def test_an_earned_recipient_reports_the_earned_basis_even_when_refused(session_maker, fences) -> None:
+    run_id, recipient_id = await seed_recipient(session_maker)
+
+    proof = await _prove(session_maker, run_id, recipient_id)
+
+    assert proof.proven is False
+    assert proof.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED
+    assert proof.as_safe_dict()["first_visit_proof"] == "earned"

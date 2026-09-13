@@ -80,6 +80,7 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -1694,6 +1695,10 @@ async def _add_easyweek_test_recipient(run_id: int, body: AddRecipientRequest) -
     if not body.phone:
         raise HTTPException(status_code=400, detail={"reason": test_recipient.PHONE_UNUSABLE})
 
+    # BEFORE the client is constructed, not merely before the request: `httpx`
+    # logs the full URL at INFO, the web application runs at INFO, and this
+    # request's URL is `/customers/{uuid}` — a line that names one human being.
+    redact_easyweek_url_logging()
     try:
         async with EasyWeekClient() as client:
             outcome = await add_test_recipient_to_preview(

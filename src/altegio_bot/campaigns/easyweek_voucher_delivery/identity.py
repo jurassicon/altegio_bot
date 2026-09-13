@@ -91,6 +91,11 @@ DELIVERY_ALREADY_ATTEMPTED: Final = "delivery_already_attempted"
 DELIVERY_OUTCOME_UNKNOWN: Final = "delivery_outcome_unknown"
 MANUAL_CLEANUP_REQUIRED: Final = "manual_cleanup_required"
 
+# The durable row cannot be rebuilt into a whole identity: a missing field, an
+# unknown basis, or a basis that disagrees with the booking it does or does not
+# carry. Nothing is acted on and nothing is declared proven.
+LEDGER_IDENTITY_INCOMPLETE: Final = "voucher_delivery_ledger_identity_incomplete"
+
 # -- operator authorisation --------------------------------------------------
 LEDGER_STATE_UNEXPECTED: Final = "voucher_delivery_ledger_state_unexpected"
 PLAN_DIGEST_MISMATCH: Final = "voucher_delivery_plan_digest_mismatch"

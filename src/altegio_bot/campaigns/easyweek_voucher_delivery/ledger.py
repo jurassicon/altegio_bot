@@ -47,6 +47,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     VOUCHER_DELIVERY_AMBIGUOUS,
+    VOUCHER_DELIVERY_BASIS_EARNED,
     VOUCHER_DELIVERY_BASIS_TEST,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATE_REJECTED,
@@ -207,12 +208,13 @@ class LedgerSnapshot:
             "status": self.status,
             "reason_code": self.reason_code,
             "recipient_basis": self.recipient_basis,
-            # Said in the report, not left to be inferred from an absent field:
-            # a test canary never proved a first visit, and printing `false`
-            # would suggest it looked and failed.
-            "first_visit_proof": (
-                "not_applicable" if self.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST else "earned"
-            ),
+            # Said in the report, not left to be inferred from an absent field.
+            # Three answers, and the third one matters: a test canary never
+            # proved a first visit (`not_applicable`, not a `false` that would
+            # suggest it looked and failed), an earned one did, and a ledger
+            # that does not exist yet proved NOTHING — printing `earned` there
+            # would be an absence of evidence reported as evidence.
+            "first_visit_proof": _first_visit_proof(self.exists, self.recipient_basis),
             "campaign_run_id": self.campaign_run_id,
             "campaign_recipient_id": self.campaign_recipient_id,
             "company_id": self.company_id,
@@ -233,6 +235,25 @@ class LedgerSnapshot:
             "reconciliation_required": self.reconciliation_required,
             "evidence": dict(self.evidence),
         }
+
+
+# What an operator report says about the first-visit contract, for each of the
+# three states a row can be in. `not_available` is deliberately not `false`:
+# there is no row to have proven anything either way.
+FIRST_VISIT_EARNED: Final = "earned"
+FIRST_VISIT_NOT_APPLICABLE: Final = "not_applicable"
+FIRST_VISIT_NOT_AVAILABLE: Final = "not_available"
+
+
+def _first_visit_proof(exists: bool, basis: str | None) -> str:
+    if not exists or basis is None:
+        return FIRST_VISIT_NOT_AVAILABLE
+    if basis == VOUCHER_DELIVERY_BASIS_TEST:
+        return FIRST_VISIT_NOT_APPLICABLE
+    if basis == VOUCHER_DELIVERY_BASIS_EARNED:
+        return FIRST_VISIT_EARNED
+    # A basis this code does not know is not an earned one.
+    return FIRST_VISIT_NOT_AVAILABLE
 
 
 def _iso(value: datetime | None) -> str | None:

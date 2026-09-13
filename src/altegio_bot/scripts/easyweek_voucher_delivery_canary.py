@@ -65,6 +65,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.runner import CanaryRequest
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationClient
 from altegio_bot.settings import settings
 
@@ -93,10 +94,6 @@ COMMAND_RECONCILE: Final = "reconcile"
 
 # The EasyWeek sender line every EasyWeek send resolves through.
 SENDER_CODE: Final = "default"
-
-# httpx logs every request at INFO as a full URL. Neither a Graph URL carrying a
-# phone-number id nor an EasyWeek path belongs in an operator transcript.
-_URL_LOGGING_NAMESPACES: Final = ("httpx", "httpcore")
 
 
 class _SafetyArgumentParser(argparse.ArgumentParser):
@@ -152,8 +149,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _silence_url_logging() -> None:
-    for name in _URL_LOGGING_NAMESPACES:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    """The shared rule, not a second copy of it.
+
+    This used to raise the transport loggers here and only here, which left the
+    Ops endpoint — same client, same `/customers/{uuid}` URL, INFO logging —
+    with no protection at all. One implementation now owns it, and it scrubs as
+    well as silences.
+    """
+    redact_easyweek_url_logging()
 
 
 def _print_json(payload: dict[str, Any]) -> None:
