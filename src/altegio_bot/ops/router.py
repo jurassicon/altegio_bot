@@ -31,6 +31,9 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
+    RECIPIENT_BASIS_MANUAL,
+    RECIPIENT_BASIS_TEST,
     CampaignRecipient,
     CampaignRun,
     EasyWeekCampaignVoucherDeliveryLedger,
@@ -121,6 +124,26 @@ def _error_cell(error: str | None) -> str:
         badge = '<span class="badge bg-info text-dark me-1">suppressed 131026</span>'
         cell = badge + cell
     return cell
+
+
+def _basis_badge(recipient: CampaignRecipient) -> str:
+    """`auto`, `manual` or `test` — plus what an override overrode.
+
+    A manual row that was originally excluded automatically shows both: the
+    operator's decision, and the reason it was taken against. Hiding the second
+    half would make an override indistinguishable from a clean addition.
+    """
+    basis = getattr(recipient, "recipient_basis", None) or RECIPIENT_BASIS_EARNED
+    label, style = {
+        RECIPIENT_BASIS_EARNED: ("auto", "bg-secondary"),
+        RECIPIENT_BASIS_MANUAL: ("manual", "bg-primary"),
+        RECIPIENT_BASIS_TEST: ("test", "bg-warning text-dark"),
+    }.get(basis, (basis, "bg-light text-dark"))
+    badge = f'<span class="badge {style}">{_esc(label)}</span>'
+    overrode = getattr(recipient, "auto_excluded_reason", None)
+    if overrode:
+        badge += f' <span class="text-muted small">было: {_esc(overrode)}</span>'
+    return badge
 
 
 def _status_badge(status: str | None) -> str:
@@ -3365,6 +3388,22 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     # Компании для выбора (один dropdown — и компания, и location_id)
     company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
 
+    # The EasyWeek branches come from the server's own registry and nowhere
+    # else. The browser picks among what is configured; it does not get to say
+    # what a branch is, and no location UUID crosses the wire.
+    ew_registry = configured_easyweek_locations()
+    ew_branches = sorted(ew_registry.locations.items()) if ew_registry.ready else []
+    easyweek_options = "".join(
+        f'<option value="{cid}">{_esc(location.name.title())} ({cid})</option>' for cid, location in ew_branches
+    )
+    easyweek_registry_note = (
+        "Список филиалов задан на сервере; location UUID не передаётся из браузера."
+        if ew_branches
+        else "EasyWeek location registry не настроен — preview недоступен."
+    )
+    if not ew_branches:
+        easyweek_options = '<option value="">— registry не настроен —</option>'
+
     # JavaScript-маппинг company_id → Meta template name для newsletter
     company_templates_js = json.dumps({str(cid): tname for cid, tname in _NC_COMPANY_TEMPLATES.items()})
 
@@ -3419,11 +3458,14 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
       <div class="col-md-4">
         <label class="form-label">Provider</label>
-        <input id="f-provider" class="form-control" value="altegio" disabled>
-        <div class="form-text">EasyWeek campaigns: readiness only in PR-13.</div>
+        <select id="f-provider" class="form-select" onchange="onProviderChange()">
+          <option value="altegio">altegio</option>
+          <option value="easyweek">easyweek</option>
+        </select>
+        <div class="form-text">EasyWeek: preview и редактирование snapshot (§37.1). Отправка закрыта.</div>
       </div>
 
-      <div class="col-md-4">
+      <div class="col-md-4 altegio-only">
         <label class="form-label">Кабинет / филиал Altegio</label>
         <select id="f-company" class="form-select">
           {company_options}
@@ -3431,7 +3473,15 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
         <div class="form-text">Выбор филиала задаёт company_id и location_id одновременно.</div>
       </div>
 
-      <div class="col-md-4">
+      <div class="col-md-4 easyweek-only d-none">
+        <label class="form-label">Филиал EasyWeek</label>
+        <select id="f-ew-company" class="form-select">
+          {easyweek_options}
+        </select>
+        <div class="form-text">{_esc(easyweek_registry_note)}</div>
+      </div>
+
+      <div class="col-md-4 altegio-only">
         <label class="form-label">Тип карты лояльности</label>
         <select id="f-card-type" class="form-select" disabled>
           <option value="">— выберите филиал —</option>
@@ -3456,7 +3506,21 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     </div>
 
+    <!-- ========== EASYWEEK §37.1 ========== -->
+    <div class="easyweek-only d-none">
+      <hr class="my-3">
+      <div class="alert alert-warning mb-0">
+        <b>EasyWeek preview (§37.1).</b> Кампания <code>new_clients_monthly</code>,
+        шаблон доставки <code>new_client_voucher</code>.
+        Здесь можно построить preview и вручную отредактировать список получателей.
+        <b>Отправка в §37.1 ещё закрыта</b> — выдача ваучеров, оплата и сообщения Meta
+        открываются отдельным следующим этапом. Карты лояльности, Altegio CRM и
+        follow-up к EasyWeek не применяются.
+      </div>
+    </div>
+
     <!-- ========== FOLLOW-UP НАСТРОЙКИ ========== -->
+    <div class="altegio-only">
     <hr class="my-3">
     <h6 class="fw-bold">📩 Follow-up настройки</h6>
     <div class="row g-3">
@@ -3491,6 +3555,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     <!-- Follow-up template text (read-only preview) -->
     <div id="followup-template-text-block" class="mt-3 d-none"></div>
+    </div>
 
   </div>
 </div>
@@ -3585,7 +3650,12 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <button id="btn-run" class="btn btn-success btn-lg" disabled>
       🚀 Run Campaign
     </button>
-    <span class="text-muted ms-2 small">Доступно после создания preview</span>
+    <span class="text-muted ms-2 small altegio-only">Доступно после создания preview</span>
+    <div id="easyweek-send-closed" class="alert alert-secondary mt-2 mb-0 d-none">
+      Редактор snapshot готов. <b>Отправка EasyWeek в §37.1 закрыта</b> — выдача ваучеров,
+      оплата и сообщения Meta открываются отдельным следующим этапом, после проверки
+      редактора. Кнопка запуска намеренно недоступна, а не ведёт в Altegio send-real.
+    </div>
   </div>
   <div id="run-alert" class="mb-3"></div>
 
@@ -3656,6 +3726,7 @@ document.addEventListener("DOMContentLoaded", function () {{
 
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
+  onProviderChange();
 
   // Загрузить тексты шаблонов, типы карт и карты прошлых периодов для company по умолчанию
   loadTemplateText(companySelect.value);
@@ -4176,14 +4247,47 @@ function renderProgress(data) {{
 // ============================================================
 // Утилиты
 // ============================================================
+function isEasyWeek() {{
+  return document.getElementById("f-provider").value === "easyweek";
+}}
+
+// Show exactly the controls the chosen provider actually uses. The Altegio-only
+// ones are not merely irrelevant for EasyWeek — a loyalty card type or an
+// Altegio client id has no meaning there, and a field that does nothing invites
+// a wrong value.
+function onProviderChange() {{
+  const easyweek = isEasyWeek();
+  document.querySelectorAll(".altegio-only").forEach(function(el) {{
+    el.classList.toggle("d-none", easyweek);
+  }});
+  document.querySelectorAll(".easyweek-only").forEach(function(el) {{
+    el.classList.toggle("d-none", !easyweek);
+  }});
+  const runBtn = document.getElementById("btn-run");
+  if (runBtn) {{
+    // §37.1 opens the editor and nothing else. A button that answers 409
+    // teaches an operator to click through refusals.
+    runBtn.classList.toggle("d-none", easyweek);
+  }}
+  const runNote = document.getElementById("easyweek-send-closed");
+  if (runNote) {{
+    runNote.classList.toggle("d-none", !easyweek);
+  }}
+}}
+
 function buildPayload() {{
   // ВАЖНО: эта функция читает значения полей через JS .value — включая disabled элементы.
   // HTML form submit НЕ используется. Disabled поля не теряются из payload.
   // Это позволяет lock-логике prefill блокировать UI, но включать зафиксированные
   // значения из preview-снимка в JSON-запрос к backend.
-  const companyId = parseInt(document.getElementById("f-company").value, 10);
-  // location_id == company_id (один dropdown для обоих)
-  const locationId = companyId;
+  const easyweek = isEasyWeek();
+  const companyId = easyweek
+    ? parseInt(document.getElementById("f-ew-company").value, 10)
+    : parseInt(document.getElementById("f-company").value, 10);
+  // Altegio: location_id == company_id (один dropdown для обоих).
+  // EasyWeek: филиал определяется сервером по company_id через registry —
+  // location UUID в запрос не попадает.
+  const locationId = easyweek ? null : companyId;
   const cardTypeEl = document.getElementById("f-card-type");
   const cardTypeId = cardTypeEl.value || null;
   const periodStartDate = document.getElementById("f-period-start").value;
@@ -4199,8 +4303,8 @@ function buildPayload() {{
     return null;
   }}
 
-  // Follow-up настройки
-  const followupEnabled = document.getElementById("f-followup-enabled").checked;
+  // Follow-up настройки (Altegio-only: для EasyWeek follow-up закрыт)
+  const followupEnabled = !easyweek && document.getElementById("f-followup-enabled").checked;
   const followupDelay = parseInt(document.getElementById("f-followup-delay").value, 10) || null;
   const followupPolicy = document.getElementById("f-followup-policy").value || null;
   // Если не указан — подставить дефолт по company
@@ -4214,7 +4318,7 @@ function buildPayload() {{
     provider: document.getElementById("f-provider").value,
     company_id: companyId,
     location_id: locationId,
-    card_type_id: cardTypeId,
+    card_type_id: easyweek ? null : cardTypeId,
     period_start: periodStartDate + "T00:00:00Z",
     period_end: periodEndDate + "T23:59:59Z",
     attribution_window_days: attribution,
@@ -4592,18 +4696,16 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             if is_easyweek
             else "Это preview-run. Запустите send-real или отредактируйте snapshot."
         )
-        add_label = "➕ Add test recipient" if is_easyweek else "➕ Add recipient"
-        add_header = (
-            "➕ Добавить настроенный test recipient (§36.11)" if is_easyweek else "➕ Добавить получателя в snapshot"
-        )
-        # Said plainly, because the difference matters: this is not "add any
-        # customer", and the row it creates is not proof of an entitlement.
+        add_label = "➕ Add recipient"
+        add_header = "➕ Добавить получателя вручную (§37.1)" if is_easyweek else "➕ Добавить получателя в snapshot"
+        # Said plainly, because the difference matters: a manual addition is an
+        # operator's decision and proves nothing about a first visit.
         add_hint = (
             '<div class="alert alert-secondary small py-2">'
-            "Добавляется <b>только заранее настроенный тестовый аккаунт</b> для controlled "
-            "voucher delivery canary. Customer UUID берётся из серверной конфигурации и не "
-            "принимается из браузера; телефон вводится для проверки совпадения. Это "
-            "test-identity исключение, а не доказанный campaign entitlement."
+            "Ручное добавление — <b>решение оператора</b>, а не доказательство первого визита. "
+            "Введите телефон: сервер сам найдёт клиента в EasyWeek, перепроверит его прямым "
+            "чтением и запишет строку с основанием <code>operator_manual_selection</code>. "
+            "Customer UUID из браузера не принимается."
             "</div>"
             if is_easyweek
             else ""
@@ -4656,6 +4758,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <span>Preview run (status={run.status!r}). Действия недоступны.</span>
 </div>
 """
+
+    # Rendered into the page script so the browser never guesses the provider.
+    is_easyweek_js = "true" if run.provider == PROVIDER_EASYWEEK else "false"
 
     # Notice for preview runs: visible on direct link, not in the general list
     preview_notice_block = ""
@@ -5154,6 +5259,30 @@ function hideAddRecipientForm() {{
   document.getElementById("add-recipient-alert").innerHTML = "";
 }}
 
+// Which contract this page's Add button follows. Rendered by the server so the
+// browser never has to guess the provider from a URL.
+const IS_EASYWEEK = {is_easyweek_js};
+
+// Stable reason codes turned into sentences. The codes are what a wrapper
+// branches on; an operator should not have to read them.
+const MANUAL_ADD_REASONS = {{
+  "manual_recipient_phone_unusable": "Телефон не распознан. Введите номер в международном формате.",
+  "manual_recipient_run_not_found": "Preview не найден.",
+  "manual_recipient_run_not_easyweek": "Этот preview не относится к EasyWeek.",
+  "manual_recipient_run_not_editable": "Preview больше нельзя редактировать.",
+  "manual_recipient_branch_unknown": "Филиал этого preview не настроен на сервере.",
+  "manual_recipient_preview_frozen": "Preview занят controlled voucher canary — редактирование закрыто.",
+  "manual_recipient_customer_absent": "В EasyWeek нет клиента с таким номером. Клиент не создаётся автоматически.",
+  "manual_recipient_customer_ambiguous": "На этот номер в EasyWeek приходится несколько клиентов.",
+  "manual_recipient_customer_unproven": "EasyWeek не подтвердил клиента. Повторите позже.",
+  "manual_recipient_customer_name_missing": "У клиента в EasyWeek не заполнено имя — оно нужно для шаблона.",
+  "manual_recipient_local_client_absent": "Клиента с таким номером нет в локальной базе этого филиала.",
+  "manual_recipient_local_client_ambiguous": "В локальной базе несколько клиентов с этим номером.",
+  "manual_recipient_opted_out": "Клиент отказался от сообщений WhatsApp.",
+  "manual_recipient_rows_ambiguous": "В snapshot уже есть конфликтующие строки для этого клиента.",
+  "manual_recipient_identity_not_accepted": "Идентификатор клиента из браузера не принимается.",
+}};
+
 async function submitAddRecipient(runId) {{
   const phone = document.getElementById("add-phone").value.trim();
   // Absent for EasyWeek: that path takes the customer from server configuration
@@ -5168,7 +5297,13 @@ async function submitAddRecipient(runId) {{
   const body = {{}};
   if (phone) body.phone = phone;
   if (cid) body.altegio_client_id = parseInt(cid);
-  const resp = await fetch("/ops/campaigns/runs/" + runId + "/recipients/add", {{
+  // §37.1 for EasyWeek: a separate endpoint from the §36.11 canary one, which
+  // adds only the configured test account and must keep refusing everything
+  // else. Altegio keeps its own long-standing contract.
+  const endpoint = IS_EASYWEEK
+    ? "/ops/campaigns/runs/" + runId + "/recipients/add-manual"
+    : "/ops/campaigns/runs/" + runId + "/recipients/add";
+  const resp = await fetch(endpoint, {{
     method: "POST",
     headers: {{"Content-Type": "application/json"}},
     body: JSON.stringify(body),
@@ -5177,15 +5312,22 @@ async function submitAddRecipient(runId) {{
   if (resp.ok) {{
     const rid = (data.recipient && data.recipient.id) || data.recipient_id;
     const what = data.action ? (' (' + data.action + ')') : '';
+    const count = (data.candidates_count === undefined || data.candidates_count === null)
+      ? ''
+      : ' Активных получателей: ' + data.candidates_count + '.';
     alertEl.innerHTML = '<div class="alert alert-success py-1 mb-0">Получатель добавлен (id=' +
-      rid + ')' + what + '. <a href="">Обновите страницу.</a></div>';
+      rid + ')' + what + '.' + count + ' <a href="">Обновите страницу.</a></div>';
   }} else {{
     // The EasyWeek path answers with a stable reason code and never with a
     // phone number, a name or a customer UUID.
-    const detail = typeof data.detail === "object"
-      ? (data.detail.reason || data.detail.message || JSON.stringify(data.detail))
-      : (data.detail || JSON.stringify(data));
-    alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + detail + '</div>';
+    const code = (typeof data.detail === "object" && data.detail) ? data.detail.reason : null;
+    const detail = MANUAL_ADD_REASONS[code]
+      || code
+      || (typeof data.detail === "object"
+          ? (data.detail.message || JSON.stringify(data.detail))
+          : (data.detail || JSON.stringify(data)));
+    const safe = String(detail).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + safe + '</div>';
   }}
 }}
 
@@ -5316,6 +5458,11 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         "Name",
         "Phone",
         "Status",
+        # §37.1: on what grounds this row is here. `auto` was proven by the
+        # segmenter, `manual` is an operator's decision, `test` is the one
+        # approved canary account — three different things that would otherwise
+        # look identical in a list.
+        "Basis",
         "Excluded Reason",
         "Card #",
         "Msg Job ID",
@@ -5340,6 +5487,7 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             _esc(r.display_name or ""),
             _esc(r.phone_e164 or ""),
             _status_badge(r.status),
+            _basis_badge(r),
             _esc(r.excluded_reason or ""),
             _esc(r.loyalty_card_number or ""),
             str(r.message_job_id or ""),

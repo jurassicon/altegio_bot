@@ -674,7 +674,9 @@ async def test_the_easyweek_ui_offers_no_run_from_preview_and_no_altegio_field(
 
     assert "Run from preview" not in page
     assert "Altegio Client ID" not in page
-    assert "Add test recipient" in page
+    # §37.1 renamed the control: one "Add recipient" button, whose contract
+    # depends on the provider rather than on the label.
+    assert "Add recipient" in page
     assert "обычный send-real" in page.lower()
 
 
@@ -1093,7 +1095,7 @@ async def test_an_earned_canary_reports_earned(session_maker, fences) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("break_it", ["opt_out", "phone_change", "no_client", "malformed_binding"])
+@pytest.mark.parametrize("break_it", ["opt_out", "phone_change", "no_client"])
 async def test_a_refused_test_recipient_is_never_reported_as_earned(session_maker, fences, break_it: str) -> None:
     """The blocker: early refusals fell back to the dataclass default.
 
@@ -1113,22 +1115,14 @@ async def test_a_refused_test_recipient_is_never_reported_as_earned(session_make
                 client.phone_e164 = "+4915100007777"
             elif break_it == "no_client":
                 row.client_id = None
-            elif break_it == "malformed_binding":
-                row.easyweek_test_customer_uuid = None
-                row.status = "skipped"
 
     proof = await _prove(session_maker, run_id, added.recipient_id)
     safe = proof.as_safe_dict()
 
     assert proof.proven is False
-    if break_it == "malformed_binding":
-        # No binding left, so this is no longer a test row — but it must not be
-        # reported as a PROVEN earned one either.
-        assert safe["first_visit_proof"] != "not_applicable"
-    else:
-        assert proof.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
-        assert safe["recipient_basis"] == VOUCHER_DELIVERY_BASIS_TEST
-        assert safe["first_visit_proof"] == "not_applicable"
+    assert proof.recipient_basis == VOUCHER_DELIVERY_BASIS_TEST
+    assert safe["recipient_basis"] == VOUCHER_DELIVERY_BASIS_TEST
+    assert safe["first_visit_proof"] == "not_applicable"
     for secret in (TEST_CUSTOMER_UUID, TEST_PHONE, "Synthetic Fixture"):
         assert secret not in repr(safe)
 
@@ -1152,3 +1146,24 @@ async def test_an_earned_recipient_reports_the_earned_basis_even_when_refused(se
     assert proof.proven is False
     assert proof.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED
     assert proof.as_safe_dict()["first_visit_proof"] == "earned"
+
+
+@pytest.mark.asyncio
+async def test_a_test_binding_cannot_be_cleared_without_its_basis(session_maker, fences) -> None:
+    """§37.1 made the basis typed, and the pair an equivalence.
+
+    The old test simulated a "malformed binding" by clearing the UUID and
+    leaving the basis behind. That state is no longer representable: the
+    database refuses the inconsistent half-row outright, which is a stronger
+    guarantee than reporting it carefully afterwards.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    run_id, _ = await _empty_preview(session_maker)
+    added = await _add(session_maker, run_id)
+
+    with pytest.raises(IntegrityError):
+        async with session_maker() as session:
+            async with session.begin():
+                row = await session.get(CampaignRecipient, added.recipient_id)
+                row.easyweek_test_customer_uuid = None

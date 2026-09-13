@@ -51,7 +51,13 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import (
 from altegio_bot.campaigns.easyweek_voucher_delivery.identity import NEW_CLIENT_CAMPAIGN_CODE
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
-from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient, CampaignRun, Client
+from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_TEST,
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+)
 from altegio_bot.utils import utcnow
 from altegio_bot.webhooks.common import normalize_phone_candidate
 
@@ -285,6 +291,9 @@ async def add_test_recipient_to_preview(
                     # a second recipient.
                     return TestRecipientOutcome(True, None, recipient_id=row.id, action=ACTION_UNCHANGED)
                 row.easyweek_test_customer_uuid = customer_uuid
+                # §37.1 made the basis a typed column; the binding and the basis
+                # are one fact stated twice, and a CHECK keeps them agreeing.
+                row.recipient_basis = RECIPIENT_BASIS_TEST
                 row.status = "candidate"
                 row.excluded_reason = None
                 row.is_opted_out = False
@@ -329,6 +338,7 @@ async def add_test_recipient_to_preview(
                 # CHECK constraint keeps it that way: this row must never be
                 # able to look like proof of a first visit nobody made.
                 easyweek_test_customer_uuid=customer_uuid,
+                recipient_basis=RECIPIENT_BASIS_TEST,
                 meta={"test_recipient_added_at": utcnow().isoformat()},
             )
             session.add(row)

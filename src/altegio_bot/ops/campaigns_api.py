@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +44,11 @@ from altegio_bot.campaigns.altegio_crm import (
     get_client_crm_records,
 )
 from altegio_bot.campaigns.configuration import resolve_campaign_readiness
+from altegio_bot.campaigns.easyweek_manual_recipient import (
+    RUN_NOT_FOUND,
+    add_manual_recipient,
+)
+from altegio_bot.campaigns.easyweek_manual_recipient import known_branch as known_easyweek_branch
 from altegio_bot.campaigns.easyweek_voucher_delivery import test_recipient
 from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     TEST_CUSTOMER_UNCONFIGURED,
@@ -116,7 +121,12 @@ FollowupPolicy = Literal["unread_only", "unread_or_not_booked"]
 class CampaignBaseRequest(BaseModel):
     provider: Literal["altegio", "easyweek"] = PROVIDER_ALTEGIO
     company_id: int
-    location_id: int
+    # Altegio addresses a branch by a numeric location id and needs it. EasyWeek
+    # addresses one by UUID, which is not an integer and is not the browser's to
+    # choose: the server resolves it from `company_id` through its own registry.
+    # Optional here so the two contracts can differ, required below so Altegio
+    # keeps refusing a request without it.
+    location_id: int | None = None
     period_start: datetime
     period_end: datetime
     card_type_id: str | None = None
@@ -126,9 +136,33 @@ class CampaignBaseRequest(BaseModel):
     followup_policy: FollowupPolicy | None = None
     followup_template_name: str | None = None
 
+    @model_validator(mode="after")
+    def _provider_shape(self) -> "CampaignBaseRequest":
+        # Altegio addresses a branch by a numeric id and still requires one.
+        # EasyWeek does not have one, so the field became optional — and this
+        # keeps the Altegio contract exactly where it was.
+        if self.provider != PROVIDER_EASYWEEK and self.location_id is None:
+            raise ValueError("location_id is required for altegio")
+        return self
+
 
 class PreviewRequest(CampaignBaseRequest):
-    pass
+    """§37.1: the only request that may name an EasyWeek branch.
+
+    The registry check lives here rather than on the shared base on purpose.
+    Send-real for EasyWeek is refused by
+    `require_campaign_execution_provider` further in, with its own stable
+    reason, and moving that refusal earlier — into a validation error about a
+    branch — would change what an operator and every existing wrapper see.
+    """
+
+    @model_validator(mode="after")
+    def _easyweek_branch_is_configured(self) -> "PreviewRequest":
+        if self.provider == PROVIDER_EASYWEEK and not known_easyweek_branch(self.company_id):
+            # A company id the server never configured. Trusting it would let
+            # the request define what a branch is.
+            raise ValueError("easyweek_company_not_in_registry")
+        return self
 
 
 class RunRequest(CampaignBaseRequest):
@@ -219,7 +253,10 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
     params = RunParams(
         provider=body.provider,
         company_id=body.company_id,
-        location_id=body.location_id,
+        # EasyWeek has no numeric location id; the company id IS the branch key
+        # in its registry, and the run records that rather than a borrowed
+        # Altegio integer or an invented one.
+        location_id=body.location_id if body.location_id is not None else body.company_id,
         period_start=_ensure_utc(body.period_start),
         period_end=_ensure_utc(body.period_end),
         mode="preview",
@@ -1754,6 +1791,70 @@ _TEST_RECIPIENT_CONFIG_REASONS = frozenset(
 )
 
 
+class AddManualRecipientRequest(BaseModel):
+    """§37.1: a phone number, and deliberately nothing else.
+
+    No customer UUID, no Altegio client id, no "already verified" flag. The
+    identity is established on the server by reading EasyWeek twice; a browser
+    able to name a customer would be a browser able to choose who receives a
+    real message.
+    """
+
+    phone: str
+
+
+@router.post("/runs/{run_id}/recipients/add-manual", status_code=201)
+async def add_manual_recipient_endpoint(run_id: int, body: AddManualRecipientRequest) -> dict[str, Any]:
+    """Add one operator-chosen recipient to an EasyWeek preview (§37.1).
+
+    A separate endpoint from the §36.11 one on purpose. That one adds the single
+    configured canary account and must keep refusing everything else; this one
+    adds whoever an operator typed, on the explicitly weaker basis
+    `operator_manual_selection`. Collapsing them would quietly turn the canary's
+    narrow contract into a production path.
+
+    Opens no send path: no job, no outbox row, no voucher, no Meta request.
+    """
+    # Before the client exists: httpx logs the full URL at INFO, and this
+    # request's URLs carry a phone number and then a customer UUID.
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as client:
+            outcome = await add_manual_recipient(
+                SessionLocal,
+                run_id=run_id,
+                phone=body.phone,
+                reader=client,
+            )
+    except EasyWeekError:
+        # The live reads are the only external calls, and they happen before the
+        # write transaction opens. An unreachable EasyWeek wrote nothing.
+        raise HTTPException(status_code=502, detail={"reason": "manual_recipient_customer_unproven"}) from None
+
+    if not outcome.ok:
+        status = 404 if outcome.reason == RUN_NOT_FOUND else 409
+        logger.info("easyweek_manual_recipient refused run_id=%d reason=%s", run_id, outcome.reason)
+        raise HTTPException(status_code=status, detail=outcome.as_safe_dict())
+
+    logger.info(
+        "easyweek_manual_recipient %s run_id=%d recipient_id=%s",
+        outcome.action,
+        run_id,
+        outcome.recipient_id,
+    )
+    async with SessionLocal() as session:
+        row = await session.get(CampaignRecipient, outcome.recipient_id)
+        run = await session.get(CampaignRun, run_id)
+    return {
+        "run_id": run_id,
+        "recipient_id": outcome.recipient_id,
+        "recipient": _recipient_dict(row) if row is not None else None,
+        "candidates_count": (run.candidates_count if run is not None else None),
+        "total_clients_seen": (run.total_clients_seen if run is not None else None),
+        **outcome.as_safe_dict(),
+    }
+
+
 @router.post("/runs/{run_id}/recipients/add", status_code=201)
 async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any]:
     """Добавить клиента в preview snapshot вручную.
@@ -2521,6 +2622,12 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
         "display_name": r.display_name,
         "status": r.status,
         "excluded_reason": r.excluded_reason,
+        # §37.1. How this row got here, and — when an operator overrode the
+        # segmenter — what the segmenter had said. The customer UUID itself is
+        # never serialised: presence only.
+        "recipient_basis": r.recipient_basis,
+        "auto_excluded_reason": r.auto_excluded_reason,
+        "easyweek_customer_recorded": r.easyweek_customer_uuid is not None,
         "segment": {
             "total_records_in_period": r.total_records_in_period,
             "confirmed_records_in_period": r.confirmed_records_in_period,
