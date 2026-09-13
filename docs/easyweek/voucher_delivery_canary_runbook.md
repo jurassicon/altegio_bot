@@ -149,17 +149,35 @@ Check what the file says now:
 cd /opt/altegio_bot && grep -E '^EASYWEEK_VOUCHER_DELIVERY_(CANARY_ENABLED|TEST_RECIPIENT_ENABLED)=' easyweek.env
 ```
 
-Check what the running web container actually has:
+Check what the running web container actually has. `exec` reads a container
+that is already running and creates nothing, so it changes no topology and does
+not need the overlay — unlike the recreate below:
 
 ```bash
 cd /opt/altegio_bot && docker compose -p altegio_bot exec altegio-api printenv EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED
 ```
 
-Recreate only that service after editing the file:
+Recreate only that service after editing the file — **with the full production
+file set**:
 
 ```bash
-cd /opt/altegio_bot && docker compose -p altegio_bot up -d --force-recreate --no-deps altegio-api
+cd /opt/altegio_bot && docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate --no-deps altegio-api
 ```
+
+Both `-f` files are mandatory here, in that order. Production runs `altegio-api`
+with the base file plus the Chatwoot overlay, and the overlay is the only thing
+that attaches the service to the external `chatwoot_internal` network. Recreate
+it with the base file alone and Compose rebuilds the container without that
+network, while `CHATWOOT_BASE_URL` still points at the internal host — so every
+Chatwoot call from the API starts failing, and nothing about the canary says
+why. The same rule is stated in
+[docs/ops/chatwoot_internal_route.md](../ops/chatwoot_internal_route.md): every
+`up` or `restart` of these services uses the same file set.
+
+`--no-deps` and the single service name are equally deliberate. Only the process
+that serves the Ops Add screen needs the new value; Postgres, Redis and the
+workers must keep running untouched, and restarting them would interrupt work
+that has nothing to do with this fence.
 
 Confirm the new value took:
 
