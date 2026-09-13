@@ -2879,7 +2879,13 @@ async def test_a_valid_manage_link_survives_an_invalid_static_page(
 # time it fires, the appointment may have moved, been cancelled or been
 # completed without a webhook we saw.
 
-REMINDER_STARTS_AT = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+# The appointment these reminder tests are about. Anchored on the real clock,
+# not written as a date: the reminder deadline is derived from it
+# (`min(starts_at - 3h, anchor + 6h)` for `reminder_24h`) and compared against
+# `utcnow()`, so a fixed date silently turns every "this reminder is still in
+# time" test into a deadline-expired one the morning before that appointment.
+# A month out keeps the whole set of derived deadlines clear of today.
+REMINDER_STARTS_AT = utcnow() + timedelta(days=30)
 
 
 class _Reader:

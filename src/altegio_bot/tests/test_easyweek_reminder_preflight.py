@@ -14,7 +14,7 @@ The API client is injected, so nothing here reaches the network.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -38,11 +38,23 @@ from altegio_bot.scripts.easyweek_reminder_preflight import (
     select_open_reminder_jobs,
 )
 from altegio_bot.settings import settings
+from altegio_bot.utils import utcnow
 
 BOOKING = uuid.UUID("11111111-2222-4333-8444-555555555555")
 LOCATION_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 COMPANY_ID = 999001
-STARTS_AT = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+# The default appointment, and the thing every "not yet due" assertion in this
+# file rests on: `run_at` is 24h before it, and both must be in the FUTURE.
+#
+# Anchored on the real clock rather than written as a date. A fixed
+# `2026-09-14T08:30Z` was comfortably ahead the afternoon it was written and
+# became a past reminder at 08:30 the day before that appointment — at which
+# point `test_a_future_reminder_is_never_called_expired` began failing every
+# run, in CI, for a reason that had nothing to do with the change under test.
+#
+# A month out keeps `run_at` (a day earlier) clear of now by a wide margin, so
+# nothing here depends on what today's date happens to be.
+STARTS_AT = utcnow() + timedelta(days=30)
 
 
 @pytest.fixture(autouse=True)
@@ -356,7 +368,6 @@ def test_ready_requires_all_three_conditions_together() -> None:
 
 async def _seed_expired(session, *, job_type: str, suffix: str = "1", booking: uuid.UUID = BOOKING):
     """A queued reminder past its deadline whose appointment is still future."""
-    from altegio_bot.utils import utcnow
 
     now = utcnow()
     if job_type == "reminder_24h":
@@ -413,7 +424,6 @@ async def test_a_future_reminder_is_never_called_expired(session_maker) -> None:
     The default seed is exactly that shape: the appointment is a month out and
     `run_at` is 24h before it, so nothing here is late.
     """
-    from altegio_bot.utils import utcnow
 
     async with session_maker() as session:
         async with session.begin():
@@ -554,3 +564,22 @@ def test_the_defaults_are_bounded_and_paced() -> None:
 def test_nonsensical_bounds_are_refused(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         _parse_args(argv)
+
+
+def test_the_default_seed_stays_in_the_future_whatever_today_is() -> None:
+    """Structural, because the calendar already broke this once.
+
+    `STARTS_AT` used to be a written-out date. It was comfortably ahead when it
+    was written and turned into a past reminder at 08:30 on the day before that
+    appointment, after which every CI run failed on a fixture rather than on a
+    change. The relationship — appointment ahead, `run_at` a day earlier and
+    still ahead — is what the tests here actually depend on, so that is what is
+    pinned.
+    """
+    now = utcnow()
+    run_at = STARTS_AT - timedelta(hours=24)
+
+    assert STARTS_AT > now
+    assert run_at > now
+    # Not clinging to the edge either: a slow suite must not drift into failure.
+    assert run_at - now > timedelta(days=7)
