@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
+from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
 from altegio_bot.campaigns.loyalty_cleanup import (
     cleanup_campaign_cards,
     make_card_number,
@@ -1593,6 +1594,16 @@ async def discard_preview_run(run_id: int) -> None:
             if int(used_as_source or 0) > 0:
                 raise ValueError(f"Preview run {run_id} уже использован как источник для send-real — discard запрещён.")
 
+            # A preview the voucher delivery canary has attached itself to is
+            # frozen. Deleting or discarding it does not undo a created or paid
+            # voucher — it makes the delivery and the refund unprovable and
+            # strands a real €15 with no way to finish and no way to reverse.
+            if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+                raise ValueError(
+                    f"Preview run {run_id} используется controlled voucher delivery canary — "
+                    "редактирование и удаление запрещены."
+                )
+
             run.status = "discarded"
             run.completed_at = utcnow()
             meta = dict(run.meta or {})
@@ -1666,30 +1677,58 @@ def _update_run_counters_from_recipients(
         # учитываются только в total_clients_seen.
 
 
+async def recompute_snapshot_counters(session: AsyncSession, run: CampaignRun) -> int:
+    """Recount one snapshot's aggregates, inside the caller's transaction.
+
+    Two things make this different from the full stats recompute, and both are
+    the point.
+
+    It takes the caller's session and the run the caller has already locked, so
+    the edit and the counters it implies land in ONE transaction. The version
+    that opened its own session is what let an add commit and then fail on the
+    recount, leaving a recipient in a snapshot whose totals did not know about
+    it — and, for EasyWeek, failing every time.
+
+    And it asks only that the provider is a real one and that every recipient
+    belongs to it, NOT that the provider has a campaign execution engine. These
+    are snapshot counters: rows in a preview, grouped by why they were excluded.
+    Counting them requires no send path, no outbox and no jobs, which is why
+    `require_campaign_execution_provider` has no business here. The full
+    `recompute_campaign_run_stats` is the opposite case — it reads outbox state
+    and follow-up semantics that exist for Altegio only — and stays closed.
+    """
+    provider = validate_campaign_provider(run.provider)
+    stmt = select(CampaignRecipient).where(
+        CampaignRecipient.campaign_run_id == run.id,
+        CampaignRecipient.provider == provider,
+    )
+    recipients = list((await session.execute(stmt)).scalars().all())
+    for recipient in recipients:
+        # A row that named another provider would be counted into this run's
+        # totals while belonging to a different engine entirely.
+        require_same_provider(provider, recipient.provider)
+    _update_run_counters_from_recipients(run, recipients)
+    return len(recipients)
+
+
 async def recompute_run_counters(run_id: int) -> None:
     """Загрузить получателей из БД и пересчитать счётчики CampaignRun.
 
-    Используется после ручного изменения snapshot (add/remove recipient).
+    Standalone form, for a caller that holds no transaction of its own. The
+    snapshot edits do NOT use it: they need the recount inside their own
+    transaction, and call ``recompute_snapshot_counters`` directly.
     """
     async with SessionLocal() as session:
         async with session.begin():
             run = await session.get(CampaignRun, run_id)
             if run is None:
                 raise ValueError(f"CampaignRun {run_id} not found")
-            provider = require_campaign_execution_provider(run.provider)
-
-            stmt = select(CampaignRecipient).where(
-                CampaignRecipient.campaign_run_id == run_id,
-                CampaignRecipient.provider == provider,
-            )
-            recipients = list((await session.execute(stmt)).scalars().all())
-
-            _update_run_counters_from_recipients(run, recipients)
+            total_seen = await recompute_snapshot_counters(session, run)
 
     logger.info(
         "recompute_run_counters run_id=%d total_seen=%d",
         run_id,
-        len(recipients),
+        total_seen,
     )
 
 
@@ -2559,6 +2598,16 @@ async def delete_preview_run(run_id: int) -> None:
             if int(used_as_source or 0) > 0:
                 raise ValueError(f"Preview run {run_id} используется как источник для send-real — удаление запрещено.")
 
+            # A preview the voucher delivery canary has attached itself to is
+            # frozen. Deleting or discarding it does not undo a created or paid
+            # voucher — it makes the delivery and the refund unprovable and
+            # strands a real €15 with no way to finish and no way to reverse.
+            if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+                raise ValueError(
+                    f"Preview run {run_id} используется controlled voucher delivery canary — "
+                    "редактирование и удаление запрещены."
+                )
+
             run.status = "deleted"
             run.completed_at = utcnow()
             meta = dict(run.meta or {})
@@ -2571,6 +2620,48 @@ async def delete_preview_run(run_id: int) -> None:
 # ==========================================================================
 # Remove recipient from preview (soft-exclude)
 # ==========================================================================
+
+
+async def lock_editable_preview(session: AsyncSession, run_id: int) -> CampaignRun:
+    """Lock one run FOR UPDATE and prove the snapshot may still be edited.
+
+    Every caller that changes a snapshot goes through here, holding the lock for
+    the rest of its transaction. Checking these facts without the lock would be
+    checking them about a moment that has already passed: two operators, or an
+    operator and a canary, can act on one preview at the same time.
+
+    Raises ``ValueError`` with an operator-readable reason. Nothing here is
+    personal data.
+    """
+    run = await session.get(CampaignRun, run_id, with_for_update=True)
+    if run is None:
+        raise ValueError(f"CampaignRun {run_id} not found")
+    if run.mode != "preview":
+        raise ValueError(f"Редактирование snapshot доступно только для preview run. mode={run.mode!r}")
+    if run.status != "completed":
+        raise ValueError(f"Редактирование snapshot доступно только для completed preview. status={run.status!r}")
+
+    used_as_source = await session.scalar(
+        select(func.count())
+        .select_from(CampaignRun)
+        .where(CampaignRun.source_preview_run_id == run_id)
+        .where(CampaignRun.provider == run.provider)
+        .where(CampaignRun.mode == "send-real")
+    )
+    if int(used_as_source or 0) > 0:
+        raise ValueError(f"Preview run {run_id} уже использован как источник для send-real — редактирование запрещено.")
+
+    # And the canary lock. A preview the voucher delivery canary has attached
+    # itself to is frozen: the canary addresses its recipient by (run id,
+    # recipient id) and re-proves that pair before every external step, so an
+    # edit here does not undo a created or paid voucher — it makes the delivery
+    # and the refund unprovable and strands a real €15.
+    if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+        raise ValueError(
+            f"Preview run {run_id} используется controlled voucher delivery canary — "
+            "редактирование и удаление запрещены."
+        )
+    return run
 
 
 async def remove_recipient_from_preview(
@@ -2593,29 +2684,7 @@ async def remove_recipient_from_preview(
     """
     async with SessionLocal() as session:
         async with session.begin():
-            run = await session.get(CampaignRun, run_id)
-            if run is None:
-                raise ValueError(f"CampaignRun {run_id} not found")
-
-            if run.mode != "preview":
-                raise ValueError(f"Редактирование snapshot доступно только для preview run. mode={run.mode!r}")
-
-            if run.status != "completed":
-                raise ValueError(
-                    f"Редактирование snapshot доступно только для completed preview. status={run.status!r}"
-                )
-
-            used_as_source = await session.scalar(
-                select(func.count())
-                .select_from(CampaignRun)
-                .where(CampaignRun.source_preview_run_id == run_id)
-                .where(CampaignRun.provider == run.provider)
-                .where(CampaignRun.mode == "send-real")
-            )
-            if int(used_as_source or 0) > 0:
-                raise ValueError(
-                    f"Preview run {run_id} уже использован как источник для send-real — редактирование запрещено."
-                )
+            run = await lock_editable_preview(session, run_id)
 
             recipient = await session.get(CampaignRecipient, recipient_id)
             if recipient is None:
@@ -2631,20 +2700,27 @@ async def remove_recipient_from_preview(
                 recipient.meta = meta
                 recipient.status = "skipped"
                 recipient.excluded_reason = "manual_removed"
+                # The typed test binding is deliberately kept. It is the audit
+                # trail of what this row was added as, and clearing it would
+                # make a removed test recipient indistinguishable from an
+                # ordinary excluded one. `skipped` already says it is out.
 
-    await recompute_run_counters(run_id)
+            # In the same transaction as the edit. The version that recounted
+            # afterwards, in a session of its own, could commit the exclusion
+            # and then fail — which is exactly what happened for EasyWeek, where
+            # the recount refused the provider outright.
+            await recompute_snapshot_counters(session, run)
+
+            # Read back what will be committed, before the session closes.
+            await session.refresh(recipient)
+            session.expunge(recipient)
 
     logger.info(
         "manual_removed recipient_id=%d run_id=%d",
         recipient_id,
         run_id,
     )
-
-    async with SessionLocal() as session:
-        r = await session.get(CampaignRecipient, recipient_id)
-        if r is None:
-            raise RuntimeError(f"CampaignRecipient {recipient_id} disappeared after removal")
-        return r
+    return recipient
 
 
 # ==========================================================================

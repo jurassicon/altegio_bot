@@ -110,6 +110,7 @@ from altegio_bot.easyweek_voucher_identity import (
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
 from altegio_bot.models.models import (
     VOUCHER_DELIVERY_AMBIGUOUS,
+    VOUCHER_DELIVERY_BASIS_EARNED,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATE_REJECTED,
     VOUCHER_DELIVERY_CREATE_UNKNOWN,
@@ -278,12 +279,21 @@ def _voucher_code(payload: object) -> str | None:
 
 
 def _identity_from(request: CanaryRequest, proof: RecipientProof) -> ledger_module.CanaryIdentity:
-    assert proof.easyweek_customer_uuid is not None and proof.source_booking_uuid is not None
+    # The customer is required on both bases. The booking is required on exactly
+    # one of them, and forbidden on the other — a test canary that carried a
+    # booking would be claiming a visit nobody made, and the ledger's own CHECK
+    # would refuse the row anyway.
+    assert proof.easyweek_customer_uuid is not None
+    if proof.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED:
+        assert proof.source_booking_uuid is not None
+    else:
+        assert proof.source_booking_uuid is None
     return ledger_module.CanaryIdentity(
         company_id=request.company_id,
         campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
         campaign_run_id=request.preview_run_id,
         campaign_recipient_id=request.campaign_recipient_id,
+        recipient_basis=proof.recipient_basis,
         source_booking_uuid=proof.source_booking_uuid,
         easyweek_customer_uuid=proof.easyweek_customer_uuid,
         location_uuid=request.location_uuid,
@@ -358,6 +368,7 @@ async def build_stage_plan(
         expected_company_id=request.company_id,
         client_reader=reader,
         now=issued_at,
+        enabled=enabled,
     )
     reasons.extend(proof.reasons)
 

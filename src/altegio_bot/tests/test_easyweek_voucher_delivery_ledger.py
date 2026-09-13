@@ -32,6 +32,7 @@ from altegio_bot.easyweek_voucher_identity import EASYWEEK_VOUCHER_TEMPLATE_UUID
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
+    VOUCHER_DELIVERY_BASIS_EARNED,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATED,
     VOUCHER_DELIVERY_PAID,
@@ -60,14 +61,22 @@ MAC = "a" * 64
 KEY_ID = "test-key-1"
 
 
-def _identity(*, run_id: int, recipient_id: int, booking_uuid=BOOKING_UUID) -> ledger_module.CanaryIdentity:
+def _identity(
+    *,
+    run_id: int,
+    recipient_id: int,
+    booking_uuid=BOOKING_UUID,
+    basis: str = VOUCHER_DELIVERY_BASIS_EARNED,
+    customer_uuid=EW_CUSTOMER_UUID,
+) -> ledger_module.CanaryIdentity:
     return ledger_module.CanaryIdentity(
         company_id=COMPANY_ID,
         campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
         campaign_run_id=run_id,
         campaign_recipient_id=recipient_id,
-        source_booking_uuid=str(booking_uuid),
-        easyweek_customer_uuid=str(EW_CUSTOMER_UUID),
+        recipient_basis=basis,
+        source_booking_uuid=str(booking_uuid) if booking_uuid is not None else None,
+        easyweek_customer_uuid=str(customer_uuid),
         location_uuid=KARLSRUHE_LOCATION_UUID,
         staffer_uuid=STAFFER_UUID,
         payment_account_uuid=ACCOUNT_UUID,

@@ -43,9 +43,21 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     NEW_CLIENT_CAMPAIGN_CODE,
     RECIPIENT_IDENTITY_UNPROVEN,
     SOURCE_BOOKING_NOT_CURRENT,
+    TEST_BINDING_MISMATCH,
+    TEST_CUSTOMER_UNCONFIGURED,
+    TEST_CUSTOMER_UNPROVEN,
+    TEST_RECIPIENT_DISABLED,
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
-from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient, CampaignRun, Client
+from altegio_bot.easyweek_migration.customer_api import read_customer_card
+from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
+    VOUCHER_DELIVERY_BASIS_EARNED,
+    VOUCHER_DELIVERY_BASIS_TEST,
+    CampaignRecipient,
+    CampaignRun,
+    Client,
+)
 from altegio_bot.settings import settings
 from altegio_bot.webhooks.common import normalize_phone_candidate
 
@@ -56,6 +68,10 @@ class RecipientProof:
 
     proven: bool
     reasons: tuple[str, ...]
+    # Which contract proved this: an earned first visit, or the owner's approved
+    # test account. Printed, because a report that hides it would let a test run
+    # read exactly like an entitlement somebody earned.
+    recipient_basis: str = VOUCHER_DELIVERY_BASIS_EARNED
     proven_at: datetime | None = None
     # Needed to act, never printed: the CREATE request and the ledger binding.
     easyweek_customer_uuid: str | None = None
@@ -77,6 +93,7 @@ class RecipientProof:
         return {
             "recipient_proven": self.proven,
             "reasons": list(self.reasons),
+            "recipient_basis": self.recipient_basis,
             "company_id": self.company_id,
             "checks": dict(self.checks or {}),
             # Presence, never the value.
@@ -117,6 +134,86 @@ def _booking_customer_uuid(payload: object, *, expected_booking_uuid: uuid_modul
     return _canonical(customer.get("uuid"))
 
 
+@dataclass(frozen=True)
+class TestCustomerProof:
+    """The one configured test account, read live and compared, or a refusal."""
+
+    proven: bool
+    reason: str | None = None
+    # Needed to act, never printed.
+    customer_uuid: str | None = None
+    phone: str | None = None
+    first_name: str | None = None
+
+
+def configured_test_customer_uuid() -> str | None:
+    """The canonical UUID of the approved test account, or ``None``.
+
+    Read from the server's own configuration and nowhere else. The Ops UI sends
+    a phone number; a screen that could name any customer UUID would be a way to
+    point a real €15 voucher at any real person.
+    """
+    return _canonical((settings.easyweek_voucher_delivery_test_customer_uuid or "").strip())
+
+
+def test_recipient_fences_reason(*, enabled: bool | None = None) -> str | None:
+    """Why the test-recipient path is closed, or ``None`` if it is open.
+
+    TWO fences, both of which must be open. The canary fence says a canary may
+    run at all; this one says the owner's test account may stand in for an
+    earned entitlement. Neither implies the other, and turning on the canary
+    must never be what turns on the substitution.
+    """
+    canary_open = settings.easyweek_voucher_delivery_canary_enabled if enabled is None else enabled
+    if not canary_open or not settings.easyweek_voucher_delivery_test_recipient_enabled:
+        return TEST_RECIPIENT_DISABLED
+    if configured_test_customer_uuid() is None:
+        # Empty, or something that is not a UUID. Either way there is no account
+        # to prove, and guessing one is not an option.
+        return TEST_CUSTOMER_UNCONFIGURED
+    return None
+
+
+async def prove_test_customer(
+    client_reader: BookingReader,
+    *,
+    expected_phone: str,
+    enabled: bool | None = None,
+) -> TestCustomerProof:
+    """Read the ONE configured customer and prove it is still that customer.
+
+    Read-only, and strict in both directions: the answer must carry the exact
+    UUID we asked about, and the number on that card must be the number the
+    operator typed. A 200 is not proof that the row belongs to this account, and
+    a card whose number has moved on belongs to a different phone, whoever
+    answers it.
+
+    Every failure — 404, auth, timeout, 429, 5xx, a malformed body, a mismatch —
+    lands on the same fail-closed answer with a stable reason. None of them are
+    "probably fine".
+    """
+    fence_reason = test_recipient_fences_reason(enabled=enabled)
+    if fence_reason is not None:
+        return TestCustomerProof(False, fence_reason)
+    configured = configured_test_customer_uuid()
+    assert configured is not None  # the fence check proved it
+
+    try:
+        payload = await client_reader.get_customer(configured)
+        card = read_customer_card(payload, expected_phone=expected_phone)
+    except Exception:  # noqa: BLE001 - every read failure is the same refusal
+        return TestCustomerProof(False, TEST_CUSTOMER_UNPROVEN)
+
+    if card.uuid != configured or card.phone != expected_phone:
+        return TestCustomerProof(False, TEST_CUSTOMER_UNPROVEN)
+    return TestCustomerProof(
+        proven=True,
+        customer_uuid=card.uuid,
+        phone=card.phone,
+        first_name=card.first_name,
+    )
+
+
 async def prove_recipient(
     session: AsyncSession,
     *,
@@ -125,6 +222,7 @@ async def prove_recipient(
     expected_company_id: int,
     client_reader: BookingReader,
     now: datetime,
+    enabled: bool | None = None,
 ) -> RecipientProof:
     """Re-prove one exact recipient, live, from durable evidence outwards.
 
@@ -139,6 +237,12 @@ async def prove_recipient(
     if run is None or recipient is None:
         return RecipientProof(False, (RECIPIENT_IDENTITY_UNPROVEN,), checks=checks)
 
+    # Which contract this recipient is under is decided by the durable typed
+    # binding, not by a flag a caller passes in: the column's presence IS the
+    # basis, and a CHECK constraint keeps it from coexisting with earned proof.
+    test_binding = _canonical(recipient.easyweek_test_customer_uuid)
+    is_test = recipient.easyweek_test_customer_uuid is not None
+
     # -- the run, the recipient and their relationship ----------------------
     identity_ok = (
         run.provider == PROVIDER_EASYWEEK
@@ -151,7 +255,11 @@ async def prove_recipient(
         and expected_company_id in (run.company_ids or [])
         and recipient.status == "candidate"
         and not recipient.is_opted_out
-        and recipient.source_booking_uuid is not None
+        # An earned row names the visit it was earned by; a test row names none.
+        # Reading the column as "optional" in both directions is what would let
+        # one basis quietly borrow the other's evidence.
+        and (recipient.source_booking_uuid is None if is_test else recipient.source_booking_uuid is not None)
+        and (test_binding is not None if is_test else True)
         and recipient.client_id is not None
     )
     checks["recipient_identity"] = identity_ok
@@ -172,6 +280,55 @@ async def prove_recipient(
     checks["destination_current"] = phone_ok
     if not phone_ok:
         return RecipientProof(False, (RECIPIENT_IDENTITY_UNPROVEN,), checks=checks)
+
+    if is_test:
+        # The owner's test account. Its history is not evidence of anything —
+        # it cannot be cleared, which is the whole reason this basis exists — so
+        # the first-visit contract is NOT run here and NOT reported as passed.
+        # What is proven instead is that this is still the exact configured
+        # account, reachable at the exact number the preview recorded, with both
+        # fences still open. That proof is re-taken on every stage, including
+        # the one immediately before the Meta send.
+        checks["first_visit_proof_applicable"] = False
+        assert test_binding is not None  # identity_ok proved it
+        proof = await prove_test_customer(client_reader, enabled=enabled, expected_phone=destination)
+        checks["test_customer_proven"] = proof.proven
+        if not proof.proven:
+            return RecipientProof(
+                False,
+                (proof.reason or TEST_CUSTOMER_UNPROVEN,),
+                recipient_basis=VOUCHER_DELIVERY_BASIS_TEST,
+                checks=checks,
+            )
+        # A configured UUID that no longer matches the binding this recipient
+        # was added under is a rotation, not a match. Refusing here is what
+        # makes a rotated environment stop the canary instead of quietly
+        # pointing it at a different account.
+        if proof.customer_uuid != test_binding:
+            checks["test_binding_current"] = False
+            return RecipientProof(
+                False,
+                (TEST_BINDING_MISMATCH,),
+                recipient_basis=VOUCHER_DELIVERY_BASIS_TEST,
+                checks=checks,
+            )
+        checks["test_binding_current"] = True
+        return RecipientProof(
+            proven=True,
+            reasons=(),
+            recipient_basis=VOUCHER_DELIVERY_BASIS_TEST,
+            proven_at=now,
+            easyweek_customer_uuid=proof.customer_uuid,
+            # No booking, deliberately. There is no visit to name, and naming
+            # one would be the lie this whole basis exists to avoid.
+            source_booking_uuid=None,
+            company_id=recipient.company_id,
+            destination_phone=destination,
+            client_display_name=(
+                (client.display_name or recipient.display_name or proof.first_name or "").strip() or None
+            ),
+            checks=checks,
+        )
 
     # -- the live guard, unchanged from the campaign contract ---------------
     registry = configured_easyweek_locations()
@@ -230,6 +387,7 @@ async def prove_recipient(
     return RecipientProof(
         proven=True,
         reasons=(),
+        recipient_basis=VOUCHER_DELIVERY_BASIS_EARNED,
         proven_at=now,
         easyweek_customer_uuid=customer_uuid,
         source_booking_uuid=str(booking_uuid),
@@ -240,4 +398,11 @@ async def prove_recipient(
     )
 
 
-__all__ = ["RecipientProof", "prove_recipient"]
+__all__ = [
+    "RecipientProof",
+    "TestCustomerProof",
+    "configured_test_customer_uuid",
+    "prove_recipient",
+    "prove_test_customer",
+    "test_recipient_fences_reason",
+]

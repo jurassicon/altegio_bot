@@ -1257,6 +1257,36 @@ class CampaignRecipient(Base):
             "source_visits_total IS NULL OR source_visits_total = 1",
             name="ck_campaign_recipients_easyweek_source_visits_first",
         ),
+        # §36.11. The owner-approved test identity, typed rather than hidden in
+        # `meta`: an operator reading this row, and every constraint below, can
+        # tell what basis it is on without parsing JSON.
+        CheckConstraint(
+            "easyweek_test_customer_uuid IS NULL OR provider = 'easyweek'",
+            name="ck_campaign_recipients_test_customer_provider",
+        ),
+        # A test row must not be able to look like earned proof. Not "does not
+        # happen to have one" — cannot have one: the source proof columns are
+        # forbidden here, so no later code path can fill them in and turn a test
+        # identity into a first visit nobody made.
+        CheckConstraint(
+            "easyweek_test_customer_uuid IS NULL OR ("
+            "source_easyweek_event_id IS NULL "
+            "AND source_record_id IS NULL "
+            "AND source_booking_uuid IS NULL "
+            "AND source_visits_total IS NULL "
+            "AND source_visits_total_updated_at IS NULL)",
+            name="ck_campaign_recipients_test_customer_has_no_source_proof",
+        ),
+        # One test recipient per customer per preview. Partial, because the rule
+        # is about test rows only and the ordinary snapshot is untouched by it.
+        Index(
+            "uq_campaign_recipients_test_customer_per_run",
+            "provider",
+            "campaign_run_id",
+            "easyweek_test_customer_uuid",
+            unique=True,
+            postgresql_where=text("easyweek_test_customer_uuid IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -1348,6 +1378,15 @@ class CampaignRecipient(Base):
     source_visits_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_visits_total_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # §36.11: the owner-approved test identity this row stands for, or NULL for
+    # every ordinary recipient. Its presence IS the basis — there is no separate
+    # boolean to disagree with it — and the constraints above make sure a row
+    # carrying it can never also carry earned-first-visit proof.
+    easyweek_test_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
         nullable=True,
     )
 
@@ -2306,6 +2345,23 @@ VOUCHER_DELIVERY_STATUSES = (
 
 _VOUCHER_DELIVERY_STATUS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_DELIVERY_STATUSES)
 
+# On what grounds this canary may act for this person (§36.11). Two grounds, and
+# the difference between them is not a detail: one is a voucher somebody earned,
+# the other is the owner's test account standing in for one.
+#
+# `earned_first_visit` is the §36 contract unchanged — a real first visit, proven
+# live, with the booking that earned it recorded and unique.
+#
+# `owner_test_account` is the one pre-configured identity the owner approved for
+# testing. Its history cannot be cleared and a fresh account per attempt is not
+# workable, so the first-visit proof is `not_applicable` for it — recorded as
+# exactly that, never as a quiet `true`. It carries no booking at all, because
+# there is no visit to point at and inventing one would make the ledger lie.
+VOUCHER_DELIVERY_BASIS_EARNED = "earned_first_visit"
+VOUCHER_DELIVERY_BASIS_TEST = "owner_test_account"
+VOUCHER_DELIVERY_BASES = (VOUCHER_DELIVERY_BASIS_EARNED, VOUCHER_DELIVERY_BASIS_TEST)
+_VOUCHER_DELIVERY_BASIS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_DELIVERY_BASES)
+
 
 class EasyWeekCampaignVoucherDeliveryLedger(Base):
     """The one durable row of the controlled voucher DELIVERY canary (§36).
@@ -2347,12 +2403,29 @@ class EasyWeekCampaignVoucherDeliveryLedger(Base):
         # 1. One canary, ever. A second scope is a code change plus a review.
         UniqueConstraint("canary_scope", name="uq_ew_voucher_delivery_scope"),
         # 2. One voucher per earned entitlement, whatever run proposes it.
-        UniqueConstraint(
+        # Partial, because only an earned row HAS an entitlement to be unique
+        # about: a test row carries no booking, and a plain unique constraint
+        # over a nullable column would enforce nothing there anyway.
+        Index(
+            "uq_ew_voucher_delivery_entitlement",
             "provider",
             "company_id",
             "campaign_code",
             "source_booking_uuid",
-            name="uq_ew_voucher_delivery_entitlement",
+            unique=True,
+            postgresql_where=text(f"recipient_basis = '{VOUCHER_DELIVERY_BASIS_EARNED}'"),
+        ),
+        # 2b. And one canary per test identity, which is the same rule stated
+        # about the only thing a test row can be identified by. Without it a
+        # second preview could point a second canary at the same account.
+        Index(
+            "uq_ew_voucher_delivery_test_identity",
+            "provider",
+            "company_id",
+            "campaign_code",
+            "easyweek_customer_uuid",
+            unique=True,
+            postgresql_where=text(f"recipient_basis = '{VOUCHER_DELIVERY_BASIS_TEST}'"),
         ),
         # 3-5. A result may belong to exactly one canary row.
         UniqueConstraint("target_order_uuid", name="uq_ew_voucher_delivery_target_order"),
@@ -2380,6 +2453,19 @@ class EasyWeekCampaignVoucherDeliveryLedger(Base):
         ),
         # This canary is EasyWeek-only by construction.
         CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_delivery_provider"),
+        # A closed basis vocabulary, and the one invariant that keeps the two
+        # apart: an earned row names the booking it was earned by, and a test
+        # row names none. That is what stops a test canary from being written
+        # with a borrowed, random or customer-shaped "source booking" — the
+        # column is not merely unused there, it is forbidden.
+        CheckConstraint(
+            f"recipient_basis IN ({_VOUCHER_DELIVERY_BASIS_SQL})",
+            name="ck_ew_voucher_delivery_basis",
+        ),
+        CheckConstraint(
+            f"(recipient_basis = '{VOUCHER_DELIVERY_BASIS_EARNED}') = (source_booking_uuid IS NOT NULL)",
+            name="ck_ew_voucher_delivery_basis_source",
+        ),
         # 8. Stage order. A stage cannot be attempted before it was claimed, and
         # cannot be verified before it was attempted.
         CheckConstraint(
@@ -2473,9 +2559,20 @@ class EasyWeekCampaignVoucherDeliveryLedger(Base):
     campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
+    # On what grounds this row exists: an earned first visit, or the owner's
+    # approved test account. Not a flag — every stage plan, the identity match
+    # and the operator report all read it, so a row cannot quietly change what
+    # it is claiming about the person it names.
+    recipient_basis: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text(f"'{VOUCHER_DELIVERY_BASIS_EARNED}'"),
+    )
+
     # The visit that earned the entitlement. Part of the uniqueness rule that
-    # survives a new preview run.
-    source_booking_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    # survives a new preview run — and NULL for a test row, which has no visit
+    # to name. A CHECK ties the two together in both directions.
+    source_booking_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
     easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
 
     # -- the frozen EasyWeek identity this canary may act on ----------------
