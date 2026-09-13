@@ -50,7 +50,9 @@ Before anything is run in production, all of these must be true:
    `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY` (≥32 bytes) with an
    `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY_ID` are set in `easyweek.env`;
 5. a **fresh** preview and preflight have been run, and the owner has chosen one
-   recipient from them. Nothing about an earlier run carries over;
+   recipient from them — or, for a test run, the one approved test account has
+   been added to that preview (see [§1b](#1b-the-one-owner-approved-test-recipient)).
+   Nothing about an earlier run carries over;
 6. the owner has separately authorised a **non-refundable** €15 test payment for
    this recipient — once the message is sent, the refund path is closed;
 7. the owner authorises each of CREATE, PAY and DELIVER as its own decision.
@@ -102,6 +104,134 @@ what the rows actually say.
 An aligned row is bookkeeping, not authorisation. The fence, the key, a fresh
 preview and preflight, the chosen recipient and the owner's approval of each
 stage are all proven separately, and the general EasyWeek send stays closed.
+
+## 1b. The one owner-approved test recipient
+
+The canary has to send a real message to a real phone, and the owner's test
+account cannot pass the first-visit proof: its history cannot be cleared, and a
+fresh account per attempt is not a workable way to test. So ONE pre-configured
+account is approved to stand in for an earned recipient — for this canary and
+nothing else.
+
+**That is a test identity, not an entitlement.** Nothing about the account says
+a voucher was earned. The row it creates is marked `owner_test_account`, carries
+no source booking, no event and no visit count, and a CHECK constraint stops it
+from ever acquiring them.
+
+**Two fences, both of which must be open**, plus the account itself:
+
+```
+EASYWEEK_VOUCHER_DELIVERY_CANARY_ENABLED=true
+EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED=true
+EASYWEEK_VOUCHER_DELIVERY_TEST_CUSTOMER_UUID=<the test account's canonical UUID>
+```
+
+**Both stay on for the whole canary.** The test account is re-proven before
+every external step — CREATE, PAY, DELIVER and REFUND all call the same live
+check — and that check reads both fences. Switching the second one off after
+Add does not "lock in" the recipient; it stops the next stage.
+
+Turn `..._TEST_RECIPIENT_ENABLED` back to `false` only once the canary has
+reached a proven ending:
+
+* a successful DELIVER, or
+* a proven REFUND or manual cleanup, if nothing was ever sent.
+
+Then restart the service that serves the Ops Add screen, because a container
+that is already running does not re-read `easyweek.env`. Each
+`docker compose run` starts a new container and therefore sees the current
+value, which is why the CLI stages pick up a change immediately while the web
+app does not.
+
+Check what the file says now:
+
+```bash
+cd /opt/altegio_bot && grep -E '^EASYWEEK_VOUCHER_DELIVERY_(CANARY_ENABLED|TEST_RECIPIENT_ENABLED)=' easyweek.env
+```
+
+Check what the running web container actually has. `exec` reads a container
+that is already running and creates nothing, so it changes no topology and does
+not need the overlay — unlike the recreate below:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot exec altegio-api printenv EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED
+```
+
+Recreate only that service after editing the file — **with the full production
+file set**:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate --no-deps altegio-api
+```
+
+Both `-f` files are mandatory here, in that order. Production runs `altegio-api`
+with the base file plus the Chatwoot overlay, and the overlay is the only thing
+that attaches the service to the external `chatwoot_internal` network. Recreate
+it with the base file alone and Compose rebuilds the container without that
+network, while `CHATWOOT_BASE_URL` still points at the internal host — so every
+Chatwoot call from the API starts failing, and nothing about the canary says
+why. The same rule is stated in
+[docs/ops/chatwoot_internal_route.md](../ops/chatwoot_internal_route.md): every
+`up` or `restart` of these services uses the same file set.
+
+`--no-deps` and the single service name are equally deliberate. Only the process
+that serves the Ops Add screen needs the new value; Postgres, Redis and the
+workers must keep running untouched, and restarting them would interrupt work
+that has nothing to do with this fence.
+
+Confirm the new value took:
+
+```bash
+cd /opt/altegio_bot && docker compose -p altegio_bot exec altegio-api printenv EASYWEEK_VOUCHER_DELIVERY_TEST_RECIPIENT_ENABLED
+```
+
+**The UUID is a server setting, never a form field.** In Ops → the EasyWeek
+preview → **Add test recipient**, you type only the phone number. The customer
+UUID comes from the environment; the browser does not send one, and a request
+that carries an Altegio client id is refused rather than ignored. Before the row
+is written the canary reads that exact customer live and requires the UUID and
+the phone number in the answer to match the configuration and what you typed.
+
+Anything that does not line up stops before any write, with a stable reason and
+nothing personal in it:
+
+| Reason | What to do |
+|---|---|
+| `voucher_delivery_test_recipient_disabled` | One of the two fences is off |
+| `voucher_delivery_test_customer_unconfigured` | `..._TEST_CUSTOMER_UUID` is empty or not a UUID |
+| `voucher_delivery_test_customer_unproven` | The live read did not match, or EasyWeek did not answer. **Do not retry blindly** — check the account and the number |
+| `test_recipient_client_unresolved` | Zero or two local clients for that number |
+| `test_recipient_client_opted_out` | The account opted out of WhatsApp |
+| `test_recipient_rows_ambiguous` | The preview already holds a row for that client that this may not overwrite |
+| `test_recipient_preview_locked_by_canary` | The canary already holds this preview — see below |
+
+Adding the same test recipient twice is not two recipients: an exact candidate
+is left alone, and a single previously-removed row for the same client is
+reactivated in place.
+
+**Every stage re-proves it.** The account, the fences, the configured UUID, the
+current number and the opt-out state are checked again before CREATE, before
+PAY, before REFUND and again immediately before the Meta send — which is why
+both fences have to stay open until the canary is finished. Rotating
+`..._TEST_CUSTOMER_UUID` after the canary has opened its ledger is a mismatch,
+not a switch of account: the canary stops and does nothing externally.
+
+**The first-visit proof is not run, and not faked.** Reports print
+`first_visit_proof: not_applicable` for this basis rather than a comfortable
+`true`, and `recipient_basis` appears in the plan, the status and the reconcile
+output so a test run can never be mistaken for an earned one.
+
+**The preview freezes once the canary attaches to it.** After the ledger row
+exists — that is, from CREATE onwards — Add, Remove, Discard and Delete are all
+refused by the backend under a row lock, and the Ops UI stops offering them.
+This is not tidiness: the canary addresses its recipient by run id and recipient
+id and re-proves that pair before every external step, so editing the preview
+after CREATE or PAY does not undo anything. It makes DELIVER and REFUND
+unprovable and strands a real €15.
+
+**EasyWeek previews have no Run from preview button.** The ordinary EasyWeek
+send-real path is closed and stays closed; this canary is the only way a message
+goes out, and it goes out one stage at a time with your approval on each.
 
 ## 2. The command surface
 

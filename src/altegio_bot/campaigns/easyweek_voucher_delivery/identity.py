@@ -77,10 +77,24 @@ VOUCHER_ORDER_ALREADY_REFUNDED: Final = "voucher_order_already_refunded"
 # look before anything else happens.
 VOUCHER_STATE_UNATTRIBUTABLE: Final = "voucher_state_unattributable"
 
+# -- the one owner-approved test identity (§36.11) ---------------------------
+# Separate codes, because "the fence is closed", "nobody configured an account"
+# and "the account we read is not the one configured" are three different things
+# for the operator holding the terminal, and only the last one is alarming.
+TEST_RECIPIENT_DISABLED: Final = "voucher_delivery_test_recipient_disabled"
+TEST_CUSTOMER_UNCONFIGURED: Final = "voucher_delivery_test_customer_unconfigured"
+TEST_CUSTOMER_UNPROVEN: Final = "voucher_delivery_test_customer_unproven"
+TEST_BINDING_MISMATCH: Final = "voucher_delivery_test_binding_mismatch"
+
 # -- the send ---------------------------------------------------------------
 DELIVERY_ALREADY_ATTEMPTED: Final = "delivery_already_attempted"
 DELIVERY_OUTCOME_UNKNOWN: Final = "delivery_outcome_unknown"
 MANUAL_CLEANUP_REQUIRED: Final = "manual_cleanup_required"
+
+# The durable row cannot be rebuilt into a whole identity: a missing field, an
+# unknown basis, or a basis that disagrees with the booking it does or does not
+# carry. Nothing is acted on and nothing is declared proven.
+LEDGER_IDENTITY_INCOMPLETE: Final = "voucher_delivery_ledger_identity_incomplete"
 
 # -- operator authorisation --------------------------------------------------
 LEDGER_STATE_UNEXPECTED: Final = "voucher_delivery_ledger_state_unexpected"

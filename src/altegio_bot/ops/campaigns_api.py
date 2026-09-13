@@ -44,6 +44,13 @@ from altegio_bot.campaigns.altegio_crm import (
     get_client_crm_records,
 )
 from altegio_bot.campaigns.configuration import resolve_campaign_readiness
+from altegio_bot.campaigns.easyweek_voucher_delivery import test_recipient
+from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
+    TEST_CUSTOMER_UNCONFIGURED,
+    TEST_RECIPIENT_DISABLED,
+)
+from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
+from altegio_bot.campaigns.easyweek_voucher_delivery.test_recipient import add_test_recipient_to_preview
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.gift_card_readiness import probe_gift_card_readiness
 from altegio_bot.campaigns.loyalty_cleanup import (
@@ -73,11 +80,14 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
+    PROVIDER_EASYWEEK,
     CampaignRecipient,
     CampaignRun,
     Client,
+    EasyWeekCampaignVoucherDeliveryLedger,
     MessageJob,
     MessageTemplate,
     Record,
@@ -1204,8 +1214,23 @@ async def list_runs(
             )
             used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
 
+        canary_locked_ids: set[int] = set()
+        if preview_ids:
+            locked_stmt = select(EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id).where(
+                EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id.in_(preview_ids),
+                EasyWeekCampaignVoucherDeliveryLedger.provider == PROVIDER_EASYWEEK,
+            )
+            canary_locked_ids = {row[0] for row in (await session.execute(locked_stmt)).all() if row[0] is not None}
+
     return {
-        "items": [_run_summary(r, used_as_source=(r.id in used_as_source_ids)) for r in runs],
+        "items": [
+            _run_summary(
+                r,
+                used_as_source=(r.id in used_as_source_ids),
+                canary_locked=(r.id in canary_locked_ids),
+            )
+            for r in runs
+        ],
         "total": total,
         "offset": offset,
         "limit": limit,
@@ -1247,8 +1272,9 @@ async def get_run(run_id: int) -> dict[str, Any]:
                 )
             )
             used_as_source = int(src_count or 0) > 0
+        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
 
-    result = _run_detail(run, used_as_source=used_as_source)
+    result = _run_detail(run, used_as_source=used_as_source, canary_locked=canary_locked)
     result["execution_job"] = execution_job
     result["progress"] = progress
     result["followup_auto"] = _followup_auto(run)
@@ -1643,13 +1669,89 @@ async def remove_recipient(run_id: int, recipient_id: int) -> dict[str, Any]:
 class AddRecipientRequest(BaseModel):
     """Запрос на добавление клиента в preview snapshot.
 
-    Нужно указать хотя бы одно из: phone или altegio_client_id.
-    Если передан только phone — клиент ищется в локальной БД для
-    получения altegio_client_id (необходим для CRM-проверки).
+    Altegio: нужно указать хотя бы одно из phone / altegio_client_id.
+
+    EasyWeek (§36.11): только phone, и добавляется исключительно ЗАРАНЕЕ
+    НАСТРОЕННЫЙ тестовый аккаунт controlled voucher delivery canary. Customer
+    UUID берётся из серверной конфигурации и НЕ принимается из запроса:
+    экран, способный назвать любой customer UUID, был бы способом направить
+    реальный ваучер на €15 любому реальному человеку. Переданный для EasyWeek
+    ``altegio_client_id`` — отказ, а не игнорируемое поле.
     """
 
     phone: str | None = None
     altegio_client_id: int | None = None
+
+
+async def _add_easyweek_test_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any]:
+    """Add the one owner-approved test recipient (§36.11).
+
+    Not the ordinary EasyWeek segment, and not a campaign entitlement: the
+    account is named by the server, proven live before anything is written, and
+    recorded under a typed test basis that cannot masquerade as a first visit.
+    Reaches no Altegio API — that one has nothing to say about an EasyWeek
+    customer — and creates no job, outbox row or send permission.
+    """
+    if not body.phone:
+        raise HTTPException(status_code=400, detail={"reason": test_recipient.PHONE_UNUSABLE})
+
+    # BEFORE the client is constructed, not merely before the request: `httpx`
+    # logs the full URL at INFO, the web application runs at INFO, and this
+    # request's URL is `/customers/{uuid}` — a line that names one human being.
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as client:
+            outcome = await add_test_recipient_to_preview(
+                SessionLocal,
+                run_id=run_id,
+                phone=body.phone,
+                client_reader=client,
+                altegio_client_id=body.altegio_client_id,
+            )
+    except EasyWeekError:
+        # The live read is the only external call on this path, and an
+        # unreachable EasyWeek is uncertainty, not a verdict. Nothing was
+        # written: the read happens before the write transaction opens.
+        raise HTTPException(status_code=502, detail={"reason": test_recipient.RUN_NOT_SUPPORTED}) from None
+
+    if not outcome.ok:
+        # 409 for the states an operator can resolve, 422 for the ones that need
+        # configuration. Either way the body is a stable code and nothing else:
+        # no phone number, no name, no customer UUID.
+        status = 422 if outcome.reason in _TEST_RECIPIENT_CONFIG_REASONS else 409
+        logger.info(
+            "easyweek_test_recipient refused run_id=%d reason=%s",
+            run_id,
+            outcome.reason,
+        )
+        raise HTTPException(status_code=status, detail=outcome.as_safe_dict())
+
+    logger.info(
+        "easyweek_test_recipient %s run_id=%d recipient_id=%s",
+        outcome.action,
+        run_id,
+        outcome.recipient_id,
+    )
+    async with SessionLocal() as session:
+        row = await session.get(CampaignRecipient, outcome.recipient_id)
+    return {
+        "run_id": run_id,
+        "recipient_id": outcome.recipient_id,
+        "recipient": _recipient_dict(row) if row is not None else None,
+        **outcome.as_safe_dict(),
+        "message": "Добавлен настроенный test recipient для controlled voucher delivery canary",
+    }
+
+
+# Refusals that mean "the server is not set up for this", as opposed to "this
+# preview or this client is not in a state where it can happen".
+_TEST_RECIPIENT_CONFIG_REASONS = frozenset(
+    {
+        TEST_RECIPIENT_DISABLED,
+        TEST_CUSTOMER_UNCONFIGURED,
+        test_recipient.RUN_NOT_SUPPORTED,
+    }
+)
 
 
 @router.post("/runs/{run_id}/recipients/add", status_code=201)
@@ -1669,17 +1771,25 @@ async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any
         из локальной БД по phone, или передаётся напрямую).
       - Если клиент не найден в локальной БД и altegio_client_id не передан — 400.
     """
+    # --- Загрузить run ПЕРЕД разбором тела: путь зависит от провайдера ---
+    async with SessionLocal() as session:
+        run = await session.get(CampaignRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.provider == PROVIDER_EASYWEEK:
+        # A different operation with a different contract. It deliberately does
+        # not pass through `require_campaign_execution_provider`: that gate
+        # refuses ordinary EasyWeek campaign execution, which is correct and
+        # stays correct — this adds one pre-configured test account to a preview
+        # and opens no send path at all.
+        return await _add_easyweek_test_recipient(run_id, body)
+
     if not body.phone and body.altegio_client_id is None:
         raise HTTPException(
             status_code=400,
             detail="Нужно указать phone или altegio_client_id",
         )
-
-    # --- Загрузить и проверить run ---
-    async with SessionLocal() as session:
-        run = await session.get(CampaignRun, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
 
     try:
         require_campaign_execution_provider(run.provider)
@@ -2267,7 +2377,7 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
     }
 
 
-def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str, Any]:
+def _run_summary(run: CampaignRun, *, used_as_source: bool = False, canary_locked: bool = False) -> dict[str, Any]:
     """Краткая сводка по run для списков."""
     return {
         "id": run.id,
@@ -2293,13 +2403,34 @@ def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str,
         # Still accessible via direct link; absent from the default list.
         "hidden": bool((run.meta or {}).get("hidden")),
         "hidden_reason": (run.meta or {}).get("hidden_reason"),
+        # A preview the §36 voucher delivery canary has attached itself to is
+        # frozen: the canary re-proves (run id, recipient id) before every
+        # external step, so editing or deleting it strands a real paid voucher
+        # rather than undoing it. The backend refuses these under a row lock;
+        # this flag is what lets the UI stop offering them in the first place.
+        "canary_locked": canary_locked,
         # Discard разрешён только для completed preview, не использованного как source.
         # running → race condition; discarded/deleted → уже терминал; used_as_source → запрещено бэкендом.
-        "is_discardable": (run.mode == "preview" and run.status == "completed" and not used_as_source),
+        "is_discardable": (
+            run.mode == "preview" and run.status == "completed" and not used_as_source and not canary_locked
+        ),
         # delete allowed only for stable terminal states (not running — race condition risk)
-        "is_deletable": (run.mode == "preview" and run.status in ("completed", "discarded") and not used_as_source),
+        "is_deletable": (
+            run.mode == "preview"
+            and run.status in ("completed", "discarded")
+            and not used_as_source
+            and not canary_locked
+        ),
         # snapshot editing (add/remove) requires completed + not yet used for send-real
-        "is_snapshot_editable": (run.mode == "preview" and run.status == "completed" and not used_as_source),
+        "is_snapshot_editable": (
+            run.mode == "preview" and run.status == "completed" and not used_as_source and not canary_locked
+        ),
+        # The ordinary EasyWeek send path is closed, so a preview from it is
+        # never a thing to "run". Said here rather than left to the template to
+        # infer from the provider string.
+        "is_runnable_from_preview": (
+            run.mode == "preview" and run.status == "completed" and run.provider != PROVIDER_EASYWEEK
+        ),
         "excluded": {
             "opted_out": run.excluded_opted_out or 0,
             "no_phone": run.excluded_no_phone or 0,
@@ -2314,9 +2445,9 @@ def _run_summary(run: CampaignRun, *, used_as_source: bool = False) -> dict[str,
     }
 
 
-def _run_detail(run: CampaignRun, *, used_as_source: bool = False) -> dict[str, Any]:
+def _run_detail(run: CampaignRun, *, used_as_source: bool = False, canary_locked: bool = False) -> dict[str, Any]:
     """Полная информация по run."""
-    base = _run_summary(run, used_as_source=used_as_source)
+    base = _run_summary(run, used_as_source=used_as_source, canary_locked=canary_locked)
     base.update(
         {
             "location_id": run.location_id,

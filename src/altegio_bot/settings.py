@@ -788,6 +788,23 @@ class Settings(BaseSettings):
     # bindings loudly instead of silently comparing against the wrong secret.
     easyweek_voucher_delivery_hmac_key_id: str = ""
 
+    # --- §36.11: the one owner-approved test recipient ------------------------
+    # The canary needs a person to send to, and the owner's test account cannot
+    # pass the first-visit proof: its history cannot be cleared, and creating a
+    # fresh account for every attempt is not a workable way to test.
+    #
+    # So the owner approved ONE pre-configured account as a test identity. That
+    # is not an entitlement — nothing about this account proves a voucher was
+    # earned — which is why it gets its own fence rather than riding on the
+    # canary's. Both must be true before an operator can add it to a preview.
+    easyweek_voucher_delivery_test_recipient_enabled: bool = False
+
+    # WHICH account, decided by the server and only by the server. The browser
+    # never sends a customer UUID: an operator UI that could name any customer
+    # would be a way to point a real voucher at any real person. Empty is a
+    # refusal, never a wildcard and never a guess.
+    easyweek_voucher_delivery_test_customer_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

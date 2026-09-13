@@ -64,6 +64,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     DELIVERY_ALREADY_ATTEMPTED,
     DELIVERY_OUTCOME_UNKNOWN,
     IDENTITY_BINDING_MISMATCH,
+    LEDGER_IDENTITY_INCOMPLETE,
     LEDGER_STATE_UNEXPECTED,
     MANUAL_CLEANUP_REQUIRED,
     MUTATION_REJECTED,
@@ -110,6 +111,8 @@ from altegio_bot.easyweek_voucher_identity import (
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
 from altegio_bot.models.models import (
     VOUCHER_DELIVERY_AMBIGUOUS,
+    VOUCHER_DELIVERY_BASIS_EARNED,
+    VOUCHER_DELIVERY_BASIS_TEST,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATE_REJECTED,
     VOUCHER_DELIVERY_CREATE_UNKNOWN,
@@ -278,12 +281,21 @@ def _voucher_code(payload: object) -> str | None:
 
 
 def _identity_from(request: CanaryRequest, proof: RecipientProof) -> ledger_module.CanaryIdentity:
-    assert proof.easyweek_customer_uuid is not None and proof.source_booking_uuid is not None
+    # The customer is required on both bases. The booking is required on exactly
+    # one of them, and forbidden on the other — a test canary that carried a
+    # booking would be claiming a visit nobody made, and the ledger's own CHECK
+    # would refuse the row anyway.
+    assert proof.easyweek_customer_uuid is not None
+    if proof.recipient_basis == VOUCHER_DELIVERY_BASIS_EARNED:
+        assert proof.source_booking_uuid is not None
+    else:
+        assert proof.source_booking_uuid is None
     return ledger_module.CanaryIdentity(
         company_id=request.company_id,
         campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
         campaign_run_id=request.preview_run_id,
         campaign_recipient_id=request.campaign_recipient_id,
+        recipient_basis=proof.recipient_basis,
         source_booking_uuid=proof.source_booking_uuid,
         easyweek_customer_uuid=proof.easyweek_customer_uuid,
         location_uuid=request.location_uuid,
@@ -291,6 +303,72 @@ def _identity_from(request: CanaryRequest, proof: RecipientProof) -> ledger_modu
         payment_account_uuid=request.payment_account_uuid,
         voucher_template_uuid=request.voucher_template_uuid,
         reconciliation_marker=request.marker,
+    )
+
+
+def _identity_from_snapshot(snapshot: ledger_module.LedgerSnapshot) -> ledger_module.CanaryIdentity | None:
+    """Rebuild the identity the ledger was opened with, or refuse.
+
+    ``None`` means the durable row cannot be turned into a whole identity, and
+    the caller must stop rather than act on a partial one.
+
+    The refusal matters more than the rebuild. An earlier version filled the
+    gaps — ``or 0`` for the ids, ``or ""`` for the UUIDs — which turns an
+    incomplete ledger into an identity that compares equal to nothing and is
+    refused far downstream, or worse, compares equal to something. In particular
+    an empty-string "source booking" is not a missing booking: it is a value,
+    and on the test basis the contract says that column must be NULL and stay
+    NULL. So every required field is checked for what it actually is, and the
+    basis has to agree with the booking in both directions.
+    """
+    basis = snapshot.recipient_basis
+    if basis not in (VOUCHER_DELIVERY_BASIS_EARNED, VOUCHER_DELIVERY_BASIS_TEST):
+        # Missing, empty, or a word this code does not know. Guessing which
+        # contract a real €15 is under is not something to do quietly.
+        return None
+
+    ids = (snapshot.company_id, snapshot.campaign_run_id, snapshot.campaign_recipient_id)
+    if any(value is None for value in ids):
+        return None
+
+    uuids = {
+        "easyweek_customer_uuid": canonical_uuid(snapshot.easyweek_customer_uuid),
+        "location_uuid": canonical_uuid(snapshot.location_uuid),
+        "staffer_uuid": canonical_uuid(snapshot.staffer_uuid),
+        "payment_account_uuid": canonical_uuid(snapshot.payment_account_uuid),
+        "voucher_template_uuid": canonical_uuid(snapshot.voucher_template_uuid),
+    }
+    if any(value is None for value in uuids.values()):
+        return None
+
+    marker = (snapshot.reconciliation_marker or "").strip()
+    if not marker:
+        return None
+
+    booking = canonical_uuid(snapshot.source_booking_uuid)
+    if basis == VOUCHER_DELIVERY_BASIS_EARNED:
+        # An earned canary names the visit it was earned by. No booking means
+        # the row cannot say whose entitlement this is.
+        if booking is None:
+            return None
+    elif snapshot.source_booking_uuid is not None:
+        # A test canary that carries a booking is claiming a visit nobody made.
+        return None
+
+    return ledger_module.CanaryIdentity(
+        company_id=int(snapshot.company_id or 0),
+        campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
+        campaign_run_id=int(snapshot.campaign_run_id or 0),
+        campaign_recipient_id=int(snapshot.campaign_recipient_id or 0),
+        recipient_basis=basis,
+        # Genuinely nullable: NULL on the test basis, never an empty string.
+        source_booking_uuid=booking,
+        easyweek_customer_uuid=uuids["easyweek_customer_uuid"] or "",
+        location_uuid=uuids["location_uuid"] or "",
+        staffer_uuid=uuids["staffer_uuid"] or "",
+        payment_account_uuid=uuids["payment_account_uuid"] or "",
+        voucher_template_uuid=uuids["voucher_template_uuid"] or "",
+        reconciliation_marker=marker,
     )
 
 
@@ -358,6 +436,7 @@ async def build_stage_plan(
         expected_company_id=request.company_id,
         client_reader=reader,
         now=issued_at,
+        enabled=enabled,
     )
     reasons.extend(proof.reasons)
 
@@ -1661,20 +1740,30 @@ async def _reconcile_create(
 
     assert observation is not None
     if state == ORDER_OPEN:
-        # Exactly the proof a fresh create must pass, including the binding.
-        identity = ledger_module.CanaryIdentity(
-            company_id=snapshot.company_id or 0,
-            campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
-            campaign_run_id=snapshot.campaign_run_id or 0,
-            campaign_recipient_id=snapshot.campaign_recipient_id or 0,
-            source_booking_uuid=snapshot.source_booking_uuid or "",
-            easyweek_customer_uuid=snapshot.easyweek_customer_uuid or "",
-            location_uuid=snapshot.location_uuid or "",
-            staffer_uuid=snapshot.staffer_uuid or "",
-            payment_account_uuid=snapshot.payment_account_uuid or "",
-            voucher_template_uuid=snapshot.voucher_template_uuid or "",
-            reconciliation_marker=snapshot.reconciliation_marker or "",
-        )
+        # Exactly the proof a fresh create must pass, including the binding —
+        # under whichever basis the row was actually opened on, taken from the
+        # durable ledger rather than assumed.
+        identity = _identity_from_snapshot(snapshot)
+        if identity is None:
+            result = await ledger_module.record_outcome(
+                session_maker,
+                status=VOUCHER_DELIVERY_CREATE_UNKNOWN,
+                expected_statuses=unresolved,
+                reason_code=LEDGER_IDENTITY_INCOMPLETE,
+                evidence={"create_reconcile_readback": safe},
+                manual_cleanup_required=True,
+                reconciliation_required=True,
+            )
+            return StageReport(
+                stage="reconcile",
+                outcome=OUTCOME_UNKNOWN,
+                reasons=[LEDGER_IDENTITY_INCOMPLETE],
+                reconciliation_required=True,
+                manual_cleanup_required=True,
+                ledger=result.snapshot.as_safe_dict(),
+                observations=[safe] if safe else [],
+                order_state=state,
+            )
         report = await _verify_created(
             session_maker,
             order_reader=order_reader,

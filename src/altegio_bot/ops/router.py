@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
 
+from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
@@ -28,7 +29,14 @@ from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
-from altegio_bot.models.models import CampaignRecipient, CampaignRun, MessageJob, OutboxMessage
+from altegio_bot.models.models import (
+    PROVIDER_EASYWEEK,
+    CampaignRecipient,
+    CampaignRun,
+    EasyWeekCampaignVoucherDeliveryLedger,
+    MessageJob,
+    OutboxMessage,
+)
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 from altegio_bot.workers.followup_worker import STALE_PROCESSING_MINUTES
@@ -3031,6 +3039,14 @@ async def ops_campaigns_list(request: Request) -> str:
             )
             used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
 
+        canary_locked_ids: set[int] = set()
+        if preview_ids:
+            locked_stmt = select(EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id).where(
+                EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id.in_(preview_ids),
+                EasyWeekCampaignVoucherDeliveryLedger.provider == PROVIDER_EASYWEEK,
+            )
+            canary_locked_ids = {row[0] for row in (await session.execute(locked_stmt)).all() if row[0] is not None}
+
     filter_form = _filter_form(
         "/ops/campaigns",
         [
@@ -3064,13 +3080,29 @@ async def ops_campaigns_list(request: Request) -> str:
         last_error = meta.get("last_error", "")
         # Действия зависят от режима, статуса и признака used_as_source
         is_used = run.id in used_as_source_ids
-        if run.mode == "preview" and run.status == "completed" and not is_used:
-            # Editable: Run / Discard / Delete / (can edit snapshot)
+        if run.mode == "preview" and run.status == "completed" and run.id in canary_locked_ids:
+            # Held by the §36 voucher delivery canary: every edit is refused by
+            # the backend, so the list offers none of them.
             actions = (
                 f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
-                f'<button class="btn btn-sm btn-success me-1" '
-                f'onclick="runFromPreview({run.id})" title="Run campaign from this preview">'
-                f"▶ Run</button>"
+                f'<span class="badge bg-warning text-dark">canary</span>'
+            )
+        elif run.mode == "preview" and run.status == "completed" and not is_used:
+            # Editable: Run / Discard / Delete / (can edit snapshot). EasyWeek
+            # gets no Run button: the ordinary send-real path is closed, and a
+            # button that answers 409 is worse than no button.
+            run_btn = (
+                ""
+                if run.provider == PROVIDER_EASYWEEK
+                else (
+                    f'<button class="btn btn-sm btn-success me-1" '
+                    f'onclick="runFromPreview({run.id})" title="Run campaign from this preview">'
+                    f"▶ Run</button>"
+                )
+            )
+            actions = (
+                f'<a href="/ops/campaigns/{run.id}" class="btn btn-sm btn-outline-primary me-1">open</a>'
+                f"{run_btn}"
                 f'<button class="btn btn-sm btn-outline-warning me-1" '
                 f'onclick="discardPreview({run.id})" title="Discard this preview">'
                 f"⊘ Discard</button>"
@@ -4398,6 +4430,10 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                 )
             )
             used_as_source = int(src_count or 0) > 0
+        # A preview the §36 canary has attached itself to is frozen. The backend
+        # refuses the edits under a row lock; not offering the buttons is how an
+        # operator finds out before they click.
+        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
 
         # Follow-up eligibility aggregation
         try:
@@ -4527,31 +4563,83 @@ async def ops_campaign_run_detail(run_id: int) -> str:
      class="btn btn-success btn-sm">▶ Run again</a>
 </div>
 """
+    elif run.mode == "preview" and run.status == "completed" and canary_locked:
+        # Editing or deleting this preview would not undo a created or paid
+        # voucher — it would make the delivery and the refund unprovable and
+        # strand a real €15.
+        preview_actions_block = """
+<div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <span>Этот preview занят controlled voucher delivery canary (§36).
+        Add, Remove, Discard и Delete заблокированы бэкендом до завершения canary.</span>
+</div>
+"""
     elif run.mode == "preview" and run.status == "completed":
+        is_easyweek = run.provider == PROVIDER_EASYWEEK
+        # The ordinary EasyWeek send-real path is closed, so there is nothing to
+        # run this preview as. Offering a button that answers 409 only teaches
+        # an operator to click through refusals.
+        run_button = (
+            ""
+            if is_easyweek
+            else (
+                f'<a href="/ops/campaigns/new-clients?from_preview={run_id}"'
+                ' class="btn btn-success btn-sm">▶ Run from preview</a>'
+            )
+        )
+        lead = (
+            "Это EasyWeek preview. Обычный send-real для EasyWeek закрыт — используется "
+            "только controlled voucher delivery canary (§36)."
+            if is_easyweek
+            else "Это preview-run. Запустите send-real или отредактируйте snapshot."
+        )
+        add_label = "➕ Add test recipient" if is_easyweek else "➕ Add recipient"
+        add_header = (
+            "➕ Добавить настроенный test recipient (§36.11)" if is_easyweek else "➕ Добавить получателя в snapshot"
+        )
+        # Said plainly, because the difference matters: this is not "add any
+        # customer", and the row it creates is not proof of an entitlement.
+        add_hint = (
+            '<div class="alert alert-secondary small py-2">'
+            "Добавляется <b>только заранее настроенный тестовый аккаунт</b> для controlled "
+            "voucher delivery canary. Customer UUID берётся из серверной конфигурации и не "
+            "принимается из браузера; телефон вводится для проверки совпадения. Это "
+            "test-identity исключение, а не доказанный campaign entitlement."
+            "</div>"
+            if is_easyweek
+            else ""
+        )
+        # EasyWeek customers have no Altegio client id, and this path never
+        # calls the Altegio CRM. A field that does nothing is a field that
+        # invites a wrong value.
+        altegio_field = (
+            ""
+            if is_easyweek
+            else """<div class="col-auto">
+        <label class="form-label small mb-1">Altegio Client ID</label>
+        <input id="add-altegio-cid" type="number" class="form-control form-control-sm" placeholder="необязательно">
+      </div>"""
+        )
         preview_actions_block = f"""
 <div class="alert alert-info d-flex align-items-center gap-3 mb-3 flex-wrap">
-  <span>Это preview-run. Запустите send-real или отредактируйте snapshot.</span>
-  <a href="/ops/campaigns/new-clients?from_preview={run_id}"
-     class="btn btn-success btn-sm">▶ Run from preview</a>
+  <span>{lead}</span>
+  {run_button}
   <button class="btn btn-outline-warning btn-sm"
           onclick="discardAndRefresh({run_id})">⊘ Discard</button>
   <button class="btn btn-outline-danger btn-sm"
           onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
   <button class="btn btn-outline-secondary btn-sm"
-          onclick="showAddRecipientForm()">➕ Add recipient</button>
+          onclick="showAddRecipientForm()">{add_label}</button>
 </div>
 <div id="add-recipient-form" class="card mb-3 d-none">
-  <div class="card-header">➕ Добавить получателя в snapshot</div>
+  <div class="card-header">{add_header}</div>
   <div class="card-body">
+    {add_hint}
     <div class="row g-2 align-items-end">
       <div class="col-auto">
         <label class="form-label small mb-1">Phone</label>
         <input id="add-phone" type="text" class="form-control form-control-sm" placeholder="+49...">
       </div>
-      <div class="col-auto">
-        <label class="form-label small mb-1">Altegio Client ID</label>
-        <input id="add-altegio-cid" type="number" class="form-control form-control-sm" placeholder="необязательно">
-      </div>
+      {altegio_field}
       <div class="col-auto">
         <button class="btn btn-primary btn-sm" onclick="submitAddRecipient({run_id})">Добавить</button>
         <button class="btn btn-outline-secondary btn-sm ms-1" onclick="hideAddRecipientForm()">Отмена</button>
@@ -5068,7 +5156,10 @@ function hideAddRecipientForm() {{
 
 async function submitAddRecipient(runId) {{
   const phone = document.getElementById("add-phone").value.trim();
-  const cid = document.getElementById("add-altegio-cid").value.trim();
+  // Absent for EasyWeek: that path takes the customer from server configuration
+  // and refuses a client id outright rather than ignoring it.
+  const cidEl = document.getElementById("add-altegio-cid");
+  const cid = cidEl ? cidEl.value.trim() : "";
   const alertEl = document.getElementById("add-recipient-alert");
   if (!phone && !cid) {{
     alertEl.innerHTML = '<div class="alert alert-warning py-1 mb-0">Укажите phone или altegio_client_id</div>';
@@ -5084,11 +5175,15 @@ async function submitAddRecipient(runId) {{
   }});
   const data = await resp.json();
   if (resp.ok) {{
+    const rid = (data.recipient && data.recipient.id) || data.recipient_id;
+    const what = data.action ? (' (' + data.action + ')') : '';
     alertEl.innerHTML = '<div class="alert alert-success py-1 mb-0">Получатель добавлен (id=' +
-      data.recipient.id + '). <a href="">Обновите страницу.</a></div>';
+      rid + ')' + what + '. <a href="">Обновите страницу.</a></div>';
   }} else {{
+    // The EasyWeek path answers with a stable reason code and never with a
+    // phone number, a name or a customer UUID.
     const detail = typeof data.detail === "object"
-      ? (data.detail.message || JSON.stringify(data.detail))
+      ? (data.detail.reason || data.detail.message || JSON.stringify(data.detail))
       : (data.detail || JSON.stringify(data));
     alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + detail + '</div>';
   }}
@@ -5176,6 +5271,7 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 )
             )
             used_as_source = int(src_count or 0) > 0
+        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
 
         conditions: list[Any] = [
             CampaignRecipient.campaign_run_id == run_id,
@@ -5206,8 +5302,11 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
         ],
     )
 
-    # Remove button только для completed preview, не используемого send-real
-    is_editable_preview = run.mode == "preview" and run.status == "completed" and not used_as_source
+    # Remove button только для completed preview, не используемого send-real,
+    # и не занятого controlled voucher delivery canary.
+    is_editable_preview = (
+        run.mode == "preview" and run.status == "completed" and not used_as_source and not canary_locked
+    )
     # Retry button доступен для send-real runs (не для preview)
     is_send_real = run.mode == "send-real"
 

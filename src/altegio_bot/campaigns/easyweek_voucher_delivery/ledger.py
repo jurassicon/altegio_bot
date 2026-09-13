@@ -47,6 +47,8 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     VOUCHER_DELIVERY_AMBIGUOUS,
+    VOUCHER_DELIVERY_BASIS_EARNED,
+    VOUCHER_DELIVERY_BASIS_TEST,
     VOUCHER_DELIVERY_CREATE_CLAIMED,
     VOUCHER_DELIVERY_CREATE_REJECTED,
     VOUCHER_DELIVERY_CREATE_UNKNOWN,
@@ -169,6 +171,11 @@ class LedgerSnapshot:
     exists: bool
     status: str | None
     reason_code: str | None
+    # On what grounds this canary exists: an earned first visit, or the owner's
+    # approved test account. Safe to print — it names a KIND of basis, never a
+    # person — and an operator who cannot see it cannot tell what the row is
+    # claiming about the human being it names.
+    recipient_basis: str | None
     campaign_run_id: int | None
     campaign_recipient_id: int | None
     company_id: int | None
@@ -200,6 +207,14 @@ class LedgerSnapshot:
             "ledger_row_exists": self.exists,
             "status": self.status,
             "reason_code": self.reason_code,
+            "recipient_basis": self.recipient_basis,
+            # Said in the report, not left to be inferred from an absent field.
+            # Three answers, and the third one matters: a test canary never
+            # proved a first visit (`not_applicable`, not a `false` that would
+            # suggest it looked and failed), an earned one did, and a ledger
+            # that does not exist yet proved NOTHING — printing `earned` there
+            # would be an absence of evidence reported as evidence.
+            "first_visit_proof": _first_visit_proof(self.exists, self.recipient_basis),
             "campaign_run_id": self.campaign_run_id,
             "campaign_recipient_id": self.campaign_recipient_id,
             "company_id": self.company_id,
@@ -222,6 +237,25 @@ class LedgerSnapshot:
         }
 
 
+# What an operator report says about the first-visit contract, for each of the
+# three states a row can be in. `not_available` is deliberately not `false`:
+# there is no row to have proven anything either way.
+FIRST_VISIT_EARNED: Final = "earned"
+FIRST_VISIT_NOT_APPLICABLE: Final = "not_applicable"
+FIRST_VISIT_NOT_AVAILABLE: Final = "not_available"
+
+
+def _first_visit_proof(exists: bool, basis: str | None) -> str:
+    if not exists or basis is None:
+        return FIRST_VISIT_NOT_AVAILABLE
+    if basis == VOUCHER_DELIVERY_BASIS_TEST:
+        return FIRST_VISIT_NOT_APPLICABLE
+    if basis == VOUCHER_DELIVERY_BASIS_EARNED:
+        return FIRST_VISIT_EARNED
+    # A basis this code does not know is not an earned one.
+    return FIRST_VISIT_NOT_AVAILABLE
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -236,6 +270,7 @@ def _snapshot(row: EasyWeekCampaignVoucherDeliveryLedger | None) -> LedgerSnapsh
             exists=False,
             status=None,
             reason_code=None,
+            recipient_basis=None,
             campaign_run_id=None,
             campaign_recipient_id=None,
             company_id=None,
@@ -264,6 +299,7 @@ def _snapshot(row: EasyWeekCampaignVoucherDeliveryLedger | None) -> LedgerSnapsh
         exists=True,
         status=row.status,
         reason_code=row.reason_code,
+        recipient_basis=row.recipient_basis,
         campaign_run_id=row.campaign_run_id,
         campaign_recipient_id=row.campaign_recipient_id,
         company_id=row.company_id,
@@ -336,7 +372,13 @@ class CanaryIdentity:
     campaign_code: str
     campaign_run_id: int
     campaign_recipient_id: int
-    source_booking_uuid: str
+    # ``earned_first_visit`` or ``owner_test_account``. Part of the identity
+    # because it is part of what the operator approved: the same person on a
+    # different basis is a different decision, and a row may not change its mind
+    # about which one it was opened under.
+    recipient_basis: str
+    # NULL for a test canary, which has no visit to name. Never a placeholder.
+    source_booking_uuid: str | None
     easyweek_customer_uuid: str
     location_uuid: str
     staffer_uuid: str
@@ -354,6 +396,7 @@ class CanaryIdentity:
             return True
         return (
             snapshot.company_id == self.company_id
+            and snapshot.recipient_basis == self.recipient_basis
             and snapshot.campaign_run_id == self.campaign_run_id
             and snapshot.campaign_recipient_id == self.campaign_recipient_id
             and snapshot.source_booking_uuid == self.source_booking_uuid
@@ -364,6 +407,29 @@ class CanaryIdentity:
             and snapshot.voucher_template_uuid == self.voucher_template_uuid
             and snapshot.reconciliation_marker == self.reconciliation_marker
         )
+
+
+async def preview_is_locked_by_canary(session: AsyncSession, *, campaign_run_id: int) -> bool:
+    """Has a voucher delivery canary attached itself to this preview run?
+
+    Once it has, the snapshot stops being editable. The reason is not tidiness:
+    the canary addresses its recipient by run id and recipient id, and re-proves
+    that pair live before every external step. An operator who edits or discards
+    the preview after CREATE or PAY therefore does not undo anything — they make
+    the DELIVER and the REFUND unprovable, leaving a real €15 order with no way
+    to finish it and no way to take it back.
+
+    Takes the caller's session so the check can happen under the same lock as
+    the edit it is guarding. Asked in the UI as well, but that is a courtesy;
+    this is where it is enforced.
+    """
+    found = await session.scalar(
+        select(EasyWeekCampaignVoucherDeliveryLedger.id)
+        .where(EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id == campaign_run_id)
+        .where(EasyWeekCampaignVoucherDeliveryLedger.provider == PROVIDER_EASYWEEK)
+        .limit(1)
+    )
+    return found is not None
 
 
 async def open_canary(
@@ -393,7 +459,10 @@ async def open_canary(
                 campaign_code=identity.campaign_code,
                 campaign_run_id=identity.campaign_run_id,
                 campaign_recipient_id=identity.campaign_recipient_id,
-                source_booking_uuid=uuid_module.UUID(identity.source_booking_uuid),
+                recipient_basis=identity.recipient_basis,
+                source_booking_uuid=(
+                    uuid_module.UUID(identity.source_booking_uuid) if identity.source_booking_uuid is not None else None
+                ),
                 easyweek_customer_uuid=uuid_module.UUID(identity.easyweek_customer_uuid),
                 location_uuid=uuid_module.UUID(identity.location_uuid),
                 staffer_uuid=uuid_module.UUID(identity.staffer_uuid),
