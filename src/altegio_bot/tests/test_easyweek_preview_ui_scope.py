@@ -315,10 +315,13 @@ async def test_the_page_invalidates_the_preview_on_every_switch(http_client) -> 
     script = _page_script(page)
 
     invalidate = _function_source(script, "invalidatePreviewContext")
-    # It moves the page clock, which revokes everything still in flight, and
-    # takes the surface down through the single function that owns that.
-    assert "PAGE_EPOCH += 1;" in invalidate
-    assert "resetPreviewSurface();" in invalidate
+    # It takes the surface down through the single function that owns that, and
+    # that function is what moves the page clock — revoking everything still in
+    # flight. The card select's fate is the caller's decision, not its own.
+    assert "takeDownPreview();" in invalidate
+    takedown = _function_source(script, "takeDownPreview")
+    assert "PAGE_EPOCH += 1;" in takedown
+    assert "resetPreviewSurface();" in takedown
     surface = _function_source(script, "resetPreviewSurface")
     assert "PREVIEW_CONTEXT = null;" in surface
     assert "previewRunId = null;" in surface
@@ -662,6 +665,8 @@ async def _lifecycle(http_client: AsyncClient, *extra: str) -> str:
         "isEasyWeek",
         "applyRunAvailability",
         "invalidatePreviewContext",
+        "takeDownPreview",
+        "recoverLiveCardTypes",
         "resetPreviewSurface",
         "unlockSnapshotFields",
         "setPreviewBusy",
@@ -2944,3 +2949,303 @@ console.log(JSON.stringify(out));
     assert answer["otherBranch"] == "stale"
     assert answer["liveHere"] == "ready"
     assert answer["liveElsewhere"] == "stale"
+
+
+# ---------------------------------------------------------------------------
+# Building a new preview from an open `?from_preview=`
+# ---------------------------------------------------------------------------
+#
+# The operator opens a saved preview, changes nothing they need to change, and
+# presses Create Preview to get a fresh snapshot of the same parameters. The
+# card type is the snapshot's frozen one, and it has to survive the moment the
+# old preview is taken down — the payload and the signature are read on either
+# side of that moment.
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_pressing_create_preview_on_a_loaded_snapshot_builds_a_new_run(
+    http_client,
+) -> None:
+    """Driven through the button's own click handler, not by calling the function.
+
+    Taking the previous preview down used to fetch a live card list, which
+    blanked the select synchronously: the POST carried card 7007 while the
+    signature it was checked against carried none.
+    """
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.card_type_id = "7007";          // frozen, and in no live list
+
+const slowPost = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) return slowPost.promise;
+  return defaultRoutes(url);
+};
+
+await boot();
+const loaded = Object.assign(state(), {previewButtonDisabled: el("btn-preview").disabled});
+
+// The operator presses the button that is on the page.
+const pressed = fireEvent("btn-preview", "click");
+await settle();
+const inFlight = Object.assign(state(), {
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+});
+
+slowPost.resolve({ok: true, body: {id: 210, provider: "altegio", company_ids: [1271200],
+                                   is_runnable_from_preview: true, total_clients_seen: 12,
+                                   candidates_count: 12}});
+await pressed;
+await settle();
+
+emit({
+  loaded: loaded,
+  inFlight: inFlight,
+  after: state(),
+  alert: el("preview-alert").innerHTML,
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+  recipientsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/recipients") !== -1),
+});
+"""
+    answer = _run_node(source, driver)
+
+    # The saved preview loaded, frozen on its own card, and the button is one
+    # the operator can actually press.
+    assert answer["loaded"]["context"]["runId"] == 41
+    assert answer["loaded"]["card"] == "7007"
+    assert answer["loaded"]["runDisabled"] is False
+    assert answer["loaded"]["previewButtonDisabled"] is False
+
+    # Exactly one POST, carrying the frozen card — and no card-types GET racing it.
+    assert len(answer["inFlight"]["posts"]) == 1, answer["inFlight"]["posts"]
+    assert answer["inFlight"]["posts"][0]["card_type_id"] == "7007"
+    assert answer["inFlight"]["posts"][0]["company_id"] == 1271200
+    assert answer["inFlight"]["cardsAsked"] == [], "a competing card-types read blanked the select"
+    assert answer["inFlight"]["card"] == "7007", "the frozen card was cleared mid-request"
+    assert answer["inFlight"]["spinnerHidden"] is False
+
+    # The new run is the one on screen, and it is internally consistent.
+    after = answer["after"]
+    assert after["context"]["runId"] == 210
+    assert after["previewRunId"] == 210
+    assert after["context"]["signature"]["cardTypeId"] == "7007"
+    assert after["context"]["companyId"] == "1271200"
+    assert after["card"] == "7007"
+    assert after["cardState"] == "snapshot"
+    assert after["cardStatus"] == "ready", "the card select was left loading"
+    assert after["spinnerHidden"] is True
+    assert after["previewDisabled"] is False
+    assert after["resultsHidden"] is False
+    # Run is offered: the server allows it and the form still describes the run.
+    assert after["runDisabled"] is False
+    assert "Run ID: 210" in answer["alert"]
+    # And the new run's recipients were read, not the old one's.
+    assert any("/runs/210/recipients" in url for url in answer["recipientsAsked"])
+    assert answer["cardsAsked"] == []
+    assert after["rejections"] == []
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_repeat_preview_is_not_offered_for_run_when_the_server_refuses(
+    http_client,
+) -> None:
+    """The same path, with the server's verdict being no."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.card_type_id = "7007";
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 211, provider: "altegio", company_ids: [1271200],
+                             is_runnable_from_preview: false}};
+  }
+  return defaultRoutes(url);
+};
+await boot();
+await fireEvent("btn-preview", "click");
+emit(state());
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["context"]["runId"] == 211
+    assert answer["context"]["runnable"] is False
+    assert answer["context"]["signature"]["cardTypeId"] == "7007"
+    assert answer["runDisabled"] is True
+    assert answer["cardStatus"] == "ready"
+    assert answer["spinnerHidden"] is True
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_failed_repeat_preview_leaves_an_ordinary_usable_page(http_client) -> None:
+    """Both ways it can fail, and the page is editable again afterwards.
+
+    There is nothing to go back to — the loaded snapshot was revoked before the
+    request left — so what has to be true is that the page is ordinary again:
+    no spinner, no held button, and a real card list instead of the frozen card
+    whose snapshot is gone.
+    """
+    for failure in ('{ok: false, status: 500, body: {detail: "preview exploded"}}', '{throw: "connection reset"}'):
+        source = await _browser(http_client, "?from_preview=41")
+        driver = (
+            """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.card_type_id = "7007";
+
+const slowCards = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1 && FETCHES.filter(
+        (f) => f.url.indexOf("/new-clients/preview") !== -1).length === 1) {
+    return %s;
+  }
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 212, provider: "altegio", company_ids: [1271200],
+                             is_runnable_from_preview: true}};
+  }
+  if (url.indexOf("/card-types") !== -1) return slowCards.promise;
+  return defaultRoutes(url);
+};
+
+await boot();
+await fireEvent("btn-preview", "click");
+const failed = Object.assign(state(), {
+  alert: el("preview-alert").innerHTML,
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+});
+
+// Pressing again while the list is still coming is refused, not queued.
+await fireEvent("btn-preview", "click");
+const whileLoading = {
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).length,
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1).length,
+};
+
+slowCards.resolve({ok: true, body: CARD_TYPES});
+await settle();
+const recovered = state();
+
+await fireEvent("btn-preview", "click");
+emit({
+  failed: failed, whileLoading: whileLoading, recovered: recovered, after: state(),
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+});
+"""
+            % failure
+        )
+        answer = _run_node(source, driver)
+        label = failure[:24]
+
+        # The old preview is not restored, and nothing is left running.
+        assert answer["failed"]["context"] is None, label
+        assert answer["failed"]["previewRunId"] is None, label
+        assert answer["failed"]["spinnerHidden"] is True, label
+        assert answer["failed"]["previewDisabled"] is False, label
+        assert answer["failed"]["runDisabled"] is True, label
+        assert answer["failed"]["recipientsLoadingHidden"] is True, label
+        # A live list was asked for exactly once, for the branch on screen.
+        assert len(answer["failed"]["cardsAsked"]) == 1, answer["failed"]["cardsAsked"]
+        assert "location_id=1271200" in answer["failed"]["cardsAsked"][0], label
+        assert answer["whileLoading"]["posts"] == 1, f"{label}: a preview was sent on a leftover card"
+        assert answer["whileLoading"]["cardsAsked"] == 1, f"{label}: the list was fetched twice"
+
+        # Once it lands the page is an ordinary one that can build previews.
+        assert answer["recovered"]["cardStatus"] == "ready", label
+        assert answer["recovered"]["cardDisabled"] is False, label
+        assert "7007" not in answer["recovered"]["cardOptions"], label
+        assert len(answer["posts"]) == 2, label
+        assert answer["posts"][1]["card_type_id"] == "1001", label
+        assert answer["after"]["context"]["runId"] == 212, label
+        assert answer["after"]["spinnerHidden"] is True, label
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_repeat_preview_answer_is_dropped_when_the_branch_moved(http_client) -> None:
+    """And it does not take the new branch's reference reads with it."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.card_type_id = "7007";
+
+const slowPost = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) return slowPost.promise;
+  return defaultRoutes(url);
+};
+
+await boot();
+const pressed = fireEvent("btn-preview", "click");
+await settle();
+
+// The operator moves to the other branch while the POST is in flight.
+el("f-company").value = "758285";
+await fireEvent("f-company", "change");
+const moved = state();
+
+slowPost.resolve({ok: true, body: {id: 213, provider: "altegio", company_ids: [1271200],
+                                   is_runnable_from_preview: true}});
+await pressed;
+await settle();
+
+emit({
+  moved: moved,
+  after: state(),
+  alert: el("preview-alert").innerHTML,
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+});
+"""
+    answer = _run_node(source, driver)
+
+    # The branch change asked for that branch's list; the late answer left it be.
+    assert len(answer["cardsAsked"]) == 1
+    assert "location_id=758285" in answer["cardsAsked"][0]
+    assert answer["after"]["cardStatus"] == "ready"
+    assert answer["after"]["cardOptions"] == ["1001", "2002"]
+    # The answer for the branch that was left is not on screen.
+    assert answer["after"]["context"] is None
+    assert answer["after"]["previewRunId"] is None
+    assert "213" not in answer["alert"]
+    # And the page is idle, not stuck mid-request.
+    assert answer["after"]["spinnerHidden"] is True
+    assert answer["after"]["previewDisabled"] is False
+    assert answer["after"]["runDisabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_request_is_captured_before_anything_is_taken_down(http_client) -> None:
+    """A source-order check, and deliberately so.
+
+    With the takedown no longer touching the card select, reading the payload
+    or the signature afterwards happens to give the same answer — so no
+    executed test can tell the two orders apart today. That is exactly why the
+    ordering is worth pinning: the defect this fixes was a DOM change sneaking
+    in between the payload and the signature, and the next one would be too.
+    """
+    script = _page_script((await http_client.get("/ops/campaigns/new-clients")).text)
+    create = _function_source(script, "createPreview")
+
+    capture = create.index("const captured = {")
+    takedown = create.index("revokePreviewFor(captured);")
+    request = create.index('await fetch("/ops/campaigns/new-clients/preview"')
+    assert capture < takedown < request
+
+    # Everything the request is judged by comes out of that one capture.
+    assert "payload: buildPayload()," in create
+    assert "scope: currentScope()," in create
+    assert "signature: snapshotSignature()," in create
+    assert "const asked = captured.scope;" in create
+    assert "const askedSignature = captured.signature;" in create
+    assert "JSON.stringify(captured.payload)" in create
+    # And nothing re-reads the form between the takedown and the request.
+    between = create[takedown:request]
+    for reread in ("buildPayload()", "snapshotSignature()", "currentScope()"):
+        assert reread not in between, f"{reread} is read after the takedown"

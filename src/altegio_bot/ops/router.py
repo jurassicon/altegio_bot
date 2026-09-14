@@ -4293,8 +4293,18 @@ async function loadCardTypes() {{
   // it was asked for. Two things can make an answer unusable: a newer read, or
   // the selection moving underneath it — and neither is the page clock, which
   // is why this does not ride it.
-  const generation = ++CARD_TYPES_GENERATION;
   const scope = currentScope();
+  // Already on its way for this very branch — a branch change both recovers the
+  // list and reloads it — so a second read would ask the same question. Checked
+  // BEFORE taking a generation: taking one would revoke the read in flight and
+  // then return, leaving the select loading forever.
+  if (CARD_TYPES_STATE.state === "loading"
+      && CARD_TYPES_STATE.scope
+      && scopeMatches(CARD_TYPES_STATE.scope, scope)) {{
+    return;
+  }}
+
+  const generation = ++CARD_TYPES_GENERATION;
   const statusEl = document.getElementById("card-load-status");
   const cardSelect = document.getElementById("f-card-type");
 
@@ -4411,18 +4421,30 @@ async function createPreview() {{
     }}
   }}
 
-  const payload = buildPayload();
-  if (!payload) return;
+  // Everything this request is about, read in one go BEFORE anything is
+  // revoked, reloaded or redrawn: what is being asked for, which provider and
+  // branch it belongs to, the full snapshot signature, and whether the card
+  // type in both of those came from a snapshot's frozen select rather than a
+  // live list. Reading any of it after the takedown is what let the payload and
+  // the signature disagree about the card.
+  const captured = {{
+    payload: buildPayload(),
+    scope: currentScope(),
+    signature: snapshotSignature(),
+    fromFrozenSnapshot: !isEasyWeek() && CARD_TYPES_STATE.state === "snapshot"
+      && cardTypesStatus() === "ready",
+  }};
+  if (!captured.payload) return;
 
   // Starting B revokes A here, BEFORE the request goes out. Anything that
   // arrives for A afterwards has nothing to restore, and a failure of B leaves
   // no stale predecessor behind either.
-  invalidatePreviewContext();
+  revokePreviewFor(captured);
 
   // This request owns the busy state from here until it loses the ticket.
   const ticket = beginOperation();
-  const asked = currentScope();
-  const askedSignature = snapshotSignature();
+  const asked = captured.scope;
+  const askedSignature = captured.signature;
   PREVIEW_IN_FLIGHT = {{ticket: ticket, scope: asked, signature: askedSignature}};
   setPreviewBusy(true);
 
@@ -4430,7 +4452,7 @@ async function createPreview() {{
     const resp = await fetch("/ops/campaigns/new-clients/preview", {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify(payload),
+      body: JSON.stringify(captured.payload),
     }});
     const data = await resp.json();
     // Four things have to agree before a single pixel changes: this request is
@@ -4444,6 +4466,10 @@ async function createPreview() {{
     if (!signatureMatches(askedSignature, snapshotSignature())) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "danger", "Preview ошибка: " + (data.detail || JSON.stringify(data)));
+      // Nothing to go back to: the previous preview was revoked before this
+      // request left. What remains is an ordinary editable page — except that
+      // its select may still hold a frozen card with no snapshot behind it.
+      recoverLiveCardTypes();
       return;
     }}
     // The context comes from the RUN, not from the dropdown, and carries the
@@ -4465,6 +4491,7 @@ async function createPreview() {{
   }} catch (e) {{
     if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка сети: " + e.message);
+    recoverLiveCardTypes();
   }} finally {{
     // Even the cleanup belongs to whoever owns the page now. An old request
     // finishing here would hide a running spinner and re-enable a button
@@ -5103,21 +5130,54 @@ function resetPreviewSurface() {{
 // Forget the preview on screen without touching the saved run. Called whenever
 // the screen stops describing it: another provider, another branch, an edited
 // snapshot field, a new preview. The CampaignRun itself stays in the database.
-function invalidatePreviewContext() {{
+function takeDownPreview() {{
   // Moving the clock revokes everything in flight at once — preview, prefill,
   // card types, recipients — so none of them can come back and paint over a
-  // page that has moved on.
+  // page that has moved on. What the card select means afterwards is NOT
+  // decided here: that is the difference between the two callers below, and it
+  // is the whole reason they are two functions.
   PAGE_EPOCH += 1;
-  const wasFrozenByASnapshot = CARD_TYPES_STATE.state === "snapshot";
   resetPreviewSurface();
   setAlert("preview-alert", "", "");
-  // The select was frozen by a snapshot that no longer exists, so the operator
-  // needs a real list again. A page whose list was already live keeps it: this
-  // is a recovery, not a reload on every invalidation.
-  if (wasFrozenByASnapshot) {{
-    CARD_TYPES_STATE = {{state: "idle", scope: null}};
-    loadCardTypes();
+}}
+
+// The select is showing a card that a snapshot froze, and that snapshot is
+// gone. The card is a leftover, not a list to choose from, so a real one is
+// fetched. A page whose list was already live keeps it: this is a recovery, not
+// a reload after every takedown.
+function recoverLiveCardTypes() {{
+  if (isEasyWeek()) return;
+  if (CARD_TYPES_STATE.state !== "snapshot") return;
+  CARD_TYPES_STATE = {{state: "idle", scope: null}};
+  loadCardTypes();
+}}
+
+// Discard the preview on screen with nothing replacing it: a provider switch, a
+// branch change, an edited parameter, a refused run.
+function invalidatePreviewContext() {{
+  takeDownPreview();
+  recoverLiveCardTypes();
+}}
+
+// Discard the preview on screen because a NEW request is replacing it. The same
+// takedown, with one deliberate difference: when the card in the outgoing
+// request came from a snapshot's frozen select, that card is carried over
+// rather than discarded and re-fetched.
+//
+// Fetching here is what broke repeat previews from an open `?from_preview=`.
+// The reload blanked the select synchronously, between the payload being built
+// and the signature being read — so the POST carried the frozen card while the
+// signature carried none, and the answer was either thrown away or accepted as
+// a preview whose Run could never be offered.
+function revokePreviewFor(captured) {{
+  takeDownPreview();
+  if (captured.fromFrozenSnapshot) {{
+    // The replacement already holds this card, in its payload and in its
+    // signature. The select keeps showing it, and no list is fetched.
+    CARD_TYPES_STATE = {{state: "snapshot", scope: captured.scope}};
+    return;
   }}
+  recoverLiveCardTypes();
 }}
 
 function buildPayload() {{
