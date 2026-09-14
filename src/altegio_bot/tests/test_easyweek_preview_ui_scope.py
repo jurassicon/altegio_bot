@@ -315,10 +315,14 @@ async def test_the_page_invalidates_the_preview_on_every_switch(http_client) -> 
     script = _page_script(page)
 
     invalidate = _function_source(script, "invalidatePreviewContext")
-    # It forgets the page state and offers nothing to run.
-    assert "PREVIEW_CONTEXT = null;" in invalidate
-    assert "previewRunId = null;" in invalidate
-    assert "applyRunAvailability();" in invalidate
+    # It moves the page clock, which revokes everything still in flight, and
+    # takes the surface down through the single function that owns that.
+    assert "PAGE_EPOCH += 1;" in invalidate
+    assert "resetPreviewSurface();" in invalidate
+    surface = _function_source(script, "resetPreviewSurface")
+    assert "PREVIEW_CONTEXT = null;" in surface
+    assert "previewRunId = null;" in surface
+    assert "applyRunAvailability();" in surface
     # And it does not delete anything: no fetch, no discard, no delete.
     for destructive in ("fetch(", "discard", "delete"):
         assert destructive not in invalidate.lower()
@@ -654,11 +658,15 @@ async def _lifecycle(http_client: AsyncClient, *extra: str) -> str:
         "isEasyWeek",
         "applyRunAvailability",
         "invalidatePreviewContext",
+        "resetPreviewSurface",
+        "unlockSnapshotFields",
+        "setPreviewBusy",
         *extra,
     ]
     bodies = "\n".join(_function_source(script, name) for name in names)
     # The module-level state the functions read, declared the way the page does.
-    state = "let PREVIEW_CONTEXT = null;\nlet PREVIEW_GENERATION = 0;\n"
+    state = "let PREVIEW_CONTEXT = null;\nlet PAGE_EPOCH = 0;\n"
+    state += "let PREVIEW_IN_FLIGHT = null;\n"
     state += "let RECIPIENTS_GENERATION = 0;\nlet previewRunId = null;\n"
     # `SIGNATURE_FIELDS` is a const the page ships; take it verbatim.
     fields = re.search(r"const SIGNATURE_FIELDS = \[.*?\];", script, re.DOTALL)
@@ -920,19 +928,37 @@ BROWSER = """
 // A DOM that is small to read and complete enough to run the page. Elements are
 // created on demand rather than enumerated, so a new field in the page does not
 // silently become `null` here and quietly skip the code under test.
+//
+// Selects are modelled properly rather than as a string of HTML, because the
+// races this file exists to catch are exactly the ones a string cannot show:
+// replacing a select's markup replaces its options and moves the selection to
+// the first of them, and assigning a value no option carries selects nothing at
+// all. A harness that just remembers `innerHTML` reports every one of those as
+// a success.
 const EVENTS = {};
 const ELEMENTS = {};
 const ALERTS = [];
 const FETCHES = [];
 const REJECTIONS = [];
 
+function parseOptions(html) {
+  const found = [];
+  const pattern = /<option([^>]*)>([\\s\\S]*?)<\\/option>/g;
+  let match;
+  while ((match = pattern.exec(html)) !== null) {
+    const value = match[1].match(/value="([^"]*)"/);
+    found.push({value: value ? value[1] : match[2].trim(), text: match[2]});
+  }
+  return found;
+}
+
 function makeElement(id) {
   const element = {
     id: id,
-    value: "",
+    _value: "",
+    _html: "",
     checked: false,
     disabled: false,
-    innerHTML: "",
     textContent: "",
     className: "",
     options: [],
@@ -953,6 +979,29 @@ function makeElement(id) {
       EVENTS[id][type] = (EVENTS[id][type] || []).concat([handler]);
     },
   };
+  Object.defineProperty(element, "innerHTML", {
+    get() { return this._html; },
+    set(html) {
+      this._html = String(html);
+      const parsed = parseOptions(this._html);
+      if (parsed.length || this.options.length) {
+        // Rewriting a select's markup rewrites its options, and the browser
+        // then selects the first one. This is how a late card-types answer
+        // silently replaces a card type a loaded snapshot had fixed.
+        this.options = parsed;
+        this._value = parsed.length ? parsed[0].value : "";
+      }
+    },
+  });
+  Object.defineProperty(element, "value", {
+    get() { return this._value; },
+    set(next) {
+      const wanted = String(next);
+      if (this.options.length === 0) { this._value = wanted; return; }
+      // A select cannot hold a value none of its options carries.
+      this._value = this.options.some((o) => String(o.value) === wanted) ? wanted : "";
+    },
+  });
   ELEMENTS[id] = element;
   return element;
 }
@@ -962,6 +1011,19 @@ globalThis.hidden = function (id) { return el(id).classList.contains("d-none"); 
 globalThis.fireEvent = async function (id, type) {
   for (const handler of ((EVENTS[id] || {})[type] || [])) await handler();
   await settle();
+};
+// The page as the server rendered it: real options, real defaults.
+globalThis.seedSelect = function (id, options, disabled) {
+  const element = el(id);
+  element.options = options.map((pair) => ({value: pair[0], text: pair[1]}));
+  element._value = element.options.length ? element.options[0].value : "";
+  element.disabled = !!disabled;
+};
+globalThis.seedInput = function (id, value, checked, disabled) {
+  const element = el(id);
+  element._value = String(value);
+  element.checked = !!checked;
+  element.disabled = !!disabled;
 };
 
 const DOM_READY = [];
@@ -1036,10 +1098,13 @@ globalThis.RUN = {
   followup_enabled: false,
   is_runnable_from_preview: true,
 };
-globalThis.EMPTY = {items: [], total: 0, card_types: [], cards: [], rows: [], items_total: 0};
+globalThis.EMPTY = {items: [], total: 0, rows: []};
+// What /card-types answers with: a plain array, as the endpoint returns.
+globalThis.CARD_TYPES = [{id: "1001", title: "Bronze"}, {id: "2002", title: "Silver"}];
 
-// The default network: the run itself, and empty everything else.
+// The default network: the run itself, the branch's card types, empty rest.
 globalThis.defaultRoutes = async function (url) {
+  if (url.indexOf("/card-types") !== -1) return {ok: true, body: CARD_TYPES};
   if (url.indexOf("/recipients") !== -1) return {ok: true, body: EMPTY};
   const match = url.match(/^\\/ops\\/campaigns\\/runs\\/(\\d+)$/);
   if (match) {
@@ -1059,12 +1124,17 @@ globalThis.state = function () {
   return {
     context: PREVIEW_CONTEXT,
     previewRunId: previewRunId,
+    inFlight: PREVIEW_IN_FLIGHT === null ? null : PREVIEW_IN_FLIGHT.ticket,
     runDisabled: el("btn-run").disabled,
     runHidden: hidden("btn-run"),
     resultsHidden: hidden("preview-results"),
     spinnerHidden: hidden("preview-spinner"),
     previewDisabled: el("btn-preview").disabled,
     table: el("recipients-table").innerHTML,
+    company: el("f-company").value,
+    card: el("f-card-type").value,
+    cardOptions: el("f-card-type").options.map((o) => o.value),
+    cardDisabled: el("f-card-type").disabled,
     rejections: REJECTIONS,
     fetched: FETCHES.map((f) => f.url),
   };
@@ -1072,17 +1142,51 @@ globalThis.state = function () {
 """
 
 
+_SELECT_RE = re.compile(r'<select id="([\w-]+)"([^>]*)>(.*?)</select>', re.DOTALL)
+_OPTION_RE = re.compile(r'<option value="([^"]*)"[^>]*>(.*?)</option>', re.DOTALL)
+_INPUT_RE = re.compile(r"<input([^>]*)>")
+_ID_RE = re.compile(r'id="([\w-]+)"')
+_VALUE_RE = re.compile(r'value="([^"]*)"')
+
+
+def _dom_seed(page: str) -> str:
+    """Seed the harness with the form the SERVER actually rendered.
+
+    Which branches exist, which one is selected by default, whether the card
+    select starts shut — all of that is the server's answer, not the test's
+    opinion. The Rastatt case in particular is only meaningful if the option
+    the page must select is one the server really renders.
+    """
+    lines = []
+    for element_id, attributes, inner in _SELECT_RE.findall(page):
+        options = [[value, re.sub(r"\s+", " ", text).strip()] for value, text in _OPTION_RE.findall(inner)]
+        shut = json.dumps("disabled" in attributes)
+        lines.append(f"seedSelect({json.dumps(element_id)}, {json.dumps(options)}, {shut});")
+    for attributes in _INPUT_RE.findall(page):
+        found = _ID_RE.search(attributes)
+        if not found:
+            continue
+        value = _VALUE_RE.search(attributes)
+        lines.append(
+            f"seedInput({json.dumps(found.group(1))}, {json.dumps(value.group(1) if value else '')}, "
+            f"{json.dumps('checked' in attributes)}, {json.dumps('disabled' in attributes)});"
+        )
+    return "\n".join(lines)
+
+
 async def _page(http_client: AsyncClient, query: str = "") -> str:
     return (await http_client.get("/ops/campaigns/new-clients" + query)).text
 
 
 async def _browser(http_client: AsyncClient, query: str = "") -> str:
-    """The harness plus the page's own script, exactly as served."""
-    return BROWSER + "\n" + _page_script(await _page(http_client, query))
+    """The harness, the server's own form, and the page script as served."""
+    page = await _page(http_client, query)
+    return BROWSER + "\n" + _dom_seed(page) + "\n" + _page_script(page)
 
 
-# The form as the server renders it, so a boot starts from the real defaults.
-ALTEGIO_FORM = {"f-provider": "altegio", "f-company": "758285", "f-ew-company": str(KARLSRUHE)}
+# The defaults now come from the rendered page, so a driver only names what it
+# deliberately changes.
+ALTEGIO_FORM: dict[str, str] = {}
 
 
 @needs_node
@@ -1195,6 +1299,11 @@ async def test_a_prefill_that_lands_after_a_provider_switch_is_ignored(http_clie
     source = await _browser(http_client, "?from_preview=37")
     driver = """
 preset(%s);
+// A period the form would never be showing by itself, so filling it in is
+// visible as filling it in.
+RUN.period_start = "2026-05-03T00:00:00Z";
+RUN.period_end = "2026-05-31T23:59:59Z";
+const untouched = el("f-period-start").value;
 const late = deferred();
 ROUTES = async (url) => {
   if (url === "/ops/campaigns/runs/37") return late.promise;
@@ -1215,6 +1324,7 @@ emit({
   before: beforeAnswer,
   after: state(),
   period: el("f-period-start").value,
+  untouched: untouched,
   companyLocked: el("f-company").disabled,
 });
 """ % json.dumps(ALTEGIO_FORM)
@@ -1224,7 +1334,8 @@ emit({
     # The late answer paints nothing and fills nothing in behind the operator.
     assert answer["after"]["context"] is None
     assert answer["after"]["previewRunId"] is None
-    assert answer["period"] == ""
+    assert answer["period"] == answer["untouched"], "the run was filled in behind the operator"
+    assert answer["period"] != "2026-05-03"
     assert answer["companyLocked"] is False
     assert answer["after"]["runDisabled"] is True
     assert answer["after"]["runHidden"] is True
@@ -1535,3 +1646,641 @@ emit({loaded: loaded, easyweek: easyweek, back: state()});
     assert answer["easyweek"]["runDisabled"] is True
     assert answer["back"]["context"] is None
     assert answer["back"]["runDisabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Any branch, not just the default one
+# ---------------------------------------------------------------------------
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_from_preview_loads_a_non_default_branch(http_client) -> None:
+    """Rastatt is not the branch the form opens on, and that is the point.
+
+    The page used to remember the branch it opened with, then set the branch
+    the run belongs to, then compare the two and refuse — so every preview of
+    any branch but the default was unopenable.
+    """
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.period_start = "2026-05-03T00:00:00Z";
+RUN.period_end = "2026-05-31T23:59:59Z";
+RUN.attribution_window_days = 45;
+RUN.card_type_id = "7007";
+const defaultCompany = el("f-company").value;
+await boot();
+emit(Object.assign(state(), {
+  defaultCompany: defaultCompany,
+  start: el("f-period-start").value,
+  end: el("f-period-end").value,
+  attribution: el("f-attribution").value,
+  recipientsAsked: FETCHES.some((f) => f.url.indexOf("/runs/41/recipients") !== -1),
+}));
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["defaultCompany"] == "758285", "the page no longer opens on Karlsruhe"
+    assert answer["company"] == "1271200", "the branch of the saved run was not selected"
+    assert answer["context"]["runId"] == 41
+    assert answer["context"]["companyId"] == "1271200"
+    assert answer["previewRunId"] == 41
+    assert answer["recipientsAsked"] is True, "the snapshot's recipients were never loaded"
+    # The signature describes the run, not the defaults the page opened with.
+    signature = answer["context"]["signature"]
+    assert signature["companyId"] == "1271200"
+    assert signature["periodStart"] == "2026-05-03"
+    assert signature["periodEnd"] == "2026-05-31"
+    assert signature["attributionWindowDays"] == "45"
+    assert signature["cardTypeId"] == "7007"
+    assert answer["runDisabled"] is False
+    assert answer["rejections"] == []
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_run_stays_shut_when_the_server_does_not_allow_it(http_client) -> None:
+    """Loading a branch's preview is not the same as being allowed to send it."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.is_runnable_from_preview = false;
+await boot();
+emit(state());
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["context"]["runId"] == 41, "the preview still loads"
+    assert answer["context"]["runnable"] is False
+    assert answer["company"] == "1271200"
+    assert answer["runDisabled"] is True
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_branch_this_ui_does_not_offer_is_refused_before_anything_is_filled(
+    http_client,
+) -> None:
+    """And the form is left usable, not half-filled and frozen."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [999999];
+const before = {company: el("f-company").value, start: el("f-period-start").value};
+await boot();
+emit(Object.assign(state(), {
+  before: before,
+  start: el("f-period-start").value,
+  companyDisabled: el("f-company").disabled,
+  startDisabled: el("f-period-start").disabled,
+  attributionDisabled: el("f-attribution").disabled,
+  alerts: ALERTS,
+}));
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["context"] is None
+    assert answer["company"] == answer["before"]["company"], "a refused run still moved the branch"
+    assert answer["start"] == answer["before"]["start"]
+    assert answer["companyDisabled"] is False
+    assert answer["startDisabled"] is False
+    assert answer["attributionDisabled"] is False
+    assert answer["spinnerHidden"] is True
+    assert answer["previewDisabled"] is False
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_response_for_another_run_is_refused(http_client) -> None:
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+ROUTES = async (url) => {
+  if (url.indexOf("/ops/campaigns/runs/41") !== -1 && url.indexOf("recipients") === -1) {
+    // The same shape, a different run.
+    return {ok: true, body: Object.assign({}, RUN, {id: 99})};
+  }
+  return defaultRoutes(url);
+};
+await boot();
+emit(Object.assign(state(), {alerts: ALERTS}));
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["context"] is None
+    assert answer["previewRunId"] is None
+    assert answer["runDisabled"] is True
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_user_branch_change_cancels_a_prefill_but_the_runs_own_does_not(
+    http_client,
+) -> None:
+    """The distinction the old code could not draw.
+
+    Both are `f-company.value = ...`. One is the operator saying "show me
+    something else" and must cancel; the other is the page describing the run
+    it was told to load and must not.
+    """
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+
+// (a) the operator changes the branch while the run is in flight
+const late = deferred();
+ROUTES = async (url) => {
+  if (url === "/ops/campaigns/runs/41") return late.promise;
+  return defaultRoutes(url);
+};
+await boot();
+el("f-company").value = "1271200";
+await fireEvent("f-company", "change");
+late.resolve({ok: true, body: RUN});
+await settle();
+const afterUserChange = state();
+
+emit({afterUserChange: afterUserChange});
+"""
+    cancelled = _run_node(source, driver)
+    # Even though the operator happened to pick the very branch the run uses,
+    # their change revoked the request that was in flight.
+    assert cancelled["afterUserChange"]["context"] is None
+    assert cancelled["afterUserChange"]["previewRunId"] is None
+    assert cancelled["afterUserChange"]["runDisabled"] is True
+    assert cancelled["afterUserChange"]["spinnerHidden"] is True
+    assert cancelled["afterUserChange"]["previewDisabled"] is False
+
+    # (b) nobody touches anything: the run's own branch change is not a cancel
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+await boot();
+emit(state());
+"""
+    loaded = _run_node(source, driver)
+    assert loaded["context"]["runId"] == 41
+    assert loaded["company"] == "1271200"
+    assert loaded["runDisabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Card types cannot race a loaded snapshot
+# ---------------------------------------------------------------------------
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_late_card_types_answer_cannot_touch_a_loaded_snapshot(http_client) -> None:
+    """The snapshot's card type survives a list that arrives after it.
+
+    The list is deliberately one that does NOT contain the snapshot's card, and
+    the harness models a select properly — replacing its markup replaces its
+    options and moves the selection — so a leaked answer shows up as a changed
+    card, not as an ignored string.
+    """
+    source = await _browser(http_client, "?from_preview=37")
+    driver = """
+RUN.card_type_id = "7007";   // not in the branch's live list
+const late = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/card-types") !== -1) return late.promise;
+  return defaultRoutes(url);
+};
+
+await boot();
+const loaded = state();
+
+// Whatever asked for card types — a stray earlier load — answers now.
+loadCardTypes();
+await settle();
+late.resolve({ok: true, body: CARD_TYPES});
+await settle();
+
+emit({loaded: loaded, after: state(), status: el("card-load-status").textContent});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["loaded"]["context"]["runId"] == 37
+    assert answer["loaded"]["card"] == "7007"
+    assert answer["loaded"]["cardDisabled"] is True
+
+    after = answer["after"]
+    assert after["card"] == "7007", "a late card-types answer replaced the snapshot's card"
+    assert "7007" in after["cardOptions"], "the snapshot's option was dropped from the list"
+    assert after["cardDisabled"] is True, "the frozen select was handed back to the operator"
+    assert after["context"]["runId"] == 37
+    assert after["context"]["signature"]["cardTypeId"] == "7007"
+    assert after["runDisabled"] is False
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_from_preview_page_does_not_ask_for_live_card_types(http_client) -> None:
+    """The simplest form of the guarantee: the race is never started."""
+    source = await _browser(http_client, "?from_preview=37")
+    driver = """
+await boot();
+emit({asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1)});
+"""
+    assert _run_node(source, driver)["asked"] == []
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_an_ordinary_page_still_loads_card_types(http_client) -> None:
+    """Nothing above may cost the normal flow its card types."""
+    source = await _browser(http_client)
+    driver = """
+await boot();
+const booted = {
+  asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+  options: el("f-card-type").options.map((o) => o.value),
+  disabled: el("f-card-type").disabled,
+};
+// And choosing a branch by hand asks again, for that branch.
+el("f-company").value = "1271200";
+await fireEvent("f-company", "change");
+emit({booted: booted, asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1)});
+"""
+    answer = _run_node(source, driver)
+
+    assert len(answer["booted"]["asked"]) == 1
+    assert "location_id=758285" in answer["booted"]["asked"][0]
+    assert answer["booted"]["options"] == ["1001", "2002"]
+    assert answer["booted"]["disabled"] is False
+    assert len(answer["asked"]) == 2
+    assert "location_id=1271200" in answer["asked"][1]
+
+
+# ---------------------------------------------------------------------------
+# Cancelling leaves the page idle, not stuck
+# ---------------------------------------------------------------------------
+
+
+PREVIEW_DRIVER_PRELUDE = """
+const late = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) return late.promise;
+  return defaultRoutes(url);
+};
+await boot();
+const running = createPreview();
+await settle();
+const busy = state();
+"""
+
+PREVIEW_DRIVER_CODA = """
+const cancelled = state();
+late.resolve({ok: true, body: {id: 101, provider: "altegio", company_ids: [758285],
+                               is_runnable_from_preview: true, total_clients_seen: 9,
+                               candidates_count: 9}});
+await running;
+await settle();
+emit({busy: busy, cancelled: cancelled, after: state(), alerts: ALERTS});
+"""
+
+
+def _assert_cancelled_to_idle(answer: dict) -> None:
+    """A cancelled preview leaves an idle page and a void answer."""
+    assert answer["busy"]["spinnerHidden"] is False, "the request never showed as running"
+    assert answer["busy"]["previewDisabled"] is True
+
+    for stage in ("cancelled", "after"):
+        assert answer[stage]["spinnerHidden"] is True, f"{stage}: the spinner was left running"
+        assert answer[stage]["previewDisabled"] is False, f"{stage}: Create Preview stayed held"
+        assert answer[stage]["runDisabled"] is True, stage
+        assert answer[stage]["context"] is None, stage
+        assert answer[stage]["previewRunId"] is None, stage
+        assert answer[stage]["resultsHidden"] is True, stage
+        assert answer[stage]["inFlight"] is None, stage
+    assert not any("101" in text for text in answer["alerts"]), "the cancelled answer announced itself"
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_provider_switch_during_a_preview_returns_the_page_to_idle(http_client) -> None:
+    source = await _browser(http_client)
+    driver = (
+        PREVIEW_DRIVER_PRELUDE
+        + """
+el("f-provider").value = "easyweek";
+onProviderChange();
+await settle();
+"""
+        + PREVIEW_DRIVER_CODA
+    )
+    _assert_cancelled_to_idle(_run_node(source, driver))
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_branch_change_during_a_preview_returns_the_page_to_idle(http_client) -> None:
+    source = await _browser(http_client)
+    driver = (
+        PREVIEW_DRIVER_PRELUDE
+        + """
+el("f-company").value = "1271200";
+await fireEvent("f-company", "change");
+"""
+        + PREVIEW_DRIVER_CODA
+    )
+    _assert_cancelled_to_idle(_run_node(source, driver))
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_editing_any_snapshot_field_during_a_preview_revokes_it(http_client) -> None:
+    """With no context on screen yet — which is where the old check gave up."""
+    edits = {
+        "f-period-start": '"2026-07-01"',
+        "f-period-end": '"2026-09-30"',
+        "f-attribution": '"60"',
+        "f-card-type": '"2002"',
+        "f-followup-enabled": "true",
+        "f-followup-delay": '"7"',  # the server renders 3, so 3 is not a change
+        "f-followup-policy": '"skip_if_booked"',
+        "f-followup-template": '"some_template"',
+    }
+    for field, value in edits.items():
+        source = await _browser(http_client)
+        if field.startswith("f-followup-") and field != "f-followup-enabled":
+            # Those three only mean anything while follow-up is on.
+            setup = 'el("f-followup-enabled").checked = true;\n'
+        else:
+            setup = ""
+        driver = (
+            setup
+            + PREVIEW_DRIVER_PRELUDE
+            + """
+const target = %s;
+if (typeof %s === "boolean") el(target).checked = %s; else el(target).value = %s;
+await fireEvent(target, "change");
+"""
+            % (json.dumps(field), value, value, value)
+            + PREVIEW_DRIVER_CODA
+        )
+        answer = _run_node(source, driver)
+        try:
+            _assert_cancelled_to_idle(answer)
+        except AssertionError as failure:  # pragma: no cover - only on a regression
+            raise AssertionError(f"{field}: {failure}") from failure
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_second_preview_keeps_its_own_spinner_when_the_first_answers(http_client) -> None:
+    """A must not clean up after B, and must not paint over it."""
+    source = await _browser(http_client)
+    driver = """
+const slowA = deferred();
+const slowB = deferred();
+let started = 0;
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    started += 1;
+    return started === 1 ? slowA.promise : slowB.promise;
+  }
+  return defaultRoutes(url);
+};
+await boot();
+
+const runningA = createPreview();
+await settle();
+const runningB = createPreview();
+await settle();
+
+// A answers — late, and with an error, which is the worst case for cleanup.
+slowA.resolve({ok: false, status: 500, body: {detail: "gateway"}});
+await runningA;
+await settle();
+const whileBRuns = state();
+const alertsWhileBRuns = ALERTS.slice();
+
+slowB.resolve({ok: true, body: {id: 102, provider: "altegio", company_ids: [758285],
+                                is_runnable_from_preview: true}});
+await runningB;
+await settle();
+emit({whileBRuns: whileBRuns, alertsWhileBRuns: alertsWhileBRuns, after: state()});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["whileBRuns"]["spinnerHidden"] is False, "A's cleanup hid B's spinner"
+    assert answer["whileBRuns"]["previewDisabled"] is True, "A's cleanup released B's button"
+    assert not any("gateway" in text for text in answer["alertsWhileBRuns"])
+    assert answer["after"]["context"]["runId"] == 102
+    assert answer["after"]["spinnerHidden"] is True
+    assert answer["after"]["previewDisabled"] is False
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_late_prefill_cannot_overwrite_a_preview_created_since(http_client) -> None:
+    """One clock: the prefill is revoked by the preview that replaced it."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+const latePrefill = deferred();
+ROUTES = async (url) => {
+  if (url === "/ops/campaigns/runs/41") return latePrefill.promise;
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 102, provider: "altegio", company_ids: [758285],
+                             is_runnable_from_preview: true}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();          // the prefill is now in flight
+await createPreview(); // and the operator builds their own preview instead
+await settle();
+const own = state();
+
+latePrefill.resolve({ok: true, body: RUN});
+await settle();
+
+emit({own: own, after: state(), companyLocked: el("f-company").disabled});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["own"]["context"]["runId"] == 102
+    assert answer["after"]["context"]["runId"] == 102, "the late prefill took the screen back"
+    assert answer["after"]["previewRunId"] == 102
+    assert answer["after"]["company"] == "758285", "the late prefill moved the branch"
+    assert answer["companyLocked"] is False, "the late prefill froze the form"
+    assert answer["after"]["runDisabled"] is False
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_returning_to_the_original_scope_does_not_revive_a_revoked_prefill(
+    http_client,
+) -> None:
+    """A → B → A. The clock only moves forward, so A's answer stays revoked."""
+    cases = {
+        "provider": """
+el("f-provider").value = "easyweek";
+onProviderChange();
+await settle();
+el("f-provider").value = "altegio";
+onProviderChange();
+await settle();
+""",
+        "company": """
+el("f-company").value = "1271200";
+await fireEvent("f-company", "change");
+el("f-company").value = "758285";
+await fireEvent("f-company", "change");
+""",
+    }
+    for name, aba in cases.items():
+        source = await _browser(http_client, "?from_preview=37")
+        driver = (
+            """
+RUN.period_start = "2026-05-03T00:00:00Z";
+const late = deferred();
+ROUTES = async (url) => {
+  if (url === "/ops/campaigns/runs/37") return late.promise;
+  return defaultRoutes(url);
+};
+await boot();
+const untouched = el("f-period-start").value;
+"""
+            + aba
+            + """
+late.resolve({ok: true, body: RUN});
+await settle();
+emit(Object.assign(state(), {
+  untouched: untouched,
+  period: el("f-period-start").value,
+  companyLocked: el("f-company").disabled,
+}));
+"""
+        )
+        answer = _run_node(source, driver)
+
+        assert answer["context"] is None, f"{name}: the revoked prefill was accepted on return"
+        assert answer["previewRunId"] is None, name
+        assert answer["period"] == answer["untouched"], name
+        assert answer["companyLocked"] is False, name
+        assert answer["runDisabled"] is True, name
+        assert answer["spinnerHidden"] is True, name
+        assert answer["previewDisabled"] is False, name
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_an_easyweek_preview_keeps_the_message_that_refuses_it(http_client) -> None:
+    """The refusal used to erase itself: invalidation cleared its own alert."""
+    source = await _browser(http_client, "?from_preview=37")
+    driver = """
+RUN.provider = "easyweek";
+await boot();
+emit(Object.assign(state(), {alertText: el("preview-alert").innerHTML}));
+"""
+    answer = _run_node(source, driver)
+
+    assert "EasyWeek" in answer["alertText"]
+    assert "§37.1" in answer["alertText"]
+    assert answer["context"] is None
+    assert answer["runDisabled"] is True
+    assert answer["spinnerHidden"] is True
+    assert answer["previewDisabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# `?from_preview=` is data, not code
+# ---------------------------------------------------------------------------
+
+
+# Everything a link, a typo or an attacker can put in the query string. Each one
+# reaches a <script> block, so each one has to leave it a parseable script that
+# does nothing the value asked for.
+MALFORMED_FROM_PREVIEW = [
+    "abc",
+    "-1",
+    "0",
+    "1.5",
+    "1e3",
+    "99999999999999",
+    "37abc",
+    "  ",
+    '1";alert("pwned");//',
+    "1'};alert('pwned');{'",
+    "1</script><script>window.PWNED=1;</script>",
+    "1\nwindow.PWNED = 1;",
+    "1 + window.PWNED",
+    "(function(){window.PWNED=1;})()",
+    "٣٧",
+]
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_from_preview_never_reaches_the_script(http_client) -> None:
+    for raw in MALFORMED_FROM_PREVIEW:
+        response = await http_client.get("/ops/campaigns/new-clients", params={"from_preview": raw})
+        # A controlled page, not a 500 and not a broken one.
+        assert response.status_code == 200, raw
+        script = _page_script(response.text)
+
+        declaration = [line.strip() for line in script.splitlines() if "FROM_PREVIEW_ID =" in line]
+        assert declaration == ["const FROM_PREVIEW_ID = null;"], (raw, declaration)
+        # Not merely escaped somewhere else on the page: absent from the script.
+        # The page has `alert(` of its own, so the marker is what to look for.
+        assert "pwned" not in script.lower(), raw
+        # Short numeric junk like "-1" occurs incidentally in ordinary markup
+        # ("me-1"), so only the distinctive payloads are checked verbatim.
+        if any(character in raw for character in "(<;\n'\""):
+            assert raw.strip() not in script, raw
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_malformed_from_preview_leaves_a_working_page(http_client) -> None:
+    """Parsed and executed, not just inspected: the injected code never runs."""
+    for raw in MALFORMED_FROM_PREVIEW:
+        page = (await http_client.get("/ops/campaigns/new-clients", params={"from_preview": raw})).text
+        source = BROWSER + "\n" + _dom_seed(page) + "\n" + _page_script(page)
+        driver = """
+globalThis.PWNED = undefined;
+await boot();
+emit({
+  pwned: globalThis.PWNED === undefined ? null : String(globalThis.PWNED),
+  fromPreview: FROM_PREVIEW_ID,
+  prefilled: FETCHES.some((f) => /\\/ops\\/campaigns\\/runs\\/\\d+$/.test(f.url)),
+  cardTypes: FETCHES.some((f) => f.url.indexOf("/card-types") !== -1),
+  context: PREVIEW_CONTEXT,
+});
+"""
+        answer = _run_node(source, driver)
+
+        assert answer["pwned"] is None, raw
+        assert answer["fromPreview"] is None, raw
+        assert answer["prefilled"] is False, raw
+        # An ordinary page: it loads card types and offers nothing to run.
+        assert answer["cardTypes"] is True, raw
+        assert answer["context"] is None, raw
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_well_formed_from_preview_still_works(http_client) -> None:
+    """Including with the whitespace a hand-edited URL picks up."""
+    for raw, expected in (("41", 41), ("  41  ", 41), ("00041", 41)):
+        page = (await http_client.get("/ops/campaigns/new-clients", params={"from_preview": raw})).text
+        source = BROWSER + "\n" + _dom_seed(page) + "\n" + _page_script(page)
+        driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+await boot();
+emit({fromPreview: FROM_PREVIEW_ID, context: PREVIEW_CONTEXT, company: el("f-company").value});
+"""
+        answer = _run_node(source, driver)
+
+        assert answer["fromPreview"] == expected, raw
+        assert answer["context"]["runId"] == 41, raw
+        assert answer["company"] == "1271200", raw

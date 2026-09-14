@@ -3372,6 +3372,27 @@ _NC_COMPANY_FOLLOWUP_TEMPLATES: dict[int, str] = {
 # Маппинг location_id → человекочитаемое название филиала
 LOCATIONS: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
 
+# `?from_preview=` reaches a <script> block, so it is parsed here and never
+# forwarded as text. A run id is a small positive integer; nothing else is a
+# legitimate value, so anything else becomes "no preview" rather than something
+# to escape. `[0-9]` and not `\d`, because `\d` also matches digits from other
+# scripts that `int()` would happily accept.
+_FROM_PREVIEW_RE = re.compile(r"^[0-9]{1,10}$")
+_MAX_RUN_ID = 2147483647  # a PostgreSQL integer primary key
+
+
+def _parse_from_preview(raw: str | None) -> int | None:
+    """The `from_preview` query parameter as a run id, or None."""
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not _FROM_PREVIEW_RE.match(value):
+        return None
+    number = int(value)
+    if number <= 0 or number > _MAX_RUN_ID:
+        return None
+    return number
+
 
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
 async def ops_new_clients_campaign_page(request: Request) -> str:
@@ -3385,8 +3406,11 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     default_period_start = first_of_prev.strftime("%Y-%m-%d")
     default_period_end = last_day_prev.strftime("%Y-%m-%d")
 
-    # Если передан from_preview — предзаполнить previewRunId
-    from_preview_id = request.query_params.get("from_preview", "")
+    # Если передан from_preview — предзаполнить previewRunId.
+    # Значение уходит в исполняемый script, поэтому сюда оно попадает уже
+    # разобранным в int, а в разметку — через JSON-сериализатор.
+    from_preview_id = _parse_from_preview(request.query_params.get("from_preview"))
+    from_preview_js = json.dumps(from_preview_id)
 
     # Компании для выбора (один dropdown — и компания, и location_id)
     company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
@@ -3714,12 +3738,48 @@ const COMPANY_FOLLOWUP_TEMPLATES = {company_followup_templates_js};
 // Where the page STARTED, when opened as `?from_preview=37`. Read once and
 // never rewritten: it is not the preview currently on screen, and treating it
 // as mutable state is how the initial provider setup came to erase it.
-const FROM_PREVIEW_ID = {from_preview_id or "null"};
+const FROM_PREVIEW_ID = {from_preview_js};
 let previewRunId = null;
 // The provider the UI was last shaped for. `onProviderChange` runs once during
 // setup, and that first call is not a user switching anything.
 let LAST_PROVIDER = null;
-let PREFILL_GENERATION = 0;
+
+// ---------------------------------------------------------------------------
+// One clock for everything asynchronous on this page
+// ---------------------------------------------------------------------------
+// Preview, from-preview prefill, card types and recipients used to keep their
+// own counters, which meant they could disagree: an invalidation that revoked
+// a preview left a prefill running, and a prefill could finish over a preview
+// that had replaced it. They share one clock now.
+//
+// A request takes a ticket when it starts and may touch the screen only while
+// that ticket is still the current one. Anything that makes the screen mean
+// something else — a provider switch, a branch change, an edited snapshot
+// field, a new preview, an explicit invalidation — moves the clock forward,
+// and every older ticket stops being valid at that instant. Because the clock
+// only ever goes forward, coming back to where you started (Altegio → EasyWeek
+// → Altegio) does not revive anything that was asked for the first time round.
+let PAGE_EPOCH = 0;
+
+function beginOperation() {{
+  PAGE_EPOCH += 1;
+  return PAGE_EPOCH;
+}}
+
+// A ticket for work that rides along with whatever is current — card types,
+// template texts — rather than starting something new.
+function currentTicket() {{
+  return PAGE_EPOCH;
+}}
+
+function owns(ticket) {{
+  return ticket === PAGE_EPOCH;
+}}
+
+// The preview or prefill request that currently owns the busy state, or null
+// when the page is idle. `signature` is what that request asked for; a prefill
+// has none, because what it will ask for is decided by the run it is fetching.
+let PREVIEW_IN_FLIGHT = null;
 
 // ---------------------------------------------------------------------------
 // The scope a rendered preview belongs to
@@ -3732,7 +3792,6 @@ let PREFILL_GENERATION = 0;
 // Each load also carries a token, so an answer that arrives after the operator
 // has moved on is discarded instead of painting over the newer one.
 let PREVIEW_CONTEXT = null;
-let PREVIEW_GENERATION = 0;
 let RECIPIENTS_GENERATION = 0;
 
 // -- the decisions, as pure functions ---------------------------------------
@@ -3880,13 +3939,7 @@ document.addEventListener("DOMContentLoaded", function () {{
   ]) {{
     const el = document.getElementById(fieldId);
     if (!el) continue;
-    el.addEventListener("change", function () {{
-      if (PREVIEW_CONTEXT && !signatureMatches(PREVIEW_CONTEXT.signature, snapshotSignature())) {{
-        invalidatePreviewContext();
-      }} else {{
-        applyRunAvailability();
-      }}
-    }});
+    el.addEventListener("change", onSnapshotFieldChange);
   }}
 
   document.getElementById("btn-preview").addEventListener("click", createPreview);
@@ -3909,128 +3962,189 @@ document.addEventListener("DOMContentLoaded", function () {{
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
-  loadCardTypes();
   loadOutstandingCards(companySelect.value);
 
   // Если открыта со страницы history (from_preview), подгрузить параметры preview.
   // Read from the immutable id, not from the mutable current-preview state:
   // shaping the form above must not be able to erase where the page started.
   if (FROM_PREVIEW_ID) {{
+    // Deliberately NOT loading live card types here. The snapshot's own card
+    // type is set from the run and the select stays shut, so there is nothing
+    // for a live list to contribute — and a list requested for the default
+    // branch, arriving after a preview of another branch has loaded, is exactly
+    // the race this avoids. A page opened without `from_preview` loads them as
+    // always, and choosing a branch by hand loads them again.
     loadPreviewAndPrefill(FROM_PREVIEW_ID);
+  }} else {{
+    loadCardTypes();
   }}
 }});
 
 // ============================================================
 // Предзаполнение формы из preview run (from_preview=ID)
 // ============================================================
+// Does this UI know the branch the saved run was built for? The company select
+// is rendered from the server's own list, so an option existing IS the check.
+function companyOptionExists(companyId) {{
+  const select = document.getElementById("f-company");
+  if (!select) return false;
+  for (const option of select.options) {{
+    if (String(option.value) === String(companyId)) return true;
+  }}
+  return false;
+}}
+
+// May this saved run be loaded into the editor? Decided before a single field
+// is touched, so a rejection can never leave a half-filled, half-frozen form.
+// Returns null to accept, or the message to show.
+//
+// Note what is NOT checked here: which branch the form happened to be showing
+// when the page opened. The run decides the branch — comparing it against the
+// default is what made every preview of a non-default branch unopenable.
+function prefillRejection(run, runId) {{
+  if (!run || Number(run.id) !== Number(runId)) {{
+    return {{level: "danger",
+      message: "Ответ сервера относится к другому run, а не к preview #" + runId + "."}};
+  }}
+  if (run.mode !== "preview" || run.status !== "completed") {{
+    return {{level: "danger",
+      message: "Preview #" + runId + " имеет режим «" + (run.mode || "?") + "» и статус «" +
+        (run.status || "?") + "». Запускать можно только завершённые preview."}};
+  }}
+  if (run.provider !== "altegio") {{
+    // An EasyWeek preview opens in the editor, never in the runner: §37.1
+    // opens editing and nothing else.
+    return {{level: "warning",
+      message: "Preview #" + runId + " относится к EasyWeek. Запуск для EasyWeek закрыт (§37.1); " +
+        "доступен только просмотр и редактирование snapshot."}};
+  }}
+  const companies = run.company_ids || [];
+  if (companies.length !== 1) {{
+    return {{level: "danger",
+      message: "Preview #" + runId + " охватывает " + companies.length +
+        " филиал(ов). Редактор работает с одним филиалом."}};
+  }}
+  if (!companyOptionExists(companies[0])) {{
+    return {{level: "danger",
+      message: "Филиал " + companies[0] + " из preview #" + runId +
+        " недоступен в этом интерфейсе."}};
+  }}
+  return null;
+}}
+
+// Fill the form from the saved run and freeze what the snapshot fixed. Called
+// only after `prefillRejection` has accepted the run, and every value it writes
+// is the run's own — this is the page programmatically describing the snapshot,
+// not the operator choosing anything.
+function hydrateFormFromRun(run) {{
+  const companyId = String((run.company_ids || [])[0]);
+  const companySelect = document.getElementById("f-company");
+  companySelect.value = companyId;
+  loadTemplateText(companyId);
+  setFollowupTemplateDefault(companyId);
+  loadFollowupTemplateText(companyId);
+
+  if (run.period_start) {{
+    document.getElementById("f-period-start").value = run.period_start.substring(0, 10);
+  }}
+  if (run.period_end) {{
+    document.getElementById("f-period-end").value = run.period_end.substring(0, 10);
+  }}
+
+  // The attribution window is part of the snapshot signature, so it has to
+  // come back from the run like every other locked parameter — otherwise the
+  // form would describe a different window than the recipients below it.
+  if (run.attribution_window_days) {{
+    document.getElementById("f-attribution").value = String(run.attribution_window_days);
+  }}
+  document.getElementById("f-attribution").disabled = true;
+
+  // Предзаполнить и зафиксировать card_type_id из снимка. The option may not be
+  // in the list — the branch's live card types are not loaded for a from-preview
+  // page precisely so that they cannot race this — so it is added when missing.
+  if (run.card_type_id) {{
+    const cardEl = document.getElementById("f-card-type");
+    let found = false;
+    for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
+    if (!found) {{
+      const opt = document.createElement("option");
+      opt.value = String(run.card_type_id);
+      opt.text = "Card " + run.card_type_id + " (из preview)";
+      cardEl.appendChild(opt);
+    }}
+    cardEl.value = String(run.card_type_id);
+  }}
+  // Shut either way: a snapshot without a card type is not one to pick a card
+  // type for.
+  document.getElementById("f-card-type").disabled = true;
+
+  // Предзаполнить и зафиксировать followup-параметры из снимка
+  const fuCheckbox = document.getElementById("f-followup-enabled");
+  fuCheckbox.checked = !!run.followup_enabled;
+  fuCheckbox.disabled = true;
+
+  const fuDelay = document.getElementById("f-followup-delay");
+  const fuPolicy = document.getElementById("f-followup-policy");
+  const fuTemplate = document.getElementById("f-followup-template");
+
+  if (run.followup_enabled) {{
+    fuDelay.value = run.followup_delay_days || "";
+    fuPolicy.value = run.followup_policy || "";
+    fuTemplate.value = run.followup_template_name || "";
+  }}
+  fuDelay.disabled = true;
+  fuPolicy.disabled = true;
+  fuTemplate.disabled = true;
+
+  // Заблокировать ключевые поля — они должны совпадать с preview
+  companySelect.disabled = true;
+  document.getElementById("f-period-start").disabled = true;
+  document.getElementById("f-period-end").disabled = true;
+}}
+
 async function loadPreviewAndPrefill(runId) {{
-  // Part of the same lifecycle as every other load: a token, and a scope the
-  // answer is checked against. An operator who switches provider or branch
-  // while this is in flight must not have the form filled in behind them.
-  const token = ++PREFILL_GENERATION;
-  const asked = currentScope();
+  // On the same clock as everything else: a ticket, checked before the answer
+  // is allowed to touch anything. An operator who switches provider or branch
+  // while this is in flight must not have the form filled in behind them — and
+  // because the clock only moves forward, going away and coming back to the
+  // same provider and branch does not make this answer welcome again.
+  const ticket = beginOperation();
+  PREVIEW_IN_FLIGHT = {{ticket: ticket, scope: currentScope(), signature: null}};
+  setPreviewBusy(true);
   try {{
     const resp = await fetch("/ops/campaigns/runs/" + runId);
-    if (token !== PREFILL_GENERATION || !scopeMatches(asked, currentScope())) return;
+    // Ownership is the whole check. The branch on screen is deliberately NOT
+    // compared: what the run says is about to become the branch on screen.
+    if (!owns(ticket)) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "warning",
         "Не удалось загрузить параметры preview #" + runId +
         ". Проверьте ID.");
+      resetPreviewSurface();
       return;
     }}
     const run = await resp.json();
+    if (!owns(ticket)) return;
 
-    // The saved run has to be a completed preview, of a provider whose send
-    // path exists, and the SERVER has to say it may be run from. Availability
-    // is never decided here — `applyRunAvailability` owns that.
-    if (run.mode !== "preview" || run.status !== "completed") {{
-      setAlert("preview-alert", "danger",
-        "Preview #" + runId + " имеет режим «" + (run.mode || "?") + "» и статус «" +
-        (run.status || "?") + "». Запускать можно только завершённые preview.");
-      invalidatePreviewContext();
+    const rejection = prefillRejection(run, runId);
+    if (rejection) {{
+      // The surface comes down but the message stays: `invalidatePreviewContext`
+      // would clear the very alert that explains the refusal.
+      setAlert("preview-alert", rejection.level, rejection.message);
+      resetPreviewSurface();
       return;
     }}
 
-    if (run.provider !== "altegio") {{
-      // An EasyWeek preview opens in the editor, never in the runner: §37.1
-      // opens editing and nothing else.
-      setAlert("preview-alert", "warning",
-        "Preview #" + runId + " относится к EasyWeek. Запуск для EasyWeek закрыт (§37.1); " +
-        "доступен только просмотр и редактирование snapshot.");
-      invalidatePreviewContext();
-      return;
-    }}
-    const companyId = (run.company_ids || [])[0];
-    if (companyId) {{
-      const companySelect = document.getElementById("f-company");
-      companySelect.value = String(companyId);
-      loadTemplateText(String(companyId));
-      setFollowupTemplateDefault(String(companyId));
-      loadFollowupTemplateText(String(companyId));
-    }}
-
-    if (run.period_start) {{
-      document.getElementById("f-period-start").value =
-        run.period_start.substring(0, 10);
-    }}
-    if (run.period_end) {{
-      document.getElementById("f-period-end").value =
-        run.period_end.substring(0, 10);
-    }}
-
-    // The attribution window is part of the snapshot signature, so it has to
-    // come back from the run like every other locked parameter — otherwise the
-    // form would describe a different window than the recipients below it.
-    if (run.attribution_window_days) {{
-      document.getElementById("f-attribution").value =
-        String(run.attribution_window_days);
-    }}
-    document.getElementById("f-attribution").disabled = true;
-
-    // Предзаполнить и зафиксировать card_type_id из снимка
-    if (run.card_type_id) {{
-      const cardEl = document.getElementById("f-card-type");
-      let found = false;
-      for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
-      if (!found) {{
-        const opt = document.createElement("option");
-        opt.value = String(run.card_type_id);
-        opt.text = "Card " + run.card_type_id + " (из preview)";
-        cardEl.appendChild(opt);
-      }}
-      cardEl.value = String(run.card_type_id);
-      cardEl.disabled = true;
-    }}
-
-    // Предзаполнить и зафиксировать followup-параметры из снимка
-    const fuCheckbox = document.getElementById("f-followup-enabled");
-    fuCheckbox.checked = !!run.followup_enabled;
-    fuCheckbox.disabled = true;
-
-    const fuDelay = document.getElementById("f-followup-delay");
-    const fuPolicy = document.getElementById("f-followup-policy");
-    const fuTemplate = document.getElementById("f-followup-template");
-
-    if (run.followup_enabled) {{
-      fuDelay.value = run.followup_delay_days || "";
-      fuPolicy.value = run.followup_policy || "";
-      fuTemplate.value = run.followup_template_name || "";
-    }}
-    fuDelay.disabled = true;
-    fuPolicy.disabled = true;
-    fuTemplate.disabled = true;
-
-    // Заблокировать ключевые поля — они должны совпадать с preview
-    document.getElementById("f-company").disabled = true;
-    document.getElementById("f-period-start").disabled = true;
-    document.getElementById("f-period-end").disabled = true;
-
-    // Nothing above may have moved the ground under us.
-    if (token !== PREFILL_GENERATION || !scopeMatches(asked, currentScope())) return;
+    hydrateFormFromRun(run);
+    // Filling the form ran no `await`, so nothing could have moved underneath
+    // it — but the context is only ever built on a ticket that is still current.
+    if (!owns(ticket)) return;
 
     // A full context, built from the SAVED RUN — including the server's own
     // verdict about whether it may be run from. The signature is read back off
     // the form that was just filled from that run, so the two cannot disagree.
+    // Availability is never decided here: `applyRunAvailability` owns that, and
+    // it refuses anything the server did not mark runnable.
     PREVIEW_CONTEXT = {{
       runId: run.id,
       provider: run.provider,
@@ -4051,8 +4165,14 @@ async function loadPreviewAndPrefill(runId) {{
         : " Сервер не разрешает запуск из этого preview."));
 
   }} catch (e) {{
-    if (token !== PREFILL_GENERATION) return;
+    if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
+    resetPreviewSurface();
+  }} finally {{
+    if (owns(ticket)) {{
+      PREVIEW_IN_FLIGHT = null;
+      setPreviewBusy(false);
+    }}
   }}
 }}
 
@@ -4141,6 +4261,16 @@ async function loadFollowupTemplateText(companyId) {{
 // Загрузка типов карт
 // ============================================================
 async function loadCardTypes() {{
+  // Rides along with whatever the page is doing now rather than starting
+  // something new. If a prefill or a preview moves the clock while this is in
+  // flight, the answer is dropped: it would otherwise replace the card type a
+  // loaded snapshot fixed, and hand back a select the operator can change.
+  const ticket = currentTicket();
+  // A loaded snapshot fixed its card type, and the select is shut. A live list
+  // has nothing to contribute to it and everything to break, so it steps aside
+  // — checked here and again after the answer, because a snapshot can finish
+  // loading while this request is in flight.
+  if (PREVIEW_CONTEXT) return;
   // location_id == company_id (один dropdown для обоих)
   const locationId = document.getElementById("f-company").value.trim();
   const statusEl = document.getElementById("card-load-status");
@@ -4161,13 +4291,16 @@ async function loadCardTypes() {{
     const resp = await fetch(
       "/ops/campaigns/new-clients/card-types?location_id=" + encodeURIComponent(locationId)
     );
+    if (!owns(ticket) || PREVIEW_CONTEXT) return;
     if (!resp.ok) {{
       const err = await resp.json().catch(() => ({{detail: resp.statusText}}));
+      if (!owns(ticket) || PREVIEW_CONTEXT) return;
       statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText);
       cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
       return;
     }}
     const types = await resp.json();
+    if (!owns(ticket) || PREVIEW_CONTEXT) return;
     if (!Array.isArray(types) || types.length === 0) {{
       statusEl.textContent = "Нет доступных типов карт.";
       cardSelect.innerHTML = '<option value="">— нет доступных типов карт —</option>';
@@ -4181,6 +4314,7 @@ async function loadCardTypes() {{
     cardSelect.disabled = false;
     statusEl.textContent = "Загружено " + types.length + " тип(ов) карт.";
   }} catch (e) {{
+    if (!owns(ticket) || PREVIEW_CONTEXT) return;
     statusEl.textContent = "Не удалось загрузить типы карт. " + e.message;
     cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
   }}
@@ -4198,13 +4332,12 @@ async function createPreview() {{
   // no stale predecessor behind either.
   invalidatePreviewContext();
 
-  setAlert("preview-alert", "", "");
-  document.getElementById("preview-spinner").classList.remove("d-none");
-  document.getElementById("btn-preview").disabled = true;
-
-  const token = ++PREVIEW_GENERATION;
+  // This request owns the busy state from here until it loses the ticket.
+  const ticket = beginOperation();
   const asked = currentScope();
   const askedSignature = snapshotSignature();
+  PREVIEW_IN_FLIGHT = {{ticket: ticket, scope: asked, signature: askedSignature}};
+  setPreviewBusy(true);
 
   try {{
     const resp = await fetch("/ops/campaigns/new-clients/preview", {{
@@ -4213,10 +4346,15 @@ async function createPreview() {{
       body: JSON.stringify(payload),
     }});
     const data = await resp.json();
-    // The operator may have changed provider, branch, or asked for another
-    // preview while this one was in flight. Any of those makes this answer a
-    // description of a screen that no longer exists.
-    if (!mayRender(token, PREVIEW_GENERATION, asked, currentScope())) return;
+    // Four things have to agree before a single pixel changes: this request is
+    // still the current one, the provider and branch are still the ones it was
+    // asked for, and the form still describes the snapshot it asked for. Any
+    // of them having moved makes this answer a description of a screen that no
+    // longer exists — including a Detail link to a snapshot built from
+    // parameters the operator has since edited away.
+    if (!owns(ticket)) return;
+    if (!scopeMatches(asked, currentScope())) return;
+    if (!signatureMatches(askedSignature, snapshotSignature())) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "danger", "Preview ошибка: " + (data.detail || JSON.stringify(data)));
       return;
@@ -4238,14 +4376,16 @@ async function createPreview() {{
     loadRecipients(true);
     setAlert("preview-alert", "success", "Preview готов! Run ID: " + previewRunId);
   }} catch (e) {{
-    if (token !== PREVIEW_GENERATION) return;
+    if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка сети: " + e.message);
   }} finally {{
-    // Even the cleanup is the newest request's to do. An old one finishing here
-    // would hide a running spinner and re-enable a button mid-flight.
-    if (token === PREVIEW_GENERATION) {{
-      document.getElementById("preview-spinner").classList.add("d-none");
-      document.getElementById("btn-preview").disabled = false;
+    // Even the cleanup belongs to whoever owns the page now. An old request
+    // finishing here would hide a running spinner and re-enable a button
+    // mid-flight; a revoked one has already been cleaned up by the invalidation
+    // that revoked it.
+    if (owns(ticket)) {{
+      PREVIEW_IN_FLIGHT = null;
+      setPreviewBusy(false);
     }}
   }}
 }}
@@ -4695,6 +4835,24 @@ async function loadEasyWeekTemplateStatus() {{
     + escHtml(String(data.provider)) + '</code>';
 }}
 
+// An edited snapshot parameter. What is on screen was built from the old one,
+// and what is in flight was asked for the old one, so both go — and the
+// decision deliberately does not depend on a PREVIEW_CONTEXT existing, because
+// the dangerous moment is exactly the one where a request is still running and
+// there is no context yet.
+function onSnapshotFieldChange() {{
+  const now = snapshotSignature();
+  const inFlightStale = PREVIEW_IN_FLIGHT !== null &&
+    !(PREVIEW_IN_FLIGHT.signature && signatureMatches(PREVIEW_IN_FLIGHT.signature, now));
+  const shownStale = PREVIEW_CONTEXT !== null &&
+    !signatureMatches(PREVIEW_CONTEXT.signature, now);
+  if (inFlightStale || shownStale) {{
+    invalidatePreviewContext();
+  }} else {{
+    applyRunAvailability();
+  }}
+}}
+
 // The Run button, offered from exactly one place so the rule cannot drift.
 function applyRunAvailability() {{
   const btn = document.getElementById("btn-run");
@@ -4705,14 +4863,50 @@ function applyRunAvailability() {{
   btn.classList.toggle("d-none", currentScope().provider === "easyweek");
 }}
 
-// Forget the preview on screen without touching the saved run. Called whenever
-// the screen stops describing it: another provider, another branch, a new
-// preview. The CampaignRun itself stays in the database.
-function invalidatePreviewContext() {{
-  PREVIEW_GENERATION += 1;
-  RECIPIENTS_GENERATION += 1;
+// Is the page waiting for a preview? The spinner and the Create button say so,
+// and exactly one place decides it.
+function setPreviewBusy(busy) {{
+  const spinner = document.getElementById("preview-spinner");
+  if (spinner) spinner.classList.toggle("d-none", !busy);
+  const button = document.getElementById("btn-preview");
+  if (button) button.disabled = busy;
+}}
+
+// The from-preview prefill freezes the fields the loaded snapshot fixed.
+// Anything that takes that preview away has to give them back, or the operator
+// is left with a form they cannot edit and nothing on screen to explain why.
+// Each field returns to the state it would have had on a fresh page, which is
+// not simply "enabled": follow-up details follow their checkbox, and the card
+// type stays shut until a branch's types have actually loaded.
+function unlockSnapshotFields() {{
+  for (const id of ["f-company", "f-period-start", "f-period-end", "f-attribution"]) {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = false;
+  }}
+  const followupEnabled = document.getElementById("f-followup-enabled");
+  if (followupEnabled) followupEnabled.disabled = false;
+  const enabled = !!(followupEnabled && followupEnabled.checked);
+  for (const id of ["f-followup-delay", "f-followup-policy", "f-followup-template"]) {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = !enabled;
+  }}
+  const cardSelect = document.getElementById("f-card-type");
+  if (cardSelect) {{
+    // An option with a real value means a branch's types are loaded; a lone
+    // placeholder means there is nothing to choose yet.
+    let choosable = false;
+    for (const option of cardSelect.options) {{ if (option.value) {{ choosable = true; break; }} }}
+    cardSelect.disabled = !choosable;
+  }}
+}}
+
+// Take the preview off the screen. Kept apart from `invalidatePreviewContext`
+// because a rejected prefill needs exactly this WITHOUT losing the alert that
+// explains the rejection.
+function resetPreviewSurface() {{
   PREVIEW_CONTEXT = null;
   previewRunId = null;
+  PREVIEW_IN_FLIGHT = null;
   const results = document.getElementById("preview-results");
   if (results) results.classList.add("d-none");
   const table = document.getElementById("recipients-table");
@@ -4721,8 +4915,24 @@ function invalidatePreviewContext() {{
   if (links) links.innerHTML = "";
   const breakdown = document.getElementById("excluded-breakdown");
   if (breakdown) breakdown.innerHTML = "";
-  setAlert("preview-alert", "", "");
+  unlockSnapshotFields();
+  // Whatever was in flight no longer owns anything, so the page is idle. A new
+  // request that starts right after this raises the spinner again itself.
+  setPreviewBusy(false);
   applyRunAvailability();
+}}
+
+// Forget the preview on screen without touching the saved run. Called whenever
+// the screen stops describing it: another provider, another branch, an edited
+// snapshot field, a new preview. The CampaignRun itself stays in the database.
+function invalidatePreviewContext() {{
+  // Moving the clock revokes everything in flight at once — preview, prefill,
+  // card types, recipients — so none of them can come back and paint over a
+  // page that has moved on.
+  PAGE_EPOCH += 1;
+  RECIPIENTS_GENERATION += 1;
+  resetPreviewSurface();
+  setAlert("preview-alert", "", "");
 }}
 
 function buildPayload() {{
