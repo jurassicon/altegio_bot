@@ -54,6 +54,32 @@ def _use_or_fallback(run_value: int | None, fallback: int) -> int:
     return run_value if run_value is not None else fallback
 
 
+async def excluded_reason_counts(session: AsyncSession, run: CampaignRun) -> dict[str, int]:
+    """Why this run's recipients are excluded, counted from the rows themselves.
+
+    The single source for every surface that shows exclusions — the preview
+    response, the JSON report and the detail page — so they cannot drift.
+
+    Read from `CampaignRecipient` rather than from `run.meta`: the segmenter's
+    own reason counts are a snapshot of the moment segmentation finished, and a
+    manual add or remove afterwards leaves them stale. The rows are what the
+    snapshot actually is.
+
+    Counts only. A reason code carries no phone, no name and no UUID, and an
+    unknown one is passed through rather than dropped — EasyWeek's vocabulary
+    grows, and a reason this code has never heard of is exactly the one an
+    operator needs to see.
+    """
+    stmt = (
+        select(CampaignRecipient.excluded_reason, func.count(CampaignRecipient.id))
+        .where(CampaignRecipient.campaign_run_id == run.id)
+        .where(CampaignRecipient.provider == run.provider)
+        .where(CampaignRecipient.excluded_reason.is_not(None))
+        .group_by(CampaignRecipient.excluded_reason)
+    )
+    return {reason: int(count) for reason, count in (await session.execute(stmt)).all() if reason}
+
+
 async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     """Полный отчёт по одному CampaignRun."""
     run = await session.get(CampaignRun, run_id)
@@ -74,11 +100,9 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     rows = (await session.execute(stmt)).all()
 
     status_counts: dict[str, int] = {}
-    reason_counts: dict[str, int] = {}
-    for status, reason, cnt in rows:
+    for status, _reason, cnt in rows:
         status_counts[status] = status_counts.get(status, 0) + cnt
-        if reason:
-            reason_counts[reason] = reason_counts.get(reason, 0) + cnt
+    reason_counts = await excluded_reason_counts(session, run)
 
     # §37.1: on what grounds the snapshot's rows are in it. Counts only — no
     # phone, no name, no customer UUID — and the totals reconcile with

@@ -67,7 +67,7 @@ from altegio_bot.campaigns.provider import (
     require_campaign_execution_provider,
     require_same_provider,
 )
-from altegio_bot.campaigns.reports import monthly_dashboard, run_report
+from altegio_bot.campaigns.reports import excluded_reason_counts, monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
     CAMPAIGN_EXECUTION_JOB_TYPE,
@@ -277,7 +277,7 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
             detail="Preview failed due to internal error. See server logs for details.",
         )
 
-    return _run_summary(run)
+    return await _summary_with_reasons(run)
 
 
 # ==========================================================================
@@ -2476,6 +2476,28 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
         "followup_auto_recovered": meta.get("followup_auto_recovered"),
         "followup_auto_recovered_at": meta.get("followup_auto_recovered_at"),
     }
+
+
+async def _summary_with_reasons(run: CampaignRun) -> dict[str, Any]:
+    """A run summary whose `excluded` block names the actual reasons.
+
+    The fixed Altegio counters answer for Altegio and say nothing about
+    EasyWeek, whose reasons are its own and whose vocabulary grows. Without
+    this, a freshly created EasyWeek preview came back with an `excluded` block
+    that had no `by_reason` at all, and the page read that as "nothing was
+    excluded" while the totals said otherwise.
+
+    Counted from the stored rows through the same aggregator the report and the
+    detail page use, so the three surfaces cannot disagree.
+    """
+    summary = _run_summary(run)
+    async with SessionLocal() as session:
+        by_reason = await excluded_reason_counts(session, run)
+    excluded = dict(summary.get("excluded") or {})
+    excluded["by_reason"] = by_reason
+    excluded["total"] = sum(by_reason.values())
+    summary["excluded"] = excluded
+    return summary
 
 
 def _run_summary(run: CampaignRun, *, used_as_source: bool = False, canary_locked: bool = False) -> dict[str, Any]:

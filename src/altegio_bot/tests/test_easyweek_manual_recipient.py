@@ -1283,3 +1283,333 @@ async def test_the_preview_page_offers_both_easyweek_add_actions(http_client, co
     assert "Add test recipient" in page
     assert "recipients/add-manual" in page
     assert "§37.1" in page and "§36.11" in page
+
+
+# ---------------------------------------------------------------------------
+# A fresh preview reports the reasons it actually recorded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_easyweek_preview_returns_its_real_exclusion_reasons(
+    session_maker, configuration, http_client, monkeypatch
+) -> None:
+    """The blocker: the POST answered without `by_reason` at all.
+
+    The page reads that key for EasyWeek, so an absent one rendered as
+    "nothing was excluded" while the totals said otherwise.
+    """
+    import altegio_bot.campaigns.runner as runner
+
+    run_id = await _preview(session_maker)
+    # A reason this page has never heard of.
+    await _auto_excluded(session_maker, run_id, reason="easyweek_brand_new_reason_code")
+    async with session_maker() as session:
+        async with session.begin():
+            run = await session.get(CampaignRun, run_id)
+            await runner.recompute_snapshot_counters(session, run)
+
+    # What the POST answers for a freshly built preview: the `excluded` block
+    # carries `by_reason`, which is the key the page reads for EasyWeek.
+    fresh = await http_client.post(
+        "/ops/campaigns/new-clients/preview",
+        json={
+            "provider": "easyweek",
+            "company_id": COMPANY_ID,
+            "period_start": "2026-08-01T00:00:00Z",
+            "period_end": "2026-08-31T23:59:59Z",
+        },
+    )
+    assert fresh.status_code == 200, fresh.text
+    assert "by_reason" in fresh.json()["excluded"]
+
+    # And the run that HAS the excluded row reports it, through the same
+    # aggregator the report uses.
+
+    report = (await http_client.get(f"/ops/campaigns/runs/{run_id}/report")).json()
+    assert report["excluded"]["by_reason"] == {"easyweek_brand_new_reason_code": 1}
+    # The HTML detail page, not the JSON one: this is what an operator reads.
+    detail = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+    assert "easyweek_brand_new_reason_code" in detail
+    assert "Исключённых получателей нет" not in detail
+
+
+@pytest.mark.asyncio
+async def test_the_preview_summary_and_the_report_agree_about_exclusions(
+    session_maker, configuration, http_client
+) -> None:
+    """One aggregator, so the two surfaces cannot drift apart."""
+    from altegio_bot.campaigns.reports import excluded_reason_counts
+
+    run_id = await _preview(session_maker)
+    await _auto_excluded(session_maker, run_id, reason="has_records_before_period")
+    await _auto_excluded(session_maker, run_id, reason="opted_out")
+
+    report = (await http_client.get(f"/ops/campaigns/runs/{run_id}/report")).json()
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        direct = await excluded_reason_counts(session, run)
+
+    assert report["excluded"]["by_reason"] == direct
+    assert sum(direct.values()) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_altegio_preview_contract_is_unchanged(http_client, configuration, monkeypatch) -> None:
+    """The long-standing Altegio counters stay exactly where they were."""
+    import altegio_bot.campaigns.runner as runner
+
+    async def no_candidates(**kwargs: Any):
+        return []
+
+    monkeypatch.setattr(runner, "_find_candidates", no_candidates)
+
+    resp = await http_client.post(
+        "/ops/campaigns/new-clients/preview",
+        json={
+            "provider": "altegio",
+            "company_id": 758285,
+            "location_id": 758285,
+            "period_start": "2026-08-01T00:00:00Z",
+            "period_end": "2026-08-31T23:59:59Z",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    excluded = resp.json()["excluded"]
+    for legacy in ("opted_out", "no_phone", "invalid_phone", "multiple_records_in_period"):
+        assert legacy in excluded
+
+
+# ---------------------------------------------------------------------------
+# The inline editor table, per provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_inline_table_has_an_easyweek_branch_with_basis_columns(http_client, configuration) -> None:
+    page = (await http_client.get("/ops/campaigns/new-clients")).text
+
+    table_fn = page[page.find("function renderRecipientsTable") :][:3000]
+    # Two branches, chosen by provider.
+    assert "const easyweek = isEasyWeek();" in table_fn
+    # The EasyWeek columns.
+    for column in ("Основание", "Было исключено автоматически", "EasyWeek customer"):
+        assert column in table_fn
+    # The three bases, with short labels.
+    for basis in ("earned_first_visit", "operator_manual_selection", "owner_test_account"):
+        assert basis in table_fn
+    for label in (">auto<", ">manual<", ">test<"):
+        assert label in table_fn
+    # Altegio keeps its own columns.
+    for column in ("Ресничных", "Подтверждённых лаш", "До периода (CRM)"):
+        assert column in table_fn
+    # And no customer UUID is ever rendered — presence only.
+    assert "easyweek_customer_recorded" in table_fn
+    assert "easyweek_customer_uuid" not in table_fn
+
+
+@pytest.mark.asyncio
+async def test_the_recipients_json_carries_everything_the_table_needs(
+    session_maker, configuration, http_client
+) -> None:
+    """Behaviour, not markup: the three bases and an override, as served."""
+    run_id = await _preview(session_maker, keep_recipient=True)
+
+    earned = (await http_client.get(f"/ops/campaigns/runs/{run_id}/recipients")).json()
+
+    [earned_row] = earned["items"]
+    assert earned_row["recipient_basis"] == RECIPIENT_BASIS_EARNED
+    assert earned_row["auto_excluded_reason"] is None
+    assert earned_row["easyweek_customer_recorded"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_recipients_json_shows_a_manual_override(session_maker, configuration, http_client) -> None:
+    """The override, as the table receives it: manual basis plus what it overrode."""
+    manual_run = await _preview(session_maker)
+    overridden = await _auto_excluded(session_maker, manual_run, reason="has_records_before_period")
+    await _add(session_maker, manual_run)
+
+    manual = (await http_client.get(f"/ops/campaigns/runs/{manual_run}/recipients")).json()
+
+    [manual_row] = [row for row in manual["items"] if row["id"] == overridden]
+    assert manual_row["recipient_basis"] == RECIPIENT_BASIS_MANUAL
+    assert manual_row["auto_excluded_reason"] == "has_records_before_period"
+    assert manual_row["easyweek_customer_recorded"] is True
+    # Presence only, in the payload as on the screen.
+    assert CUSTOMER_UUID not in repr(manual)
+
+
+# ---------------------------------------------------------------------------
+# The template surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_easyweek_template_block_never_shows_the_altegio_newsletter(http_client, configuration) -> None:
+    page = (await http_client.get("/ops/campaigns/new-clients")).text
+
+    ew_block = page[page.find("Шаблон EasyWeek") : page.find("БЛОК ШАБЛОНА: ALTEGIO")]
+    assert "new_client_voucher" in ew_block
+    assert "kitilash_ka_new_client_voucher_v1" in ew_block
+    assert "<code>de</code>" in ew_block
+    assert "<code>easyweek</code>" in ew_block
+    for altegio_only in ("newsletter_new_clients_monthly", "newsletter_new_clients_followup"):
+        assert altegio_only not in ew_block
+    # And it says what §37.1 does not open.
+    assert "закрыт" in ew_block
+    # The Altegio block still exists, for Altegio.
+    assert "БЛОК ШАБЛОНА: ALTEGIO" in page
+    assert "altegio-only" in page
+
+
+@pytest.mark.asyncio
+async def test_the_template_endpoint_never_answers_easyweek_with_an_altegio_row(
+    session_maker, configuration, http_client
+) -> None:
+    """No cross-provider fallback: a missing EasyWeek row is missing."""
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                MessageTemplate(
+                    provider="altegio",
+                    company_id=COMPANY_ID,
+                    code="new_client_voucher",
+                    language="de",
+                    body="Altegio body that must never be served to EasyWeek",
+                    meta_template_name="kitilash_ka_new_client_voucher_v1",
+                    is_active=True,
+                )
+            )
+
+    resp = await http_client.get(
+        "/ops/campaigns/new-clients/template-text",
+        params={
+            "provider": "easyweek",
+            "template_name": "kitilash_ka_new_client_voucher_v1",
+            "company_id": COMPANY_ID,
+        },
+    )
+
+    assert resp.status_code == 404
+    assert "Altegio body" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# The outstanding-cards race, deterministically
+# ---------------------------------------------------------------------------
+
+
+def _js(page: str, name: str) -> str:
+    start = page.find(f"async function {name}")
+    assert start != -1, name
+    return page[start : start + 6000]
+
+
+@pytest.mark.asyncio
+async def test_a_late_answer_for_another_branch_cannot_repaint_or_be_deleted(http_client, configuration) -> None:
+    """A → B → B answers → A answers. A must not paint, and Delete must refuse.
+
+    Checked on the shipped code rather than a re-implementation: every guard the
+    ordering depends on has to be present, and the load must take a NEW token
+    each time rather than reusing one per provider.
+    """
+    page = (await http_client.get("/ops/campaigns/new-clients")).text
+    load_fn = _js(page, "loadOutstandingCards")
+    delete_fn = _js(page, "deleteOutstandingCards")
+
+    # A new token per load — not one per provider change.
+    assert "const generation = ++OUTSTANDING_GENERATION;" in load_fn
+    # The answer is discarded unless it is the newest AND the branch still matches.
+    assert "generation !== OUTSTANDING_GENERATION" in load_fn
+    assert "currentCompany !== scope.companyId" in load_fn
+    # The painted table records what it is showing.
+    assert "OUTSTANDING_SCOPE = scope;" in load_fn
+    # Delete refuses when the screen and the loaded scope disagree.
+    assert "OUTSTANDING_SCOPE.companyId !== String(companyId)" in delete_fn
+    assert 'OUTSTANDING_SCOPE.provider !== "altegio"' in delete_fn
+    assert "Загрузите список заново" in delete_fn
+    # Switching branch or provider drops both.
+    assert page.count("OUTSTANDING_SCOPE = null;") >= 3
+
+
+def test_the_outstanding_card_race_rules_hold_when_answers_land_out_of_order() -> None:
+    """The ordering itself, executed rather than described.
+
+    A faithful transcription of the guards above: load A, load B, let B answer,
+    then let A answer late. A must neither paint nor leave a scope Delete could
+    act on.
+    """
+    state = {"generation": 0, "scope": None, "painted": None, "selected": "A"}
+
+    def begin_load(company: str) -> dict[str, object]:
+        state["generation"] += 1
+        state["scope"] = None
+        return {"generation": state["generation"], "company": company}
+
+    def finish_load(request: dict[str, object]) -> None:
+        if request["generation"] != state["generation"]:
+            return
+        if request["company"] != state["selected"]:
+            return
+        state["painted"] = request["company"]
+        state["scope"] = {"provider": "altegio", "company": request["company"]}
+
+    def delete_allowed() -> bool:
+        scope = state["scope"]
+        return bool(scope and scope["provider"] == "altegio" and scope["company"] == state["selected"])
+
+    request_a = begin_load("A")
+    state["selected"] = "B"
+    request_b = begin_load("B")
+
+    finish_load(request_b)
+    assert state["painted"] == "B"
+    assert delete_allowed() is True
+
+    # A answers late, for a branch nobody is looking at any more.
+    finish_load(request_a)
+
+    assert state["painted"] == "B", "a stale answer repainted the screen"
+    assert state["scope"] == {"provider": "altegio", "company": "B"}
+    assert delete_allowed() is True
+
+    # And if the operator moves again without reloading, Delete stops.
+    state["selected"] = "A"
+    assert delete_allowed() is False
+
+
+@pytest.mark.asyncio
+async def test_the_easyweek_detail_page_marks_altegio_only_sections_closed(
+    session_maker, configuration, http_client
+) -> None:
+    """Zeros under Delivery and Loyalty read as a working feature. Say it plainly."""
+    run_id = await _preview(session_maker, keep_recipient=True)
+
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+
+    assert "Delivery — закрыто (§37.1)" in page
+    assert "Loyalty — не применяется" in page
+    assert "Follow-up — закрыто (§37.1)" in page
+    # The Altegio follow-up schedule fields are not rendered for EasyWeek.
+    assert "Auto status (run.meta)" not in page
+    assert "Follow-up due at" not in page
+    # What §37.1 DOES open stays visible: the basis, the exclusions, the editor.
+    assert "Excluded (EasyWeek)" in page
+    assert "Add recipient" in page
+
+
+@pytest.mark.asyncio
+async def test_the_altegio_detail_page_keeps_all_three_sections(session_maker, configuration, http_client) -> None:
+    """The Altegio page is untouched by any of this."""
+    run_id, _ = await seed_recipient(session_maker, provider=PROVIDER_ALTEGIO, phone=PHONE, client_phone=PHONE)
+
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+
+    assert "📨 Delivery" in page and "закрыто" not in page.split("📨 Delivery")[1][:80]
+    assert "🎁 Loyalty" in page
+    assert "Follow-up schedule / auto-run" in page
+    assert "Auto status (run.meta)" in page

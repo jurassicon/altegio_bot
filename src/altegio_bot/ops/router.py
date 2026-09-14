@@ -3560,8 +3560,31 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
   </div>
 </div>
 
-<!-- ========== БЛОК ШАБЛОНА ========== -->
-<div class="card mb-3">
+<!-- ========== БЛОК ШАБЛОНА: EASYWEEK ========== -->
+<div class="card mb-3 easyweek-only d-none">
+  <div class="card-header fw-bold">📄 Шаблон EasyWeek (только для просмотра)</div>
+  <div class="card-body">
+    <dl class="row mb-2">
+      <dt class="col-sm-3">Provider</dt>
+      <dd class="col-sm-9"><code>easyweek</code></dd>
+      <dt class="col-sm-3">Internal code</dt>
+      <dd class="col-sm-9"><code>new_client_voucher</code></dd>
+      <dt class="col-sm-3">Meta template</dt>
+      <dd class="col-sm-9"><code>kitilash_ka_new_client_voucher_v1</code></dd>
+      <dt class="col-sm-3">Язык</dt>
+      <dd class="col-sm-9"><code>de</code></dd>
+    </dl>
+    <div id="ew-template-status" class="text-muted small">⏳ Проверка шаблона филиала…</div>
+    <div class="alert alert-warning small mt-2 mb-0">
+      §37.1 открывает <b>только preview и редактор snapshot</b>. Send-real, follow-up,
+      jobs, Outbox и массовая доставка для EasyWeek закрыты; Altegio newsletter и
+      follow-up к EasyWeek не относятся и здесь не используются.
+    </div>
+  </div>
+</div>
+
+<!-- ========== БЛОК ШАБЛОНА: ALTEGIO ========== -->
+<div class="card mb-3 altegio-only">
   <div class="card-header fw-bold">📄 Текст рассылки (Meta WhatsApp — только для просмотра)</div>
   <div class="card-body">
     <dl class="row mb-2">
@@ -3703,6 +3726,10 @@ document.addEventListener("DOMContentLoaded", function () {{
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
     loadFollowupTemplateText(cid);
+    // A different branch: the table on screen no longer describes anything
+    // deletable, and any in-flight read for the previous one is now stale.
+    OUTSTANDING_GENERATION += 1;
+    OUTSTANDING_SCOPE = null;
     // Перезагрузить карты прошлых периодов для новой компании
     loadOutstandingCards(cid);
     // Автоматически загрузить типы карт для выбранного филиала
@@ -3729,6 +3756,16 @@ document.addEventListener("DOMContentLoaded", function () {{
   onProviderChange();
 
   // Загрузить тексты шаблонов, типы карт и карты прошлых периодов для company по умолчанию
+  const ewCompanySelect = document.getElementById("f-ew-company");
+  if (ewCompanySelect) {{
+    ewCompanySelect.addEventListener("change", function () {{
+      loadEasyWeekTemplateStatus();
+      // A branch change invalidates any in-flight Altegio card read too.
+      OUTSTANDING_GENERATION += 1;
+      OUTSTANDING_SCOPE = null;
+    }});
+  }}
+
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
@@ -4116,15 +4153,43 @@ function renderRecipientsTable(items, total) {{
       '<p class="text-muted p-3">Нет записей по заданному фильтру.</p>';
     return;
   }}
-  const cols = [
-    "Имя", "Телефон", "Статус", "Причина исключения",
-    "Ресничных", "Подтверждённых лаш", "До периода (CRM)",
-    "Услуги в периоде", "Лок. клиент"
-  ];
+  // EasyWeek has no lash records, no Altegio CRM history and no card types, so
+  // those columns showed em-dashes where an operator needed the things that DO
+  // exist here: on what grounds each row is in the snapshot, and what a manual
+  // inclusion overrode.
+  const easyweek = isEasyWeek();
+  const cols = easyweek
+    ? ["Имя", "Телефон", "Статус", "Основание", "Причина исключения",
+       "Было исключено автоматически", "EasyWeek customer", "Лок. клиент"]
+    : ["Имя", "Телефон", "Статус", "Причина исключения",
+       "Ресничных", "Подтверждённых лаш", "До периода (CRM)",
+       "Услуги в периоде", "Лок. клиент"];
   const header = '<tr>' + cols.map(function(c) {{
     return '<th>' + escHtml(c) + '</th>';
   }}).join("") + '</tr>';
-  const rows = items.map(function(r) {{
+  const BASIS_LABELS = {{
+    "earned_first_visit": ['<span class="badge bg-secondary">auto</span>', "первый визит доказан сегментатором"],
+    "operator_manual_selection": ['<span class="badge bg-primary">manual</span>', "решение оператора (§37.1)"],
+    "owner_test_account": ['<span class="badge bg-warning text-dark">test</span>', "тестовый аккаунт canary (§36.11)"],
+  }};
+  const rows = easyweek ? items.map(function(r) {{
+    const seg = r.segment || {{}};
+    const statusColor = r.status === "candidate" ? "success" : "secondary";
+    const basis = BASIS_LABELS[r.recipient_basis] || ['<span class="badge bg-light text-dark">'
+      + escHtml(String(r.recipient_basis || "—")) + '</span>', ""];
+    // Presence only. The UUID itself is never rendered.
+    const bound = r.easyweek_customer_recorded ? "✓" : "—";
+    return '<tr>' +
+      '<td>' + escHtml(r.display_name || "") + '</td>' +
+      '<td>' + escHtml(r.phone_e164 || "") + '</td>' +
+      '<td><span class="badge bg-' + statusColor + '">' + escHtml(r.status || "") + '</span></td>' +
+      '<td>' + basis[0] + '<div class="text-muted small">' + escHtml(basis[1]) + '</div></td>' +
+      '<td><small>' + escHtml(r.excluded_reason || "—") + '</small></td>' +
+      '<td><small>' + escHtml(r.auto_excluded_reason || "—") + '</small></td>' +
+      '<td>' + bound + '</td>' +
+      '<td>' + (seg.local_client_found ? "✓" : "—") + '</td>' +
+      '</tr>';
+  }}).join("") : items.map(function(r) {{
     const seg = r.segment || {{}};
     const statusColor = r.status === "candidate" ? "success" : "secondary";
     const titles = (seg.service_titles_in_period || []).join(", ") || "—";
@@ -4292,7 +4357,9 @@ function onProviderChange() {{
 
   // Invalidate any in-flight outstanding-cards read, then hide and empty the
   // panel at once rather than waiting for a response that may never come.
+  if (easyweek) loadEasyWeekTemplateStatus();
   OUTSTANDING_GENERATION += 1;
+  OUTSTANDING_SCOPE = null;
   const section = document.getElementById("outstanding-cards-section");
   const tableEl = document.getElementById("outstanding-cards-table");
   const deleteBtn = document.getElementById("btn-delete-outstanding");
@@ -4301,6 +4368,42 @@ function onProviderChange() {{
   if (tableEl && easyweek) tableEl.innerHTML = "";
   if (deleteBtn) deleteBtn.disabled = easyweek;
   if (deleteResult && easyweek) deleteResult.innerHTML = "";
+}}
+
+// Does THIS branch have the exact EasyWeek template row? Asked with
+// provider=easyweek and the branch's own company id, so a missing row is
+// reported as missing rather than answered with an Altegio one — the endpoint
+// refuses the cross-provider fallback, and this says so plainly.
+async function loadEasyWeekTemplateStatus() {{
+  const el = document.getElementById("ew-template-status");
+  if (!el || !isEasyWeek()) return;
+  const companyEl = document.getElementById("f-ew-company");
+  const companyId = companyEl ? companyEl.value : "";
+  if (!companyId) {{
+    el.innerHTML = '<span class="text-danger">Филиал не выбран.</span>';
+    return;
+  }}
+  el.textContent = "⏳ Проверка шаблона филиала…";
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/new-clients/template-text?provider=easyweek"
+        + "&template_name=kitilash_ka_new_client_voucher_v1"
+        + "&company_id=" + encodeURIComponent(companyId)
+    );
+    if (!isEasyWeek()) return;
+    if (!resp.ok) {{
+      el.innerHTML = '<span class="text-danger">Шаблон <code>new_client_voucher</code> для этого '
+        + 'филиала не настроен. Отправка и так закрыта в §37.1; строку добавляет отдельный '
+        + 'reconciler после live-проверки Meta.</span>';
+      return;
+    }}
+    const data = await resp.json();
+    el.innerHTML = '<span class="text-success">Шаблон найден:</span> <code>'
+      + escHtml(String(data.code)) + '</code> / <code>' + escHtml(String(data.language))
+      + '</code> / provider <code>' + escHtml(String(data.provider)) + '</code>';
+  }} catch (e) {{
+    el.innerHTML = '<span class="text-danger">Не удалось проверить шаблон филиала.</span>';
+  }}
 }}
 
 function buildPayload() {{
@@ -4376,10 +4479,17 @@ function escHtml(s) {{
 // Outstanding cards (previous-period loyalty cards cleanup)
 // ---------------------------------------------------------------------------
 
-// Bumped whenever the provider changes. An in-flight Altegio read that lands
-// after the operator has switched to EasyWeek belongs to a previous generation
-// and must not repaint a destructive panel that no longer applies.
+// Bumped for EVERY load, not only on a provider change. Two branches in a row
+// otherwise share one generation, so a slow answer for the previous company can
+// still repaint the screen of the current one — and the panel it repaints is
+// the one that deletes real loyalty cards.
 let OUTSTANDING_GENERATION = 0;
+
+// What the table on screen is actually showing. Checked again immediately
+// before Delete, because "the list I looked at" and "the branch selected now"
+// are two different facts, and only the first one describes what would be
+// deleted.
+let OUTSTANDING_SCOPE = null;
 
 async function loadOutstandingCards(companyId) {{
   const section = document.getElementById("outstanding-cards-section");
@@ -4393,7 +4503,9 @@ async function loadOutstandingCards(companyId) {{
   if (isEasyWeek()) return {{ok: true, state: "empty", count: 0}};
   if (!companyId) return {{ok: true, state: "empty", count: 0}};
 
-  const generation = OUTSTANDING_GENERATION;
+  const generation = ++OUTSTANDING_GENERATION;
+  const scope = {{provider: "altegio", companyId: String(companyId)}};
+  OUTSTANDING_SCOPE = null;
   let data;
   try {{
     const resp = await fetch(
@@ -4408,15 +4520,21 @@ async function loadOutstandingCards(companyId) {{
     return {{ok: false, state: "failed", error: String(e)}};
   }}
 
-  // The answer is only usable if the world still looks the way it did when we
-  // asked. A stale response must not resurrect the panel.
-  if (generation !== OUTSTANDING_GENERATION || isEasyWeek()) {{
+  // Usable only if this is still the newest request AND the selection has not
+  // moved underneath it. Either check alone lets a late answer for another
+  // branch paint the current one.
+  const currentCompany = String(document.getElementById("f-company").value || "");
+  if (generation !== OUTSTANDING_GENERATION || isEasyWeek() || currentCompany !== scope.companyId) {{
     return {{ok: true, state: "empty", count: 0}};
   }}
 
   if (!data.cards || data.cards.length === 0) {{
     return {{ok: true, state: "empty", count: 0}};
   }}
+
+  // From here the table on screen belongs to this scope, and Delete may only
+  // act within it.
+  OUTSTANDING_SCOPE = scope;
 
   badge.textContent = data.cards.length + " карт";
   section.classList.remove("d-none");
@@ -4470,6 +4588,19 @@ async function deleteOutstandingCards() {{
   const excludedIds = Array.from(document.querySelectorAll(".oc-check:not(:checked)"))
     .map(cb => parseInt(cb.dataset.recipient, 10));
   const companyId = parseInt(document.getElementById("f-company").value, 10);
+
+  // The rows on screen were loaded for one branch. If the selection has moved
+  // since, deleting would send THIS branch's id with THAT branch's exclusions —
+  // which is how the wrong cards get deleted. Fail closed and make the operator
+  // reload.
+  if (!OUTSTANDING_SCOPE
+      || OUTSTANDING_SCOPE.provider !== "altegio"
+      || OUTSTANDING_SCOPE.companyId !== String(companyId)) {{
+    setAlert("outstanding-delete-result", "warning",
+      "Список карт относится к другому филиалу или провайдеру. Загрузите список заново "
+      + "перед удалением.");
+    return;
+  }}
 
   btn.disabled = true;
   btn.textContent = "⏳ Удаление…";
@@ -4930,7 +5061,21 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("Opted-out after", run.opted_out_after_count or 0, "danger"),
         ]
     )
-    delivery_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Delivery counters are the Altegio send path's own. For EasyWeek they
+        # would be a row of zeros presented as a working feature, which is worse
+        # than saying plainly that the path is closed.
+        delivery_block = """
+<div class="card mb-3">
+  <div class="card-header">📨 Delivery — закрыто (§37.1)</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">EasyWeek send-real, jobs, Outbox и массовая доставка закрыты.
+    §37.1 открывает только preview и редактор snapshot.</p>
+  </div>
+</div>
+"""
+    else:
+        delivery_block = f"""
 <div class="card mb-3">
   <div class="card-header">📨 Delivery</div>
   <div class="card-body">
@@ -4947,7 +5092,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("Cleanup failed", run.cleanup_failed_count or 0, "danger"),
         ]
     )
-    loyalty_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Loyalty cards are an Altegio concept: EasyWeek has none to issue,
+        # delete or fail at.
+        loyalty_block = """
+<div class="card mb-3">
+  <div class="card-header">🎁 Loyalty — не применяется</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">Карты лояльности относятся только к Altegio.</p>
+  </div>
+</div>
+"""
+    else:
+        loyalty_block = f"""
 <div class="card mb-3">
   <div class="card-header">🎁 Loyalty</div>
   <div class="card-body">
@@ -5076,7 +5233,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         else ""
     )
 
-    followup_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Follow-up is Altegio job/outbox machinery. Showing its schedule for an
+        # EasyWeek run would present a closed path as a configured one.
+        followup_block = """
+<div class="card mb-3">
+  <div class="card-header">🔁 Follow-up — закрыто (§37.1)</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">Follow-up, retry, resume и scheduling для EasyWeek не открыты.</p>
+  </div>
+</div>
+"""
+    else:
+        followup_block = f"""
 <div class="card mb-3">
   <div class="card-header">🔁 Follow-up schedule / auto-run</div>
   <div class="card-body">

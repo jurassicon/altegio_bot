@@ -1391,7 +1391,7 @@ async def test_campaign_new_page_has_auto_card_type_loader(http_client: AsyncCli
     assert "loadCardTypes()" in text
 
     # Автовызов при смене филиала
-    company_change_block = text[text.find("companySelect.addEventListener") :][:600]
+    company_change_block = text[text.find("companySelect.addEventListener") :][:900]
     assert "loadCardTypes()" in company_change_block
 
     # Кнопки «Загрузить» (btn-load-cards) нет ни в HTML, ни в JS
@@ -1439,7 +1439,7 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     # A fixed-length window, widened because the function grew a provider guard
     # in §37.1. Every assertion below is unchanged — only the slice that has to
     # contain them.
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4200]
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4800]
     assert "escHtml(String(detail))" in delete_fn
     assert "escHtml(String(e))" in delete_fn
 
@@ -1479,7 +1479,7 @@ async def test_campaign_new_page_preserves_failed_card_details_on_reload_warning
     assert response.status_code == 200
     text = response.text
 
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4800]
 
     # failDetails строится из card_id / recipient_id / error
     assert "card_id=" in delete_fn
