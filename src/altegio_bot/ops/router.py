@@ -3442,7 +3442,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <div class="mt-3 d-flex gap-2">
       <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(true)">Выбрать все</button>
       <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(false)">Снять все</button>
-      <button id="btn-delete-outstanding" class="btn btn-sm btn-danger ms-auto"
+      <button id="btn-delete-outstanding" class="btn btn-sm btn-danger ms-auto" disabled
               onclick="deleteOutstandingCards()">
         🗑️ Удалить выбранные
       </button>
@@ -3570,9 +3570,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       <dt class="col-sm-3">Internal code</dt>
       <dd class="col-sm-9"><code>new_client_voucher</code></dd>
       <dt class="col-sm-3">Meta template</dt>
-      <dd class="col-sm-9"><code>kitilash_ka_new_client_voucher_v1</code></dd>
+      <dd class="col-sm-9"><span id="ew-template-name">—</span></dd>
       <dt class="col-sm-3">Язык</dt>
-      <dd class="col-sm-9"><code>de</code></dd>
+      <dd class="col-sm-9"><span id="ew-template-language">—</span></dd>
     </dl>
     <div id="ew-template-status" class="text-muted small">⏳ Проверка шаблона филиала…</div>
     <div class="alert alert-warning small mt-2 mb-0">
@@ -3709,6 +3709,58 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 const COMPANY_TEMPLATES = {company_templates_js};
 const COMPANY_FOLLOWUP_TEMPLATES = {company_followup_templates_js};
 let previewRunId = {from_preview_id or "null"};
+
+// ---------------------------------------------------------------------------
+// The scope a rendered preview belongs to
+// ---------------------------------------------------------------------------
+// Everything on screen describes ONE saved run. Which provider's schema to draw
+// it with is a property of that run, not of whatever the dropdown says now —
+// reading the dropdown is how an EasyWeek snapshot ends up rendered with
+// Altegio columns a second after somebody switches provider.
+//
+// Each load also carries a token, so an answer that arrives after the operator
+// has moved on is discarded instead of painting over the newer one.
+let PREVIEW_CONTEXT = null;
+let PREVIEW_GENERATION = 0;
+let RECIPIENTS_GENERATION = 0;
+
+// -- the decisions, as pure functions ---------------------------------------
+// No DOM and no fetch, so they can be executed directly rather than described
+// twice: once here and once in a test that re-implements them.
+
+function currentScope() {{
+  const provider = document.getElementById("f-provider").value;
+  const companyEl = provider === "easyweek"
+    ? document.getElementById("f-ew-company")
+    : document.getElementById("f-company");
+  return {{provider: provider, companyId: String((companyEl && companyEl.value) || "")}};
+}}
+
+function scopeMatches(a, b) {{
+  if (!a || !b) return false;
+  return a.provider === b.provider && String(a.companyId) === String(b.companyId);
+}}
+
+// May an answer that just arrived be drawn?
+function mayRender(responseToken, currentToken, responseScope, current) {{
+  if (responseToken !== currentToken) return false;
+  return scopeMatches(responseScope, current);
+}}
+
+// May the Run button be offered at all? Only for a saved Altegio preview that
+// still matches the screen and that the SERVER said is runnable. EasyWeek never
+// qualifies: §37.1 opens the editor, not the sending.
+function mayRunFromPreview(context, current) {{
+  if (!context || !context.runId) return false;
+  if (context.provider !== "altegio") return false;
+  if (!context.runnable) return false;
+  return scopeMatches(context, current);
+}}
+
+// Which schema to draw a preview or a recipients page with.
+function schemaProvider(context) {{
+  return (context && context.provider) ? context.provider : "altegio";
+}}
 let runRunId = null;
 let progressInterval = null;
 
@@ -3730,6 +3782,9 @@ document.addEventListener("DOMContentLoaded", function () {{
     // deletable, and any in-flight read for the previous one is now stale.
     OUTSTANDING_GENERATION += 1;
     OUTSTANDING_SCOPE = null;
+    const ocDelete = document.getElementById("btn-delete-outstanding");
+    if (ocDelete) ocDelete.disabled = true;
+    invalidatePreviewContext();
     // Перезагрузить карты прошлых периодов для новой компании
     loadOutstandingCards(cid);
     // Автоматически загрузить типы карт для выбранного филиала
@@ -3760,7 +3815,9 @@ document.addEventListener("DOMContentLoaded", function () {{
   if (ewCompanySelect) {{
     ewCompanySelect.addEventListener("change", function () {{
       loadEasyWeekTemplateStatus();
-      // A branch change invalidates any in-flight Altegio card read too.
+      // A different branch: the preview on screen is somebody else's snapshot.
+      invalidatePreviewContext();
+      // And any in-flight Altegio card read is now stale.
       OUTSTANDING_GENERATION += 1;
       OUTSTANDING_SCOPE = null;
     }});
@@ -4017,6 +4074,9 @@ async function createPreview() {{
   document.getElementById("preview-spinner").classList.remove("d-none");
   document.getElementById("btn-preview").disabled = true;
 
+  const token = ++PREVIEW_GENERATION;
+  const asked = currentScope();
+
   try {{
     const resp = await fetch("/ops/campaigns/new-clients/preview", {{
       method: "POST",
@@ -4024,14 +4084,26 @@ async function createPreview() {{
       body: JSON.stringify(payload),
     }});
     const data = await resp.json();
+    // The operator may have changed provider, branch, or asked for another
+    // preview while this one was in flight. Any of those makes this answer a
+    // description of a screen that no longer exists.
+    if (!mayRender(token, PREVIEW_GENERATION, asked, currentScope())) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "danger", "Preview ошибка: " + (data.detail || JSON.stringify(data)));
       return;
     }}
+    // The context comes from the RUN, not from the dropdown, and carries the
+    // server's own verdict about whether it may be run from.
+    PREVIEW_CONTEXT = {{
+      runId: data.id,
+      provider: data.provider || asked.provider,
+      companyId: String((data.company_ids && data.company_ids[0]) || asked.companyId),
+      runnable: data.is_runnable_from_preview === true,
+    }};
     previewRunId = data.id;
     renderPreviewSummary(data);
     document.getElementById("preview-results").classList.remove("d-none");
-    document.getElementById("btn-run").disabled = false;
+    applyRunAvailability();
     loadRecipients(true);
     setAlert("preview-alert", "success", "Preview готов! Run ID: " + previewRunId);
   }} catch (e) {{
@@ -4047,6 +4119,9 @@ async function createPreview() {{
 // ============================================================
 function renderPreviewSummary(data) {{
   const runId = data.id;
+  // The run's own provider, so a summary cannot be redrawn under another
+  // provider's schema after the dropdown moves.
+  const summaryProvider = data.provider || schemaProvider(PREVIEW_CONTEXT);
   // Метрики
   const metrics = [
     ["Всего найдено", data.total_clients_seen || 0, "secondary"],
@@ -4080,7 +4155,7 @@ function renderPreviewSummary(data) {{
   breakdownHtml += '<table class="table table-sm table-bordered mb-0" style="max-width:500px">';
   breakdownHtml += '<thead class="table-light"><tr><th>Причина</th>';
   breakdownHtml += '<th class="text-end">Кол-во</th></tr></thead><tbody>';
-  if (isEasyWeek()) {{
+  if (summaryProvider === "easyweek") {{
     // EasyWeek has its own reason vocabulary, and it will grow. Rendering the
     // Altegio list here printed a column of zeros against reasons that do not
     // exist and hid the ones that do — so show what the run actually reported,
@@ -4130,15 +4205,25 @@ async function loadRecipients(eligibleOnly) {{
   const url = "/ops/campaigns/runs/" + previewRunId + "/recipients" +
     (eligibleOnly ? "?status=candidate&limit=500" : "?limit=500");
 
+  const token = ++RECIPIENTS_GENERATION;
+  const asked = PREVIEW_CONTEXT ? {{provider: PREVIEW_CONTEXT.provider, companyId: PREVIEW_CONTEXT.companyId}}
+                                : currentScope();
+
   try {{
     const resp = await fetch(url);
     const data = await resp.json();
+    // Two filter clicks in a row finish in whatever order the network decides.
+    // Only the newest one may paint, and only while its preview is still the
+    // one on screen.
+    if (!mayRender(token, RECIPIENTS_GENERATION, asked, currentScope())) return;
     if (!resp.ok) {{
       document.getElementById("recipients-table").innerHTML =
         '<div class="alert alert-danger m-3">Ошибка загрузки получателей</div>';
       return;
     }}
-    renderRecipientsTable(data.items || [], data.total || 0);
+    // The provider of the RUN — served at the top level of the response —
+    // chooses the schema. Not the dropdown, which may have moved.
+    renderRecipientsTable(data.items || [], data.total || 0, data.provider || schemaProvider(PREVIEW_CONTEXT));
   }} catch (e) {{
     document.getElementById("recipients-table").innerHTML =
       '<div class="alert alert-danger m-3">Ошибка сети: ' + escHtml(e.message) + '</div>';
@@ -4147,7 +4232,7 @@ async function loadRecipients(eligibleOnly) {{
   }}
 }}
 
-function renderRecipientsTable(items, total) {{
+function renderRecipientsTable(items, total, provider) {{
   if (items.length === 0) {{
     document.getElementById("recipients-table").innerHTML =
       '<p class="text-muted p-3">Нет записей по заданному фильтру.</p>';
@@ -4157,7 +4242,7 @@ function renderRecipientsTable(items, total) {{
   // those columns showed em-dashes where an operator needed the things that DO
   // exist here: on what grounds each row is in the snapshot, and what a manual
   // inclusion overrode.
-  const easyweek = isEasyWeek();
+  const easyweek = (provider || schemaProvider(PREVIEW_CONTEXT)) === "easyweek";
   const cols = easyweek
     ? ["Имя", "Телефон", "Статус", "Основание", "Причина исключения",
        "Было исключено автоматически", "EasyWeek customer", "Лок. клиент"]
@@ -4344,12 +4429,9 @@ function onProviderChange() {{
   document.querySelectorAll(".easyweek-only").forEach(function(el) {{
     el.classList.toggle("d-none", !easyweek);
   }});
-  const runBtn = document.getElementById("btn-run");
-  if (runBtn) {{
-    // §37.1 opens the editor and nothing else. A button that answers 409
-    // teaches an operator to click through refusals.
-    runBtn.classList.toggle("d-none", easyweek);
-  }}
+  // The preview on screen belongs to the provider it was built under, so a
+  // switch stops it from describing anything. The saved run is untouched.
+  invalidatePreviewContext();
   const runNote = document.getElementById("easyweek-send-closed");
   if (runNote) {{
     runNote.classList.toggle("d-none", !easyweek);
@@ -4357,7 +4439,6 @@ function onProviderChange() {{
 
   // Invalidate any in-flight outstanding-cards read, then hide and empty the
   // panel at once rather than waiting for a response that may never come.
-  if (easyweek) loadEasyWeekTemplateStatus();
   OUTSTANDING_GENERATION += 1;
   OUTSTANDING_SCOPE = null;
   const section = document.getElementById("outstanding-cards-section");
@@ -4365,45 +4446,119 @@ function onProviderChange() {{
   const deleteBtn = document.getElementById("btn-delete-outstanding");
   const deleteResult = document.getElementById("outstanding-delete-result");
   if (section) section.classList.add("d-none");
-  if (tableEl && easyweek) tableEl.innerHTML = "";
-  if (deleteBtn) deleteBtn.disabled = easyweek;
-  if (deleteResult && easyweek) deleteResult.innerHTML = "";
+  if (tableEl) tableEl.innerHTML = "";
+  // Disabled until a list for THIS branch has actually loaded and set a scope.
+  // An enabled button over an empty or stale table is the dangerous state.
+  if (deleteBtn) deleteBtn.disabled = true;
+  if (deleteResult) deleteResult.innerHTML = "";
+
+  if (easyweek) {{
+    loadEasyWeekTemplateStatus();
+  }} else {{
+    // Coming back from EasyWeek: the Altegio panel was cleared on the way out,
+    // so reload the list for whichever Altegio branch is selected now.
+    const altegioCompany = document.getElementById("f-company");
+    if (altegioCompany && altegioCompany.value) loadOutstandingCards(altegioCompany.value);
+  }}
 }}
 
 // Does THIS branch have the exact EasyWeek template row? Asked with
 // provider=easyweek and the branch's own company id, so a missing row is
 // reported as missing rather than answered with an Altegio one — the endpoint
 // refuses the cross-provider fallback, and this says so plainly.
+let TEMPLATE_GENERATION = 0;
+
+// Reasons the server can give, as sentences. The codes are stable; an operator
+// should not have to read them.
+const EW_TEMPLATE_REASONS = {{
+  "branch_not_in_registry": "Филиал не настроен на сервере.",
+  "branch_contract_not_approved":
+    "Для этого филиала нет отдельно утверждённого voucher-контракта. "
+    + "Доказанный контракт относится только к Karlsruhe и не переносится на другие филиалы.",
+  "template_row_missing": "Шаблон для этого филиала не настроен.",
+  "template_rows_ambiguous": "Для этого филиала несколько активных шаблонов — неоднозначно.",
+  "voucher_delivery_template_unproven": "Шаблон филиала не доказан.",
+  "voucher_delivery_template_mismatch": "Строка шаблона не совпадает с контрактом.",
+}};
+
 async function loadEasyWeekTemplateStatus() {{
   const el = document.getElementById("ew-template-status");
+  const nameEl = document.getElementById("ew-template-name");
+  const langEl = document.getElementById("ew-template-language");
   if (!el || !isEasyWeek()) return;
   const companyEl = document.getElementById("f-ew-company");
   const companyId = companyEl ? companyEl.value : "";
+  if (nameEl) nameEl.innerHTML = "—";
+  if (langEl) langEl.innerHTML = "—";
   if (!companyId) {{
     el.innerHTML = '<span class="text-danger">Филиал не выбран.</span>';
     return;
   }}
   el.textContent = "⏳ Проверка шаблона филиала…";
+
+  // Its own token and its own scope: an answer for the branch the operator has
+  // just left must not describe the one they are looking at now.
+  const token = ++TEMPLATE_GENERATION;
+  const asked = {{provider: "easyweek", companyId: String(companyId)}};
+
+  let data;
   try {{
     const resp = await fetch(
-      "/ops/campaigns/new-clients/template-text?provider=easyweek"
-        + "&template_name=kitilash_ka_new_client_voucher_v1"
-        + "&company_id=" + encodeURIComponent(companyId)
+      "/ops/campaigns/new-clients/easyweek-template-status?company_id=" + encodeURIComponent(companyId)
     );
-    if (!isEasyWeek()) return;
-    if (!resp.ok) {{
-      el.innerHTML = '<span class="text-danger">Шаблон <code>new_client_voucher</code> для этого '
-        + 'филиала не настроен. Отправка и так закрыта в §37.1; строку добавляет отдельный '
-        + 'reconciler после live-проверки Meta.</span>';
-      return;
-    }}
-    const data = await resp.json();
-    el.innerHTML = '<span class="text-success">Шаблон найден:</span> <code>'
-      + escHtml(String(data.code)) + '</code> / <code>' + escHtml(String(data.language))
-      + '</code> / provider <code>' + escHtml(String(data.provider)) + '</code>';
+    data = resp.ok ? await resp.json() : null;
   }} catch (e) {{
-    el.innerHTML = '<span class="text-danger">Не удалось проверить шаблон филиала.</span>';
+    data = null;
   }}
+  if (!mayRender(token, TEMPLATE_GENERATION, asked, currentScope())) return;
+
+  if (!data) {{
+    el.innerHTML = '<span class="text-danger">Не удалось проверить шаблон филиала.</span>';
+    return;
+  }}
+  if (data.configured !== true) {{
+    const sentence = EW_TEMPLATE_REASONS[data.reason] || "Шаблон для этого филиала не настроен.";
+    el.innerHTML = '<span class="text-danger">' + escHtml(sentence) + '</span>'
+      + '<div class="text-muted small">Отправка и так закрыта в §37.1; строку добавляет отдельный '
+      + 'reconciler после live-проверки Meta.</div>';
+    return;
+  }}
+  // Only a proven row gets to put a name on the screen.
+  if (nameEl) nameEl.innerHTML = '<code>' + escHtml(String(data.meta_template_name)) + '</code>';
+  if (langEl) langEl.innerHTML = '<code>' + escHtml(String(data.language)) + '</code>';
+  el.innerHTML = '<span class="text-success">Шаблон филиала доказан:</span> <code>'
+    + escHtml(String(data.template_code)) + '</code> / provider <code>'
+    + escHtml(String(data.provider)) + '</code>';
+}}
+
+// The Run button, offered from exactly one place so the rule cannot drift.
+function applyRunAvailability() {{
+  const btn = document.getElementById("btn-run");
+  if (!btn) return;
+  const allowed = mayRunFromPreview(PREVIEW_CONTEXT, currentScope());
+  btn.disabled = !allowed;
+  // EasyWeek never gets the button at all: the path behind it is closed.
+  btn.classList.toggle("d-none", currentScope().provider === "easyweek");
+}}
+
+// Forget the preview on screen without touching the saved run. Called whenever
+// the screen stops describing it: another provider, another branch, a new
+// preview. The CampaignRun itself stays in the database.
+function invalidatePreviewContext() {{
+  PREVIEW_GENERATION += 1;
+  RECIPIENTS_GENERATION += 1;
+  PREVIEW_CONTEXT = null;
+  previewRunId = null;
+  const results = document.getElementById("preview-results");
+  if (results) results.classList.add("d-none");
+  const table = document.getElementById("recipients-table");
+  if (table) table.innerHTML = "";
+  const links = document.getElementById("preview-links");
+  if (links) links.innerHTML = "";
+  const breakdown = document.getElementById("excluded-breakdown");
+  if (breakdown) breakdown.innerHTML = "";
+  setAlert("preview-alert", "", "");
+  applyRunAvailability();
 }}
 
 function buildPayload() {{
@@ -4497,6 +4652,9 @@ async function loadOutstandingCards(companyId) {{
   const badge   = document.getElementById("outstanding-count-badge");
   section.classList.add("d-none");
   tableEl.innerHTML = "";
+  OUTSTANDING_SCOPE = null;
+  const deleteBtnEl = document.getElementById("btn-delete-outstanding");
+  if (deleteBtnEl) deleteBtnEl.disabled = true;
 
   // Loyalty cards are an Altegio concept. EasyWeek has none, so there is
   // nothing to read and nothing to offer deleting.
@@ -4533,8 +4691,11 @@ async function loadOutstandingCards(companyId) {{
   }}
 
   // From here the table on screen belongs to this scope, and Delete may only
-  // act within it.
+  // act within it. Until this line runs — an empty list, an error, a stale
+  // answer — the button stays disabled.
   OUTSTANDING_SCOPE = scope;
+  const okDeleteBtn = document.getElementById("btn-delete-outstanding");
+  if (okDeleteBtn) okDeleteBtn.disabled = false;
 
   badge.textContent = data.cards.length + " карт";
   section.classList.remove("d-none");
@@ -4723,10 +4884,13 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # operator finds out before they click.
         canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
 
-        # Follow-up eligibility aggregation
+        # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
+        # not computed: it is Altegio follow-up machinery, and running it would
+        # spend work deciding something that cannot happen.
+        report = None
         try:
             report = await run_report(session, run_id)
-            followup_eligibility = report.get("followup_eligibility", {})
+            followup_eligibility = {} if run.provider == PROVIDER_EASYWEEK else report.get("followup_eligibility", {})
         except Exception:
             followup_eligibility = {}
 
@@ -4777,7 +4941,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # Bounded to the displayed funnel set (<= _FUNNEL_TABLE_LIMIT rows).
         candidate_now = utcnow()
         final_preview: dict[int, FollowupFinalEligibilityResult] = {}
-        if run.followup_policy:
+        if run.followup_policy and run.provider != PROVIDER_EASYWEEK:
             for _r in funnel_recipients:
                 if _r.followup_status is not None:
                     continue
@@ -5016,8 +5180,11 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(_fmt_dt(run.created_at, tz))}</dd>
       <dt class="col-sm-3">Completed</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz))}</dd>
-      <dt class="col-sm-3">Card Type ID</dt>
-      <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
+{
+        ""
+        if run.provider == PROVIDER_EASYWEEK
+        else f'<dt class="col-sm-3">Card Type ID</dt><dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>'
+    }
       <dt class="col-sm-3">Attribution Window</dt>
       <dd class="col-sm-9">{run.attribution_window_days} days</dd>
 {
@@ -5033,13 +5200,16 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 """
 
     # --- Progress block ---
-    progress_block = _metric_cards(
-        [
-            ("Seen", run.total_clients_seen or 0, "secondary"),
-            ("Candidates", run.candidates_count or 0, "info"),
-            ("Queued", run.queued_count or 0, "primary"),
-        ]
-    )
+    progress_metrics = [
+        ("Seen", run.total_clients_seen or 0, "secondary"),
+        ("Candidates", run.candidates_count or 0, "info"),
+    ]
+    if run.provider != PROVIDER_EASYWEEK:
+        # `Queued` is the first stage of the Altegio delivery pipeline. For
+        # EasyWeek that pipeline is closed, and a zero under it reads as a stage
+        # that simply has not started yet.
+        progress_metrics.append(("Queued", run.queued_count or 0, "primary"))
+    progress_block = _metric_cards(progress_metrics)
     progress_block = f"""
 <div class="card mb-3">
   <div class="card-header">📈 Progress</div>
@@ -5712,7 +5882,11 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             (
                 "status",
                 "Status",
-                "select:candidate,card_issued,skipped,queued,cleanup_failed",
+                # EasyWeek rows are only ever candidates or skipped: the other
+                # statuses are stages of a delivery pipeline it does not have.
+                "select:candidate,skipped"
+                if run.provider == PROVIDER_EASYWEEK
+                else "select:candidate,card_issued,skipped,queued,cleanup_failed",
                 status_filter,
             ),
             ("excluded_reason", "Excluded Reason", "text", excluded_reason_filter),
@@ -5725,29 +5899,47 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
     is_editable_preview = (
         run.mode == "preview" and run.status == "completed" and not used_as_source and not canary_locked
     )
-    # Retry button доступен для send-real runs (не для preview)
-    is_send_real = run.mode == "send-real"
+    # Retry button доступен для send-real runs (не для preview). EasyWeek has no
+    # send path to retry into.
+    is_send_real = run.mode == "send-real" and run.provider != PROVIDER_EASYWEEK
 
-    base_cols = [
-        "ID",
-        "Client ID",
-        "Name",
-        "Phone",
-        "Status",
-        # §37.1: on what grounds this row is here. `auto` was proven by the
-        # segmenter, `manual` is an operator's decision, `test` is the one
-        # approved canary account — three different things that would otherwise
-        # look identical in a list.
-        "Basis",
-        "Excluded Reason",
-        "Card #",
-        "Msg Job ID",
-        "Sent",
-        "Read",
-        "Replied",
-        "Booked",
-        "Followup",
-    ]
+    is_easyweek_run = run.provider == PROVIDER_EASYWEEK
+    if is_easyweek_run:
+        # Cards, jobs and the delivery timestamps belong to the Altegio send
+        # path. For EasyWeek every one of them is permanently empty, and a
+        # column of dashes reads as "not yet" rather than "not applicable".
+        base_cols = [
+            "ID",
+            "Client ID",
+            "Name",
+            "Phone",
+            "Status",
+            "Basis",
+            "Excluded Reason",
+            "EasyWeek customer",
+            "Лок. клиент",
+        ]
+    else:
+        base_cols = [
+            "ID",
+            "Client ID",
+            "Name",
+            "Phone",
+            "Status",
+            # §37.1: on what grounds this row is here. `auto` was proven by the
+            # segmenter, `manual` is an operator's decision, `test` is the one
+            # approved canary account — three different things that would
+            # otherwise look identical in a list.
+            "Basis",
+            "Excluded Reason",
+            "Card #",
+            "Msg Job ID",
+            "Sent",
+            "Read",
+            "Replied",
+            "Booked",
+            "Followup",
+        ]
     extra_cols: list[str] = []
     if is_editable_preview:
         extra_cols.append("")
@@ -5757,22 +5949,36 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
 
     rows = []
     for r in recipients:
-        row = [
-            str(r.id),
-            str(r.client_id or ""),
-            _esc(r.display_name or ""),
-            _esc(r.phone_e164 or ""),
-            _status_badge(r.status),
-            _basis_badge(r),
-            _esc(r.excluded_reason or ""),
-            _esc(r.loyalty_card_number or ""),
-            str(r.message_job_id or ""),
-            _esc(_fmt_dt(r.sent_at, tz)),
-            _esc(_fmt_dt(r.read_at, tz)),
-            _esc(_fmt_dt(r.replied_at, tz)),
-            _esc(_fmt_dt(r.booked_after_at, tz)),
-            _esc(r.followup_status or ""),
-        ]
+        if is_easyweek_run:
+            row = [
+                str(r.id),
+                str(r.client_id or ""),
+                _esc(r.display_name or ""),
+                _esc(r.phone_e164 or ""),
+                _status_badge(r.status),
+                _basis_badge(r),
+                _esc(r.excluded_reason or ""),
+                # Presence only: the customer UUID is never rendered.
+                "✓" if r.easyweek_customer_uuid is not None else "—",
+                "✓" if r.local_client_found else "—",
+            ]
+        else:
+            row = [
+                str(r.id),
+                str(r.client_id or ""),
+                _esc(r.display_name or ""),
+                _esc(r.phone_e164 or ""),
+                _status_badge(r.status),
+                _basis_badge(r),
+                _esc(r.excluded_reason or ""),
+                _esc(r.loyalty_card_number or ""),
+                str(r.message_job_id or ""),
+                _esc(_fmt_dt(r.sent_at, tz)),
+                _esc(_fmt_dt(r.read_at, tz)),
+                _esc(_fmt_dt(r.replied_at, tz)),
+                _esc(_fmt_dt(r.booked_after_at, tz)),
+                _esc(r.followup_status or ""),
+            ]
         if is_editable_preview:
             # Remove is for ACTIVE candidates. A row the segmenter already
             # excluded has nothing to remove, and offering the button would

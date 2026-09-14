@@ -1391,7 +1391,7 @@ async def test_campaign_new_page_has_auto_card_type_loader(http_client: AsyncCli
     assert "loadCardTypes()" in text
 
     # Автовызов при смене филиала
-    company_change_block = text[text.find("companySelect.addEventListener") :][:900]
+    company_change_block = text[text.find("companySelect.addEventListener") :][:1200]
     assert "loadCardTypes()" in company_change_block
 
     # Кнопки «Загрузить» (btn-load-cards) нет ни в HTML, ни в JS

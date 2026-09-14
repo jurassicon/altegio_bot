@@ -1391,8 +1391,10 @@ async def test_the_inline_table_has_an_easyweek_branch_with_basis_columns(http_c
     page = (await http_client.get("/ops/campaigns/new-clients")).text
 
     table_fn = page[page.find("function renderRecipientsTable") :][:3000]
-    # Two branches, chosen by provider.
-    assert "const easyweek = isEasyWeek();" in table_fn
+    # Two branches, chosen by the provider of the RUN being drawn rather than by
+    # the dropdown — which may have moved since the answer was requested.
+    assert 'const easyweek = (provider || schemaProvider(PREVIEW_CONTEXT)) === "easyweek";' in table_fn
+    assert "isEasyWeek()" not in table_fn
     # The EasyWeek columns.
     for column in ("Основание", "Было исключено автоматически", "EasyWeek customer"):
         assert column in table_fn
@@ -1452,9 +1454,13 @@ async def test_the_easyweek_template_block_never_shows_the_altegio_newsletter(ht
 
     ew_block = page[page.find("Шаблон EasyWeek") : page.find("БЛОК ШАБЛОНА: ALTEGIO")]
     assert "new_client_voucher" in ew_block
-    assert "kitilash_ka_new_client_voucher_v1" in ew_block
-    assert "<code>de</code>" in ew_block
     assert "<code>easyweek</code>" in ew_block
+    # The approved Meta name and the language are filled in only after THIS
+    # branch's row has been proven — Karlsruhe's approval is not a default for
+    # Durlach or Rastatt, so the markup asserts neither.
+    assert 'id="ew-template-name"' in ew_block
+    assert 'id="ew-template-language"' in ew_block
+    assert "kitilash_ka_new_client_voucher_v1" not in ew_block
     for altegio_only in ("newsletter_new_clients_monthly", "newsletter_new_clients_followup"):
         assert altegio_only not in ew_block
     # And it says what §37.1 does not open.

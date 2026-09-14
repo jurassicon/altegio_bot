@@ -49,7 +49,7 @@ from altegio_bot.campaigns.easyweek_manual_recipient import (
     add_manual_recipient,
 )
 from altegio_bot.campaigns.easyweek_manual_recipient import known_branch as known_easyweek_branch
-from altegio_bot.campaigns.easyweek_voucher_delivery import test_recipient
+from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract, test_recipient
 from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     TEST_CUSTOMER_UNCONFIGURED,
     TEST_RECIPIENT_DISABLED,
@@ -85,7 +85,9 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
+from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -1114,6 +1116,83 @@ def normalize_meta_template_name(template_name: str) -> str:
 # ==========================================================================
 # Текст Meta-шаблона из БД
 # ==========================================================================
+
+
+@router.get("/new-clients/easyweek-template-status")
+async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, Any]:
+    """Is THIS branch's voucher template row proven? (§37.1)
+
+    Narrow, read-only and deliberately branch-specific. The approved Meta
+    contract — the name, the language, the body, the parameter order — was
+    proven for Karlsruhe and for Karlsruhe only. Showing that name on a Durlach
+    or Rastatt screen would present somebody else's approval as this branch's,
+    so a branch without its own approved contract is reported as not configured
+    rather than filled in from the one that has one.
+
+    The row itself is judged by `template_contract`, the same source the canary's
+    readiness uses: EVERY row for this provider, company, code and language is
+    considered, exactly one must be active, and that one must match the contract
+    completely. A first row taken with LIMIT 1 would be a row, not a proof.
+
+    No Meta request is made: this answers what the database holds, and the live
+    read belongs to the separate reconciler that maintains it.
+    """
+    registry = configured_easyweek_locations()
+    location = registry.locations.get(company_id) if registry.ready else None
+    if location is None:
+        return {"configured": False, "reason": "branch_not_in_registry", "company_id": company_id}
+    if location.location_uuid != KARLSRUHE_LOCATION_UUID:
+        return {
+            "configured": False,
+            "reason": "branch_contract_not_approved",
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(MessageTemplate)
+                    .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
+                    .where(MessageTemplate.company_id == company_id)
+                    .where(MessageTemplate.code == template_contract.VOUCHER_TEMPLATE_CODE)
+                    .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    active = [row for row in rows if row.is_active]
+    if len(active) != 1:
+        # Zero is nothing to send with; two is an ambiguity about which text a
+        # customer would receive.
+        return {
+            "configured": False,
+            "reason": "template_row_missing" if not active else "template_rows_ambiguous",
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    blocker = template_contract.db_row_blocker(active[0], company_id=company_id)
+    if blocker is not None:
+        return {
+            "configured": False,
+            "reason": blocker,
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    return {
+        "configured": True,
+        "reason": None,
+        "company_id": company_id,
+        "provider": PROVIDER_EASYWEEK,
+        "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        "language": template_contract.VOUCHER_TEMPLATE_LANGUAGE,
+        "meta_template_name": template_contract.VOUCHER_META_TEMPLATE_NAME,
+    }
 
 
 @router.get("/new-clients/template-text")
