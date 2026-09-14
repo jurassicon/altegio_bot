@@ -3781,6 +3781,18 @@ function owns(ticket) {{
 // has none, because what it will ask for is decided by the run it is fetching.
 let PREVIEW_IN_FLIGHT = null;
 
+// The live card-type list is a REFERENCE read, not part of a snapshot
+// operation, so it keeps its own generation. Revoking a preview or a prefill
+// must not permanently destroy the only list the operator can choose from —
+// which is exactly what happens when a reference read rides the page clock.
+//
+// `state` is one of: "idle" (nothing loaded), "loading", "loaded" (a live list
+// for `scope`), "empty" (the branch has no card types), "failed" (and may be
+// retried) and "snapshot" (frozen by a loaded preview). `scope` says who the
+// list belongs to, because a list loaded for another branch is not a list.
+let CARD_TYPES_GENERATION = 0;
+let CARD_TYPES_STATE = {{state: "idle", scope: null}};
+
 // ---------------------------------------------------------------------------
 // The scope a rendered preview belongs to
 // ---------------------------------------------------------------------------
@@ -3879,6 +3891,9 @@ function mayRunFromPreview(context, current, signature) {{
   // period or card type means the operator is looking at different parameters
   // than the recipients below them.
   if (signature !== undefined && !signatureMatches(context.signature, signature)) return false;
+  // The campaign issues a loyalty card, so a snapshot with no card type has
+  // nothing to send. Refused here rather than discovered at confirm time.
+  if (signature !== undefined && !signature.cardTypeId) return false;
   return true;
 }}
 
@@ -3897,18 +3912,13 @@ document.addEventListener("DOMContentLoaded", function () {{
 
   companySelect.addEventListener("change", function () {{
     const cid = companySelect.value;
-    // Очистить результат предыдущей операции удаления при смене филиала
-    document.getElementById("outstanding-delete-result").innerHTML = "";
     // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
     loadFollowupTemplateText(cid);
     // A different branch: the table on screen no longer describes anything
     // deletable, and any in-flight read for the previous one is now stale.
-    OUTSTANDING_GENERATION += 1;
-    OUTSTANDING_SCOPE = null;
-    const ocDelete = document.getElementById("btn-delete-outstanding");
-    if (ocDelete) ocDelete.disabled = true;
+    resetOutstandingPanel();
     invalidatePreviewContext();
     // Перезагрузить карты прошлых периодов для новой компании
     loadOutstandingCards(cid);
@@ -3962,21 +3972,22 @@ document.addEventListener("DOMContentLoaded", function () {{
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
-  loadOutstandingCards(companySelect.value);
 
   // Если открыта со страницы history (from_preview), подгрузить параметры preview.
   // Read from the immutable id, not from the mutable current-preview state:
   // shaping the form above must not be able to erase where the page started.
   if (FROM_PREVIEW_ID) {{
-    // Deliberately NOT loading live card types here. The snapshot's own card
-    // type is set from the run and the select stays shut, so there is nothing
-    // for a live list to contribute — and a list requested for the default
-    // branch, arriving after a preview of another branch has loaded, is exactly
-    // the race this avoids. A page opened without `from_preview` loads them as
-    // always, and choosing a branch by hand loads them again.
+    // Deliberately NOT loading live card types or outstanding cards here. Both
+    // would be requested for the branch the page happens to open on, while the
+    // run about to load may belong to another one — and an answer for the
+    // default branch arriving afterwards is exactly the race this avoids. The
+    // prefill reads both for the run's own branch once the run is accepted, and
+    // a refused prefill hands the page back as an ordinary one that reads them
+    // for the branch on screen.
     loadPreviewAndPrefill(FROM_PREVIEW_ID);
   }} else {{
     loadCardTypes();
+    loadOutstandingCards(companySelect.value);
   }}
 }});
 
@@ -4044,6 +4055,14 @@ function hydrateFormFromRun(run) {{
   setFollowupTemplateDefault(companyId);
   loadFollowupTemplateText(companyId);
 
+  // Selecting a branch from JavaScript fires no `change`, so nothing else will
+  // do this: revoke whatever the panel was showing or waiting for, then read
+  // the cards of the branch this run actually belongs to. Without it the page
+  // keeps the default branch's outstanding cards under another branch's
+  // preview, and Delete would act on the wrong list.
+  resetOutstandingPanel();
+  loadOutstandingCards(companyId);
+
   if (run.period_start) {{
     document.getElementById("f-period-start").value = run.period_start.substring(0, 10);
   }}
@@ -4075,8 +4094,9 @@ function hydrateFormFromRun(run) {{
     cardEl.value = String(run.card_type_id);
   }}
   // Shut either way: a snapshot without a card type is not one to pick a card
-  // type for.
+  // type for. The select now belongs to the snapshot, not to any live list.
   document.getElementById("f-card-type").disabled = true;
+  CARD_TYPES_STATE = {{state: "snapshot", scope: {{provider: "altegio", companyId: companyId}}}};
 
   // Предзаполнить и зафиксировать followup-параметры из снимка
   const fuCheckbox = document.getElementById("f-followup-enabled");
@@ -4119,8 +4139,9 @@ async function loadPreviewAndPrefill(runId) {{
     if (!resp.ok) {{
       setAlert("preview-alert", "warning",
         "Не удалось загрузить параметры preview #" + runId +
-        ". Проверьте ID.");
+        ". Проверьте ID. Страница работает как обычно.");
       resetPreviewSurface();
+      returnToOrdinaryAltegioPage();
       return;
     }}
     const run = await resp.json();
@@ -4132,6 +4153,9 @@ async function loadPreviewAndPrefill(runId) {{
       // would clear the very alert that explains the refusal.
       setAlert("preview-alert", rejection.level, rejection.message);
       resetPreviewSurface();
+      // A refused link must not leave a page that can no longer do anything:
+      // the live card list and this branch's outstanding cards come back.
+      returnToOrdinaryAltegioPage();
       return;
     }}
 
@@ -4160,14 +4184,18 @@ async function loadPreviewAndPrefill(runId) {{
     setAlert("preview-alert", "info",
       "🔒 Параметры зафиксированы по preview #" + runId +
       " (компания, период, тип карты, follow-up)." +
-      (PREVIEW_CONTEXT.runnable
-        ? " Нажмите «Run Campaign» для запуска."
-        : " Сервер не разрешает запуск из этого preview."));
+      (!run.card_type_id
+        ? " В снимке не сохранён тип карты лояльности, поэтому запуск недоступен: "
+          + "постройте preview заново с выбранным типом карты."
+        : PREVIEW_CONTEXT.runnable
+          ? " Нажмите «Run Campaign» для запуска."
+          : " Сервер не разрешает запуск из этого preview."));
 
   }} catch (e) {{
     if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
     resetPreviewSurface();
+    returnToOrdinaryAltegioPage();
   }} finally {{
     if (owns(ticket)) {{
       PREVIEW_IN_FLIGHT = null;
@@ -4261,49 +4289,72 @@ async function loadFollowupTemplateText(companyId) {{
 // Загрузка типов карт
 // ============================================================
 async function loadCardTypes() {{
-  // Rides along with whatever the page is doing now rather than starting
-  // something new. If a prefill or a preview moves the clock while this is in
-  // flight, the answer is dropped: it would otherwise replace the card type a
-  // loaded snapshot fixed, and hand back a select the operator can change.
-  const ticket = currentTicket();
+  // A reference read on its own generation, scoped to the provider and branch
+  // it was asked for. Two things can make an answer unusable: a newer read, or
+  // the selection moving underneath it — and neither is the page clock, which
+  // is why this does not ride it.
+  const generation = ++CARD_TYPES_GENERATION;
+  const scope = currentScope();
+  const statusEl = document.getElementById("card-load-status");
+  const cardSelect = document.getElementById("f-card-type");
+
+  // Loyalty cards are an Altegio concept; EasyWeek has none to load.
+  if (isEasyWeek()) {{
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
+    return;
+  }}
   // A loaded snapshot fixed its card type, and the select is shut. A live list
   // has nothing to contribute to it and everything to break, so it steps aside
   // — checked here and again after the answer, because a snapshot can finish
   // loading while this request is in flight.
   if (PREVIEW_CONTEXT) return;
-  // location_id == company_id (один dropdown для обоих)
-  const locationId = document.getElementById("f-company").value.trim();
-  const statusEl = document.getElementById("card-load-status");
-  const cardSelect = document.getElementById("f-card-type");
 
+  // location_id == company_id (один dropdown для обоих)
+  const locationId = String(scope.companyId || "").trim();
   if (!locationId) {{
     cardSelect.innerHTML = '<option value="">— выберите филиал —</option>';
     cardSelect.disabled = true;
     statusEl.textContent = "";
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
     return;
   }}
 
+  CARD_TYPES_STATE = {{state: "loading", scope: scope}};
   statusEl.textContent = "Загрузка типов карт...";
   cardSelect.innerHTML = '<option value="">— загрузка… —</option>';
   cardSelect.disabled = true;
+
+  // Still ours to paint? A newer read, a moved selection, a provider switch or
+  // a snapshot that loaded meanwhile all say no.
+  const mine = function () {{
+    return generation === CARD_TYPES_GENERATION
+      && !PREVIEW_CONTEXT
+      && !isEasyWeek()
+      && scopeMatches(scope, currentScope());
+  }};
 
   try {{
     const resp = await fetch(
       "/ops/campaigns/new-clients/card-types?location_id=" + encodeURIComponent(locationId)
     );
-    if (!owns(ticket) || PREVIEW_CONTEXT) return;
+    if (!mine()) return;
     if (!resp.ok) {{
       const err = await resp.json().catch(() => ({{detail: resp.statusText}}));
-      if (!owns(ticket) || PREVIEW_CONTEXT) return;
-      statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText);
+      if (!mine()) return;
+      CARD_TYPES_STATE = {{state: "failed", scope: scope}};
+      statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText)
+        + " Выберите филиал заново, чтобы повторить.";
       cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
+      cardSelect.disabled = true;
       return;
     }}
     const types = await resp.json();
-    if (!owns(ticket) || PREVIEW_CONTEXT) return;
+    if (!mine()) return;
     if (!Array.isArray(types) || types.length === 0) {{
+      CARD_TYPES_STATE = {{state: "empty", scope: scope}};
       statusEl.textContent = "Нет доступных типов карт.";
       cardSelect.innerHTML = '<option value="">— нет доступных типов карт —</option>';
+      cardSelect.disabled = true;
       return;
     }}
     cardSelect.innerHTML = types.map(function(t) {{
@@ -4312,11 +4363,17 @@ async function loadCardTypes() {{
       return '<option value="' + escHtml(String(id)) + '">' + escHtml(title) + '</option>';
     }}).join("");
     cardSelect.disabled = false;
+    CARD_TYPES_STATE = {{state: "loaded", scope: scope}};
     statusEl.textContent = "Загружено " + types.length + " тип(ов) карт.";
+    // The list is what Run availability was waiting for.
+    applyRunAvailability();
   }} catch (e) {{
-    if (!owns(ticket) || PREVIEW_CONTEXT) return;
-    statusEl.textContent = "Не удалось загрузить типы карт. " + e.message;
+    if (!mine()) return;
+    CARD_TYPES_STATE = {{state: "failed", scope: scope}};
+    statusEl.textContent = "Не удалось загрузить типы карт. " + e.message
+      + " Выберите филиал заново, чтобы повторить.";
     cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
+    cardSelect.disabled = true;
   }}
 }}
 
@@ -4324,6 +4381,36 @@ async function loadCardTypes() {{
 // Создать Preview
 // ============================================================
 async function createPreview() {{
+  // A preview is a snapshot of who gets which loyalty card. Asking for one
+  // before the branch's card types have loaded would send card_type_id=null and
+  // save a snapshot that can never be run.
+  if (!isEasyWeek()) {{
+    const status = cardTypesStatus();
+    if (status === "loading") {{
+      setAlert("preview-alert", "warning",
+        "Типы карт ещё загружаются. Дождитесь списка и выберите тип карты.");
+      return;
+    }}
+    if (status === "failed" || status === "empty") {{
+      setAlert("preview-alert", "danger",
+        "Типы карт для этого филиала недоступны, preview не может быть построен. "
+        + "Выберите филиал заново, чтобы повторить загрузку.");
+      return;
+    }}
+    if (status === "stale") {{
+      setAlert("preview-alert", "warning",
+        "Список типов карт относится к другому филиалу. Загружаем актуальный — "
+        + "повторите попытку.");
+      loadCardTypes();
+      return;
+    }}
+    if (!document.getElementById("f-card-type").value) {{
+      setAlert("preview-alert", "danger",
+        "Выберите тип карты лояльности перед построением preview.");
+      return;
+    }}
+  }}
+
   const payload = buildPayload();
   if (!payload) return;
 
@@ -4468,32 +4555,51 @@ function renderPreviewSummary(data) {{
 // Загрузить получателей preview
 // ============================================================
 async function loadRecipients(eligibleOnly) {{
-  if (!previewRunId) return;
+  // The run this read is about, captured now. `previewRunId` is page state and
+  // can be another run — or none — by the time the answer lands.
+  const runId = previewRunId;
+  if (!runId) return;
   document.getElementById("btn-eligible").className =
     eligibleOnly ? "btn btn-primary" : "btn btn-outline-secondary";
   document.getElementById("btn-all-recip").className =
     eligibleOnly ? "btn btn-outline-secondary" : "btn btn-primary";
 
-  const loading = document.getElementById("recipients-loading");
-  loading.classList.remove("d-none");
-  document.getElementById("recipients-table").innerHTML = "";
+  const table = document.getElementById("recipients-table");
+  setRecipientsLoading(true);
+  table.innerHTML = "";
 
-  const url = "/ops/campaigns/runs/" + previewRunId + "/recipients" +
+  const url = "/ops/campaigns/runs/" + runId + "/recipients" +
     (eligibleOnly ? "?status=candidate&limit=500" : "?limit=500");
 
   const token = ++RECIPIENTS_GENERATION;
   const asked = PREVIEW_CONTEXT ? {{provider: PREVIEW_CONTEXT.provider, companyId: PREVIEW_CONTEXT.companyId}}
                                 : currentScope();
 
+  // Three things, not one: two filter clicks in a row finish in whatever order
+  // the network decides, the preview underneath can be replaced, and the
+  // provider or branch can move. Every outcome below — the table, an error, the
+  // spinner — is only this request's to write while all three still hold.
+  const mine = function () {{
+    return token === RECIPIENTS_GENERATION
+      && runId === previewRunId
+      && scopeMatches(asked, currentScope());
+  }};
+
   try {{
     const resp = await fetch(url);
-    const data = await resp.json();
-    // Two filter clicks in a row finish in whatever order the network decides.
-    // Only the newest one may paint, and only while its preview is still the
-    // one on screen.
-    if (!mayRender(token, RECIPIENTS_GENERATION, asked, currentScope())) return;
+    if (!mine()) return;
+    let data;
+    try {{
+      data = await resp.json();
+    }} catch (parseError) {{
+      if (!mine()) return;
+      table.innerHTML =
+        '<div class="alert alert-danger m-3">Ответ сервера не удалось разобрать</div>';
+      return;
+    }}
+    if (!mine()) return;
     if (!resp.ok) {{
-      document.getElementById("recipients-table").innerHTML =
+      table.innerHTML =
         '<div class="alert alert-danger m-3">Ошибка загрузки получателей</div>';
       return;
     }}
@@ -4501,10 +4607,13 @@ async function loadRecipients(eligibleOnly) {{
     // chooses the schema. Not the dropdown, which may have moved.
     renderRecipientsTable(data.items || [], data.total || 0, data.provider || schemaProvider(PREVIEW_CONTEXT));
   }} catch (e) {{
-    document.getElementById("recipients-table").innerHTML =
+    if (!mine()) return;
+    table.innerHTML =
       '<div class="alert alert-danger m-3">Ошибка сети: ' + escHtml(e.message) + '</div>';
   }} finally {{
-    loading.classList.add("d-none");
+    // A stale request must not put out a spinner that belongs to the read which
+    // replaced it. Invalidation clears the state itself.
+    if (mine()) setRecipientsLoading(false);
   }}
 }}
 
@@ -4742,27 +4851,21 @@ function onProviderChange() {{
 
   // Invalidate any in-flight outstanding-cards read, then hide and empty the
   // panel at once rather than waiting for a response that may never come.
-  OUTSTANDING_GENERATION += 1;
-  OUTSTANDING_SCOPE = null;
-  const section = document.getElementById("outstanding-cards-section");
-  const tableEl = document.getElementById("outstanding-cards-table");
-  const deleteBtn = document.getElementById("btn-delete-outstanding");
-  const deleteResult = document.getElementById("outstanding-delete-result");
-  if (section) section.classList.add("d-none");
-  if (tableEl) tableEl.innerHTML = "";
-  // Disabled until a list for THIS branch has actually loaded and set a scope.
-  // An enabled button over an empty or stale table is the dangerous state.
-  if (deleteBtn) deleteBtn.disabled = true;
-  if (deleteResult) deleteResult.innerHTML = "";
+  resetOutstandingPanel();
 
   if (easyweek) {{
+    // Going out: the Altegio card list belongs to a provider that is no longer
+    // on screen, and a newer generation makes sure its answer cannot land.
+    CARD_TYPES_GENERATION += 1;
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
     loadEasyWeekTemplateStatus();
   }} else if (switched) {{
-    // Coming back from EasyWeek: the Altegio panel was cleared on the way out,
-    // so reload the list for whichever Altegio branch is selected now. On the
-    // initial call the ordinary setup below already loads it.
+    // Coming back from EasyWeek: both Altegio panels were cleared on the way
+    // out, so both are read again for whichever branch is selected now. On the
+    // initial call the ordinary setup below already does it.
     const altegioCompany = document.getElementById("f-company");
     if (altegioCompany && altegioCompany.value) loadOutstandingCards(altegioCompany.value);
+    loadCardTypes();
   }}
 }}
 
@@ -4835,6 +4938,77 @@ async function loadEasyWeekTemplateStatus() {{
     + escHtml(String(data.provider)) + '</code>';
 }}
 
+// May an Altegio preview be built right now? The card type has to be a real,
+// chosen one: the campaign issues a loyalty card, and "none" is not a card.
+//
+//   "ready"          — a live list for this very branch, or a loaded snapshot's
+//                      own frozen card
+//   "loading"        — the list is still on its way; asking now would send null
+//   "failed"/"empty" — nothing to choose from, and the operator must be told
+//   "stale"          — the list belongs to another branch or to a preview that
+//                      has since been thrown away, so it proves nothing
+//
+// The last one is the subtle case: the synthetic «из preview» option a prefill
+// adds looks like a loaded list, but once its PREVIEW_CONTEXT is gone it is a
+// leftover, not a choice.
+function cardTypesStatus() {{
+  if (isEasyWeek()) return "not-applicable";
+  const here = currentScope();
+  const scope = CARD_TYPES_STATE.scope;
+  const sameScope = !!scope && scope.provider === here.provider
+    && String(scope.companyId) === String(here.companyId);
+  if (CARD_TYPES_STATE.state === "snapshot") {{
+    return (PREVIEW_CONTEXT && sameScope) ? "ready" : "stale";
+  }}
+  if (!sameScope) return "stale";
+  if (CARD_TYPES_STATE.state === "loaded") return "ready";
+  if (CARD_TYPES_STATE.state === "loading") return "loading";
+  if (CARD_TYPES_STATE.state === "failed") return "failed";
+  if (CARD_TYPES_STATE.state === "empty") return "empty";
+  return "stale";
+}}
+
+// The recipients spinner, owned by one place so that invalidation can put it
+// out. Forbidding a stale request to hide it is only half the rule: without
+// this the spinner would be left running forever by the very invalidation that
+// revoked the request underneath it.
+function setRecipientsLoading(busy) {{
+  const loading = document.getElementById("recipients-loading");
+  if (loading) loading.classList.toggle("d-none", !busy);
+}}
+
+// The outstanding-cards panel, taken down and revoked. The three places that
+// used to repeat these lines — provider switch, branch switch, and now the
+// prefill that selects the run's own branch — mean the same thing by them.
+function resetOutstandingPanel() {{
+  OUTSTANDING_GENERATION += 1;
+  OUTSTANDING_SCOPE = null;
+  const section = document.getElementById("outstanding-cards-section");
+  if (section) section.classList.add("d-none");
+  const table = document.getElementById("outstanding-cards-table");
+  if (table) table.innerHTML = "";
+  const badge = document.getElementById("outstanding-count-badge");
+  if (badge) badge.textContent = "";
+  const deleteResult = document.getElementById("outstanding-delete-result");
+  if (deleteResult) deleteResult.innerHTML = "";
+  // Disabled until a list for THIS branch has actually loaded and set a scope.
+  // An enabled button over an empty or stale table is the dangerous state.
+  const deleteBtn = document.getElementById("btn-delete-outstanding");
+  if (deleteBtn) deleteBtn.disabled = true;
+}}
+
+// Back to being an ordinary Altegio page: no snapshot, a live card list and the
+// current branch's outstanding cards. Used when a from-preview load is refused,
+// so a rejected link does not leave a page that can no longer do anything.
+function returnToOrdinaryAltegioPage() {{
+  if (isEasyWeek()) return;
+  const companyId = document.getElementById("f-company").value;
+  CARD_TYPES_STATE = {{state: "idle", scope: null}};
+  loadCardTypes();
+  resetOutstandingPanel();
+  loadOutstandingCards(companyId);
+}}
+
 // An edited snapshot parameter. What is on screen was built from the old one,
 // and what is in flight was asked for the old one, so both go — and the
 // decision deliberately does not depend on a PREVIEW_CONTEXT existing, because
@@ -4892,11 +5066,10 @@ function unlockSnapshotFields() {{
   }}
   const cardSelect = document.getElementById("f-card-type");
   if (cardSelect) {{
-    // An option with a real value means a branch's types are loaded; a lone
-    // placeholder means there is nothing to choose yet.
-    let choosable = false;
-    for (const option of cardSelect.options) {{ if (option.value) {{ choosable = true; break; }} }}
-    cardSelect.disabled = !choosable;
+    // Not "does an option happen to be there": the «из preview» option a
+    // prefill synthesises would pass that test and hand the operator a select
+    // holding one card that no longer belongs to anything.
+    cardSelect.disabled = cardTypesStatus() !== "ready";
   }}
 }}
 
@@ -4919,6 +5092,11 @@ function resetPreviewSurface() {{
   // Whatever was in flight no longer owns anything, so the page is idle. A new
   // request that starts right after this raises the spinner again itself.
   setPreviewBusy(false);
+  // Recipients belong to the preview that is going away. Revoke the read AND
+  // put its spinner out: refusing to let the old request hide it would leave it
+  // running forever.
+  RECIPIENTS_GENERATION += 1;
+  setRecipientsLoading(false);
   applyRunAvailability();
 }}
 
@@ -4930,9 +5108,16 @@ function invalidatePreviewContext() {{
   // card types, recipients — so none of them can come back and paint over a
   // page that has moved on.
   PAGE_EPOCH += 1;
-  RECIPIENTS_GENERATION += 1;
+  const wasFrozenByASnapshot = CARD_TYPES_STATE.state === "snapshot";
   resetPreviewSurface();
   setAlert("preview-alert", "", "");
+  // The select was frozen by a snapshot that no longer exists, so the operator
+  // needs a real list again. A page whose list was already live keeps it: this
+  // is a recovery, not a reload on every invalidation.
+  if (wasFrozenByASnapshot) {{
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
+    loadCardTypes();
+  }}
 }}
 
 function buildPayload() {{

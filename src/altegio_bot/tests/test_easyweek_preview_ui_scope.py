@@ -336,10 +336,14 @@ async def test_returning_to_altegio_reloads_that_branch_cards(http_client) -> No
     script = _page_script((await http_client.get("/ops/campaigns/new-clients")).text)
     switch = _function_source(script, "onProviderChange")
 
-    # Leaving EasyWeek reloads the Altegio list for the branch selected now.
+    # Leaving EasyWeek reloads the Altegio list for the branch selected now,
+    # and the card types with it.
     assert "loadOutstandingCards(altegioCompany.value)" in switch
-    # And the button is disabled until that load succeeds.
-    assert "deleteBtn.disabled = true;" in switch
+    assert "loadCardTypes();" in switch
+    # And the button is disabled until that load succeeds — through the one
+    # function that owns taking the panel down.
+    assert "resetOutstandingPanel();" in switch
+    assert "deleteBtn.disabled = true;" in _function_source(script, "resetOutstandingPanel")
 
 
 @pytest.mark.asyncio
@@ -661,6 +665,8 @@ async def _lifecycle(http_client: AsyncClient, *extra: str) -> str:
         "resetPreviewSurface",
         "unlockSnapshotFields",
         "setPreviewBusy",
+        "setRecipientsLoading",
+        "cardTypesStatus",
         *extra,
     ]
     bodies = "\n".join(_function_source(script, name) for name in names)
@@ -668,6 +674,10 @@ async def _lifecycle(http_client: AsyncClient, *extra: str) -> str:
     state = "let PREVIEW_CONTEXT = null;\nlet PAGE_EPOCH = 0;\n"
     state += "let PREVIEW_IN_FLIGHT = null;\n"
     state += "let RECIPIENTS_GENERATION = 0;\nlet previewRunId = null;\n"
+    state += "let CARD_TYPES_GENERATION = 0;\n"
+    state += 'let CARD_TYPES_STATE = {state: "idle", scope: null};\n'
+    state += "let CARD_TYPES_RELOADS = 0;\n"
+    state += "function loadCardTypes() { CARD_TYPES_RELOADS += 1; }\n"
     # `SIGNATURE_FIELDS` is a const the page ships; take it verbatim.
     fields = re.search(r"const SIGNATURE_FIELDS = \[.*?\];", script, re.DOTALL)
     assert fields, "SIGNATURE_FIELDS is not in the page script"
@@ -1026,10 +1036,32 @@ globalThis.seedInput = function (id, value, checked, disabled) {
   element.disabled = !!disabled;
 };
 
+// The outstanding-cards table is markup the page generates and then reads back
+// through `.oc-check` selectors, so the harness parses its own rows rather than
+// pretending the table is empty — otherwise a delete would always look scoped.
+function outstandingCheckboxes(selector) {
+  const html = el("outstanding-cards-table").innerHTML;
+  const rows = [];
+  const pattern = /<input([^>]*class="oc-check"[^>]*)>/g;
+  let match;
+  while ((match = pattern.exec(html)) !== null) {
+    const attributes = match[1];
+    const recipient = attributes.match(/data-recipient="([^"]*)"/);
+    rows.push({
+      dataset: {recipient: recipient ? recipient[1] : ""},
+      checked: / checked/.test(attributes),
+    });
+  }
+  if (selector.indexOf(":not(:checked)") !== -1) return rows.filter((r) => !r.checked);
+  if (selector.indexOf(":checked") !== -1) return rows.filter((r) => r.checked);
+  return rows;
+}
+
 const DOM_READY = [];
 globalThis.document = {
   getElementById: (id) => el(id),
-  querySelectorAll: () => [],
+  querySelectorAll: (selector) =>
+    String(selector).indexOf(".oc-check") === 0 ? outstandingCheckboxes(String(selector)) : [],
   createElement: () => ({value: "", text: ""}),
   addEventListener: (type, handler) => {
     if (type === "DOMContentLoaded") DOM_READY.push(handler);
@@ -1059,7 +1091,12 @@ globalThis.fetch = async function (url, options) {
     ok: !answer || answer.ok !== false,
     status: (answer && answer.status) || ((answer && answer.ok === false) ? 400 : 200),
     statusText: "test",
-    json: async () => body,
+    // `{malformed: true}` answers with a body that cannot be parsed, which is a
+    // different failure from a network error and takes a different branch.
+    json: async () => {
+      if (answer && answer.malformed) throw new SyntaxError("Unexpected token < in JSON");
+      return body;
+    },
     text: async () => JSON.stringify(body),
   };
 };
@@ -1103,7 +1140,23 @@ globalThis.EMPTY = {items: [], total: 0, rows: []};
 globalThis.CARD_TYPES = [{id: "1001", title: "Bronze"}, {id: "2002", title: "Silver"}];
 
 // The default network: the run itself, the branch's card types, empty rest.
+// Outstanding loyalty cards, per branch, so a table can be told apart by which
+// branch's rows it holds.
+globalThis.OUTSTANDING = {
+  "758285": [{recipient_id: 11, display_name: "Karlsruhe One", phone_e164: "+4910000001",
+              loyalty_card_number: "KA-1", period_start: "2026-07-01"}],
+  "1271200": [{recipient_id: 22, display_name: "Rastatt One", phone_e164: "+4910000002",
+               loyalty_card_number: "RA-1", period_start: "2026-07-01"}],
+};
+
 globalThis.defaultRoutes = async function (url) {
+  if (url.indexOf("/outstanding-cards") !== -1) {
+    const company = (url.match(/company_id=(\d+)/) || [])[1] || "";
+    return {ok: true, body: {cards: OUTSTANDING[company] || []}};
+  }
+  if (url.indexOf("/bulk-delete-cards") !== -1) {
+    return {ok: true, body: {deleted_count: 1, failed_count: 0, skipped_count: 0, failed: []}};
+  }
   if (url.indexOf("/card-types") !== -1) return {ok: true, body: CARD_TYPES};
   if (url.indexOf("/recipients") !== -1) return {ok: true, body: EMPTY};
   const match = url.match(/^\\/ops\\/campaigns\\/runs\\/(\\d+)$/);
@@ -1135,6 +1188,13 @@ globalThis.state = function () {
     card: el("f-card-type").value,
     cardOptions: el("f-card-type").options.map((o) => o.value),
     cardDisabled: el("f-card-type").disabled,
+    cardStatus: cardTypesStatus(),
+    cardState: CARD_TYPES_STATE.state,
+    outstanding: el("outstanding-cards-table").innerHTML,
+    outstandingScope: OUTSTANDING_SCOPE,
+    deleteDisabled: el("btn-delete-outstanding").disabled,
+    recipientsLoadingHidden: hidden("recipients-loading"),
+    recipientsTable: el("recipients-table").innerHTML,
     rejections: REJECTIONS,
     fetched: FETCHES.map((f) => f.url),
   };
@@ -2096,17 +2156,24 @@ ROUTES = async (url) => {
 };
 
 await boot();          // the prefill is now in flight
-await createPreview(); // and the operator builds their own preview instead
+// The operator builds their own preview instead. The first press is refused:
+// a from-preview page has no live card list, and a preview without a card type
+// is a snapshot that can never be run. The refusal asks for the list.
+await createPreview();
+await settle();
+const refused = state();
+await createPreview();
 await settle();
 const own = state();
 
 latePrefill.resolve({ok: true, body: RUN});
 await settle();
 
-emit({own: own, after: state(), companyLocked: el("f-company").disabled});
+emit({refused: refused, own: own, after: state(), companyLocked: el("f-company").disabled});
 """
     answer = _run_node(source, driver)
 
+    assert answer["refused"]["context"] is None, "a preview was built without a card type"
     assert answer["own"]["context"]["runId"] == 102
     assert answer["after"]["context"]["runId"] == 102, "the late prefill took the screen back"
     assert answer["after"]["previewRunId"] == 102
@@ -2284,3 +2351,596 @@ emit({fromPreview: FROM_PREVIEW_ID, context: PREVIEW_CONTEXT, company: el("f-com
         assert answer["fromPreview"] == expected, raw
         assert answer["context"]["runId"] == 41, raw
         assert answer["company"] == "1271200", raw
+
+
+# ---------------------------------------------------------------------------
+# A preview is never built before its card types are
+# ---------------------------------------------------------------------------
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_preview_is_refused_while_card_types_are_still_loading(http_client) -> None:
+    """And accepted, with the real card id, once the list has landed."""
+    source = await _browser(http_client)
+    driver = """
+const slowCards = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/card-types") !== -1) return slowCards.promise;
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 101, provider: "altegio", company_ids: [758285],
+                             is_runnable_from_preview: true}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();
+const pending = state();
+await createPreview();
+await settle();
+const attempted = {
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1),
+  alert: el("preview-alert").innerHTML,
+  context: PREVIEW_CONTEXT,
+};
+
+slowCards.resolve({ok: true, body: CARD_TYPES});
+await settle();
+const ready = state();
+
+await createPreview();
+await settle();
+emit({
+  pending: pending,
+  attempted: attempted,
+  ready: ready,
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+  after: state(),
+});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["pending"]["cardStatus"] == "loading"
+    # Nothing went out, and the operator was told why.
+    assert answer["attempted"]["posts"] == [], "a preview was requested before its card types"
+    assert answer["attempted"]["context"] is None
+    assert "Типы карт" in answer["attempted"]["alert"]
+
+    assert answer["ready"]["cardStatus"] == "ready"
+    assert answer["ready"]["card"] == "1001"
+    assert answer["ready"]["cardDisabled"] is False
+    # Exactly one POST, carrying the real card id rather than null.
+    assert len(answer["posts"]) == 1
+    assert answer["posts"][0]["card_type_id"] == "1001"
+    assert answer["posts"][0]["provider"] == "altegio"
+    assert answer["after"]["context"]["runId"] == 101
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_failed_card_types_load_is_shown_and_can_be_retried(http_client) -> None:
+    source = await _browser(http_client)
+    driver = """
+let attempts = 0;
+ROUTES = async (url) => {
+  if (url.indexOf("/card-types") !== -1) {
+    attempts += 1;
+    if (attempts === 1) return {ok: false, status: 502, body: {detail: "upstream is down"}};
+    return {ok: true, body: CARD_TYPES};
+  }
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 101, provider: "altegio", company_ids: [758285],
+                             is_runnable_from_preview: true}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();
+const failed = {status: cardTypesStatus(), text: el("card-load-status").textContent,
+                disabled: el("f-card-type").disabled};
+await createPreview();
+await settle();
+const refused = {
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).length,
+  alert: el("preview-alert").innerHTML,
+};
+
+// The retry the operator has: pick the branch again.
+await fireEvent("f-company", "change");
+const recovered = state();
+await createPreview();
+await settle();
+
+emit({failed: failed, refused: refused, recovered: recovered,
+      posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+      after: state()});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["failed"]["status"] == "failed"
+    assert "upstream is down" in answer["failed"]["text"]
+    assert "повторить" in answer["failed"]["text"]
+    assert answer["failed"]["disabled"] is True
+    assert answer["refused"]["posts"] == 0
+    assert "недоступны" in answer["refused"]["alert"]
+
+    assert answer["recovered"]["cardStatus"] == "ready"
+    assert answer["recovered"]["card"] == "1001"
+    assert len(answer["posts"]) == 1
+    assert answer["posts"][0]["card_type_id"] == "1001"
+    assert answer["after"]["context"]["runId"] == 101
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_provider_round_trip_reloads_the_card_list(http_client) -> None:
+    """Altegio → EasyWeek → Altegio, with the first list still in flight."""
+    source = await _browser(http_client)
+    driver = """
+const slowFirst = deferred();
+let asked = 0;
+ROUTES = async (url) => {
+  if (url.indexOf("/card-types") !== -1) {
+    asked += 1;
+    if (asked === 1) return slowFirst.promise;
+    return {ok: true, body: [{id: "3003", title: "Gold"}]};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();                      // the first list is in flight
+el("f-provider").value = "easyweek";
+onProviderChange();
+await settle();
+const inEasyWeek = state();
+
+el("f-provider").value = "altegio";
+onProviderChange();
+await settle();
+const back = state();
+
+// Only now does the first, abandoned request answer.
+slowFirst.resolve({ok: true, body: CARD_TYPES});
+await settle();
+
+emit({
+  inEasyWeek: inEasyWeek,
+  back: back,
+  after: state(),
+  asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["inEasyWeek"]["cardState"] == "idle", "the Altegio loader was left owning the page"
+    # Coming back asked again, for the branch on screen.
+    assert len(answer["asked"]) == 2
+    assert "location_id=758285" in answer["asked"][1]
+    assert answer["back"]["cardStatus"] == "ready"
+    assert answer["back"]["cardOptions"] == ["3003"]
+    # And the abandoned answer changed nothing.
+    assert answer["after"]["cardOptions"] == ["3003"], "the abandoned list painted over the new one"
+    assert answer["after"]["card"] == "3003"
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_refused_prefill_hands_back_an_ordinary_working_page(http_client) -> None:
+    """The warning stays, the form is usable, and the page reads its own branch."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.provider = "easyweek";   // refused: the editor opens it, the runner does not
+ROUTES = async (url) => {
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 105, provider: "altegio", company_ids: [758285],
+                             is_runnable_from_preview: true}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();
+const refused = Object.assign(state(), {alert: el("preview-alert").innerHTML});
+
+await createPreview();
+await settle();
+emit({
+  refused: refused,
+  after: state(),
+  alertAfter: el("preview-alert").innerHTML,
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+  cardsAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+  outstandingAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/outstanding-cards") !== -1),
+});
+"""
+    answer = _run_node(source, driver)
+
+    # The explanation survives the takedown that follows it.
+    assert "EasyWeek" in answer["refused"]["alert"]
+    assert answer["refused"]["context"] is None
+    # The form is not left frozen.
+    assert answer["refused"]["runDisabled"] is True
+    assert answer["refused"]["previewDisabled"] is False
+    # And the page went back to reading what an ordinary page reads.
+    assert len(answer["cardsAsked"]) == 1
+    assert "location_id=758285" in answer["cardsAsked"][0]
+    assert len(answer["outstandingAsked"]) == 1
+    assert "company_id=758285" in answer["outstandingAsked"][0]
+    # An ordinary preview can be built again, with a real card.
+    assert len(answer["posts"]) == 1
+    assert answer["posts"][0]["card_type_id"] == "1001"
+    assert answer["after"]["context"]["runId"] == 105
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_snapshot_without_a_card_type_cannot_be_run(http_client) -> None:
+    """Fail closed, with a reason — not a silently substituted card."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.card_type_id = null;
+await boot();
+emit(Object.assign(state(), {alert: el("preview-alert").innerHTML}));
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["context"]["runId"] == 41, "the preview still opens for inspection"
+    assert answer["card"] == "", "a card type was substituted"
+    assert answer["runDisabled"] is True
+    assert "тип карты" in answer["alert"]
+
+
+# ---------------------------------------------------------------------------
+# Outstanding cards follow the run's branch, in either finishing order
+# ---------------------------------------------------------------------------
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_outstanding_cards_follow_a_non_default_preview(http_client) -> None:
+    """Karlsruhe is the default; the run is Rastatt's.
+
+    Selecting a branch from JavaScript fires no `change`, so nothing reloaded
+    the panel and the page showed one branch's loyalty cards underneath another
+    branch's preview — with Delete enabled over them. Both finishing orders are
+    driven, because which request wins the race is not ours to choose.
+    """
+    for order in ("outstanding-first", "run-first"):
+        source = await _browser(http_client, "?from_preview=41")
+        driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+
+const slowRun = deferred();
+const slowOutstanding = {};
+ROUTES = async (url) => {
+  if (url === "/ops/campaigns/runs/41") return slowRun.promise;
+  if (url.indexOf("/outstanding-cards") !== -1) {
+    const company = (url.match(/company_id=(\\d+)/) || [])[1] || "";
+    if (company === "758285") {
+      slowOutstanding.karlsruhe = slowOutstanding.karlsruhe || deferred();
+      return slowOutstanding.karlsruhe.promise;
+    }
+  }
+  return defaultRoutes(url);
+};
+
+await boot();
+// A Karlsruhe read may exist from an earlier page state; drive it explicitly so
+// the race is real rather than assumed.
+const strayKarlsruhe = loadOutstandingCards("758285");
+await settle();
+
+const answerKarlsruhe = () => {
+  if (slowOutstanding.karlsruhe) {
+    slowOutstanding.karlsruhe.resolve({ok: true, body: {cards: OUTSTANDING["758285"]}});
+  }
+};
+const answerRun = () => slowRun.resolve({ok: true, body: RUN});
+
+if (%s) { answerKarlsruhe(); await settle(); answerRun(); }
+else { answerRun(); await settle(); answerKarlsruhe(); }
+await settle();
+await strayKarlsruhe;
+await settle();
+
+// And the delete the operator can now press.
+await deleteOutstandingCards();
+await settle();
+
+emit(Object.assign(state(), {
+  outstandingAsked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/outstanding-cards") !== -1),
+  deletePayload: (FETCHES.filter((f) => f.url.indexOf("/bulk-delete-cards") !== -1)[0] || {}).body,
+  deleteResult: el("outstanding-delete-result").innerHTML,
+}));
+""" % ("true" if order == "outstanding-first" else "false")
+        answer = _run_node(source, driver)
+
+        assert answer["context"]["runId"] == 41, order
+        assert answer["company"] == "1271200", order
+        # The table holds the run's branch and nothing else.
+        assert "Rastatt One" in answer["outstanding"], order
+        assert "Karlsruhe One" not in answer["outstanding"], f"{order}: the default branch's rows survived"
+        assert any("company_id=1271200" in url for url in answer["outstandingAsked"]), order
+        # The scope, and therefore Delete, belongs to Rastatt.
+        assert answer["outstandingScope"] == {"provider": "altegio", "companyId": "1271200"}, order
+        assert answer["deleteDisabled"] is False, order
+        assert answer["deletePayload"]["company_id"] == 1271200, order
+        assert answer["deletePayload"]["provider"] == "altegio", order
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_from_preview_page_asks_for_no_default_branch_cards(http_client) -> None:
+    """The race is not merely lost by the stale answer; it is never started."""
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+await boot();
+emit({asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/outstanding-cards") !== -1)});
+"""
+    asked = _run_node(source, driver)["asked"]
+
+    assert len(asked) == 1, asked
+    assert "company_id=1271200" in asked[0]
+
+
+# ---------------------------------------------------------------------------
+# Recipients: one owner, every outcome
+# ---------------------------------------------------------------------------
+
+
+RECIPIENTS_CASES = {
+    "success": '{ok: true, body: {items: [{id: 1, phone_e164: "+49STALE"}], total: 1, provider: "altegio"}}',
+    "http_error": '{ok: false, status: 500, body: {detail: "stale failure"}}',
+    "malformed": "{ok: true, malformed: true}",
+    "exception": '{throw: "stale network"}',
+}
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_only_the_newest_recipients_read_may_write_the_screen(http_client) -> None:
+    """Two reads finishing backwards — for every way the old one can end."""
+    for name, stale_answer in RECIPIENTS_CASES.items():
+        source = await _browser(http_client, "?from_preview=37")
+        driver = (
+            """
+const slowFirst = deferred();
+let reads = 0;
+ROUTES = async (url) => {
+  if (url.indexOf("/recipients") !== -1) {
+    reads += 1;
+    if (reads === 1) return slowFirst.promise;
+    return {ok: true, body: {items: [{id: 2, phone_e164: "+49FRESH"}], total: 1, provider: "altegio"}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();                     // the prefill starts read #1
+const second = loadRecipients(false);
+await settle();
+await second;
+await settle();
+const fresh = state();
+
+// Now the abandoned first read ends, in the way this case is about.
+slowFirst.resolve(%s);
+await settle();
+emit({fresh: fresh, after: state()});
+"""
+            % stale_answer
+        )
+        answer = _run_node(source, driver)
+
+        fresh, after = answer["fresh"], answer["after"]
+        assert "+49FRESH" in fresh["recipientsTable"], name
+        assert fresh["recipientsLoadingHidden"] is True, name
+        # Nothing the abandoned read does reaches the screen.
+        assert after["recipientsTable"] == fresh["recipientsTable"], f"{name}: the stale read repainted"
+        assert "+49STALE" not in after["recipientsTable"], name
+        assert "stale failure" not in after["recipientsTable"], name
+        assert "stale network" not in after["recipientsTable"], name
+        assert "разобрать" not in after["recipientsTable"], name
+        assert after["recipientsLoadingHidden"] is True, name
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_stale_finally_does_not_put_out_the_new_spinner(http_client) -> None:
+    source = await _browser(http_client, "?from_preview=37")
+    driver = """
+const slowFirst = deferred();
+const slowSecond = deferred();
+let reads = 0;
+ROUTES = async (url) => {
+  if (url.indexOf("/recipients") !== -1) {
+    reads += 1;
+    return reads === 1 ? slowFirst.promise : slowSecond.promise;
+  }
+  return defaultRoutes(url);
+};
+
+await boot();                       // read #1 in flight
+const second = loadRecipients(false);
+await settle();
+
+// #1 ends while #2 is still running.
+slowFirst.resolve({ok: true, body: {items: [], total: 0, provider: "altegio"}});
+await settle();
+const whileSecondRuns = state();
+
+slowSecond.resolve({ok: true, body: {items: [{id: 2, phone_e164: "+49FRESH"}], total: 1,
+                                     provider: "altegio"}});
+await second;
+await settle();
+emit({whileSecondRuns: whileSecondRuns, after: state()});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["whileSecondRuns"]["recipientsLoadingHidden"] is False, "the stale finally hid the spinner"
+    assert answer["after"]["recipientsLoadingHidden"] is True
+    assert "+49FRESH" in answer["after"]["recipientsTable"]
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_invalidation_puts_the_recipients_spinner_out(http_client) -> None:
+    """Refusing the old request the right to hide it is only half the rule."""
+    source = await _browser(http_client, "?from_preview=37")
+    driver = """
+const never = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/recipients") !== -1) return never.promise;
+  return defaultRoutes(url);
+};
+await boot();
+const loading = state();
+
+invalidatePreviewContext();
+await settle();
+const cleared = state();
+
+// The abandoned read finally answers, into a page that has moved on.
+never.resolve({ok: true, body: {items: [{id: 9, phone_e164: "+49STALE"}], total: 1,
+                                provider: "altegio"}});
+await settle();
+emit({loading: loading, cleared: cleared, after: state()});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["loading"]["recipientsLoadingHidden"] is False
+    assert answer["cleared"]["recipientsLoadingHidden"] is True, "invalidation left the spinner running"
+    assert answer["cleared"]["recipientsTable"] == ""
+    assert answer["after"]["recipientsTable"] == ""
+    assert "+49STALE" not in answer["after"]["recipientsTable"]
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_discarding_a_snapshot_gives_the_live_card_list_back(http_client) -> None:
+    """A frozen select must not outlive the snapshot that froze it.
+
+    The synthetic «из preview» option looks like a loaded list. Once the preview
+    it belongs to is gone it is a leftover: the page has to fetch a real list
+    for the branch on screen before another preview can be built.
+    """
+    source = await _browser(http_client, "?from_preview=41")
+    driver = """
+RUN.id = 41;
+RUN.company_ids = [1271200];
+RUN.card_type_id = "7007";          // not in any live list
+
+const slowCards = deferred();
+ROUTES = async (url) => {
+  if (url.indexOf("/card-types") !== -1) return slowCards.promise;
+  if (url.indexOf("/new-clients/preview") !== -1) {
+    return {ok: true, body: {id: 110, provider: "altegio", company_ids: [1271200],
+                             is_runnable_from_preview: true}};
+  }
+  return defaultRoutes(url);
+};
+
+await boot();
+const frozen = state();
+
+// The operator edits a snapshot parameter, which discards the preview.
+el("f-period-end").value = "2026-09-30";
+await fireEvent("f-period-end", "change");
+const discarded = state();
+// Asked for by the invalidation itself, before anything else happens.
+const askedAfterDiscard = FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1);
+
+// While the real list is still on its way, the leftover option proves nothing.
+await createPreview();
+await settle();
+const tooEarly = {
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).length,
+  status: cardTypesStatus(),
+};
+
+slowCards.resolve({ok: true, body: CARD_TYPES});
+await settle();
+const recovered = state();
+
+await createPreview();
+await settle();
+emit({
+  frozen: frozen, discarded: discarded, tooEarly: tooEarly, recovered: recovered,
+  askedAfterDiscard: askedAfterDiscard,
+  asked: FETCHES.map((f) => f.url).filter((u) => u.indexOf("/card-types") !== -1),
+  posts: FETCHES.filter((f) => f.url.indexOf("/new-clients/preview") !== -1).map((f) => f.body),
+  after: state(),
+});
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["frozen"]["cardState"] == "snapshot"
+    assert answer["frozen"]["card"] == "7007"
+    assert answer["frozen"]["cardDisabled"] is True
+
+    # Discarding asks for a real list, for the branch that is on screen — and
+    # the invalidation itself does it, not the next thing the operator tries.
+    assert answer["discarded"]["context"] is None
+    assert len(answer["askedAfterDiscard"]) == 1, answer["askedAfterDiscard"]
+    assert "location_id=1271200" in answer["askedAfterDiscard"][0]
+    assert answer["discarded"]["cardState"] == "loading"
+    assert len(answer["asked"]) == 1, answer["asked"]
+    assert "location_id=1271200" in answer["asked"][0]
+    assert answer["tooEarly"]["status"] == "loading"
+    assert answer["tooEarly"]["posts"] == 0, "a preview was built on a leftover option"
+
+    assert answer["recovered"]["cardStatus"] == "ready"
+    assert answer["recovered"]["cardDisabled"] is False
+    assert "7007" not in answer["recovered"]["cardOptions"], "the leftover option survived"
+    assert len(answer["posts"]) == 1
+    assert answer["posts"][0]["card_type_id"] == "1001"
+    assert answer["after"]["context"]["runId"] == 110
+
+
+@needs_node
+@pytest.mark.asyncio
+async def test_a_snapshots_card_list_counts_only_while_its_snapshot_does(http_client) -> None:
+    """The shipped rule, executed on its own.
+
+    `cardTypesStatus` is the one place that answers "may a preview be built?".
+    Its answer for a snapshot must depend on that snapshot still being loaded,
+    independently of whatever else the page does afterwards to recover.
+    """
+    source = await _lifecycle(http_client)
+    driver = """
+const out = {};
+CARD_TYPES_STATE = {state: "snapshot", scope: {provider: "altegio", companyId: "758285"}};
+
+PREVIEW_CONTEXT = {runId: 7, provider: "altegio", companyId: "758285", runnable: true,
+                   signature: snapshotSignature()};
+out.withSnapshot = cardTypesStatus();
+
+// The snapshot is gone; the frozen option is a leftover.
+PREVIEW_CONTEXT = null;
+out.withoutSnapshot = cardTypesStatus();
+
+// And a snapshot for another branch is not this branch's list either.
+PREVIEW_CONTEXT = {runId: 7, provider: "altegio", companyId: "758285", runnable: true,
+                   signature: snapshotSignature()};
+CARD_TYPES_STATE = {state: "snapshot", scope: {provider: "altegio", companyId: "1271200"}};
+out.otherBranch = cardTypesStatus();
+
+// A live list, by contrast, is only good for the branch it was loaded for.
+PREVIEW_CONTEXT = null;
+CARD_TYPES_STATE = {state: "loaded", scope: {provider: "altegio", companyId: "758285"}};
+out.liveHere = cardTypesStatus();
+CARD_TYPES_STATE = {state: "loaded", scope: {provider: "altegio", companyId: "1271200"}};
+out.liveElsewhere = cardTypesStatus();
+
+console.log(JSON.stringify(out));
+"""
+    answer = _run_node(source, driver)
+
+    assert answer["withSnapshot"] == "ready"
+    assert answer["withoutSnapshot"] == "stale", "a leftover option passed as a loaded list"
+    assert answer["otherBranch"] == "stale"
+    assert answer["liveHere"] == "ready"
+    assert answer["liveElsewhere"] == "stale"

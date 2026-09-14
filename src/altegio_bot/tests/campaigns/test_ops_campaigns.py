@@ -1502,10 +1502,14 @@ async def test_campaign_new_page_clears_outstanding_delete_result_on_company_cha
     assert response.status_code == 200
     text = response.text
 
-    # Обработчик change компании содержит очистку outstanding-delete-result
+    # Обработчик change компании снимает панель целиком — через единственную
+    # функцию, которая этим владеет, и она очищает прошлый результат удаления.
     change_block = text[text.find("companySelect.addEventListener") :][:800]
-    assert "outstanding-delete-result" in change_block
-    assert "innerHTML" in change_block
+    assert "resetOutstandingPanel();" in change_block
+
+    reset_block = text[text.find("function resetOutstandingPanel()") :][:900]
+    assert "outstanding-delete-result" in reset_block
+    assert "innerHTML" in reset_block
 
 
 # ---------------------------------------------------------------------------
