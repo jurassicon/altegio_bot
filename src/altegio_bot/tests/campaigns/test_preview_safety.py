@@ -385,8 +385,11 @@ async def test_from_preview_page_has_prefill_js(http_client: AsyncClient) -> Non
     response = await http_client.get("/ops/campaigns/new-clients?from_preview=123")
     assert response.status_code == 200
     text = response.text
-    # JS переменная previewRunId должна быть установлена
-    assert "previewRunId = 123" in text
+    # §37.1 отделил исходный from_preview ID от изменяемого состояния активного
+    # preview: страница несёт неизменяемый FROM_PREVIEW_ID, а previewRunId
+    # описывает то, что сейчас на экране.
+    assert "FROM_PREVIEW_ID = 123" in text
+    assert "loadPreviewAndPrefill(FROM_PREVIEW_ID)" in text
     # Должна быть функция prefill
     assert "loadPreviewAndPrefill" in text
     # Disabled поля

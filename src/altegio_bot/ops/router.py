@@ -126,7 +126,7 @@ def _error_cell(error: str | None) -> str:
     return cell
 
 
-def _basis_badge(recipient: CampaignRecipient) -> str:
+def _basis_badge(recipient: CampaignRecipient, *, with_audit_column: bool = False) -> str:
     """`auto`, `manual` or `test` — plus what an override overrode.
 
     A manual row that was originally excluded automatically shows both: the
@@ -141,7 +141,10 @@ def _basis_badge(recipient: CampaignRecipient) -> str:
     }.get(basis, (basis, "bg-light text-dark"))
     badge = f'<span class="badge {style}">{_esc(label)}</span>'
     overrode = getattr(recipient, "auto_excluded_reason", None)
-    if overrode:
+    if overrode and not with_audit_column:
+        # The inline preview has no separate audit column, so the badge carries
+        # the override there. The full recipients page has one, and repeating it
+        # would read as two different facts.
         badge += f' <span class="text-muted small">было: {_esc(overrode)}</span>'
     return badge
 
@@ -3708,7 +3711,15 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 // ============================================================
 const COMPANY_TEMPLATES = {company_templates_js};
 const COMPANY_FOLLOWUP_TEMPLATES = {company_followup_templates_js};
-let previewRunId = {from_preview_id or "null"};
+// Where the page STARTED, when opened as `?from_preview=37`. Read once and
+// never rewritten: it is not the preview currently on screen, and treating it
+// as mutable state is how the initial provider setup came to erase it.
+const FROM_PREVIEW_ID = {from_preview_id or "null"};
+let previewRunId = null;
+// The provider the UI was last shaped for. `onProviderChange` runs once during
+// setup, and that first call is not a user switching anything.
+let LAST_PROVIDER = null;
+let PREFILL_GENERATION = 0;
 
 // ---------------------------------------------------------------------------
 // The scope a rendered preview belongs to
@@ -3736,6 +3747,56 @@ function currentScope() {{
   return {{provider: provider, companyId: String((companyEl && companyEl.value) || "")}};
 }}
 
+// Everything that defines WHICH snapshot a preview is. Two previews with the
+// same provider and company but a different period are different previews, and
+// running one against the other's recipients is the mistake this prevents.
+function snapshotSignature() {{
+  const provider = document.getElementById("f-provider").value;
+  const easyweek = provider === "easyweek";
+  const companyEl = easyweek
+    ? document.getElementById("f-ew-company")
+    : document.getElementById("f-company");
+  const companyId = String((companyEl && companyEl.value) || "");
+  const value = function (id) {{
+    const el = document.getElementById(id);
+    return el ? String(el.value || "") : "";
+  }};
+  const followupEnabled = easyweek
+    ? false
+    : !!(document.getElementById("f-followup-enabled") || {{}}).checked;
+  return {{
+    provider: provider,
+    companyId: companyId,
+    // Altegio addresses a branch by a numeric id; EasyWeek resolves it from the
+    // company on the server, so there is none to compare.
+    locationId: easyweek ? "" : companyId,
+    periodStart: value("f-period-start"),
+    periodEnd: value("f-period-end"),
+    attributionWindowDays: value("f-attribution"),
+    // Altegio-only fields. They are empty for EasyWeek by construction, which
+    // is itself part of the signature: a snapshot that had one is not this one.
+    cardTypeId: easyweek ? "" : value("f-card-type"),
+    followupEnabled: followupEnabled,
+    followupDelayDays: followupEnabled ? value("f-followup-delay") : "",
+    followupPolicy: followupEnabled ? value("f-followup-policy") : "",
+    followupTemplateName: followupEnabled ? value("f-followup-template") : "",
+  }};
+}}
+
+const SIGNATURE_FIELDS = [
+  "provider", "companyId", "locationId", "periodStart", "periodEnd",
+  "attributionWindowDays", "cardTypeId", "followupEnabled",
+  "followupDelayDays", "followupPolicy", "followupTemplateName",
+];
+
+function signatureMatches(a, b) {{
+  if (!a || !b) return false;
+  for (const field of SIGNATURE_FIELDS) {{
+    if (String(a[field]) !== String(b[field])) return false;
+  }}
+  return true;
+}}
+
 function scopeMatches(a, b) {{
   if (!a || !b) return false;
   return a.provider === b.provider && String(a.companyId) === String(b.companyId);
@@ -3750,11 +3811,16 @@ function mayRender(responseToken, currentToken, responseScope, current) {{
 // May the Run button be offered at all? Only for a saved Altegio preview that
 // still matches the screen and that the SERVER said is runnable. EasyWeek never
 // qualifies: §37.1 opens the editor, not the sending.
-function mayRunFromPreview(context, current) {{
+function mayRunFromPreview(context, current, signature) {{
   if (!context || !context.runId) return false;
   if (context.provider !== "altegio") return false;
   if (!context.runnable) return false;
-  return scopeMatches(context, current);
+  if (!scopeMatches(context, current)) return false;
+  // And the form must still describe the snapshot that was built. A changed
+  // period or card type means the operator is looking at different parameters
+  // than the recipients below them.
+  if (signature !== undefined && !signatureMatches(context.signature, signature)) return false;
+  return true;
 }}
 
 // Which schema to draw a preview or a recipients page with.
@@ -3806,6 +3872,23 @@ document.addEventListener("DOMContentLoaded", function () {{
     }}
   }});
 
+  // Changing anything that defines the snapshot revokes the preview on screen:
+  // the recipients below no longer describe what the form now asks for.
+  for (const fieldId of [
+    "f-period-start", "f-period-end", "f-attribution", "f-card-type",
+    "f-followup-enabled", "f-followup-delay", "f-followup-policy", "f-followup-template",
+  ]) {{
+    const el = document.getElementById(fieldId);
+    if (!el) continue;
+    el.addEventListener("change", function () {{
+      if (PREVIEW_CONTEXT && !signatureMatches(PREVIEW_CONTEXT.signature, snapshotSignature())) {{
+        invalidatePreviewContext();
+      }} else {{
+        applyRunAvailability();
+      }}
+    }});
+  }}
+
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
   onProviderChange();
@@ -3829,9 +3912,11 @@ document.addEventListener("DOMContentLoaded", function () {{
   loadCardTypes();
   loadOutstandingCards(companySelect.value);
 
-  // Если открыта со страницы history (from_preview), подгрузить параметры preview
-  if (previewRunId) {{
-    loadPreviewAndPrefill(previewRunId);
+  // Если открыта со страницы history (from_preview), подгрузить параметры preview.
+  // Read from the immutable id, not from the mutable current-preview state:
+  // shaping the form above must not be able to erase where the page started.
+  if (FROM_PREVIEW_ID) {{
+    loadPreviewAndPrefill(FROM_PREVIEW_ID);
   }}
 }});
 
@@ -3839,8 +3924,14 @@ document.addEventListener("DOMContentLoaded", function () {{
 // Предзаполнение формы из preview run (from_preview=ID)
 // ============================================================
 async function loadPreviewAndPrefill(runId) {{
+  // Part of the same lifecycle as every other load: a token, and a scope the
+  // answer is checked against. An operator who switches provider or branch
+  // while this is in flight must not have the form filled in behind them.
+  const token = ++PREFILL_GENERATION;
+  const asked = currentScope();
   try {{
     const resp = await fetch("/ops/campaigns/runs/" + runId);
+    if (token !== PREFILL_GENERATION || !scopeMatches(asked, currentScope())) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "warning",
         "Не удалось загрузить параметры preview #" + runId +
@@ -3849,19 +3940,24 @@ async function loadPreviewAndPrefill(runId) {{
     }}
     const run = await resp.json();
 
-    // Только completed preview можно использовать как источник
-    if (run.status !== "completed") {{
+    // The saved run has to be a completed preview, of a provider whose send
+    // path exists, and the SERVER has to say it may be run from. Availability
+    // is never decided here — `applyRunAvailability` owns that.
+    if (run.mode !== "preview" || run.status !== "completed") {{
       setAlert("preview-alert", "danger",
-        "Preview #" + runId + " имеет статус «" + run.status + "». " +
-        "Только завершённые (completed) previews можно запускать.");
-      document.getElementById("btn-run").disabled = true;
+        "Preview #" + runId + " имеет режим «" + (run.mode || "?") + "» и статус «" +
+        (run.status || "?") + "». Запускать можно только завершённые preview.");
+      invalidatePreviewContext();
       return;
     }}
 
-    // Заполнить поля из preview
     if (run.provider !== "altegio") {{
-      setAlert("preview-alert", "danger", "Этот provider не поддерживает send-real в PR-13.");
-      document.getElementById("btn-run").disabled = true;
+      // An EasyWeek preview opens in the editor, never in the runner: §37.1
+      // opens editing and nothing else.
+      setAlert("preview-alert", "warning",
+        "Preview #" + runId + " относится к EasyWeek. Запуск для EasyWeek закрыт (§37.1); " +
+        "доступен только просмотр и редактирование snapshot.");
+      invalidatePreviewContext();
       return;
     }}
     const companyId = (run.company_ids || [])[0];
@@ -3881,6 +3977,15 @@ async function loadPreviewAndPrefill(runId) {{
       document.getElementById("f-period-end").value =
         run.period_end.substring(0, 10);
     }}
+
+    // The attribution window is part of the snapshot signature, so it has to
+    // come back from the run like every other locked parameter — otherwise the
+    // form would describe a different window than the recipients below it.
+    if (run.attribution_window_days) {{
+      document.getElementById("f-attribution").value =
+        String(run.attribution_window_days);
+    }}
+    document.getElementById("f-attribution").disabled = true;
 
     // Предзаполнить и зафиксировать card_type_id из снимка
     if (run.card_type_id) {{
@@ -3920,15 +4025,33 @@ async function loadPreviewAndPrefill(runId) {{
     document.getElementById("f-period-start").disabled = true;
     document.getElementById("f-period-end").disabled = true;
 
-    // Показать таблицу получателей и активировать Run
+    // Nothing above may have moved the ground under us.
+    if (token !== PREFILL_GENERATION || !scopeMatches(asked, currentScope())) return;
+
+    // A full context, built from the SAVED RUN — including the server's own
+    // verdict about whether it may be run from. The signature is read back off
+    // the form that was just filled from that run, so the two cannot disagree.
+    PREVIEW_CONTEXT = {{
+      runId: run.id,
+      provider: run.provider,
+      companyId: String((run.company_ids || [])[0] || ""),
+      runnable: run.is_runnable_from_preview === true,
+      signature: snapshotSignature(),
+    }};
+    previewRunId = run.id;
+
     document.getElementById("preview-results").classList.remove("d-none");
-    document.getElementById("btn-run").disabled = false;
+    applyRunAvailability();
     loadRecipients(true);
     setAlert("preview-alert", "info",
       "🔒 Параметры зафиксированы по preview #" + runId +
-      " (компания, период, тип карты, follow-up). Нажмите «Run Campaign» для запуска.");
+      " (компания, период, тип карты, follow-up)." +
+      (PREVIEW_CONTEXT.runnable
+        ? " Нажмите «Run Campaign» для запуска."
+        : " Сервер не разрешает запуск из этого preview."));
 
   }} catch (e) {{
+    if (token !== PREFILL_GENERATION) return;
     setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
   }}
 }}
@@ -4070,12 +4193,18 @@ async function createPreview() {{
   const payload = buildPayload();
   if (!payload) return;
 
+  // Starting B revokes A here, BEFORE the request goes out. Anything that
+  // arrives for A afterwards has nothing to restore, and a failure of B leaves
+  // no stale predecessor behind either.
+  invalidatePreviewContext();
+
   setAlert("preview-alert", "", "");
   document.getElementById("preview-spinner").classList.remove("d-none");
   document.getElementById("btn-preview").disabled = true;
 
   const token = ++PREVIEW_GENERATION;
   const asked = currentScope();
+  const askedSignature = snapshotSignature();
 
   try {{
     const resp = await fetch("/ops/campaigns/new-clients/preview", {{
@@ -4099,6 +4228,8 @@ async function createPreview() {{
       provider: data.provider || asked.provider,
       companyId: String((data.company_ids && data.company_ids[0]) || asked.companyId),
       runnable: data.is_runnable_from_preview === true,
+      // The parameters this snapshot was built from, frozen with it.
+      signature: askedSignature,
     }};
     previewRunId = data.id;
     renderPreviewSummary(data);
@@ -4107,10 +4238,15 @@ async function createPreview() {{
     loadRecipients(true);
     setAlert("preview-alert", "success", "Preview готов! Run ID: " + previewRunId);
   }} catch (e) {{
+    if (token !== PREVIEW_GENERATION) return;
     setAlert("preview-alert", "danger", "Ошибка сети: " + e.message);
   }} finally {{
-    document.getElementById("preview-spinner").classList.add("d-none");
-    document.getElementById("btn-preview").disabled = false;
+    // Even the cleanup is the newest request's to do. An old one finishing here
+    // would hide a running spinner and re-enable a button mid-flight.
+    if (token === PREVIEW_GENERATION) {{
+      document.getElementById("preview-spinner").classList.add("d-none");
+      document.getElementById("btn-preview").disabled = false;
+    }}
   }}
 }}
 
@@ -4306,8 +4442,20 @@ function renderRecipientsTable(items, total, provider) {{
 // Запуск кампании
 // ============================================================
 async function runCampaign() {{
-  if (!previewRunId) {{
-    alert("Сначала создайте preview.");
+  // Re-checked immediately before the confirm and the POST, not only when the
+  // button was drawn. Between those two moments the operator can change the
+  // period, the card type or the branch, and the recipients on screen would
+  // then belong to a different snapshot than the parameters being sent.
+  if (!PREVIEW_CONTEXT || !previewRunId || PREVIEW_CONTEXT.runId !== previewRunId) {{
+    setAlert("run-alert", "danger", "Сначала создайте preview.");
+    invalidatePreviewContext();
+    return;
+  }}
+  if (!mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature())) {{
+    setAlert("run-alert", "danger",
+      "Параметры формы больше не совпадают с построенным preview — запуск отменён. "
+      + "Постройте preview заново с текущими параметрами.");
+    invalidatePreviewContext();
     return;
   }}
   // Явная проверка выбора типа карты лояльности — до confirm.
@@ -4321,7 +4469,15 @@ async function runCampaign() {{
 
   const payload = buildPayload();
   if (!payload) return;
-  payload.source_preview_run_id = previewRunId;
+  // One last look: `confirm` is modal, and the form cannot change while it is
+  // up — but the check costs nothing and the backend is not the only place
+  // that should refuse a mismatch.
+  if (!mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature())) {{
+    setAlert("run-alert", "danger", "Параметры изменились — запуск отменён.");
+    invalidatePreviewContext();
+    return;
+  }}
+  payload.source_preview_run_id = PREVIEW_CONTEXT.runId;
 
   setAlert("run-alert", "", "");
   document.getElementById("btn-run").disabled = true;
@@ -4423,6 +4579,12 @@ function isEasyWeek() {{
 // a wrong value.
 function onProviderChange() {{
   const easyweek = isEasyWeek();
+  const provider = easyweek ? "easyweek" : "altegio";
+  // The first call happens during setup, to shape the form. Nothing changed,
+  // so nothing is invalidated — and in particular the `from_preview` the page
+  // was opened with survives to be loaded.
+  const switched = LAST_PROVIDER !== null && LAST_PROVIDER !== provider;
+  LAST_PROVIDER = provider;
   document.querySelectorAll(".altegio-only").forEach(function(el) {{
     el.classList.toggle("d-none", easyweek);
   }});
@@ -4430,8 +4592,9 @@ function onProviderChange() {{
     el.classList.toggle("d-none", !easyweek);
   }});
   // The preview on screen belongs to the provider it was built under, so a
-  // switch stops it from describing anything. The saved run is untouched.
-  invalidatePreviewContext();
+  // real switch stops it from describing anything. The saved run is untouched.
+  if (switched) invalidatePreviewContext();
+  applyRunAvailability();
   const runNote = document.getElementById("easyweek-send-closed");
   if (runNote) {{
     runNote.classList.toggle("d-none", !easyweek);
@@ -4454,9 +4617,10 @@ function onProviderChange() {{
 
   if (easyweek) {{
     loadEasyWeekTemplateStatus();
-  }} else {{
+  }} else if (switched) {{
     // Coming back from EasyWeek: the Altegio panel was cleared on the way out,
-    // so reload the list for whichever Altegio branch is selected now.
+    // so reload the list for whichever Altegio branch is selected now. On the
+    // initial call the ordinary setup below already loads it.
     const altegioCompany = document.getElementById("f-company");
     if (altegioCompany && altegioCompany.value) loadOutstandingCards(altegioCompany.value);
   }}
@@ -4535,7 +4699,7 @@ async function loadEasyWeekTemplateStatus() {{
 function applyRunAvailability() {{
   const btn = document.getElementById("btn-run");
   if (!btn) return;
-  const allowed = mayRunFromPreview(PREVIEW_CONTEXT, currentScope());
+  const allowed = mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature());
   btn.disabled = !allowed;
   // EasyWeek never gets the button at all: the path behind it is closed.
   btn.classList.toggle("d-none", currentScope().provider === "easyweek");
@@ -5916,6 +6080,11 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             "Status",
             "Basis",
             "Excluded Reason",
+            # Kept apart from the two above on purpose: the basis says how the
+            # row got here, `Excluded Reason` says what it is now, and this says
+            # what the segmenter had decided before an operator overrode it.
+            # Collapsing any two of them would lose which is which.
+            "Было исключено автоматически",
             "EasyWeek customer",
             "Лок. клиент",
         ]
@@ -5956,8 +6125,9 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 _esc(r.display_name or ""),
                 _esc(r.phone_e164 or ""),
                 _status_badge(r.status),
-                _basis_badge(r),
-                _esc(r.excluded_reason or ""),
+                _basis_badge(r, with_audit_column=True),
+                _esc(r.excluded_reason or "—"),
+                _esc(r.auto_excluded_reason or "—"),
                 # Presence only: the customer UUID is never rendered.
                 "✓" if r.easyweek_customer_uuid is not None else "—",
                 "✓" if r.local_client_found else "—",
