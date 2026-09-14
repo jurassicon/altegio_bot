@@ -41,6 +41,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     FIRST_VISIT_NOT_CURRENT,
     LIVE_GUARD_UNCERTAIN,
     NEW_CLIENT_CAMPAIGN_CODE,
+    RECIPIENT_BASIS_UNSUPPORTED,
     RECIPIENT_IDENTITY_UNPROVEN,
     SOURCE_BOOKING_NOT_CURRENT,
     TEST_BINDING_MISMATCH,
@@ -57,6 +58,8 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.customer_api import read_customer_card
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
+    RECIPIENT_BASIS_MANUAL,
     VOUCHER_DELIVERY_BASIS_EARNED,
     VOUCHER_DELIVERY_BASIS_TEST,
     CampaignRecipient,
@@ -271,9 +274,25 @@ async def prove_recipient(
     # let the early refusals fall back to the dataclass default, so an opted-out
     # test recipient reported itself as `earned_first_visit` — a refusal that
     # misdescribed what it was refusing.
+    # §37.1 made the basis a typed column, so it is read rather than inferred.
+    # Three bases exist; this canary serves two of them.
+    basis = recipient.recipient_basis or RECIPIENT_BASIS_EARNED
+    if basis == RECIPIENT_BASIS_MANUAL:
+        # An operator put this person in the preview by hand. That is a decision
+        # about who to message, not a proven entitlement to a €15 voucher, and
+        # delivering one on that basis is a separate approval nobody has given.
+        # Refused HERE — before any live EasyWeek read, before the ledger and
+        # before any mutator exists — and reported honestly as manual.
+        checks["recipient_basis_supported"] = False
+        return RecipientProof(
+            False,
+            (RECIPIENT_BASIS_UNSUPPORTED,),
+            recipient_basis=RECIPIENT_BASIS_MANUAL,
+            checks=checks,
+        )
+    checks["recipient_basis_supported"] = True
     test_binding = _canonical(recipient.easyweek_test_customer_uuid)
-    is_test = recipient.easyweek_test_customer_uuid is not None
-    basis = VOUCHER_DELIVERY_BASIS_TEST if is_test else VOUCHER_DELIVERY_BASIS_EARNED
+    is_test = basis == VOUCHER_DELIVERY_BASIS_TEST
 
     # -- the run, the recipient and their relationship ----------------------
     identity_ok = (

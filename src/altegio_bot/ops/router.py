@@ -4043,10 +4043,26 @@ function renderPreviewSummary(data) {{
   breakdownHtml += '<table class="table table-sm table-bordered mb-0" style="max-width:500px">';
   breakdownHtml += '<thead class="table-light"><tr><th>Причина</th>';
   breakdownHtml += '<th class="text-end">Кол-во</th></tr></thead><tbody>';
-  reasons.forEach(function(r) {{
-    const val = exc[r[0]] != null ? exc[r[0]] : 0;
-    breakdownHtml += '<tr><td>' + escHtml(r[1]) + '</td><td class="text-end">' + val + '</td></tr>';
-  }});
+  if (isEasyWeek()) {{
+    // EasyWeek has its own reason vocabulary, and it will grow. Rendering the
+    // Altegio list here printed a column of zeros against reasons that do not
+    // exist and hid the ones that do — so show what the run actually reported,
+    // including codes this page has never heard of.
+    const byReason = exc.by_reason || {{}};
+    const keys = Object.keys(byReason).sort();
+    if (keys.length === 0) {{
+      breakdownHtml += '<tr><td colspan="2" class="text-muted">Исключённых получателей нет.</td></tr>';
+    }}
+    keys.forEach(function(key) {{
+      breakdownHtml += '<tr><td><code>' + escHtml(key) + '</code></td>'
+        + '<td class="text-end">' + escHtml(String(byReason[key])) + '</td></tr>';
+    }});
+  }} else {{
+    reasons.forEach(function(r) {{
+      const val = exc[r[0]] != null ? exc[r[0]] : 0;
+      breakdownHtml += '<tr><td>' + escHtml(r[1]) + '</td><td class="text-end">' + val + '</td></tr>';
+    }});
+  }}
   breakdownHtml += '</tbody></table>';
   document.getElementById("excluded-breakdown").innerHTML = breakdownHtml;
 
@@ -4273,6 +4289,18 @@ function onProviderChange() {{
   if (runNote) {{
     runNote.classList.toggle("d-none", !easyweek);
   }}
+
+  // Invalidate any in-flight outstanding-cards read, then hide and empty the
+  // panel at once rather than waiting for a response that may never come.
+  OUTSTANDING_GENERATION += 1;
+  const section = document.getElementById("outstanding-cards-section");
+  const tableEl = document.getElementById("outstanding-cards-table");
+  const deleteBtn = document.getElementById("btn-delete-outstanding");
+  const deleteResult = document.getElementById("outstanding-delete-result");
+  if (section) section.classList.add("d-none");
+  if (tableEl && easyweek) tableEl.innerHTML = "";
+  if (deleteBtn) deleteBtn.disabled = easyweek;
+  if (deleteResult && easyweek) deleteResult.innerHTML = "";
 }}
 
 function buildPayload() {{
@@ -4348,6 +4376,11 @@ function escHtml(s) {{
 // Outstanding cards (previous-period loyalty cards cleanup)
 // ---------------------------------------------------------------------------
 
+// Bumped whenever the provider changes. An in-flight Altegio read that lands
+// after the operator has switched to EasyWeek belongs to a previous generation
+// and must not repaint a destructive panel that no longer applies.
+let OUTSTANDING_GENERATION = 0;
+
 async function loadOutstandingCards(companyId) {{
   const section = document.getElementById("outstanding-cards-section");
   const tableEl = document.getElementById("outstanding-cards-table");
@@ -4355,12 +4388,17 @@ async function loadOutstandingCards(companyId) {{
   section.classList.add("d-none");
   tableEl.innerHTML = "";
 
+  // Loyalty cards are an Altegio concept. EasyWeek has none, so there is
+  // nothing to read and nothing to offer deleting.
+  if (isEasyWeek()) return {{ok: true, state: "empty", count: 0}};
   if (!companyId) return {{ok: true, state: "empty", count: 0}};
 
+  const generation = OUTSTANDING_GENERATION;
   let data;
   try {{
     const resp = await fetch(
-      "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id=" + companyId
+      "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id="
+        + companyId + "&provider=altegio"
     );
     if (!resp.ok) {{
       return {{ok: false, state: "failed", error: resp.statusText}};
@@ -4368,6 +4406,12 @@ async function loadOutstandingCards(companyId) {{
     data = await resp.json();
   }} catch (e) {{
     return {{ok: false, state: "failed", error: String(e)}};
+  }}
+
+  // The answer is only usable if the world still looks the way it did when we
+  // asked. A stale response must not resurrect the panel.
+  if (generation !== OUTSTANDING_GENERATION || isEasyWeek()) {{
+    return {{ok: true, state: "empty", count: 0}};
   }}
 
   if (!data.cards || data.cards.length === 0) {{
@@ -4406,6 +4450,14 @@ function outstandingSelectAll(checked) {{
 }}
 
 async function deleteOutstandingCards() {{
+  // Checked here, not only by hiding the button: this call deletes real
+  // loyalty cards, and a stale click or a scripted one must not reach it while
+  // the form is on a provider that has no cards at all.
+  if (isEasyWeek()) {{
+    setAlert("outstanding-delete-result", "warning",
+      "Карты лояльности относятся только к Altegio. Для EasyWeek очистка недоступна.");
+    return;
+  }}
   const btn = document.getElementById("btn-delete-outstanding");
   if (btn.disabled) return;
 
@@ -4432,6 +4484,7 @@ async function deleteOutstandingCards() {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
       body: JSON.stringify({{
+        provider: "altegio",
         campaign_code: "new_clients_monthly",
         company_id: companyId,
         exclude_recipient_ids: excludedIds,
@@ -4697,6 +4750,15 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             else "Это preview-run. Запустите send-real или отредактируйте snapshot."
         )
         add_label = "➕ Add recipient"
+        # §36.11 and §37.1 are two different decisions with two different
+        # contracts, so they get two buttons. One "Add" that picked an endpoint
+        # by itself would hide which of them an operator just took.
+        test_recipient_button = (
+            '<button class="btn btn-outline-warning btn-sm" '
+            "onclick=\"showAddRecipientForm('test')\">🧪 Add test recipient</button>"
+            if is_easyweek
+            else ""
+        )
         add_header = "➕ Добавить получателя вручную (§37.1)" if is_easyweek else "➕ Добавить получателя в snapshot"
         # Said plainly, because the difference matters: a manual addition is an
         # operator's decision and proves nothing about a first visit.
@@ -4730,12 +4792,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <button class="btn btn-outline-danger btn-sm"
           onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
   <button class="btn btn-outline-secondary btn-sm"
-          onclick="showAddRecipientForm()">{add_label}</button>
+          onclick="showAddRecipientForm('manual')">{add_label}</button>
+  {test_recipient_button}
 </div>
 <div id="add-recipient-form" class="card mb-3 d-none">
-  <div class="card-header">{add_header}</div>
+  <div class="card-header" id="add-recipient-header">{add_header}</div>
   <div class="card-body">
-    {add_hint}
+    <div id="add-recipient-hint">{add_hint}</div>
+    <div id="add-recipient-test-hint" class="alert alert-warning small py-2 d-none">
+      Добавляется <b>только заранее настроенный тестовый аккаунт</b> controlled voucher
+      delivery canary (§36.11). Customer UUID берётся из серверной конфигурации;
+      телефон вводится для проверки совпадения. Это test-identity исключение, а не
+      доказанный entitlement и не обычный получатель.
+    </div>
     <div class="row g-2 align-items-end">
       <div class="col-auto">
         <label class="form-label small mb-1">Phone</label>
@@ -4907,19 +4976,38 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 """
 
     # --- Excluded block ---
-    excluded_block = _metric_cards(
-        [
-            ("Opted out", run.excluded_opted_out or 0, "warning"),
-            ("No phone", run.excluded_no_phone or 0, "secondary"),
-            ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
-            ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
-            ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
-            ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
-            ("Has records before", run.excluded_has_records_before or 0, "secondary"),
-            ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
-        ]
-    )
-    excluded_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # EasyWeek's reasons are its own and the vocabulary grows. A fixed
+        # Altegio list here showed zeros for reasons that cannot happen and hid
+        # the ones that did, so this renders whatever the run actually recorded.
+        by_reason = dict(((report or {}).get("excluded") or {}).get("by_reason") or {})
+        excluded_block = (
+            _metric_cards([(code, count, "secondary") for code, count in sorted(by_reason.items())])
+            if by_reason
+            else '<p class="text-muted mb-0">Исключённых получателей нет.</p>'
+        )
+        excluded_block = f"""
+<div class="card mb-3">
+  <div class="card-header">🚫 Excluded (EasyWeek)</div>
+  <div class="card-body">
+    {excluded_block}
+  </div>
+</div>
+"""
+    else:
+        excluded_block = _metric_cards(
+            [
+                ("Opted out", run.excluded_opted_out or 0, "warning"),
+                ("No phone", run.excluded_no_phone or 0, "secondary"),
+                ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
+                ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
+                ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
+                ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
+                ("Has records before", run.excluded_has_records_before or 0, "secondary"),
+                ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
+            ]
+        )
+        excluded_block = f"""
 <div class="card mb-3">
   <div class="card-header">🚫 Excluded</div>
   <div class="card-body">
@@ -5251,7 +5339,26 @@ async function deleteAndRedirect(runId) {{
   }}
 }}
 
-function showAddRecipientForm() {{
+// Which of the two contracts the operator asked for. Never inferred: §37.1
+// adds whoever they typed on an explicitly weaker basis, §36.11 adds the one
+// configured canary account, and an endpoint chosen automatically would hide
+// which of those just happened.
+let ADD_RECIPIENT_MODE = "manual";
+
+function showAddRecipientForm(mode) {{
+  ADD_RECIPIENT_MODE = (mode === "test") ? "test" : "manual";
+  const isTest = ADD_RECIPIENT_MODE === "test";
+  const header = document.getElementById("add-recipient-header");
+  if (header) {{
+    header.textContent = isTest
+      ? "🧪 Добавить настроенный test recipient (§36.11)"
+      : "➕ Добавить получателя вручную (§37.1)";
+  }}
+  const manualHint = document.getElementById("add-recipient-hint");
+  const testHint = document.getElementById("add-recipient-test-hint");
+  if (manualHint) manualHint.classList.toggle("d-none", isTest);
+  if (testHint) testHint.classList.toggle("d-none", !isTest);
+  document.getElementById("add-recipient-alert").innerHTML = "";
   document.getElementById("add-recipient-form").classList.remove("d-none");
 }}
 function hideAddRecipientForm() {{
@@ -5300,7 +5407,7 @@ async function submitAddRecipient(runId) {{
   // §37.1 for EasyWeek: a separate endpoint from the §36.11 canary one, which
   // adds only the configured test account and must keep refusing everything
   // else. Altegio keeps its own long-standing contract.
-  const endpoint = IS_EASYWEEK
+  const endpoint = (IS_EASYWEEK && ADD_RECIPIENT_MODE === "manual")
     ? "/ops/campaigns/runs/" + runId + "/recipients/add-manual"
     : "/ops/campaigns/runs/" + runId + "/recipients/add";
   const resp = await fetch(endpoint, {{
@@ -5498,8 +5605,15 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             _esc(r.followup_status or ""),
         ]
         if is_editable_preview:
+            # Remove is for ACTIVE candidates. A row the segmenter already
+            # excluded has nothing to remove, and offering the button would
+            # invite an operator to overwrite the reason it was excluded for.
             if r.excluded_reason == "manual_removed":
                 row.append('<span class="text-muted small">removed</span>')
+            elif r.excluded_reason:
+                row.append(f'<span class="text-muted small">excluded: {_esc(r.excluded_reason)}</span>')
+            elif r.status != "candidate":
+                row.append(f'<span class="text-muted small">{_esc(r.status or "")}</span>')
             else:
                 row.append(
                     f'<button class="btn btn-sm btn-outline-danger" '

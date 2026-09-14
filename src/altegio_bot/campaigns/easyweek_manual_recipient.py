@@ -60,7 +60,6 @@ from altegio_bot.easyweek_migration.customer_api import (
 )
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
-    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     RECIPIENT_BASIS_TEST,
     CampaignRecipient,
@@ -113,6 +112,11 @@ class ManualRecipientOutcome:
     reason: str | None = None
     recipient_id: int | None = None
     action: str | None = None
+    # The basis the ROW ends up on, which is not always the one that was asked
+    # for. Asking to add somebody the segmenter already proved leaves them
+    # earned; hard-coding `operator_manual_selection` here would have the
+    # top-level answer contradict the recipient it returns.
+    recipient_basis: str | None = None
     # The segmenter's original verdict, when an operator overrode one.
     overrode_auto_reason: str | None = None
 
@@ -122,7 +126,11 @@ class ManualRecipientOutcome:
             "reason": self.reason,
             "recipient_id": self.recipient_id,
             "action": self.action,
-            "recipient_basis": RECIPIENT_BASIS_MANUAL,
+            # What was asked for, and what the row actually is. On a refusal
+            # nothing was chosen, so the second one is absent rather than
+            # guessed.
+            "requested_basis": RECIPIENT_BASIS_MANUAL,
+            "recipient_basis": self.recipient_basis,
             "overrode_auto_reason": self.overrode_auto_reason,
             # Repeated on every answer, success included. §37.1 opens the editor
             # and nothing else.
@@ -375,7 +383,13 @@ async def add_manual_recipient(
             await session.flush()
             recipient_id = row.id
             await recompute_snapshot_counters(session, run)
-            return ManualRecipientOutcome(True, None, recipient_id=recipient_id, action=ACTION_CREATED)
+            return ManualRecipientOutcome(
+                True,
+                None,
+                recipient_id=recipient_id,
+                action=ACTION_CREATED,
+                recipient_basis=RECIPIENT_BASIS_MANUAL,
+            )
 
 
 def _reuse(
@@ -393,54 +407,78 @@ def _reuse(
     """
     if row.recipient_basis == RECIPIENT_BASIS_TEST:
         # The canary's account, which has its own contract and its own endpoint.
+        # Rewriting it here would convert one basis into another silently.
         return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)
     if row.easyweek_customer_uuid is not None and row.easyweek_customer_uuid != proven_uuid:
         # This row is bound to a different customer than the number resolved to.
         return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)
 
     if _active(row):
-        # Already a recipient, on whatever basis it earned. Asking twice is not
-        # two recipients, and it does not change what the first one was.
-        return ManualRecipientOutcome(True, None, recipient_id=row.id, action=ACTION_UNCHANGED)
-
-    was_manual_removal = row.excluded_reason == MANUAL_REMOVED
-    original_auto_reason = row.auto_excluded_reason
-    if not was_manual_removal and row.excluded_reason:
-        # The segmenter excluded this person and an operator is including them
-        # anyway. Keep WHY it excluded them: an override that erases what it
-        # overrode leaves nobody able to say what was decided.
-        original_auto_reason = original_auto_reason or row.excluded_reason
-
-    row.status = "candidate"
-    row.excluded_reason = None
-    row.is_opted_out = False
-    row.auto_excluded_reason = original_auto_reason
-    meta = dict(row.meta or {})
-    # A timestamp and nothing else: `meta` is untyped JSON that reaches reports.
-    meta["manually_included_at" if not was_manual_removal else "manually_restored_at"] = utcnow().isoformat()
-    row.meta = meta
-
-    if row.recipient_basis == RECIPIENT_BASIS_EARNED:
-        # Restored as what it was. Its source proof is untouched.
+        # Already a recipient, on whatever basis it has. Asking twice is not two
+        # recipients, and it does not change what the first one was — an earned
+        # candidate stays earned, with its proof intact.
         return ManualRecipientOutcome(
             True,
             None,
             recipient_id=row.id,
-            action=ACTION_REACTIVATED if was_manual_removal else ACTION_INCLUDED,
-            overrode_auto_reason=None if was_manual_removal else original_auto_reason,
+            action=ACTION_UNCHANGED,
+            recipient_basis=row.recipient_basis,
         )
 
+    meta = dict(row.meta or {})
+
+    if row.excluded_reason == MANUAL_REMOVED:
+        # An operator removed this row and is putting it back. It returns as
+        # WHAT IT WAS: an earned candidate keeps its proof and its basis, a
+        # manual one keeps its customer. Restoring either as the other would
+        # silently discard a proof or manufacture one.
+        row.status = "candidate"
+        row.excluded_reason = None
+        row.is_opted_out = False
+        meta["manually_restored_at"] = utcnow().isoformat()
+        row.meta = meta
+        return ManualRecipientOutcome(
+            True,
+            None,
+            recipient_id=row.id,
+            action=ACTION_REACTIVATED,
+            recipient_basis=row.recipient_basis,
+        )
+
+    # Everything left is a row the SEGMENTER excluded, and an operator is
+    # including them anyway. That decision — not the segmenter's evidence — is
+    # now why this person is in the snapshot, so the row becomes a manual
+    # selection outright.
+    #
+    # Its source proof goes with the basis. A row the segmenter refused to call
+    # eligible must not keep carrying first-visit evidence while being sent to:
+    # the evidence did not change, the decision did, and the ledger has to say
+    # which one it is acting on. The original verdict is kept as audit.
+    original_auto_reason = row.auto_excluded_reason or row.excluded_reason
+    row.status = "candidate"
+    row.excluded_reason = None
+    row.is_opted_out = False
+    row.auto_excluded_reason = original_auto_reason
     row.recipient_basis = RECIPIENT_BASIS_MANUAL
     row.easyweek_customer_uuid = proven_uuid
     row.phone_e164 = phone
     row.display_name = name
     row.local_client_found = True
+    row.source_easyweek_event_id = None
+    row.source_record_id = None
+    row.source_booking_uuid = None
+    row.source_visits_total = None
+    row.source_visits_total_updated_at = None
+    # A timestamp and nothing else: `meta` is untyped JSON that reaches reports.
+    meta["manually_included_at"] = utcnow().isoformat()
+    row.meta = meta
     return ManualRecipientOutcome(
         True,
         None,
         recipient_id=row.id,
-        action=ACTION_REACTIVATED if was_manual_removal else ACTION_INCLUDED,
-        overrode_auto_reason=None if was_manual_removal else original_auto_reason,
+        action=ACTION_INCLUDED,
+        recipient_basis=RECIPIENT_BASIS_MANUAL,
+        overrode_auto_reason=original_auto_reason,
     )
 
 

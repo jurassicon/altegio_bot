@@ -53,6 +53,7 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_TEST,
     CampaignRecipient,
     CampaignRun,
@@ -280,11 +281,18 @@ async def add_test_recipient_to_preview(
             customer_uuid = uuid_module.UUID(configured)
             if existing:
                 row = existing[0]
+                # Decided on the TYPED basis, before anything is written. An
+                # earned candidate is somebody's proven entitlement and a manual
+                # one is an operator's decision; converting either into the
+                # canary's test account would rewrite what somebody approved —
+                # and reaching a CHECK constraint to find that out would be a
+                # 500 where a stable refusal belongs.
+                if (row.recipient_basis or RECIPIENT_BASIS_EARNED) != RECIPIENT_BASIS_TEST:
+                    return TestRecipientOutcome(False, AMBIGUOUS_ROWS)
                 if row.source_booking_uuid is not None or (
                     row.easyweek_test_customer_uuid is not None and row.easyweek_test_customer_uuid != customer_uuid
                 ):
-                    # An earned row, or a test row bound to a different account.
-                    # Overwriting either would rewrite what somebody approved.
+                    # A test row bound to a different account.
                     return TestRecipientOutcome(False, AMBIGUOUS_ROWS)
                 if row.status == "candidate" and row.easyweek_test_customer_uuid == customer_uuid:
                     # Already exactly what was asked for. Doing it again is not

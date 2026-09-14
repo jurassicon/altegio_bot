@@ -27,6 +27,11 @@ Existing rows are classified before the constraints are added, not guessed at
 afterwards: anything already carrying `easyweek_test_customer_uuid` is the test
 account, and everything else is what the segmenter produced.
 
+This revision has never been released: the commit carrying it exists only on an
+unmerged local branch, it is on no remote, and deployment applies migrations
+from `main`. It is therefore amended in place rather than corrected by a child
+revision — there is no applied history to preserve.
+
 Revision ID: e5b3c81f74a2
 Revises: d4e7a1c95b30
 Create Date: 2026-09-13
@@ -106,9 +111,20 @@ def upgrade() -> None:
         "AND source_visits_total_updated_at IS NULL)",
     )
     op.create_check_constraint(
-        "ck_campaign_recipients_auto_excluded_provider",
+        "ck_campaign_recipients_auto_excluded_basis",
         RECIPIENTS,
-        "auto_excluded_reason IS NULL OR provider = 'easyweek'",
+        f"auto_excluded_reason IS NULL OR (provider = 'easyweek' AND recipient_basis = '{BASIS_MANUAL}')",
+    )
+    op.create_check_constraint(
+        "ck_campaign_recipients_active_earned_has_proof",
+        RECIPIENTS,
+        f"NOT (provider = 'easyweek' AND recipient_basis = '{BASIS_EARNED}' "
+        "AND status = 'candidate' AND excluded_reason IS NULL) OR ("
+        "source_easyweek_event_id IS NOT NULL "
+        "AND source_record_id IS NOT NULL "
+        "AND source_booking_uuid IS NOT NULL "
+        "AND source_visits_total IS NOT NULL "
+        "AND source_visits_total_updated_at IS NOT NULL)",
     )
     op.create_index(
         "uq_campaign_recipients_manual_customer_per_run",
@@ -141,7 +157,8 @@ def downgrade() -> None:
 
     op.drop_index("uq_campaign_recipients_manual_customer_per_run", table_name=RECIPIENTS)
     for name in (
-        "ck_campaign_recipients_auto_excluded_provider",
+        "ck_campaign_recipients_active_earned_has_proof",
+        "ck_campaign_recipients_auto_excluded_basis",
         "ck_campaign_recipients_manual_has_no_source_proof",
         "ck_campaign_recipients_basis_manual_binding",
         "ck_campaign_recipients_basis_test_binding",

@@ -569,29 +569,65 @@ async def test_a_removed_manual_candidate_comes_back_as_manual(session_maker, co
     assert restored.status == "candidate"
 
 
-@pytest.mark.asyncio
-async def test_including_an_automatically_excluded_row_keeps_the_original_reason(session_maker, configuration) -> None:
-    """An override that erases what it overrode leaves nobody able to say why."""
-    run_id = await _preview(session_maker, keep_recipient=True)
-    [row] = await _rows(session_maker, run_id)
+async def _auto_excluded(session_maker, run_id: int, *, reason: str = "has_records_before_period") -> int:
+    """A row shaped the way the segmenter actually produces an excluded one.
+
+    Not an eligible candidate forced to `skipped`: the segmenter attaches the
+    five source-proof columns EXACTLY when a row is eligible, so a row it
+    excluded carries none of them. Building the unrealistic shape and calling it
+    realistic is how a test ends up proving something the product never does.
+    """
     async with session_maker() as session:
         async with session.begin():
-            stored = await session.get(CampaignRecipient, row.id)
-            stored.status = "skipped"
-            stored.excluded_reason = "has_records_before_period"
+            client = (await session.execute(select(Client).where(Client.phone_e164 == PHONE))).scalar_one()
+            row = CampaignRecipient(
+                provider=PROVIDER_EASYWEEK,
+                campaign_run_id=run_id,
+                company_id=COMPANY_ID,
+                client_id=client.id,
+                phone_e164=PHONE,
+                display_name=client.display_name,
+                local_client_found=True,
+                status="skipped",
+                excluded_reason=reason,
+            )
+            session.add(row)
+            await session.flush()
+            return row.id
+
+
+@pytest.mark.asyncio
+async def test_including_an_automatically_excluded_row_makes_it_a_manual_selection(
+    session_maker, configuration
+) -> None:
+    """The operator's decision becomes the basis — and keeps what it overrode.
+
+    The segmenter refused to call this person eligible. Including them anyway
+    does not make the refusal into a proof: the row becomes an explicit manual
+    selection, and the original verdict is kept as audit rather than erased.
+    """
+    run_id = await _preview(session_maker)
+    row_id = await _auto_excluded(session_maker, run_id)
 
     outcome = await _add(session_maker, run_id)
 
     assert outcome.ok is True
     assert outcome.action == ACTION_INCLUDED
+    assert outcome.recipient_id == row_id
+    assert outcome.recipient_basis == RECIPIENT_BASIS_MANUAL
     assert outcome.overrode_auto_reason == "has_records_before_period"
     [included] = await _rows(session_maker, run_id)
     assert included.status == "candidate"
     assert included.excluded_reason is None
     assert included.auto_excluded_reason == "has_records_before_period"
-    # Still earned: the segmenter's proof is intact, the operator only overrode
-    # its verdict about whether to send.
-    assert included.recipient_basis == RECIPIENT_BASIS_EARNED
+    assert included.recipient_basis == RECIPIENT_BASIS_MANUAL
+    assert included.easyweek_customer_uuid == uuid_module.UUID(CUSTOMER_UUID)
+    assert included.phone_e164 == PHONE
+    assert included.display_name == FIRST_NAME
+    # And it carries no first-visit evidence at all.
+    assert included.source_easyweek_event_id is None
+    assert included.source_booking_uuid is None
+    assert included.source_visits_total is None
 
 
 @pytest.mark.asyncio
@@ -920,3 +956,330 @@ def test_no_external_mutation_is_reachable_from_this_module() -> None:
         "run_deliver",
     ):
         assert forbidden not in source, forbidden
+
+
+# ---------------------------------------------------------------------------
+# The production client, end to end through the endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_works_with_the_real_client_over_a_mock_transport(
+    session_maker, configuration, http_client, monkeypatch
+) -> None:
+    """Not a hand-written fake: the class the deployment actually constructs."""
+    import httpx
+
+    from altegio_bot.easyweek_client import EasyWeekClient
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        assert request.method == "GET", "the manual add path must never write"
+        if request.url.path.endswith(f"/customers/{CUSTOMER_UUID}"):
+            return httpx.Response(200, json=_row())
+        if request.url.path.endswith("/customers"):
+            assert request.url.params["phone"] == PHONE
+            return httpx.Response(200, json=_page([_row()]))
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    def build_client() -> EasyWeekClient:
+        return EasyWeekClient(
+            api_key="SYNTHETIC-API-KEY",
+            workspace_slug="synthetic-workspace",
+            base_url="https://my.easyweek.io/api/public/v2",
+            transport=httpx.MockTransport(handler),
+            sleep=_no_sleep,
+            max_attempts=2,
+        )
+
+    run_id = await _preview(session_maker)
+    monkeypatch.setattr(campaigns_api_module, "EasyWeekClient", build_client)
+
+    resp = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/add-manual", json={"phone": PHONE})
+
+    assert resp.status_code == 201, resp.text
+    assert [call.split()[0] for call in seen] == ["GET", "GET"]
+    [row] = await _rows(session_maker, run_id)
+    assert row.recipient_basis == RECIPIENT_BASIS_MANUAL
+
+
+# ---------------------------------------------------------------------------
+# The basis the answer reports is the basis the row has
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_top_level_basis_never_contradicts_the_recipient(
+    session_maker, configuration, http_client, monkeypatch
+) -> None:
+    """Adding somebody the segmenter proved leaves them earned — and says so."""
+    run_id = await _preview(session_maker, keep_recipient=True)
+    monkeypatch.setattr(campaigns_api_module, "EasyWeekClient", lambda: _Reader())
+
+    resp = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/add-manual", json={"phone": PHONE})
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["requested_basis"] == RECIPIENT_BASIS_MANUAL
+    assert body["recipient_basis"] == RECIPIENT_BASIS_EARNED
+    assert body["recipient"]["recipient_basis"] == RECIPIENT_BASIS_EARNED
+    assert body["action"] == ACTION_UNCHANGED
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_claims_no_resulting_basis(session_maker, configuration) -> None:
+    run_id = await _preview(session_maker)
+
+    outcome = await _add(session_maker, run_id, _Reader(pages=[_page([])]))
+
+    assert outcome.ok is False
+    assert outcome.recipient_basis is None
+    safe = outcome.as_safe_dict()
+    assert safe["requested_basis"] == RECIPIENT_BASIS_MANUAL
+    assert safe["recipient_basis"] is None
+
+
+# ---------------------------------------------------------------------------
+# What the database refuses to hold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_active_earned_easyweek_candidate_must_carry_its_proof(session_maker, configuration) -> None:
+    """`earned` is a claim about evidence, and the evidence is those columns."""
+    run_id = await _preview(session_maker, keep_recipient=True)
+    [row] = await _rows(session_maker, run_id)
+
+    with pytest.raises(IntegrityError):
+        async with session_maker() as session:
+            async with session.begin():
+                stored = await session.get(CampaignRecipient, row.id)
+                stored.source_booking_uuid = None
+
+
+@pytest.mark.asyncio
+async def test_an_auto_excluded_reason_belongs_only_to_a_manual_row(session_maker, configuration) -> None:
+    run_id = await _preview(session_maker, keep_recipient=True)
+    [row] = await _rows(session_maker, run_id)
+
+    with pytest.raises(IntegrityError):
+        async with session_maker() as session:
+            async with session.begin():
+                stored = await session.get(CampaignRecipient, row.id)
+                stored.auto_excluded_reason = "has_records_before_period"
+
+
+# ---------------------------------------------------------------------------
+# Remove
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_an_automatically_excluded_row(session_maker, configuration) -> None:
+    """Overwriting the segmenter's reason would destroy why it excluded them."""
+    run_id = await _preview(session_maker)
+    row_id = await _auto_excluded(session_maker, run_id)
+
+    with pytest.raises(ValueError, match="автоматически"):
+        await runner_module.remove_recipient_from_preview(run_id, row_id)
+
+    async with session_maker() as session:
+        row = await session.get(CampaignRecipient, row_id)
+        run = await session.get(CampaignRun, run_id)
+    assert row.excluded_reason == "has_records_before_period"
+    assert run.candidates_count == 0
+
+
+@pytest.mark.asyncio
+async def test_remove_keeps_the_basis_of_an_earned_candidate(session_maker, configuration) -> None:
+    run_id = await _preview(session_maker, keep_recipient=True)
+    [row] = await _rows(session_maker, run_id)
+
+    await runner_module.remove_recipient_from_preview(run_id, row.id)
+
+    [removed] = await _rows(session_maker, run_id)
+    assert removed.recipient_basis == RECIPIENT_BASIS_EARNED
+    assert removed.source_booking_uuid is not None
+    assert removed.excluded_reason == "manual_removed"
+
+
+@pytest.mark.asyncio
+async def test_remove_keeps_the_override_audit_of_a_manual_row(session_maker, configuration) -> None:
+    run_id = await _preview(session_maker)
+    row_id = await _auto_excluded(session_maker, run_id)
+    await _add(session_maker, run_id)
+
+    await runner_module.remove_recipient_from_preview(run_id, row_id)
+
+    [removed] = await _rows(session_maker, run_id)
+    assert removed.excluded_reason == "manual_removed"
+    assert removed.auto_excluded_reason == "has_records_before_period"
+    assert removed.recipient_basis == RECIPIENT_BASIS_MANUAL
+
+
+# ---------------------------------------------------------------------------
+# The canary will not deliver to a manual selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_canary_refuses_a_manual_recipient_before_touching_anything(
+    session_maker, configuration, monkeypatch
+) -> None:
+    """Honest about the basis, and refused before any live read or ledger row."""
+    from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import prove_recipient
+    from altegio_bot.campaigns.easyweek_voucher_delivery.identity import RECIPIENT_BASIS_UNSUPPORTED
+    from altegio_bot.utils import utcnow
+
+    run_id = await _preview(session_maker)
+    added = await _add(session_maker, run_id)
+
+    class _Forbidden:
+        async def get_booking(self, booking_uuid: str):  # pragma: no cover - must not run
+            raise AssertionError("a manual recipient must be refused before any live read")
+
+        async def get_customer(self, customer_uuid: str):  # pragma: no cover - must not run
+            raise AssertionError("a manual recipient must be refused before any live read")
+
+        async def list_customer_bookings(self, customer_uuid: str, page: int, per_page: int = 100):
+            raise AssertionError("a manual recipient must be refused before any live read")
+
+    async with session_maker() as session:
+        proof = await prove_recipient(
+            session,
+            preview_run_id=run_id,
+            campaign_recipient_id=added.recipient_id,
+            expected_company_id=COMPANY_ID,
+            client_reader=_Forbidden(),
+            now=utcnow(),
+        )
+
+    assert proof.proven is False
+    assert proof.recipient_basis == RECIPIENT_BASIS_MANUAL
+    assert RECIPIENT_BASIS_UNSUPPORTED in proof.reasons
+    safe = proof.as_safe_dict()
+    assert safe["recipient_basis"] == RECIPIENT_BASIS_MANUAL
+    assert safe["first_visit_proof"] != "earned"
+    for secret in (PHONE, CUSTOMER_UUID, FIRST_NAME):
+        assert secret not in repr(safe)
+
+
+@pytest.mark.asyncio
+async def test_the_test_endpoint_refuses_a_manual_row_without_touching_it(
+    session_maker, configuration, http_client, monkeypatch
+) -> None:
+    """No basis conversion, and no IntegrityError surfacing as a 500."""
+    from altegio_bot.settings import settings
+
+    run_id = await _preview(session_maker)
+    monkeypatch.setattr(campaigns_api_module, "EasyWeekClient", lambda: _Reader())
+    added = await _add(session_maker, run_id)
+
+    # Open the §36.11 fences so the refusal comes from the row, not the fence.
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_canary_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_test_recipient_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_test_customer_uuid", CUSTOMER_UUID, raising=False)
+
+    resp = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/add", json={"phone": PHONE})
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["reason"] == "test_recipient_rows_ambiguous"
+    [row] = await _rows(session_maker, run_id)
+    assert row.id == added.recipient_id
+    assert row.recipient_basis == RECIPIENT_BASIS_MANUAL
+    assert row.easyweek_test_customer_uuid is None
+
+
+# ---------------------------------------------------------------------------
+# Reports and the provider-aware UI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_report_counts_bases_and_overrides(session_maker, configuration, http_client) -> None:
+    run_id = await _preview(session_maker)
+    await _auto_excluded(session_maker, run_id, reason="has_records_before_period")
+    await _add(session_maker, run_id)
+
+    report = (await http_client.get(f"/ops/campaigns/runs/{run_id}/report")).json()
+
+    assert report["recipient_basis"]["by_basis"] == {RECIPIENT_BASIS_MANUAL: 1}
+    assert report["recipient_basis"]["manual_overrides_by_auto_reason"] == {"has_records_before_period": 1}
+    assert report["recipient_basis"]["manual_overrides_total"] == 1
+    # The long-standing block is untouched.
+    assert "by_reason" in report["excluded"]
+    # Every row has exactly one basis, so the bases account for the whole
+    # snapshot: what the run reports as seen, and what it reports as eligible.
+    assert sum(report["recipient_basis"]["by_basis"].values()) == report["total_found"]
+    assert report["eligible"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_easyweek_detail_page_shows_real_reasons_not_altegio_zeros(
+    session_maker, configuration, http_client
+) -> None:
+    run_id = await _preview(session_maker)
+    await _auto_excluded(session_maker, run_id, reason="easyweek_specific_future_reason")
+
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+
+    assert "Excluded (EasyWeek)" in page
+    # A reason this page has never heard of still appears.
+    assert "easyweek_specific_future_reason" in page
+    # And the Altegio-only vocabulary does not.
+    assert "CRM unavailable" not in page
+
+
+@pytest.mark.asyncio
+async def test_the_preview_page_keeps_the_card_cleanup_altegio_only(http_client, configuration) -> None:
+    page = (await http_client.get("/ops/campaigns/new-clients")).text
+
+    # The destructive call checks the provider itself, not only the button's
+    # visibility, and a stale in-flight read cannot repaint the panel.
+    assert "OUTSTANDING_GENERATION" in page
+    assert "if (isEasyWeek()) {" in page
+    assert 'provider: "altegio"' in page
+    assert "provider=altegio" in page
+
+
+@pytest.mark.asyncio
+async def test_the_card_endpoints_refuse_easyweek_without_building_a_client(
+    http_client, configuration, monkeypatch
+) -> None:
+    """Backend fails closed even if a stale click somehow reached it."""
+    import altegio_bot.campaigns.loyalty_cleanup as loyalty_cleanup
+
+    def forbidden(*args: Any, **kwargs: Any):  # pragma: no cover - must not run
+        raise AssertionError("EasyWeek must never construct an Altegio loyalty client")
+
+    monkeypatch.setattr(loyalty_cleanup, "AltegioLoyaltyClient", forbidden, raising=False)
+
+    listed = await http_client.get(
+        "/ops/campaigns/outstanding-cards",
+        params={"campaign_code": "new_clients_monthly", "company_id": COMPANY_ID, "provider": "easyweek"},
+    )
+    deleted = await http_client.post(
+        "/ops/campaigns/bulk-delete-cards",
+        json={"provider": "easyweek", "campaign_code": "new_clients_monthly", "company_id": COMPANY_ID},
+    )
+
+    assert listed.status_code == 409
+    assert deleted.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_the_preview_page_offers_both_easyweek_add_actions(http_client, configuration, session_maker) -> None:
+    run_id = await _preview(session_maker)
+
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+
+    assert "showAddRecipientForm('manual')" in page
+    assert "showAddRecipientForm('test')" in page
+    assert "Add test recipient" in page
+    assert "recipients/add-manual" in page
+    assert "§37.1" in page and "§36.11" in page

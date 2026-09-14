@@ -598,7 +598,7 @@ async def test_the_ui_stops_offering_edits_once_the_canary_holds_the_preview(
     assert "voucher delivery canary" in page
     # The helper functions still exist in the page script; what must be gone is
     # every control wired to them.
-    for gone in ('onclick="showAddRecipientForm()"', 'onclick="discardAndRefresh(', 'onclick="deleteAndRedirect('):
+    for gone in ('onclick="showAddRecipientForm(', 'onclick="discardAndRefresh(', 'onclick="deleteAndRedirect('):
         assert gone not in page
 
 

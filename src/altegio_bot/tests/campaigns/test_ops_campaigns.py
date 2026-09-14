@@ -1436,7 +1436,10 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "f.card_id" in text
 
     # Экранирование detail и exception
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+    # A fixed-length window, widened because the function grew a provider guard
+    # in §37.1. Every assertion below is unchanged — only the slice that has to
+    # contain them.
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4200]
     assert "escHtml(String(detail))" in delete_fn
     assert "escHtml(String(e))" in delete_fn
 

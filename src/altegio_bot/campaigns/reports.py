@@ -23,7 +23,13 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import PROVIDER_ALTEGIO, CampaignRecipient, CampaignRun, OutboxMessage
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    RECIPIENT_BASIS_EARNED,
+    CampaignRecipient,
+    CampaignRun,
+    OutboxMessage,
+)
 
 # Отображение company_id → название
 COMPANIES: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
@@ -74,6 +80,29 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
         if reason:
             reason_counts[reason] = reason_counts.get(reason, 0) + cnt
 
+    # §37.1: on what grounds the snapshot's rows are in it. Counts only — no
+    # phone, no name, no customer UUID — and the totals reconcile with
+    # `total_clients_seen`, because every row has exactly one basis.
+    basis_stmt = (
+        select(
+            CampaignRecipient.recipient_basis,
+            CampaignRecipient.auto_excluded_reason,
+            func.count(CampaignRecipient.id).label("cnt"),
+        )
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == run.provider)
+        .group_by(CampaignRecipient.recipient_basis, CampaignRecipient.auto_excluded_reason)
+    )
+    basis_counts: dict[str, int] = {}
+    override_counts: dict[str, int] = {}
+    for basis, overrode, cnt in (await session.execute(basis_stmt)).all():
+        key = basis or RECIPIENT_BASIS_EARNED
+        basis_counts[key] = basis_counts.get(key, 0) + cnt
+        if overrode:
+            # An operator included somebody the segmenter had excluded. Kept
+            # separately from `by_reason`, which counts rows that ARE excluded.
+            override_counts[overrode] = override_counts.get(overrode, 0) + cnt
+
     # Attribution из outbox_messages (свежие данные с кумулятивным подсчётом)
     attr = await _fetch_attribution(session, run_id, provider=run.provider)
 
@@ -114,6 +143,12 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
             "no_confirmed_record_in_period": run.excluded_no_confirmed_record,
             "has_records_before_period": run.excluded_has_records_before,
             "by_reason": reason_counts,
+        },
+        # §37.1: how the snapshot was assembled, and what an operator overrode.
+        "recipient_basis": {
+            "by_basis": basis_counts,
+            "manual_overrides_by_auto_reason": override_counts,
+            "manual_overrides_total": sum(override_counts.values()),
         },
         # Loyalty
         "cards_deleted": run.cards_deleted_count,

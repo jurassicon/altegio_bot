@@ -1339,11 +1339,28 @@ class CampaignRecipient(Base):
             "AND source_visits_total_updated_at IS NULL)",
             name="ck_campaign_recipients_manual_has_no_source_proof",
         ),
-        # The original automatic verdict is audit, and audit belongs to a row
-        # that actually had one.
+        # The original automatic verdict is audit, and audit belongs to the row
+        # that actually overrode one: an operator's manual inclusion. Anywhere
+        # else it would be a reason attached to a decision nobody made.
         CheckConstraint(
-            "auto_excluded_reason IS NULL OR provider = 'easyweek'",
-            name="ck_campaign_recipients_auto_excluded_provider",
+            f"auto_excluded_reason IS NULL OR (provider = 'easyweek' AND recipient_basis = '{RECIPIENT_BASIS_MANUAL}')",
+            name="ck_campaign_recipients_auto_excluded_basis",
+        ),
+        # An ACTIVE earned EasyWeek candidate is a claim that the segmenter
+        # proved a first visit, and the proof is those five columns together.
+        # The segmenter already works this way — it attaches the proof exactly
+        # when the row is eligible — so this states the rule rather than adding
+        # one, and stops any later path from producing a proof-free row that
+        # still says `earned`.
+        CheckConstraint(
+            f"NOT (provider = 'easyweek' AND recipient_basis = '{RECIPIENT_BASIS_EARNED}' "
+            "AND status = 'candidate' AND excluded_reason IS NULL) OR ("
+            "source_easyweek_event_id IS NOT NULL "
+            "AND source_record_id IS NOT NULL "
+            "AND source_booking_uuid IS NOT NULL "
+            "AND source_visits_total IS NOT NULL "
+            "AND source_visits_total_updated_at IS NOT NULL)",
+            name="ck_campaign_recipients_active_earned_has_proof",
         ),
         # One ACTIVE row per proven customer per run. Keyed on the customer UUID
         # rather than the phone: one number can legitimately belong to two
