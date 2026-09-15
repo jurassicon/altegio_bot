@@ -186,6 +186,7 @@ _FOLLOWUP_STATUS_SKIP_REASON: dict[str, str] = {
 }
 
 _FUNNEL_TABLE_LIMIT = 200
+_EASYWEEK_SNAPSHOT_TABLE_LIMIT = 50
 
 
 def _fu_reason(r: CampaignRecipient) -> str:
@@ -3188,6 +3189,8 @@ async def ops_campaigns_list(request: Request) -> str:
   <h4>📣 Campaign Runs</h4>
   <div>
     <a href="/ops/campaigns/new-clients" class="btn btn-sm btn-success me-2">🚀 New Clients Campaign</a>
+    <a href="/ops/campaigns?provider=easyweek&amp;mode=preview"
+       class="btn btn-sm btn-outline-primary me-2">👥 EasyWeek previews</a>
     <a href="/ops/campaigns/dashboard" class="btn btn-sm btn-outline-secondary me-2">📊 Dashboard</a>
     <span class="badge bg-secondary">{total} total</span>
   </div>
@@ -5485,6 +5488,23 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         recipients_by_status: dict[str, int] = {row.status: int(row.cnt) for row in recipient_rows}
         recipients_total = sum(recipients_by_status.values())
 
+        # The EasyWeek editor needs a human-readable view of the active
+        # snapshot near the top of the detail page. The full recipient page
+        # remains the place to inspect exclusions and remove rows.
+        easyweek_snapshot_recipients: list[CampaignRecipient] = []
+        if run.provider == PROVIDER_EASYWEEK and run.mode == "preview" and run.status == "completed":
+            snapshot_stmt = (
+                select(CampaignRecipient)
+                .where(
+                    CampaignRecipient.campaign_run_id == run_id,
+                    CampaignRecipient.provider == PROVIDER_EASYWEEK,
+                    CampaignRecipient.status == "candidate",
+                )
+                .order_by(CampaignRecipient.id.asc())
+                .limit(_EASYWEEK_SNAPSHOT_TABLE_LIMIT)
+            )
+            easyweek_snapshot_recipients = list((await session.execute(snapshot_stmt)).scalars().all())
+
         # Проверить, используется ли preview как источник для send-real
         used_as_source = False
         if run.mode == "preview":
@@ -6249,6 +6269,45 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 </div>
 """
 
+    easyweek_snapshot_block = ""
+    if run.provider == PROVIDER_EASYWEEK and run.mode == "preview" and run.status == "completed":
+        candidate_count = recipients_by_status.get("candidate", 0)
+        snapshot_rows = [
+            [
+                _esc(str(recipient.id)),
+                _esc(recipient.display_name or ""),
+                _esc(recipient.phone_e164 or ""),
+                _basis_badge(recipient),
+            ]
+            for recipient in easyweek_snapshot_recipients
+        ]
+        shown_note = (
+            f'<p class="text-muted small mb-2">Показаны первые {_EASYWEEK_SNAPSHOT_TABLE_LIMIT} '
+            f"из {candidate_count} активных строк. В списке получателей можно увеличить лимит до 1000.</p>"
+            if candidate_count > _EASYWEEK_SNAPSHOT_TABLE_LIMIT
+            else ""
+        )
+        snapshot_table_html = (
+            _table(["ID", "Имя", "Телефон", "Основание"], snapshot_rows)
+            if snapshot_rows
+            else '<p class="text-muted mb-0">Активных получателей нет.</p>'
+        )
+        easyweek_snapshot_block = f"""
+<div class="card mb-3" id="easyweek-active-snapshot">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span>👥 Активные получатели EasyWeek snapshot ({candidate_count})</span>
+    <a href="/ops/campaigns/{run_id}/recipients?status=candidate"
+       class="btn btn-sm btn-outline-primary">Открыть список / исключить получателя</a>
+  </div>
+  <div class="card-body">
+    <p class="text-muted small mb-2">Это кандидаты текущего preview, а не подтверждённая отправка.
+      EasyWeek send-real по §37.1 остаётся закрытым.</p>
+    {shown_note}
+    {snapshot_table_html}
+  </div>
+</div>
+"""
+
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h4>📣 Campaign Run #{run_id}</h4>
@@ -6258,6 +6317,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 {preview_actions_block}
 {error_block}
 {summary_block}
+{easyweek_snapshot_block}
 {progress_block}
 {delivery_block}
 {recompute_warning_block}
@@ -6376,10 +6436,16 @@ async function submitAddRecipient(runId) {{
   const data = await resp.json();
   if (resp.ok) {{
     const rid = (data.recipient && data.recipient.id) || data.recipient_id;
-    const what = data.action ? (' (' + data.action + ')') : '';
     const count = (data.candidates_count === undefined || data.candidates_count === null)
       ? ''
       : ' Активных получателей: ' + data.candidates_count + '.';
+    if (IS_EASYWEEK && data.action === "unchanged") {{
+      alertEl.innerHTML = '<div class="alert alert-warning py-1 mb-0">Получатель уже есть в preview (id=' +
+        rid + '). Повторное добавление не изменило список.' + count +
+        ' <a href="/ops/campaigns/' + runId + '/recipients?status=candidate">Откройте список.</a></div>';
+      return;
+    }}
+    const what = data.action ? (' (' + data.action + ')') : '';
     alertEl.innerHTML = '<div class="alert alert-success py-1 mb-0">Получатель добавлен (id=' +
       rid + ')' + what + '.' + count + ' <a href="">Обновите страницу.</a></div>';
   }} else {{
