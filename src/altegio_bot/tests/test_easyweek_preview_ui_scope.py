@@ -158,6 +158,62 @@ async def _decisions(http_client: AsyncClient) -> str:
     )
 
 
+@needs_node
+@pytest.mark.asyncio
+async def test_duplicate_manual_add_uses_a_warning_not_a_success_alert(
+    http_client, session_maker, configuration
+) -> None:
+    run_id, _ = await seed_recipient(session_maker)
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+    source = _function_source(_page_script(page), "submitAddRecipient")
+    driver = """
+let IS_EASYWEEK = true;
+let ADD_RECIPIENT_MODE = "manual";
+const MANUAL_ADD_REASONS = {};
+const elements = {
+  "add-phone": {value: "+4915100000042"},
+  "add-recipient-alert": {innerHTML: ""},
+};
+globalThis.document = {getElementById: id => elements[id] || null};
+let reply = {action: "unchanged", recipient_id: 5002, candidates_count: 1};
+const urls = [];
+globalThis.fetch = async url => {
+  urls.push(url);
+  return {ok: true, json: async () => reply};
+};
+await submitAddRecipient(38);
+const duplicate = elements["add-recipient-alert"].innerHTML;
+reply = {action: "created", recipient_id: 5003, candidates_count: 2};
+await submitAddRecipient(38);
+const created = elements["add-recipient-alert"].innerHTML;
+ADD_RECIPIENT_MODE = "test";
+reply = {action: "unchanged", recipient_id: 5002, candidates_count: 1};
+await submitAddRecipient(38);
+const testRecipient = elements["add-recipient-alert"].innerHTML;
+IS_EASYWEEK = false;
+ADD_RECIPIENT_MODE = "manual";
+await submitAddRecipient(38);
+const altegio = elements["add-recipient-alert"].innerHTML;
+console.log(JSON.stringify({duplicate, created, testRecipient, altegio, urls}));
+"""
+
+    alerts = _run_node(source, driver)
+    assert "alert-warning" in alerts["duplicate"]
+    assert "Повторное добавление не изменило список" in alerts["duplicate"]
+    assert "alert-success" not in alerts["duplicate"]
+    assert "alert-success" in alerts["created"]
+    assert "Получатель добавлен" in alerts["created"]
+    assert "alert-warning" in alerts["testRecipient"]
+    assert "Повторное добавление не изменило список" in alerts["testRecipient"]
+    assert "alert-success" in alerts["altegio"]
+    assert alerts["urls"] == [
+        "/ops/campaigns/runs/38/recipients/add-manual",
+        "/ops/campaigns/runs/38/recipients/add-manual",
+        "/ops/campaigns/runs/38/recipients/add",
+        "/ops/campaigns/runs/38/recipients/add",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # The whole page script parses
 # ---------------------------------------------------------------------------

@@ -1285,6 +1285,66 @@ async def test_the_preview_page_offers_both_easyweek_add_actions(http_client, co
     assert "§37.1" in page and "§36.11" in page
 
 
+@pytest.mark.asyncio
+async def test_easyweek_preview_is_discoverable_from_the_campaigns_page(
+    http_client, configuration, session_maker
+) -> None:
+    run_id = await _preview(session_maker)
+
+    general = await http_client.get("/ops/campaigns")
+    assert general.status_code == 200
+    assert 'href="/ops/campaigns?provider=easyweek&amp;mode=preview"' in general.text
+    # The Altegio default-list contract still hides previews; the new link is
+    # a provider-scoped, one-click way into the EasyWeek editor.
+    assert f'href="/ops/campaigns/{run_id}"' not in general.text
+
+    previews = await http_client.get("/ops/campaigns", params={"provider": "easyweek", "mode": "preview"})
+    assert previews.status_code == 200
+    assert f'href="/ops/campaigns/{run_id}"' in previews.text
+    assert f"runFromPreview({run_id})" not in previews.text
+
+
+@pytest.mark.asyncio
+async def test_easyweek_detail_shows_the_active_snapshot_before_progress(
+    http_client, configuration, session_maker, monkeypatch
+) -> None:
+    run_id = await _preview(session_maker)
+    monkeypatch.setattr(campaigns_api_module, "EasyWeekClient", lambda: _Reader())
+    added = await http_client.post(f"/ops/campaigns/runs/{run_id}/recipients/add-manual", json={"phone": PHONE})
+    assert added.status_code == 201, added.text
+
+    async with session_maker() as session:
+        async with session.begin():
+            active = await session.get(CampaignRecipient, added.json()["recipient_id"])
+            active.display_name = "<b>Active Fixture</b>"
+            session.add(
+                CampaignRecipient(
+                    provider=PROVIDER_EASYWEEK,
+                    campaign_run_id=run_id,
+                    company_id=COMPANY_ID,
+                    phone_e164="+4915100000043",
+                    display_name="Excluded Fixture",
+                    status="skipped",
+                    excluded_reason="has_records_before_period",
+                )
+            )
+
+    page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
+    snapshot_start = page.index('id="easyweek-active-snapshot"')
+    progress_start = page.index("📈 Progress")
+    assert snapshot_start < progress_start
+    snapshot = page[snapshot_start:progress_start]
+    assert "Активные получатели EasyWeek snapshot (1)" in snapshot
+    assert "&lt;b&gt;Active Fixture&lt;/b&gt;" in snapshot
+    assert "<b>Active Fixture</b>" not in snapshot
+    assert PHONE in snapshot
+    assert ">manual<" in snapshot
+    assert "Excluded Fixture" not in snapshot
+    assert f'href="/ops/campaigns/{run_id}/recipients?status=candidate"' in snapshot
+    assert CUSTOMER_UUID not in page
+    assert "EasyWeek send-real по §37.1 остаётся закрытым" in snapshot
+
+
 # ---------------------------------------------------------------------------
 # A fresh preview reports the reasons it actually recorded
 # ---------------------------------------------------------------------------
