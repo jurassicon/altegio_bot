@@ -1391,7 +1391,7 @@ async def test_campaign_new_page_has_auto_card_type_loader(http_client: AsyncCli
     assert "loadCardTypes()" in text
 
     # Автовызов при смене филиала
-    company_change_block = text[text.find("companySelect.addEventListener") :][:600]
+    company_change_block = text[text.find("companySelect.addEventListener") :][:1200]
     assert "loadCardTypes()" in company_change_block
 
     # Кнопки «Загрузить» (btn-load-cards) нет ни в HTML, ни в JS
@@ -1436,7 +1436,10 @@ async def test_campaign_new_page_has_outstanding_cards_status_container(
     assert "f.card_id" in text
 
     # Экранирование detail и exception
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+    # A fixed-length window, widened because the function grew a provider guard
+    # in §37.1. Every assertion below is unchanged — only the slice that has to
+    # contain them.
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4800]
     assert "escHtml(String(detail))" in delete_fn
     assert "escHtml(String(e))" in delete_fn
 
@@ -1476,7 +1479,7 @@ async def test_campaign_new_page_preserves_failed_card_details_on_reload_warning
     assert response.status_code == 200
     text = response.text
 
-    delete_fn = text[text.find("async function deleteOutstandingCards") :][:3500]
+    delete_fn = text[text.find("async function deleteOutstandingCards") :][:4800]
 
     # failDetails строится из card_id / recipient_id / error
     assert "card_id=" in delete_fn
@@ -1499,10 +1502,14 @@ async def test_campaign_new_page_clears_outstanding_delete_result_on_company_cha
     assert response.status_code == 200
     text = response.text
 
-    # Обработчик change компании содержит очистку outstanding-delete-result
+    # Обработчик change компании снимает панель целиком — через единственную
+    # функцию, которая этим владеет, и она очищает прошлый результат удаления.
     change_block = text[text.find("companySelect.addEventListener") :][:800]
-    assert "outstanding-delete-result" in change_block
-    assert "innerHTML" in change_block
+    assert "resetOutstandingPanel();" in change_block
+
+    reset_block = text[text.find("function resetOutstandingPanel()") :][:900]
+    assert "outstanding-delete-result" in reset_block
+    assert "innerHTML" in reset_block
 
 
 # ---------------------------------------------------------------------------

@@ -86,6 +86,12 @@ TEST_CUSTOMER_UNCONFIGURED: Final = "voucher_delivery_test_customer_unconfigured
 TEST_CUSTOMER_UNPROVEN: Final = "voucher_delivery_test_customer_unproven"
 TEST_BINDING_MISMATCH: Final = "voucher_delivery_test_binding_mismatch"
 
+# The recipient is on a basis this controlled canary does not serve. §37.1 lets
+# an operator put somebody in a preview by hand; delivering a real voucher to
+# them is a separate, not-yet-approved step, and the canary says so rather than
+# treating the decision as an entitlement.
+RECIPIENT_BASIS_UNSUPPORTED: Final = "voucher_delivery_recipient_basis_unsupported"
+
 # -- the send ---------------------------------------------------------------
 DELIVERY_ALREADY_ATTEMPTED: Final = "delivery_already_attempted"
 DELIVERY_OUTCOME_UNKNOWN: Final = "delivery_outcome_unknown"

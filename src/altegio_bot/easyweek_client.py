@@ -49,6 +49,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from altegio_bot.easyweek_migration.customers import normalized_international_phone
 from altegio_bot.settings import settings
 
 logger = logging.getLogger("easyweek_client")
@@ -61,6 +62,9 @@ _PATH_LOCATIONS = "locations"
 _PATH_SERVICES = "services"
 _PATH_BOOKINGS = "bookings"
 _PATH_CUSTOMERS = "customers"
+# Fixed by this client, never by a caller. One number cannot legitimately need
+# a wider page, and a caller-controlled size is how a lookup becomes an export.
+CUSTOMER_LOOKUP_PER_PAGE: Final = 100
 _PATH_WORKSPACE = "workspace"
 _PATH_VOUCHER_TEMPLATES = "voucher-templates"
 # Read-only POS surface, added for the §35 voucher-canary reconciliation. The
@@ -692,6 +696,51 @@ class EasyWeekClient:
             payload = payload["data"]
         if not isinstance(payload, dict):
             raise EasyWeekProtocolError("customer response is not a JSON object", operation="get_customer")
+        return payload
+
+    async def list_customers(self, *, params: Mapping[str, Any]) -> dict[str, Any]:
+        """One page of ``GET /customers?phone=...``, workspace-wide.
+
+        Transport only, deliberately: completeness of the page walk, the
+        exactly-one rule and the row projection belong to
+        ``easyweek_migration.customer_api``, which is reviewed and already
+        reused by the migration. Duplicating that logic here would give the
+        runtime a second, quietly divergent answer to "who has this number?".
+        Nothing of the mutating migration client is imported.
+
+        The query is closed. ``phone`` must be an exact canonical number and
+        ``page`` a positive integer; ``per_page`` is fixed here rather than
+        accepted, so no caller — least of all a browser — can widen a page and
+        turn one lookup into a workspace dump. Any other key is refused before a
+        request is made: a stray ``location_uuid`` or ``staffer_uuid`` would
+        narrow the search and turn a proven absence into a wrong one.
+        """
+        operation = "list_customers"
+        if not isinstance(params, Mapping):
+            raise EasyWeekPermanentError("customer lookup params must be a mapping", operation=operation)
+        unknown = set(params) - {"phone", "page"}
+        if unknown:
+            # Named in the exception only as a count: a key an operator mistyped
+            # is not sensitive, but a value they put in it may be.
+            raise EasyWeekPermanentError(
+                f"customer lookup accepts phone and page only ({len(unknown)} unexpected parameter(s))",
+                operation=operation,
+            )
+        phone = normalized_international_phone(params.get("phone"))
+        if phone is None or phone != params.get("phone"):
+            # Exact, not merely normalisable: the caller filtered on a string,
+            # and a lookup that silently searched for a different one would
+            # answer a question nobody asked.
+            raise EasyWeekPermanentError("customer lookup phone is not an exact canonical number", operation=operation)
+        exact_page = _positive_page(params.get("page", 1), operation=operation)
+
+        payload = await self._get_json(
+            _PATH_CUSTOMERS,
+            operation=operation,
+            params={"phone": phone, "page": exact_page, "per_page": CUSTOMER_LOOKUP_PER_PAGE},
+        )
+        if not isinstance(payload, dict):
+            raise EasyWeekProtocolError("customer lookup response is not a JSON object", operation=operation)
         return payload
 
     async def list_customer_bookings(

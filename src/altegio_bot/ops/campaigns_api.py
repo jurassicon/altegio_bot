@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,7 +44,12 @@ from altegio_bot.campaigns.altegio_crm import (
     get_client_crm_records,
 )
 from altegio_bot.campaigns.configuration import resolve_campaign_readiness
-from altegio_bot.campaigns.easyweek_voucher_delivery import test_recipient
+from altegio_bot.campaigns.easyweek_manual_recipient import (
+    RUN_NOT_FOUND,
+    add_manual_recipient,
+)
+from altegio_bot.campaigns.easyweek_manual_recipient import known_branch as known_easyweek_branch
+from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract, test_recipient
 from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     TEST_CUSTOMER_UNCONFIGURED,
     TEST_RECIPIENT_DISABLED,
@@ -62,7 +67,7 @@ from altegio_bot.campaigns.provider import (
     require_campaign_execution_provider,
     require_same_provider,
 )
-from altegio_bot.campaigns.reports import monthly_dashboard, run_report
+from altegio_bot.campaigns.reports import excluded_reason_counts, monthly_dashboard, run_report
 from altegio_bot.campaigns.runner import (
     CAMPAIGN_CODE,
     CAMPAIGN_EXECUTION_JOB_TYPE,
@@ -80,7 +85,9 @@ from altegio_bot.campaigns.runner import (
 from altegio_bot.campaigns.segment import check_lash_services, compute_excluded_reason
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
+from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
@@ -116,7 +123,12 @@ FollowupPolicy = Literal["unread_only", "unread_or_not_booked"]
 class CampaignBaseRequest(BaseModel):
     provider: Literal["altegio", "easyweek"] = PROVIDER_ALTEGIO
     company_id: int
-    location_id: int
+    # Altegio addresses a branch by a numeric location id and needs it. EasyWeek
+    # addresses one by UUID, which is not an integer and is not the browser's to
+    # choose: the server resolves it from `company_id` through its own registry.
+    # Optional here so the two contracts can differ, required below so Altegio
+    # keeps refusing a request without it.
+    location_id: int | None = None
     period_start: datetime
     period_end: datetime
     card_type_id: str | None = None
@@ -126,9 +138,33 @@ class CampaignBaseRequest(BaseModel):
     followup_policy: FollowupPolicy | None = None
     followup_template_name: str | None = None
 
+    @model_validator(mode="after")
+    def _provider_shape(self) -> "CampaignBaseRequest":
+        # Altegio addresses a branch by a numeric id and still requires one.
+        # EasyWeek does not have one, so the field became optional — and this
+        # keeps the Altegio contract exactly where it was.
+        if self.provider != PROVIDER_EASYWEEK and self.location_id is None:
+            raise ValueError("location_id is required for altegio")
+        return self
+
 
 class PreviewRequest(CampaignBaseRequest):
-    pass
+    """§37.1: the only request that may name an EasyWeek branch.
+
+    The registry check lives here rather than on the shared base on purpose.
+    Send-real for EasyWeek is refused by
+    `require_campaign_execution_provider` further in, with its own stable
+    reason, and moving that refusal earlier — into a validation error about a
+    branch — would change what an operator and every existing wrapper see.
+    """
+
+    @model_validator(mode="after")
+    def _easyweek_branch_is_configured(self) -> "PreviewRequest":
+        if self.provider == PROVIDER_EASYWEEK and not known_easyweek_branch(self.company_id):
+            # A company id the server never configured. Trusting it would let
+            # the request define what a branch is.
+            raise ValueError("easyweek_company_not_in_registry")
+        return self
 
 
 class RunRequest(CampaignBaseRequest):
@@ -219,7 +255,10 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
     params = RunParams(
         provider=body.provider,
         company_id=body.company_id,
-        location_id=body.location_id,
+        # EasyWeek has no numeric location id; the company id IS the branch key
+        # in its registry, and the run records that rather than a borrowed
+        # Altegio integer or an invented one.
+        location_id=body.location_id if body.location_id is not None else body.company_id,
         period_start=_ensure_utc(body.period_start),
         period_end=_ensure_utc(body.period_end),
         mode="preview",
@@ -240,7 +279,7 @@ async def create_preview(body: PreviewRequest) -> dict[str, Any]:
             detail="Preview failed due to internal error. See server logs for details.",
         )
 
-    return _run_summary(run)
+    return await _summary_with_reasons(run)
 
 
 # ==========================================================================
@@ -1079,6 +1118,83 @@ def normalize_meta_template_name(template_name: str) -> str:
 # ==========================================================================
 
 
+@router.get("/new-clients/easyweek-template-status")
+async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, Any]:
+    """Is THIS branch's voucher template row proven? (§37.1)
+
+    Narrow, read-only and deliberately branch-specific. The approved Meta
+    contract — the name, the language, the body, the parameter order — was
+    proven for Karlsruhe and for Karlsruhe only. Showing that name on a Durlach
+    or Rastatt screen would present somebody else's approval as this branch's,
+    so a branch without its own approved contract is reported as not configured
+    rather than filled in from the one that has one.
+
+    The row itself is judged by `template_contract`, the same source the canary's
+    readiness uses: EVERY row for this provider, company, code and language is
+    considered, exactly one must be active, and that one must match the contract
+    completely. A first row taken with LIMIT 1 would be a row, not a proof.
+
+    No Meta request is made: this answers what the database holds, and the live
+    read belongs to the separate reconciler that maintains it.
+    """
+    registry = configured_easyweek_locations()
+    location = registry.locations.get(company_id) if registry.ready else None
+    if location is None:
+        return {"configured": False, "reason": "branch_not_in_registry", "company_id": company_id}
+    if location.location_uuid != KARLSRUHE_LOCATION_UUID:
+        return {
+            "configured": False,
+            "reason": "branch_contract_not_approved",
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(MessageTemplate)
+                    .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
+                    .where(MessageTemplate.company_id == company_id)
+                    .where(MessageTemplate.code == template_contract.VOUCHER_TEMPLATE_CODE)
+                    .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    active = [row for row in rows if row.is_active]
+    if len(active) != 1:
+        # Zero is nothing to send with; two is an ambiguity about which text a
+        # customer would receive.
+        return {
+            "configured": False,
+            "reason": "template_row_missing" if not active else "template_rows_ambiguous",
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    blocker = template_contract.db_row_blocker(active[0], company_id=company_id)
+    if blocker is not None:
+        return {
+            "configured": False,
+            "reason": blocker,
+            "company_id": company_id,
+            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        }
+
+    return {
+        "configured": True,
+        "reason": None,
+        "company_id": company_id,
+        "provider": PROVIDER_EASYWEEK,
+        "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+        "language": template_contract.VOUCHER_TEMPLATE_LANGUAGE,
+        "meta_template_name": template_contract.VOUCHER_META_TEMPLATE_NAME,
+    }
+
+
 @router.get("/new-clients/template-text")
 async def get_template_text(
     template_name: str = Query(..., description="Meta template name"),
@@ -1754,6 +1870,70 @@ _TEST_RECIPIENT_CONFIG_REASONS = frozenset(
 )
 
 
+class AddManualRecipientRequest(BaseModel):
+    """§37.1: a phone number, and deliberately nothing else.
+
+    No customer UUID, no Altegio client id, no "already verified" flag. The
+    identity is established on the server by reading EasyWeek twice; a browser
+    able to name a customer would be a browser able to choose who receives a
+    real message.
+    """
+
+    phone: str
+
+
+@router.post("/runs/{run_id}/recipients/add-manual", status_code=201)
+async def add_manual_recipient_endpoint(run_id: int, body: AddManualRecipientRequest) -> dict[str, Any]:
+    """Add one operator-chosen recipient to an EasyWeek preview (§37.1).
+
+    A separate endpoint from the §36.11 one on purpose. That one adds the single
+    configured canary account and must keep refusing everything else; this one
+    adds whoever an operator typed, on the explicitly weaker basis
+    `operator_manual_selection`. Collapsing them would quietly turn the canary's
+    narrow contract into a production path.
+
+    Opens no send path: no job, no outbox row, no voucher, no Meta request.
+    """
+    # Before the client exists: httpx logs the full URL at INFO, and this
+    # request's URLs carry a phone number and then a customer UUID.
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as client:
+            outcome = await add_manual_recipient(
+                SessionLocal,
+                run_id=run_id,
+                phone=body.phone,
+                reader=client,
+            )
+    except EasyWeekError:
+        # The live reads are the only external calls, and they happen before the
+        # write transaction opens. An unreachable EasyWeek wrote nothing.
+        raise HTTPException(status_code=502, detail={"reason": "manual_recipient_customer_unproven"}) from None
+
+    if not outcome.ok:
+        status = 404 if outcome.reason == RUN_NOT_FOUND else 409
+        logger.info("easyweek_manual_recipient refused run_id=%d reason=%s", run_id, outcome.reason)
+        raise HTTPException(status_code=status, detail=outcome.as_safe_dict())
+
+    logger.info(
+        "easyweek_manual_recipient %s run_id=%d recipient_id=%s",
+        outcome.action,
+        run_id,
+        outcome.recipient_id,
+    )
+    async with SessionLocal() as session:
+        row = await session.get(CampaignRecipient, outcome.recipient_id)
+        run = await session.get(CampaignRun, run_id)
+    return {
+        "run_id": run_id,
+        "recipient_id": outcome.recipient_id,
+        "recipient": _recipient_dict(row) if row is not None else None,
+        "candidates_count": (run.candidates_count if run is not None else None),
+        "total_clients_seen": (run.total_clients_seen if run is not None else None),
+        **outcome.as_safe_dict(),
+    }
+
+
 @router.post("/runs/{run_id}/recipients/add", status_code=201)
 async def add_recipient(run_id: int, body: AddRecipientRequest) -> dict[str, Any]:
     """Добавить клиента в preview snapshot вручную.
@@ -2377,6 +2557,28 @@ def _followup_auto(run: CampaignRun) -> dict[str, Any] | None:
     }
 
 
+async def _summary_with_reasons(run: CampaignRun) -> dict[str, Any]:
+    """A run summary whose `excluded` block names the actual reasons.
+
+    The fixed Altegio counters answer for Altegio and say nothing about
+    EasyWeek, whose reasons are its own and whose vocabulary grows. Without
+    this, a freshly created EasyWeek preview came back with an `excluded` block
+    that had no `by_reason` at all, and the page read that as "nothing was
+    excluded" while the totals said otherwise.
+
+    Counted from the stored rows through the same aggregator the report and the
+    detail page use, so the three surfaces cannot disagree.
+    """
+    summary = _run_summary(run)
+    async with SessionLocal() as session:
+        by_reason = await excluded_reason_counts(session, run)
+    excluded = dict(summary.get("excluded") or {})
+    excluded["by_reason"] = by_reason
+    excluded["total"] = sum(by_reason.values())
+    summary["excluded"] = excluded
+    return summary
+
+
 def _run_summary(run: CampaignRun, *, used_as_source: bool = False, canary_locked: bool = False) -> dict[str, Any]:
     """Краткая сводка по run для списков."""
     return {
@@ -2521,6 +2723,12 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
         "display_name": r.display_name,
         "status": r.status,
         "excluded_reason": r.excluded_reason,
+        # §37.1. How this row got here, and — when an operator overrode the
+        # segmenter — what the segmenter had said. The customer UUID itself is
+        # never serialised: presence only.
+        "recipient_basis": r.recipient_basis,
+        "auto_excluded_reason": r.auto_excluded_reason,
+        "easyweek_customer_recorded": r.easyweek_customer_uuid is not None,
         "segment": {
             "total_records_in_period": r.total_records_in_period,
             "confirmed_records_in_period": r.confirmed_records_in_period,

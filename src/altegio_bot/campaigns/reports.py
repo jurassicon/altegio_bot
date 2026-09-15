@@ -23,7 +23,13 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.models.models import PROVIDER_ALTEGIO, CampaignRecipient, CampaignRun, OutboxMessage
+from altegio_bot.models.models import (
+    PROVIDER_ALTEGIO,
+    RECIPIENT_BASIS_EARNED,
+    CampaignRecipient,
+    CampaignRun,
+    OutboxMessage,
+)
 
 # Отображение company_id → название
 COMPANIES: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
@@ -48,6 +54,32 @@ def _use_or_fallback(run_value: int | None, fallback: int) -> int:
     return run_value if run_value is not None else fallback
 
 
+async def excluded_reason_counts(session: AsyncSession, run: CampaignRun) -> dict[str, int]:
+    """Why this run's recipients are excluded, counted from the rows themselves.
+
+    The single source for every surface that shows exclusions — the preview
+    response, the JSON report and the detail page — so they cannot drift.
+
+    Read from `CampaignRecipient` rather than from `run.meta`: the segmenter's
+    own reason counts are a snapshot of the moment segmentation finished, and a
+    manual add or remove afterwards leaves them stale. The rows are what the
+    snapshot actually is.
+
+    Counts only. A reason code carries no phone, no name and no UUID, and an
+    unknown one is passed through rather than dropped — EasyWeek's vocabulary
+    grows, and a reason this code has never heard of is exactly the one an
+    operator needs to see.
+    """
+    stmt = (
+        select(CampaignRecipient.excluded_reason, func.count(CampaignRecipient.id))
+        .where(CampaignRecipient.campaign_run_id == run.id)
+        .where(CampaignRecipient.provider == run.provider)
+        .where(CampaignRecipient.excluded_reason.is_not(None))
+        .group_by(CampaignRecipient.excluded_reason)
+    )
+    return {reason: int(count) for reason, count in (await session.execute(stmt)).all() if reason}
+
+
 async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     """Полный отчёт по одному CampaignRun."""
     run = await session.get(CampaignRun, run_id)
@@ -68,11 +100,32 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
     rows = (await session.execute(stmt)).all()
 
     status_counts: dict[str, int] = {}
-    reason_counts: dict[str, int] = {}
-    for status, reason, cnt in rows:
+    for status, _reason, cnt in rows:
         status_counts[status] = status_counts.get(status, 0) + cnt
-        if reason:
-            reason_counts[reason] = reason_counts.get(reason, 0) + cnt
+    reason_counts = await excluded_reason_counts(session, run)
+
+    # §37.1: on what grounds the snapshot's rows are in it. Counts only — no
+    # phone, no name, no customer UUID — and the totals reconcile with
+    # `total_clients_seen`, because every row has exactly one basis.
+    basis_stmt = (
+        select(
+            CampaignRecipient.recipient_basis,
+            CampaignRecipient.auto_excluded_reason,
+            func.count(CampaignRecipient.id).label("cnt"),
+        )
+        .where(CampaignRecipient.campaign_run_id == run_id)
+        .where(CampaignRecipient.provider == run.provider)
+        .group_by(CampaignRecipient.recipient_basis, CampaignRecipient.auto_excluded_reason)
+    )
+    basis_counts: dict[str, int] = {}
+    override_counts: dict[str, int] = {}
+    for basis, overrode, cnt in (await session.execute(basis_stmt)).all():
+        key = basis or RECIPIENT_BASIS_EARNED
+        basis_counts[key] = basis_counts.get(key, 0) + cnt
+        if overrode:
+            # An operator included somebody the segmenter had excluded. Kept
+            # separately from `by_reason`, which counts rows that ARE excluded.
+            override_counts[overrode] = override_counts.get(overrode, 0) + cnt
 
     # Attribution из outbox_messages (свежие данные с кумулятивным подсчётом)
     attr = await _fetch_attribution(session, run_id, provider=run.provider)
@@ -114,6 +167,12 @@ async def run_report(session: AsyncSession, run_id: int) -> dict[str, Any]:
             "no_confirmed_record_in_period": run.excluded_no_confirmed_record,
             "has_records_before_period": run.excluded_has_records_before,
             "by_reason": reason_counts,
+        },
+        # §37.1: how the snapshot was assembled, and what an operator overrode.
+        "recipient_basis": {
+            "by_basis": basis_counts,
+            "manual_overrides_by_auto_reason": override_counts,
+            "manual_overrides_total": sum(override_counts.values()),
         },
         # Loyalty
         "cards_deleted": run.cards_deleted_count,

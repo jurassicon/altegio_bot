@@ -2694,16 +2694,27 @@ async def remove_recipient_from_preview(
                 raise ValueError(f"CampaignRecipient {recipient_id} не принадлежит run {run_id}")
             require_same_provider(run.provider, recipient.provider)
 
+            if recipient.excluded_reason and recipient.excluded_reason != "manual_removed":
+                # The SEGMENTER already excluded this row, for its own reason.
+                # Overwriting that with `manual_removed` would destroy the only
+                # record of why the person was never a candidate — and a second
+                # removal is not what an operator asked for anyway.
+                raise ValueError(
+                    f"CampaignRecipient {recipient_id} уже исключён автоматически "
+                    f"({recipient.excluded_reason}) — ручное удаление не применяется."
+                )
+
             if recipient.excluded_reason != "manual_removed":
                 meta = dict(recipient.meta or {})
                 meta["manually_removed_at"] = utcnow().isoformat()
                 recipient.meta = meta
                 recipient.status = "skipped"
                 recipient.excluded_reason = "manual_removed"
-                # The typed test binding is deliberately kept. It is the audit
-                # trail of what this row was added as, and clearing it would
-                # make a removed test recipient indistinguishable from an
-                # ordinary excluded one. `skipped` already says it is out.
+                # The basis, the typed bindings and `auto_excluded_reason` are
+                # all deliberately kept. They are the audit trail of what this
+                # row was and why: clearing them would make a removed earned
+                # candidate, a removed manual selection and a removed test
+                # account indistinguishable. `skipped` already says it is out.
 
             # In the same transaction as the edit. The version that recounted
             # afterwards, in a session of its own, could commit the exclusion

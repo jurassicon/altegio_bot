@@ -1107,7 +1107,12 @@ async def test_record_created_builds_seven_params_in_order(
     db: AsyncSession,
     capture: CaptureProvider,
 ) -> None:
-    starts_at = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+    # Anchored on the real clock: the worker cancels a job whose appointment
+    # has already started, so a written-out date turns these into
+    # "Skipped: record starts_at is in the past" the morning it arrives.
+    # Every expectation below is derived from this value, so a relative one
+    # changes nothing except that it keeps being in the future.
+    starts_at = utcnow() + timedelta(days=30)
     client = await _seed_easyweek_client(db)
     record = await _seed_easyweek_record(db, client, starts_at=starts_at)
     db.add(
@@ -1148,7 +1153,12 @@ async def test_record_updated_builds_seven_params_in_order(
     db: AsyncSession,
     capture: CaptureProvider,
 ) -> None:
-    starts_at = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+    # Anchored on the real clock: the worker cancels a job whose appointment
+    # has already started, so a written-out date turns these into
+    # "Skipped: record starts_at is in the past" the morning it arrives.
+    # Every expectation below is derived from this value, so a relative one
+    # changes nothing except that it keeps being in the future.
+    starts_at = utcnow() + timedelta(days=30)
     client = await _seed_easyweek_client(db)
     record = await _seed_easyweek_record(db, client, starts_at=starts_at)
     db.add(
@@ -1189,7 +1199,12 @@ async def test_record_canceled_builds_five_params_with_the_static_page(
     db: AsyncSession,
     capture: CaptureProvider,
 ) -> None:
-    starts_at = datetime(2026, 9, 14, 8, 30, tzinfo=timezone.utc)
+    # Anchored on the real clock: the worker cancels a job whose appointment
+    # has already started, so a written-out date turns these into
+    # "Skipped: record starts_at is in the past" the morning it arrives.
+    # Every expectation below is derived from this value, so a relative one
+    # changes nothing except that it keeps being in the future.
+    starts_at = utcnow() + timedelta(days=30)
     client = await _seed_easyweek_client(db)
     record = await _seed_easyweek_record(db, client, starts_at=starts_at)
     db.add(

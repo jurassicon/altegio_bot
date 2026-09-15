@@ -31,6 +31,9 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.meta_templates import META_TEMPLATE_MAP
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
+    RECIPIENT_BASIS_MANUAL,
+    RECIPIENT_BASIS_TEST,
     CampaignRecipient,
     CampaignRun,
     EasyWeekCampaignVoucherDeliveryLedger,
@@ -121,6 +124,29 @@ def _error_cell(error: str | None) -> str:
         badge = '<span class="badge bg-info text-dark me-1">suppressed 131026</span>'
         cell = badge + cell
     return cell
+
+
+def _basis_badge(recipient: CampaignRecipient, *, with_audit_column: bool = False) -> str:
+    """`auto`, `manual` or `test` — plus what an override overrode.
+
+    A manual row that was originally excluded automatically shows both: the
+    operator's decision, and the reason it was taken against. Hiding the second
+    half would make an override indistinguishable from a clean addition.
+    """
+    basis = getattr(recipient, "recipient_basis", None) or RECIPIENT_BASIS_EARNED
+    label, style = {
+        RECIPIENT_BASIS_EARNED: ("auto", "bg-secondary"),
+        RECIPIENT_BASIS_MANUAL: ("manual", "bg-primary"),
+        RECIPIENT_BASIS_TEST: ("test", "bg-warning text-dark"),
+    }.get(basis, (basis, "bg-light text-dark"))
+    badge = f'<span class="badge {style}">{_esc(label)}</span>'
+    overrode = getattr(recipient, "auto_excluded_reason", None)
+    if overrode and not with_audit_column:
+        # The inline preview has no separate audit column, so the badge carries
+        # the override there. The full recipients page has one, and repeating it
+        # would read as two different facts.
+        badge += f' <span class="text-muted small">было: {_esc(overrode)}</span>'
+    return badge
 
 
 def _status_badge(status: str | None) -> str:
@@ -3346,6 +3372,27 @@ _NC_COMPANY_FOLLOWUP_TEMPLATES: dict[int, str] = {
 # Маппинг location_id → человекочитаемое название филиала
 LOCATIONS: dict[int, str] = {758285: "Karlsruhe", 1271200: "Rastatt"}
 
+# `?from_preview=` reaches a <script> block, so it is parsed here and never
+# forwarded as text. A run id is a small positive integer; nothing else is a
+# legitimate value, so anything else becomes "no preview" rather than something
+# to escape. `[0-9]` and not `\d`, because `\d` also matches digits from other
+# scripts that `int()` would happily accept.
+_FROM_PREVIEW_RE = re.compile(r"^[0-9]{1,10}$")
+_MAX_RUN_ID = 2147483647  # a PostgreSQL integer primary key
+
+
+def _parse_from_preview(raw: str | None) -> int | None:
+    """The `from_preview` query parameter as a run id, or None."""
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not _FROM_PREVIEW_RE.match(value):
+        return None
+    number = int(value)
+    if number <= 0 or number > _MAX_RUN_ID:
+        return None
+    return number
+
 
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
 async def ops_new_clients_campaign_page(request: Request) -> str:
@@ -3359,11 +3406,30 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     default_period_start = first_of_prev.strftime("%Y-%m-%d")
     default_period_end = last_day_prev.strftime("%Y-%m-%d")
 
-    # Если передан from_preview — предзаполнить previewRunId
-    from_preview_id = request.query_params.get("from_preview", "")
+    # Если передан from_preview — предзаполнить previewRunId.
+    # Значение уходит в исполняемый script, поэтому сюда оно попадает уже
+    # разобранным в int, а в разметку — через JSON-сериализатор.
+    from_preview_id = _parse_from_preview(request.query_params.get("from_preview"))
+    from_preview_js = json.dumps(from_preview_id)
 
     # Компании для выбора (один dropdown — и компания, и location_id)
     company_options = "".join(f'<option value="{cid}">{_esc(name)}</option>' for cid, name in COMPANIES.items())
+
+    # The EasyWeek branches come from the server's own registry and nowhere
+    # else. The browser picks among what is configured; it does not get to say
+    # what a branch is, and no location UUID crosses the wire.
+    ew_registry = configured_easyweek_locations()
+    ew_branches = sorted(ew_registry.locations.items()) if ew_registry.ready else []
+    easyweek_options = "".join(
+        f'<option value="{cid}">{_esc(location.name.title())} ({cid})</option>' for cid, location in ew_branches
+    )
+    easyweek_registry_note = (
+        "Список филиалов задан на сервере; location UUID не передаётся из браузера."
+        if ew_branches
+        else "EasyWeek location registry не настроен — preview недоступен."
+    )
+    if not ew_branches:
+        easyweek_options = '<option value="">— registry не настроен —</option>'
 
     # JavaScript-маппинг company_id → Meta template name для newsletter
     company_templates_js = json.dumps({str(cid): tname for cid, tname in _NC_COMPANY_TEMPLATES.items()})
@@ -3403,7 +3469,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <div class="mt-3 d-flex gap-2">
       <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(true)">Выбрать все</button>
       <button class="btn btn-sm btn-outline-secondary" onclick="outstandingSelectAll(false)">Снять все</button>
-      <button id="btn-delete-outstanding" class="btn btn-sm btn-danger ms-auto"
+      <button id="btn-delete-outstanding" class="btn btn-sm btn-danger ms-auto" disabled
               onclick="deleteOutstandingCards()">
         🗑️ Удалить выбранные
       </button>
@@ -3419,11 +3485,14 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
       <div class="col-md-4">
         <label class="form-label">Provider</label>
-        <input id="f-provider" class="form-control" value="altegio" disabled>
-        <div class="form-text">EasyWeek campaigns: readiness only in PR-13.</div>
+        <select id="f-provider" class="form-select" onchange="onProviderChange()">
+          <option value="altegio">altegio</option>
+          <option value="easyweek">easyweek</option>
+        </select>
+        <div class="form-text">EasyWeek: preview и редактирование snapshot (§37.1). Отправка закрыта.</div>
       </div>
 
-      <div class="col-md-4">
+      <div class="col-md-4 altegio-only">
         <label class="form-label">Кабинет / филиал Altegio</label>
         <select id="f-company" class="form-select">
           {company_options}
@@ -3431,7 +3500,15 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
         <div class="form-text">Выбор филиала задаёт company_id и location_id одновременно.</div>
       </div>
 
-      <div class="col-md-4">
+      <div class="col-md-4 easyweek-only d-none">
+        <label class="form-label">Филиал EasyWeek</label>
+        <select id="f-ew-company" class="form-select">
+          {easyweek_options}
+        </select>
+        <div class="form-text">{_esc(easyweek_registry_note)}</div>
+      </div>
+
+      <div class="col-md-4 altegio-only">
         <label class="form-label">Тип карты лояльности</label>
         <select id="f-card-type" class="form-select" disabled>
           <option value="">— выберите филиал —</option>
@@ -3456,7 +3533,21 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     </div>
 
+    <!-- ========== EASYWEEK §37.1 ========== -->
+    <div class="easyweek-only d-none">
+      <hr class="my-3">
+      <div class="alert alert-warning mb-0">
+        <b>EasyWeek preview (§37.1).</b> Кампания <code>new_clients_monthly</code>,
+        шаблон доставки <code>new_client_voucher</code>.
+        Здесь можно построить preview и вручную отредактировать список получателей.
+        <b>Отправка в §37.1 ещё закрыта</b> — выдача ваучеров, оплата и сообщения Meta
+        открываются отдельным следующим этапом. Карты лояльности, Altegio CRM и
+        follow-up к EasyWeek не применяются.
+      </div>
+    </div>
+
     <!-- ========== FOLLOW-UP НАСТРОЙКИ ========== -->
+    <div class="altegio-only">
     <hr class="my-3">
     <h6 class="fw-bold">📩 Follow-up настройки</h6>
     <div class="row g-3">
@@ -3491,12 +3582,36 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 
     <!-- Follow-up template text (read-only preview) -->
     <div id="followup-template-text-block" class="mt-3 d-none"></div>
+    </div>
 
   </div>
 </div>
 
-<!-- ========== БЛОК ШАБЛОНА ========== -->
-<div class="card mb-3">
+<!-- ========== БЛОК ШАБЛОНА: EASYWEEK ========== -->
+<div class="card mb-3 easyweek-only d-none">
+  <div class="card-header fw-bold">📄 Шаблон EasyWeek (только для просмотра)</div>
+  <div class="card-body">
+    <dl class="row mb-2">
+      <dt class="col-sm-3">Provider</dt>
+      <dd class="col-sm-9"><code>easyweek</code></dd>
+      <dt class="col-sm-3">Internal code</dt>
+      <dd class="col-sm-9"><code>new_client_voucher</code></dd>
+      <dt class="col-sm-3">Meta template</dt>
+      <dd class="col-sm-9"><span id="ew-template-name">—</span></dd>
+      <dt class="col-sm-3">Язык</dt>
+      <dd class="col-sm-9"><span id="ew-template-language">—</span></dd>
+    </dl>
+    <div id="ew-template-status" class="text-muted small">⏳ Проверка шаблона филиала…</div>
+    <div class="alert alert-warning small mt-2 mb-0">
+      §37.1 открывает <b>только preview и редактор snapshot</b>. Send-real, follow-up,
+      jobs, Outbox и массовая доставка для EasyWeek закрыты; Altegio newsletter и
+      follow-up к EasyWeek не относятся и здесь не используются.
+    </div>
+  </div>
+</div>
+
+<!-- ========== БЛОК ШАБЛОНА: ALTEGIO ========== -->
+<div class="card mb-3 altegio-only">
   <div class="card-header fw-bold">📄 Текст рассылки (Meta WhatsApp — только для просмотра)</div>
   <div class="card-body">
     <dl class="row mb-2">
@@ -3585,7 +3700,12 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     <button id="btn-run" class="btn btn-success btn-lg" disabled>
       🚀 Run Campaign
     </button>
-    <span class="text-muted ms-2 small">Доступно после создания preview</span>
+    <span class="text-muted ms-2 small altegio-only">Доступно после создания preview</span>
+    <div id="easyweek-send-closed" class="alert alert-secondary mt-2 mb-0 d-none">
+      Редактор snapshot готов. <b>Отправка EasyWeek в §37.1 закрыта</b> — выдача ваучеров,
+      оплата и сообщения Meta открываются отдельным следующим этапом, после проверки
+      редактора. Кнопка запуска намеренно недоступна, а не ведёт в Altegio send-real.
+    </div>
   </div>
   <div id="run-alert" class="mb-3"></div>
 
@@ -3615,7 +3735,172 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
 // ============================================================
 const COMPANY_TEMPLATES = {company_templates_js};
 const COMPANY_FOLLOWUP_TEMPLATES = {company_followup_templates_js};
-let previewRunId = {from_preview_id or "null"};
+// Where the page STARTED, when opened as `?from_preview=37`. Read once and
+// never rewritten: it is not the preview currently on screen, and treating it
+// as mutable state is how the initial provider setup came to erase it.
+const FROM_PREVIEW_ID = {from_preview_js};
+let previewRunId = null;
+// The provider the UI was last shaped for. `onProviderChange` runs once during
+// setup, and that first call is not a user switching anything.
+let LAST_PROVIDER = null;
+
+// ---------------------------------------------------------------------------
+// One clock for everything asynchronous on this page
+// ---------------------------------------------------------------------------
+// Preview, from-preview prefill, card types and recipients used to keep their
+// own counters, which meant they could disagree: an invalidation that revoked
+// a preview left a prefill running, and a prefill could finish over a preview
+// that had replaced it. They share one clock now.
+//
+// A request takes a ticket when it starts and may touch the screen only while
+// that ticket is still the current one. Anything that makes the screen mean
+// something else — a provider switch, a branch change, an edited snapshot
+// field, a new preview, an explicit invalidation — moves the clock forward,
+// and every older ticket stops being valid at that instant. Because the clock
+// only ever goes forward, coming back to where you started (Altegio → EasyWeek
+// → Altegio) does not revive anything that was asked for the first time round.
+let PAGE_EPOCH = 0;
+
+function beginOperation() {{
+  PAGE_EPOCH += 1;
+  return PAGE_EPOCH;
+}}
+
+// A ticket for work that rides along with whatever is current — card types,
+// template texts — rather than starting something new.
+function currentTicket() {{
+  return PAGE_EPOCH;
+}}
+
+function owns(ticket) {{
+  return ticket === PAGE_EPOCH;
+}}
+
+// The preview or prefill request that currently owns the busy state, or null
+// when the page is idle. `signature` is what that request asked for; a prefill
+// has none, because what it will ask for is decided by the run it is fetching.
+let PREVIEW_IN_FLIGHT = null;
+
+// The live card-type list is a REFERENCE read, not part of a snapshot
+// operation, so it keeps its own generation. Revoking a preview or a prefill
+// must not permanently destroy the only list the operator can choose from —
+// which is exactly what happens when a reference read rides the page clock.
+//
+// `state` is one of: "idle" (nothing loaded), "loading", "loaded" (a live list
+// for `scope`), "empty" (the branch has no card types), "failed" (and may be
+// retried) and "snapshot" (frozen by a loaded preview). `scope` says who the
+// list belongs to, because a list loaded for another branch is not a list.
+let CARD_TYPES_GENERATION = 0;
+let CARD_TYPES_STATE = {{state: "idle", scope: null}};
+
+// ---------------------------------------------------------------------------
+// The scope a rendered preview belongs to
+// ---------------------------------------------------------------------------
+// Everything on screen describes ONE saved run. Which provider's schema to draw
+// it with is a property of that run, not of whatever the dropdown says now —
+// reading the dropdown is how an EasyWeek snapshot ends up rendered with
+// Altegio columns a second after somebody switches provider.
+//
+// Each load also carries a token, so an answer that arrives after the operator
+// has moved on is discarded instead of painting over the newer one.
+let PREVIEW_CONTEXT = null;
+let RECIPIENTS_GENERATION = 0;
+
+// -- the decisions, as pure functions ---------------------------------------
+// No DOM and no fetch, so they can be executed directly rather than described
+// twice: once here and once in a test that re-implements them.
+
+function currentScope() {{
+  const provider = document.getElementById("f-provider").value;
+  const companyEl = provider === "easyweek"
+    ? document.getElementById("f-ew-company")
+    : document.getElementById("f-company");
+  return {{provider: provider, companyId: String((companyEl && companyEl.value) || "")}};
+}}
+
+// Everything that defines WHICH snapshot a preview is. Two previews with the
+// same provider and company but a different period are different previews, and
+// running one against the other's recipients is the mistake this prevents.
+function snapshotSignature() {{
+  const provider = document.getElementById("f-provider").value;
+  const easyweek = provider === "easyweek";
+  const companyEl = easyweek
+    ? document.getElementById("f-ew-company")
+    : document.getElementById("f-company");
+  const companyId = String((companyEl && companyEl.value) || "");
+  const value = function (id) {{
+    const el = document.getElementById(id);
+    return el ? String(el.value || "") : "";
+  }};
+  const followupEnabled = easyweek
+    ? false
+    : !!(document.getElementById("f-followup-enabled") || {{}}).checked;
+  return {{
+    provider: provider,
+    companyId: companyId,
+    // Altegio addresses a branch by a numeric id; EasyWeek resolves it from the
+    // company on the server, so there is none to compare.
+    locationId: easyweek ? "" : companyId,
+    periodStart: value("f-period-start"),
+    periodEnd: value("f-period-end"),
+    attributionWindowDays: value("f-attribution"),
+    // Altegio-only fields. They are empty for EasyWeek by construction, which
+    // is itself part of the signature: a snapshot that had one is not this one.
+    cardTypeId: easyweek ? "" : value("f-card-type"),
+    followupEnabled: followupEnabled,
+    followupDelayDays: followupEnabled ? value("f-followup-delay") : "",
+    followupPolicy: followupEnabled ? value("f-followup-policy") : "",
+    followupTemplateName: followupEnabled ? value("f-followup-template") : "",
+  }};
+}}
+
+const SIGNATURE_FIELDS = [
+  "provider", "companyId", "locationId", "periodStart", "periodEnd",
+  "attributionWindowDays", "cardTypeId", "followupEnabled",
+  "followupDelayDays", "followupPolicy", "followupTemplateName",
+];
+
+function signatureMatches(a, b) {{
+  if (!a || !b) return false;
+  for (const field of SIGNATURE_FIELDS) {{
+    if (String(a[field]) !== String(b[field])) return false;
+  }}
+  return true;
+}}
+
+function scopeMatches(a, b) {{
+  if (!a || !b) return false;
+  return a.provider === b.provider && String(a.companyId) === String(b.companyId);
+}}
+
+// May an answer that just arrived be drawn?
+function mayRender(responseToken, currentToken, responseScope, current) {{
+  if (responseToken !== currentToken) return false;
+  return scopeMatches(responseScope, current);
+}}
+
+// May the Run button be offered at all? Only for a saved Altegio preview that
+// still matches the screen and that the SERVER said is runnable. EasyWeek never
+// qualifies: §37.1 opens the editor, not the sending.
+function mayRunFromPreview(context, current, signature) {{
+  if (!context || !context.runId) return false;
+  if (context.provider !== "altegio") return false;
+  if (!context.runnable) return false;
+  if (!scopeMatches(context, current)) return false;
+  // And the form must still describe the snapshot that was built. A changed
+  // period or card type means the operator is looking at different parameters
+  // than the recipients below them.
+  if (signature !== undefined && !signatureMatches(context.signature, signature)) return false;
+  // The campaign issues a loyalty card, so a snapshot with no card type has
+  // nothing to send. Refused here rather than discovered at confirm time.
+  if (signature !== undefined && !signature.cardTypeId) return false;
+  return true;
+}}
+
+// Which schema to draw a preview or a recipients page with.
+function schemaProvider(context) {{
+  return (context && context.provider) ? context.provider : "altegio";
+}}
 let runRunId = null;
 let progressInterval = null;
 
@@ -3627,12 +3912,14 @@ document.addEventListener("DOMContentLoaded", function () {{
 
   companySelect.addEventListener("change", function () {{
     const cid = companySelect.value;
-    // Очистить результат предыдущей операции удаления при смене филиала
-    document.getElementById("outstanding-delete-result").innerHTML = "";
     // Перезагрузить шаблоны для новой компании
     loadTemplateText(cid);
     setFollowupTemplateDefault(cid);
     loadFollowupTemplateText(cid);
+    // A different branch: the table on screen no longer describes anything
+    // deletable, and any in-flight read for the previous one is now stale.
+    resetOutstandingPanel();
+    invalidatePreviewContext();
     // Перезагрузить карты прошлых периодов для новой компании
     loadOutstandingCards(cid);
     // Автоматически загрузить типы карт для выбранного филиала
@@ -3654,117 +3941,266 @@ document.addEventListener("DOMContentLoaded", function () {{
     }}
   }});
 
+  // Changing anything that defines the snapshot revokes the preview on screen:
+  // the recipients below no longer describe what the form now asks for.
+  for (const fieldId of [
+    "f-period-start", "f-period-end", "f-attribution", "f-card-type",
+    "f-followup-enabled", "f-followup-delay", "f-followup-policy", "f-followup-template",
+  ]) {{
+    const el = document.getElementById(fieldId);
+    if (!el) continue;
+    el.addEventListener("change", onSnapshotFieldChange);
+  }}
+
   document.getElementById("btn-preview").addEventListener("click", createPreview);
   document.getElementById("btn-run").addEventListener("click", runCampaign);
+  onProviderChange();
 
   // Загрузить тексты шаблонов, типы карт и карты прошлых периодов для company по умолчанию
+  const ewCompanySelect = document.getElementById("f-ew-company");
+  if (ewCompanySelect) {{
+    ewCompanySelect.addEventListener("change", function () {{
+      loadEasyWeekTemplateStatus();
+      // A different branch: the preview on screen is somebody else's snapshot.
+      invalidatePreviewContext();
+      // And any in-flight Altegio card read is now stale.
+      OUTSTANDING_GENERATION += 1;
+      OUTSTANDING_SCOPE = null;
+    }});
+  }}
+
   loadTemplateText(companySelect.value);
   loadFollowupTemplateText(companySelect.value);
   setFollowupTemplateDefault(companySelect.value);
-  loadCardTypes();
-  loadOutstandingCards(companySelect.value);
 
-  // Если открыта со страницы history (from_preview), подгрузить параметры preview
-  if (previewRunId) {{
-    loadPreviewAndPrefill(previewRunId);
+  // Если открыта со страницы history (from_preview), подгрузить параметры preview.
+  // Read from the immutable id, not from the mutable current-preview state:
+  // shaping the form above must not be able to erase where the page started.
+  if (FROM_PREVIEW_ID) {{
+    // Deliberately NOT loading live card types or outstanding cards here. Both
+    // would be requested for the branch the page happens to open on, while the
+    // run about to load may belong to another one — and an answer for the
+    // default branch arriving afterwards is exactly the race this avoids. The
+    // prefill reads both for the run's own branch once the run is accepted, and
+    // a refused prefill hands the page back as an ordinary one that reads them
+    // for the branch on screen.
+    loadPreviewAndPrefill(FROM_PREVIEW_ID);
+  }} else {{
+    loadCardTypes();
+    loadOutstandingCards(companySelect.value);
   }}
 }});
 
 // ============================================================
 // Предзаполнение формы из preview run (from_preview=ID)
 // ============================================================
+// Does this UI know the branch the saved run was built for? The company select
+// is rendered from the server's own list, so an option existing IS the check.
+function companyOptionExists(companyId) {{
+  const select = document.getElementById("f-company");
+  if (!select) return false;
+  for (const option of select.options) {{
+    if (String(option.value) === String(companyId)) return true;
+  }}
+  return false;
+}}
+
+// May this saved run be loaded into the editor? Decided before a single field
+// is touched, so a rejection can never leave a half-filled, half-frozen form.
+// Returns null to accept, or the message to show.
+//
+// Note what is NOT checked here: which branch the form happened to be showing
+// when the page opened. The run decides the branch — comparing it against the
+// default is what made every preview of a non-default branch unopenable.
+function prefillRejection(run, runId) {{
+  if (!run || Number(run.id) !== Number(runId)) {{
+    return {{level: "danger",
+      message: "Ответ сервера относится к другому run, а не к preview #" + runId + "."}};
+  }}
+  if (run.mode !== "preview" || run.status !== "completed") {{
+    return {{level: "danger",
+      message: "Preview #" + runId + " имеет режим «" + (run.mode || "?") + "» и статус «" +
+        (run.status || "?") + "». Запускать можно только завершённые preview."}};
+  }}
+  if (run.provider !== "altegio") {{
+    // An EasyWeek preview opens in the editor, never in the runner: §37.1
+    // opens editing and nothing else.
+    return {{level: "warning",
+      message: "Preview #" + runId + " относится к EasyWeek. Запуск для EasyWeek закрыт (§37.1); " +
+        "доступен только просмотр и редактирование snapshot."}};
+  }}
+  const companies = run.company_ids || [];
+  if (companies.length !== 1) {{
+    return {{level: "danger",
+      message: "Preview #" + runId + " охватывает " + companies.length +
+        " филиал(ов). Редактор работает с одним филиалом."}};
+  }}
+  if (!companyOptionExists(companies[0])) {{
+    return {{level: "danger",
+      message: "Филиал " + companies[0] + " из preview #" + runId +
+        " недоступен в этом интерфейсе."}};
+  }}
+  return null;
+}}
+
+// Fill the form from the saved run and freeze what the snapshot fixed. Called
+// only after `prefillRejection` has accepted the run, and every value it writes
+// is the run's own — this is the page programmatically describing the snapshot,
+// not the operator choosing anything.
+function hydrateFormFromRun(run) {{
+  const companyId = String((run.company_ids || [])[0]);
+  const companySelect = document.getElementById("f-company");
+  companySelect.value = companyId;
+  loadTemplateText(companyId);
+  setFollowupTemplateDefault(companyId);
+  loadFollowupTemplateText(companyId);
+
+  // Selecting a branch from JavaScript fires no `change`, so nothing else will
+  // do this: revoke whatever the panel was showing or waiting for, then read
+  // the cards of the branch this run actually belongs to. Without it the page
+  // keeps the default branch's outstanding cards under another branch's
+  // preview, and Delete would act on the wrong list.
+  resetOutstandingPanel();
+  loadOutstandingCards(companyId);
+
+  if (run.period_start) {{
+    document.getElementById("f-period-start").value = run.period_start.substring(0, 10);
+  }}
+  if (run.period_end) {{
+    document.getElementById("f-period-end").value = run.period_end.substring(0, 10);
+  }}
+
+  // The attribution window is part of the snapshot signature, so it has to
+  // come back from the run like every other locked parameter — otherwise the
+  // form would describe a different window than the recipients below it.
+  if (run.attribution_window_days) {{
+    document.getElementById("f-attribution").value = String(run.attribution_window_days);
+  }}
+  document.getElementById("f-attribution").disabled = true;
+
+  // Предзаполнить и зафиксировать card_type_id из снимка. The option may not be
+  // in the list — the branch's live card types are not loaded for a from-preview
+  // page precisely so that they cannot race this — so it is added when missing.
+  if (run.card_type_id) {{
+    const cardEl = document.getElementById("f-card-type");
+    let found = false;
+    for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
+    if (!found) {{
+      const opt = document.createElement("option");
+      opt.value = String(run.card_type_id);
+      opt.text = "Card " + run.card_type_id + " (из preview)";
+      cardEl.appendChild(opt);
+    }}
+    cardEl.value = String(run.card_type_id);
+  }}
+  // Shut either way: a snapshot without a card type is not one to pick a card
+  // type for. The select now belongs to the snapshot, not to any live list.
+  document.getElementById("f-card-type").disabled = true;
+  CARD_TYPES_STATE = {{state: "snapshot", scope: {{provider: "altegio", companyId: companyId}}}};
+
+  // Предзаполнить и зафиксировать followup-параметры из снимка
+  const fuCheckbox = document.getElementById("f-followup-enabled");
+  fuCheckbox.checked = !!run.followup_enabled;
+  fuCheckbox.disabled = true;
+
+  const fuDelay = document.getElementById("f-followup-delay");
+  const fuPolicy = document.getElementById("f-followup-policy");
+  const fuTemplate = document.getElementById("f-followup-template");
+
+  if (run.followup_enabled) {{
+    fuDelay.value = run.followup_delay_days || "";
+    fuPolicy.value = run.followup_policy || "";
+    fuTemplate.value = run.followup_template_name || "";
+  }}
+  fuDelay.disabled = true;
+  fuPolicy.disabled = true;
+  fuTemplate.disabled = true;
+
+  // Заблокировать ключевые поля — они должны совпадать с preview
+  companySelect.disabled = true;
+  document.getElementById("f-period-start").disabled = true;
+  document.getElementById("f-period-end").disabled = true;
+}}
+
 async function loadPreviewAndPrefill(runId) {{
+  // On the same clock as everything else: a ticket, checked before the answer
+  // is allowed to touch anything. An operator who switches provider or branch
+  // while this is in flight must not have the form filled in behind them — and
+  // because the clock only moves forward, going away and coming back to the
+  // same provider and branch does not make this answer welcome again.
+  const ticket = beginOperation();
+  PREVIEW_IN_FLIGHT = {{ticket: ticket, scope: currentScope(), signature: null}};
+  setPreviewBusy(true);
   try {{
     const resp = await fetch("/ops/campaigns/runs/" + runId);
+    // Ownership is the whole check. The branch on screen is deliberately NOT
+    // compared: what the run says is about to become the branch on screen.
+    if (!owns(ticket)) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "warning",
         "Не удалось загрузить параметры preview #" + runId +
-        ". Проверьте ID.");
+        ". Проверьте ID. Страница работает как обычно.");
+      resetPreviewSurface();
+      returnToOrdinaryAltegioPage();
       return;
     }}
     const run = await resp.json();
+    if (!owns(ticket)) return;
 
-    // Только completed preview можно использовать как источник
-    if (run.status !== "completed") {{
-      setAlert("preview-alert", "danger",
-        "Preview #" + runId + " имеет статус «" + run.status + "». " +
-        "Только завершённые (completed) previews можно запускать.");
-      document.getElementById("btn-run").disabled = true;
+    const rejection = prefillRejection(run, runId);
+    if (rejection) {{
+      // The surface comes down but the message stays: `invalidatePreviewContext`
+      // would clear the very alert that explains the refusal.
+      setAlert("preview-alert", rejection.level, rejection.message);
+      resetPreviewSurface();
+      // A refused link must not leave a page that can no longer do anything:
+      // the live card list and this branch's outstanding cards come back.
+      returnToOrdinaryAltegioPage();
       return;
     }}
 
-    // Заполнить поля из preview
-    if (run.provider !== "altegio") {{
-      setAlert("preview-alert", "danger", "Этот provider не поддерживает send-real в PR-13.");
-      document.getElementById("btn-run").disabled = true;
-      return;
-    }}
-    const companyId = (run.company_ids || [])[0];
-    if (companyId) {{
-      const companySelect = document.getElementById("f-company");
-      companySelect.value = String(companyId);
-      loadTemplateText(String(companyId));
-      setFollowupTemplateDefault(String(companyId));
-      loadFollowupTemplateText(String(companyId));
-    }}
+    hydrateFormFromRun(run);
+    // Filling the form ran no `await`, so nothing could have moved underneath
+    // it — but the context is only ever built on a ticket that is still current.
+    if (!owns(ticket)) return;
 
-    if (run.period_start) {{
-      document.getElementById("f-period-start").value =
-        run.period_start.substring(0, 10);
-    }}
-    if (run.period_end) {{
-      document.getElementById("f-period-end").value =
-        run.period_end.substring(0, 10);
-    }}
+    // A full context, built from the SAVED RUN — including the server's own
+    // verdict about whether it may be run from. The signature is read back off
+    // the form that was just filled from that run, so the two cannot disagree.
+    // Availability is never decided here: `applyRunAvailability` owns that, and
+    // it refuses anything the server did not mark runnable.
+    PREVIEW_CONTEXT = {{
+      runId: run.id,
+      provider: run.provider,
+      companyId: String((run.company_ids || [])[0] || ""),
+      runnable: run.is_runnable_from_preview === true,
+      signature: snapshotSignature(),
+    }};
+    previewRunId = run.id;
 
-    // Предзаполнить и зафиксировать card_type_id из снимка
-    if (run.card_type_id) {{
-      const cardEl = document.getElementById("f-card-type");
-      let found = false;
-      for (let opt of cardEl.options) {{ if (opt.value === String(run.card_type_id)) {{ found = true; break; }} }}
-      if (!found) {{
-        const opt = document.createElement("option");
-        opt.value = String(run.card_type_id);
-        opt.text = "Card " + run.card_type_id + " (из preview)";
-        cardEl.appendChild(opt);
-      }}
-      cardEl.value = String(run.card_type_id);
-      cardEl.disabled = true;
-    }}
-
-    // Предзаполнить и зафиксировать followup-параметры из снимка
-    const fuCheckbox = document.getElementById("f-followup-enabled");
-    fuCheckbox.checked = !!run.followup_enabled;
-    fuCheckbox.disabled = true;
-
-    const fuDelay = document.getElementById("f-followup-delay");
-    const fuPolicy = document.getElementById("f-followup-policy");
-    const fuTemplate = document.getElementById("f-followup-template");
-
-    if (run.followup_enabled) {{
-      fuDelay.value = run.followup_delay_days || "";
-      fuPolicy.value = run.followup_policy || "";
-      fuTemplate.value = run.followup_template_name || "";
-    }}
-    fuDelay.disabled = true;
-    fuPolicy.disabled = true;
-    fuTemplate.disabled = true;
-
-    // Заблокировать ключевые поля — они должны совпадать с preview
-    document.getElementById("f-company").disabled = true;
-    document.getElementById("f-period-start").disabled = true;
-    document.getElementById("f-period-end").disabled = true;
-
-    // Показать таблицу получателей и активировать Run
     document.getElementById("preview-results").classList.remove("d-none");
-    document.getElementById("btn-run").disabled = false;
+    applyRunAvailability();
     loadRecipients(true);
     setAlert("preview-alert", "info",
       "🔒 Параметры зафиксированы по preview #" + runId +
-      " (компания, период, тип карты, follow-up). Нажмите «Run Campaign» для запуска.");
+      " (компания, период, тип карты, follow-up)." +
+      (!run.card_type_id
+        ? " В снимке не сохранён тип карты лояльности, поэтому запуск недоступен: "
+          + "постройте preview заново с выбранным типом карты."
+        : PREVIEW_CONTEXT.runnable
+          ? " Нажмите «Run Campaign» для запуска."
+          : " Сервер не разрешает запуск из этого preview."));
 
   }} catch (e) {{
+    if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка загрузки preview: " + e.message);
+    resetPreviewSurface();
+    returnToOrdinaryAltegioPage();
+  }} finally {{
+    if (owns(ticket)) {{
+      PREVIEW_IN_FLIGHT = null;
+      setPreviewBusy(false);
+    }}
   }}
 }}
 
@@ -3853,36 +4289,82 @@ async function loadFollowupTemplateText(companyId) {{
 // Загрузка типов карт
 // ============================================================
 async function loadCardTypes() {{
-  // location_id == company_id (один dropdown для обоих)
-  const locationId = document.getElementById("f-company").value.trim();
+  // A reference read on its own generation, scoped to the provider and branch
+  // it was asked for. Two things can make an answer unusable: a newer read, or
+  // the selection moving underneath it — and neither is the page clock, which
+  // is why this does not ride it.
+  const scope = currentScope();
+  // Already on its way for this very branch — a branch change both recovers the
+  // list and reloads it — so a second read would ask the same question. Checked
+  // BEFORE taking a generation: taking one would revoke the read in flight and
+  // then return, leaving the select loading forever.
+  if (CARD_TYPES_STATE.state === "loading"
+      && CARD_TYPES_STATE.scope
+      && scopeMatches(CARD_TYPES_STATE.scope, scope)) {{
+    return;
+  }}
+
+  const generation = ++CARD_TYPES_GENERATION;
   const statusEl = document.getElementById("card-load-status");
   const cardSelect = document.getElementById("f-card-type");
 
+  // Loyalty cards are an Altegio concept; EasyWeek has none to load.
+  if (isEasyWeek()) {{
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
+    return;
+  }}
+  // A loaded snapshot fixed its card type, and the select is shut. A live list
+  // has nothing to contribute to it and everything to break, so it steps aside
+  // — checked here and again after the answer, because a snapshot can finish
+  // loading while this request is in flight.
+  if (PREVIEW_CONTEXT) return;
+
+  // location_id == company_id (один dropdown для обоих)
+  const locationId = String(scope.companyId || "").trim();
   if (!locationId) {{
     cardSelect.innerHTML = '<option value="">— выберите филиал —</option>';
     cardSelect.disabled = true;
     statusEl.textContent = "";
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
     return;
   }}
 
+  CARD_TYPES_STATE = {{state: "loading", scope: scope}};
   statusEl.textContent = "Загрузка типов карт...";
   cardSelect.innerHTML = '<option value="">— загрузка… —</option>';
   cardSelect.disabled = true;
+
+  // Still ours to paint? A newer read, a moved selection, a provider switch or
+  // a snapshot that loaded meanwhile all say no.
+  const mine = function () {{
+    return generation === CARD_TYPES_GENERATION
+      && !PREVIEW_CONTEXT
+      && !isEasyWeek()
+      && scopeMatches(scope, currentScope());
+  }};
 
   try {{
     const resp = await fetch(
       "/ops/campaigns/new-clients/card-types?location_id=" + encodeURIComponent(locationId)
     );
+    if (!mine()) return;
     if (!resp.ok) {{
       const err = await resp.json().catch(() => ({{detail: resp.statusText}}));
-      statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText);
+      if (!mine()) return;
+      CARD_TYPES_STATE = {{state: "failed", scope: scope}};
+      statusEl.textContent = "Не удалось загрузить типы карт. " + (err.detail || resp.statusText)
+        + " Выберите филиал заново, чтобы повторить.";
       cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
+      cardSelect.disabled = true;
       return;
     }}
     const types = await resp.json();
+    if (!mine()) return;
     if (!Array.isArray(types) || types.length === 0) {{
+      CARD_TYPES_STATE = {{state: "empty", scope: scope}};
       statusEl.textContent = "Нет доступных типов карт.";
       cardSelect.innerHTML = '<option value="">— нет доступных типов карт —</option>';
+      cardSelect.disabled = true;
       return;
     }}
     cardSelect.innerHTML = types.map(function(t) {{
@@ -3891,10 +4373,17 @@ async function loadCardTypes() {{
       return '<option value="' + escHtml(String(id)) + '">' + escHtml(title) + '</option>';
     }}).join("");
     cardSelect.disabled = false;
+    CARD_TYPES_STATE = {{state: "loaded", scope: scope}};
     statusEl.textContent = "Загружено " + types.length + " тип(ов) карт.";
+    // The list is what Run availability was waiting for.
+    applyRunAvailability();
   }} catch (e) {{
-    statusEl.textContent = "Не удалось загрузить типы карт. " + e.message;
+    if (!mine()) return;
+    CARD_TYPES_STATE = {{state: "failed", scope: scope}};
+    statusEl.textContent = "Не удалось загрузить типы карт. " + e.message
+      + " Выберите филиал заново, чтобы повторить.";
     cardSelect.innerHTML = '<option value="">— ошибка загрузки —</option>';
+    cardSelect.disabled = true;
   }}
 }}
 
@@ -3902,35 +4391,116 @@ async function loadCardTypes() {{
 // Создать Preview
 // ============================================================
 async function createPreview() {{
-  const payload = buildPayload();
-  if (!payload) return;
+  // A preview is a snapshot of who gets which loyalty card. Asking for one
+  // before the branch's card types have loaded would send card_type_id=null and
+  // save a snapshot that can never be run.
+  if (!isEasyWeek()) {{
+    const status = cardTypesStatus();
+    if (status === "loading") {{
+      setAlert("preview-alert", "warning",
+        "Типы карт ещё загружаются. Дождитесь списка и выберите тип карты.");
+      return;
+    }}
+    if (status === "failed" || status === "empty") {{
+      setAlert("preview-alert", "danger",
+        "Типы карт для этого филиала недоступны, preview не может быть построен. "
+        + "Выберите филиал заново, чтобы повторить загрузку.");
+      return;
+    }}
+    if (status === "stale") {{
+      setAlert("preview-alert", "warning",
+        "Список типов карт относится к другому филиалу. Загружаем актуальный — "
+        + "повторите попытку.");
+      loadCardTypes();
+      return;
+    }}
+    if (!document.getElementById("f-card-type").value) {{
+      setAlert("preview-alert", "danger",
+        "Выберите тип карты лояльности перед построением preview.");
+      return;
+    }}
+  }}
 
-  setAlert("preview-alert", "", "");
-  document.getElementById("preview-spinner").classList.remove("d-none");
-  document.getElementById("btn-preview").disabled = true;
+  // Everything this request is about, read in one go BEFORE anything is
+  // revoked, reloaded or redrawn: what is being asked for, which provider and
+  // branch it belongs to, the full snapshot signature, and whether the card
+  // type in both of those came from a snapshot's frozen select rather than a
+  // live list. Reading any of it after the takedown is what let the payload and
+  // the signature disagree about the card.
+  const captured = {{
+    payload: buildPayload(),
+    scope: currentScope(),
+    signature: snapshotSignature(),
+    fromFrozenSnapshot: !isEasyWeek() && CARD_TYPES_STATE.state === "snapshot"
+      && cardTypesStatus() === "ready",
+  }};
+  if (!captured.payload) return;
+
+  // Starting B revokes A here, BEFORE the request goes out. Anything that
+  // arrives for A afterwards has nothing to restore, and a failure of B leaves
+  // no stale predecessor behind either.
+  revokePreviewFor(captured);
+
+  // This request owns the busy state from here until it loses the ticket.
+  const ticket = beginOperation();
+  const asked = captured.scope;
+  const askedSignature = captured.signature;
+  PREVIEW_IN_FLIGHT = {{ticket: ticket, scope: asked, signature: askedSignature}};
+  setPreviewBusy(true);
 
   try {{
     const resp = await fetch("/ops/campaigns/new-clients/preview", {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify(payload),
+      body: JSON.stringify(captured.payload),
     }});
     const data = await resp.json();
+    // Four things have to agree before a single pixel changes: this request is
+    // still the current one, the provider and branch are still the ones it was
+    // asked for, and the form still describes the snapshot it asked for. Any
+    // of them having moved makes this answer a description of a screen that no
+    // longer exists — including a Detail link to a snapshot built from
+    // parameters the operator has since edited away.
+    if (!owns(ticket)) return;
+    if (!scopeMatches(asked, currentScope())) return;
+    if (!signatureMatches(askedSignature, snapshotSignature())) return;
     if (!resp.ok) {{
       setAlert("preview-alert", "danger", "Preview ошибка: " + (data.detail || JSON.stringify(data)));
+      // Nothing to go back to: the previous preview was revoked before this
+      // request left. What remains is an ordinary editable page — except that
+      // its select may still hold a frozen card with no snapshot behind it.
+      recoverLiveCardTypes();
       return;
     }}
+    // The context comes from the RUN, not from the dropdown, and carries the
+    // server's own verdict about whether it may be run from.
+    PREVIEW_CONTEXT = {{
+      runId: data.id,
+      provider: data.provider || asked.provider,
+      companyId: String((data.company_ids && data.company_ids[0]) || asked.companyId),
+      runnable: data.is_runnable_from_preview === true,
+      // The parameters this snapshot was built from, frozen with it.
+      signature: askedSignature,
+    }};
     previewRunId = data.id;
     renderPreviewSummary(data);
     document.getElementById("preview-results").classList.remove("d-none");
-    document.getElementById("btn-run").disabled = false;
+    applyRunAvailability();
     loadRecipients(true);
     setAlert("preview-alert", "success", "Preview готов! Run ID: " + previewRunId);
   }} catch (e) {{
+    if (!owns(ticket)) return;
     setAlert("preview-alert", "danger", "Ошибка сети: " + e.message);
+    recoverLiveCardTypes();
   }} finally {{
-    document.getElementById("preview-spinner").classList.add("d-none");
-    document.getElementById("btn-preview").disabled = false;
+    // Even the cleanup belongs to whoever owns the page now. An old request
+    // finishing here would hide a running spinner and re-enable a button
+    // mid-flight; a revoked one has already been cleaned up by the invalidation
+    // that revoked it.
+    if (owns(ticket)) {{
+      PREVIEW_IN_FLIGHT = null;
+      setPreviewBusy(false);
+    }}
   }}
 }}
 
@@ -3939,6 +4509,9 @@ async function createPreview() {{
 // ============================================================
 function renderPreviewSummary(data) {{
   const runId = data.id;
+  // The run's own provider, so a summary cannot be redrawn under another
+  // provider's schema after the dropdown moves.
+  const summaryProvider = data.provider || schemaProvider(PREVIEW_CONTEXT);
   // Метрики
   const metrics = [
     ["Всего найдено", data.total_clients_seen || 0, "secondary"],
@@ -3972,10 +4545,26 @@ function renderPreviewSummary(data) {{
   breakdownHtml += '<table class="table table-sm table-bordered mb-0" style="max-width:500px">';
   breakdownHtml += '<thead class="table-light"><tr><th>Причина</th>';
   breakdownHtml += '<th class="text-end">Кол-во</th></tr></thead><tbody>';
-  reasons.forEach(function(r) {{
-    const val = exc[r[0]] != null ? exc[r[0]] : 0;
-    breakdownHtml += '<tr><td>' + escHtml(r[1]) + '</td><td class="text-end">' + val + '</td></tr>';
-  }});
+  if (summaryProvider === "easyweek") {{
+    // EasyWeek has its own reason vocabulary, and it will grow. Rendering the
+    // Altegio list here printed a column of zeros against reasons that do not
+    // exist and hid the ones that do — so show what the run actually reported,
+    // including codes this page has never heard of.
+    const byReason = exc.by_reason || {{}};
+    const keys = Object.keys(byReason).sort();
+    if (keys.length === 0) {{
+      breakdownHtml += '<tr><td colspan="2" class="text-muted">Исключённых получателей нет.</td></tr>';
+    }}
+    keys.forEach(function(key) {{
+      breakdownHtml += '<tr><td><code>' + escHtml(key) + '</code></td>'
+        + '<td class="text-end">' + escHtml(String(byReason[key])) + '</td></tr>';
+    }});
+  }} else {{
+    reasons.forEach(function(r) {{
+      const val = exc[r[0]] != null ? exc[r[0]] : 0;
+      breakdownHtml += '<tr><td>' + escHtml(r[1]) + '</td><td class="text-end">' + val + '</td></tr>';
+    }});
+  }}
   breakdownHtml += '</tbody></table>';
   document.getElementById("excluded-breakdown").innerHTML = breakdownHtml;
 
@@ -3993,51 +4582,111 @@ function renderPreviewSummary(data) {{
 // Загрузить получателей preview
 // ============================================================
 async function loadRecipients(eligibleOnly) {{
-  if (!previewRunId) return;
+  // The run this read is about, captured now. `previewRunId` is page state and
+  // can be another run — or none — by the time the answer lands.
+  const runId = previewRunId;
+  if (!runId) return;
   document.getElementById("btn-eligible").className =
     eligibleOnly ? "btn btn-primary" : "btn btn-outline-secondary";
   document.getElementById("btn-all-recip").className =
     eligibleOnly ? "btn btn-outline-secondary" : "btn btn-primary";
 
-  const loading = document.getElementById("recipients-loading");
-  loading.classList.remove("d-none");
-  document.getElementById("recipients-table").innerHTML = "";
+  const table = document.getElementById("recipients-table");
+  setRecipientsLoading(true);
+  table.innerHTML = "";
 
-  const url = "/ops/campaigns/runs/" + previewRunId + "/recipients" +
+  const url = "/ops/campaigns/runs/" + runId + "/recipients" +
     (eligibleOnly ? "?status=candidate&limit=500" : "?limit=500");
+
+  const token = ++RECIPIENTS_GENERATION;
+  const asked = PREVIEW_CONTEXT ? {{provider: PREVIEW_CONTEXT.provider, companyId: PREVIEW_CONTEXT.companyId}}
+                                : currentScope();
+
+  // Three things, not one: two filter clicks in a row finish in whatever order
+  // the network decides, the preview underneath can be replaced, and the
+  // provider or branch can move. Every outcome below — the table, an error, the
+  // spinner — is only this request's to write while all three still hold.
+  const mine = function () {{
+    return token === RECIPIENTS_GENERATION
+      && runId === previewRunId
+      && scopeMatches(asked, currentScope());
+  }};
 
   try {{
     const resp = await fetch(url);
-    const data = await resp.json();
+    if (!mine()) return;
+    let data;
+    try {{
+      data = await resp.json();
+    }} catch (parseError) {{
+      if (!mine()) return;
+      table.innerHTML =
+        '<div class="alert alert-danger m-3">Ответ сервера не удалось разобрать</div>';
+      return;
+    }}
+    if (!mine()) return;
     if (!resp.ok) {{
-      document.getElementById("recipients-table").innerHTML =
+      table.innerHTML =
         '<div class="alert alert-danger m-3">Ошибка загрузки получателей</div>';
       return;
     }}
-    renderRecipientsTable(data.items || [], data.total || 0);
+    // The provider of the RUN — served at the top level of the response —
+    // chooses the schema. Not the dropdown, which may have moved.
+    renderRecipientsTable(data.items || [], data.total || 0, data.provider || schemaProvider(PREVIEW_CONTEXT));
   }} catch (e) {{
-    document.getElementById("recipients-table").innerHTML =
+    if (!mine()) return;
+    table.innerHTML =
       '<div class="alert alert-danger m-3">Ошибка сети: ' + escHtml(e.message) + '</div>';
   }} finally {{
-    loading.classList.add("d-none");
+    // A stale request must not put out a spinner that belongs to the read which
+    // replaced it. Invalidation clears the state itself.
+    if (mine()) setRecipientsLoading(false);
   }}
 }}
 
-function renderRecipientsTable(items, total) {{
+function renderRecipientsTable(items, total, provider) {{
   if (items.length === 0) {{
     document.getElementById("recipients-table").innerHTML =
       '<p class="text-muted p-3">Нет записей по заданному фильтру.</p>';
     return;
   }}
-  const cols = [
-    "Имя", "Телефон", "Статус", "Причина исключения",
-    "Ресничных", "Подтверждённых лаш", "До периода (CRM)",
-    "Услуги в периоде", "Лок. клиент"
-  ];
+  // EasyWeek has no lash records, no Altegio CRM history and no card types, so
+  // those columns showed em-dashes where an operator needed the things that DO
+  // exist here: on what grounds each row is in the snapshot, and what a manual
+  // inclusion overrode.
+  const easyweek = (provider || schemaProvider(PREVIEW_CONTEXT)) === "easyweek";
+  const cols = easyweek
+    ? ["Имя", "Телефон", "Статус", "Основание", "Причина исключения",
+       "Было исключено автоматически", "EasyWeek customer", "Лок. клиент"]
+    : ["Имя", "Телефон", "Статус", "Причина исключения",
+       "Ресничных", "Подтверждённых лаш", "До периода (CRM)",
+       "Услуги в периоде", "Лок. клиент"];
   const header = '<tr>' + cols.map(function(c) {{
     return '<th>' + escHtml(c) + '</th>';
   }}).join("") + '</tr>';
-  const rows = items.map(function(r) {{
+  const BASIS_LABELS = {{
+    "earned_first_visit": ['<span class="badge bg-secondary">auto</span>', "первый визит доказан сегментатором"],
+    "operator_manual_selection": ['<span class="badge bg-primary">manual</span>', "решение оператора (§37.1)"],
+    "owner_test_account": ['<span class="badge bg-warning text-dark">test</span>', "тестовый аккаунт canary (§36.11)"],
+  }};
+  const rows = easyweek ? items.map(function(r) {{
+    const seg = r.segment || {{}};
+    const statusColor = r.status === "candidate" ? "success" : "secondary";
+    const basis = BASIS_LABELS[r.recipient_basis] || ['<span class="badge bg-light text-dark">'
+      + escHtml(String(r.recipient_basis || "—")) + '</span>', ""];
+    // Presence only. The UUID itself is never rendered.
+    const bound = r.easyweek_customer_recorded ? "✓" : "—";
+    return '<tr>' +
+      '<td>' + escHtml(r.display_name || "") + '</td>' +
+      '<td>' + escHtml(r.phone_e164 || "") + '</td>' +
+      '<td><span class="badge bg-' + statusColor + '">' + escHtml(r.status || "") + '</span></td>' +
+      '<td>' + basis[0] + '<div class="text-muted small">' + escHtml(basis[1]) + '</div></td>' +
+      '<td><small>' + escHtml(r.excluded_reason || "—") + '</small></td>' +
+      '<td><small>' + escHtml(r.auto_excluded_reason || "—") + '</small></td>' +
+      '<td>' + bound + '</td>' +
+      '<td>' + (seg.local_client_found ? "✓" : "—") + '</td>' +
+      '</tr>';
+  }}).join("") : items.map(function(r) {{
     const seg = r.segment || {{}};
     const statusColor = r.status === "candidate" ? "success" : "secondary";
     const titles = (seg.service_titles_in_period || []).join(", ") || "—";
@@ -4069,8 +4718,20 @@ function renderRecipientsTable(items, total) {{
 // Запуск кампании
 // ============================================================
 async function runCampaign() {{
-  if (!previewRunId) {{
-    alert("Сначала создайте preview.");
+  // Re-checked immediately before the confirm and the POST, not only when the
+  // button was drawn. Between those two moments the operator can change the
+  // period, the card type or the branch, and the recipients on screen would
+  // then belong to a different snapshot than the parameters being sent.
+  if (!PREVIEW_CONTEXT || !previewRunId || PREVIEW_CONTEXT.runId !== previewRunId) {{
+    setAlert("run-alert", "danger", "Сначала создайте preview.");
+    invalidatePreviewContext();
+    return;
+  }}
+  if (!mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature())) {{
+    setAlert("run-alert", "danger",
+      "Параметры формы больше не совпадают с построенным preview — запуск отменён. "
+      + "Постройте preview заново с текущими параметрами.");
+    invalidatePreviewContext();
     return;
   }}
   // Явная проверка выбора типа карты лояльности — до confirm.
@@ -4084,7 +4745,15 @@ async function runCampaign() {{
 
   const payload = buildPayload();
   if (!payload) return;
-  payload.source_preview_run_id = previewRunId;
+  // One last look: `confirm` is modal, and the form cannot change while it is
+  // up — but the check costs nothing and the backend is not the only place
+  // that should refuse a mismatch.
+  if (!mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature())) {{
+    setAlert("run-alert", "danger", "Параметры изменились — запуск отменён.");
+    invalidatePreviewContext();
+    return;
+  }}
+  payload.source_preview_run_id = PREVIEW_CONTEXT.runId;
 
   setAlert("run-alert", "", "");
   document.getElementById("btn-run").disabled = true;
@@ -4176,14 +4845,354 @@ function renderProgress(data) {{
 // ============================================================
 // Утилиты
 // ============================================================
+function isEasyWeek() {{
+  return document.getElementById("f-provider").value === "easyweek";
+}}
+
+// Show exactly the controls the chosen provider actually uses. The Altegio-only
+// ones are not merely irrelevant for EasyWeek — a loyalty card type or an
+// Altegio client id has no meaning there, and a field that does nothing invites
+// a wrong value.
+function onProviderChange() {{
+  const easyweek = isEasyWeek();
+  const provider = easyweek ? "easyweek" : "altegio";
+  // The first call happens during setup, to shape the form. Nothing changed,
+  // so nothing is invalidated — and in particular the `from_preview` the page
+  // was opened with survives to be loaded.
+  const switched = LAST_PROVIDER !== null && LAST_PROVIDER !== provider;
+  LAST_PROVIDER = provider;
+  document.querySelectorAll(".altegio-only").forEach(function(el) {{
+    el.classList.toggle("d-none", easyweek);
+  }});
+  document.querySelectorAll(".easyweek-only").forEach(function(el) {{
+    el.classList.toggle("d-none", !easyweek);
+  }});
+  // The preview on screen belongs to the provider it was built under, so a
+  // real switch stops it from describing anything. The saved run is untouched.
+  if (switched) invalidatePreviewContext();
+  applyRunAvailability();
+  const runNote = document.getElementById("easyweek-send-closed");
+  if (runNote) {{
+    runNote.classList.toggle("d-none", !easyweek);
+  }}
+
+  // Invalidate any in-flight outstanding-cards read, then hide and empty the
+  // panel at once rather than waiting for a response that may never come.
+  resetOutstandingPanel();
+
+  if (easyweek) {{
+    // Going out: the Altegio card list belongs to a provider that is no longer
+    // on screen, and a newer generation makes sure its answer cannot land.
+    CARD_TYPES_GENERATION += 1;
+    CARD_TYPES_STATE = {{state: "idle", scope: null}};
+    loadEasyWeekTemplateStatus();
+  }} else if (switched) {{
+    // Coming back from EasyWeek: both Altegio panels were cleared on the way
+    // out, so both are read again for whichever branch is selected now. On the
+    // initial call the ordinary setup below already does it.
+    const altegioCompany = document.getElementById("f-company");
+    if (altegioCompany && altegioCompany.value) loadOutstandingCards(altegioCompany.value);
+    loadCardTypes();
+  }}
+}}
+
+// Does THIS branch have the exact EasyWeek template row? Asked with
+// provider=easyweek and the branch's own company id, so a missing row is
+// reported as missing rather than answered with an Altegio one — the endpoint
+// refuses the cross-provider fallback, and this says so plainly.
+let TEMPLATE_GENERATION = 0;
+
+// Reasons the server can give, as sentences. The codes are stable; an operator
+// should not have to read them.
+const EW_TEMPLATE_REASONS = {{
+  "branch_not_in_registry": "Филиал не настроен на сервере.",
+  "branch_contract_not_approved":
+    "Для этого филиала нет отдельно утверждённого voucher-контракта. "
+    + "Доказанный контракт относится только к Karlsruhe и не переносится на другие филиалы.",
+  "template_row_missing": "Шаблон для этого филиала не настроен.",
+  "template_rows_ambiguous": "Для этого филиала несколько активных шаблонов — неоднозначно.",
+  "voucher_delivery_template_unproven": "Шаблон филиала не доказан.",
+  "voucher_delivery_template_mismatch": "Строка шаблона не совпадает с контрактом.",
+}};
+
+async function loadEasyWeekTemplateStatus() {{
+  const el = document.getElementById("ew-template-status");
+  const nameEl = document.getElementById("ew-template-name");
+  const langEl = document.getElementById("ew-template-language");
+  if (!el || !isEasyWeek()) return;
+  const companyEl = document.getElementById("f-ew-company");
+  const companyId = companyEl ? companyEl.value : "";
+  if (nameEl) nameEl.innerHTML = "—";
+  if (langEl) langEl.innerHTML = "—";
+  if (!companyId) {{
+    el.innerHTML = '<span class="text-danger">Филиал не выбран.</span>';
+    return;
+  }}
+  el.textContent = "⏳ Проверка шаблона филиала…";
+
+  // Its own token and its own scope: an answer for the branch the operator has
+  // just left must not describe the one they are looking at now.
+  const token = ++TEMPLATE_GENERATION;
+  const asked = {{provider: "easyweek", companyId: String(companyId)}};
+
+  let data;
+  try {{
+    const resp = await fetch(
+      "/ops/campaigns/new-clients/easyweek-template-status?company_id=" + encodeURIComponent(companyId)
+    );
+    data = resp.ok ? await resp.json() : null;
+  }} catch (e) {{
+    data = null;
+  }}
+  if (!mayRender(token, TEMPLATE_GENERATION, asked, currentScope())) return;
+
+  if (!data) {{
+    el.innerHTML = '<span class="text-danger">Не удалось проверить шаблон филиала.</span>';
+    return;
+  }}
+  if (data.configured !== true) {{
+    const sentence = EW_TEMPLATE_REASONS[data.reason] || "Шаблон для этого филиала не настроен.";
+    el.innerHTML = '<span class="text-danger">' + escHtml(sentence) + '</span>'
+      + '<div class="text-muted small">Отправка и так закрыта в §37.1; строку добавляет отдельный '
+      + 'reconciler после live-проверки Meta.</div>';
+    return;
+  }}
+  // Only a proven row gets to put a name on the screen.
+  if (nameEl) nameEl.innerHTML = '<code>' + escHtml(String(data.meta_template_name)) + '</code>';
+  if (langEl) langEl.innerHTML = '<code>' + escHtml(String(data.language)) + '</code>';
+  el.innerHTML = '<span class="text-success">Шаблон филиала доказан:</span> <code>'
+    + escHtml(String(data.template_code)) + '</code> / provider <code>'
+    + escHtml(String(data.provider)) + '</code>';
+}}
+
+// May an Altegio preview be built right now? The card type has to be a real,
+// chosen one: the campaign issues a loyalty card, and "none" is not a card.
+//
+//   "ready"          — a live list for this very branch, or a loaded snapshot's
+//                      own frozen card
+//   "loading"        — the list is still on its way; asking now would send null
+//   "failed"/"empty" — nothing to choose from, and the operator must be told
+//   "stale"          — the list belongs to another branch or to a preview that
+//                      has since been thrown away, so it proves nothing
+//
+// The last one is the subtle case: the synthetic «из preview» option a prefill
+// adds looks like a loaded list, but once its PREVIEW_CONTEXT is gone it is a
+// leftover, not a choice.
+function cardTypesStatus() {{
+  if (isEasyWeek()) return "not-applicable";
+  const here = currentScope();
+  const scope = CARD_TYPES_STATE.scope;
+  const sameScope = !!scope && scope.provider === here.provider
+    && String(scope.companyId) === String(here.companyId);
+  if (CARD_TYPES_STATE.state === "snapshot") {{
+    return (PREVIEW_CONTEXT && sameScope) ? "ready" : "stale";
+  }}
+  if (!sameScope) return "stale";
+  if (CARD_TYPES_STATE.state === "loaded") return "ready";
+  if (CARD_TYPES_STATE.state === "loading") return "loading";
+  if (CARD_TYPES_STATE.state === "failed") return "failed";
+  if (CARD_TYPES_STATE.state === "empty") return "empty";
+  return "stale";
+}}
+
+// The recipients spinner, owned by one place so that invalidation can put it
+// out. Forbidding a stale request to hide it is only half the rule: without
+// this the spinner would be left running forever by the very invalidation that
+// revoked the request underneath it.
+function setRecipientsLoading(busy) {{
+  const loading = document.getElementById("recipients-loading");
+  if (loading) loading.classList.toggle("d-none", !busy);
+}}
+
+// The outstanding-cards panel, taken down and revoked. The three places that
+// used to repeat these lines — provider switch, branch switch, and now the
+// prefill that selects the run's own branch — mean the same thing by them.
+function resetOutstandingPanel() {{
+  OUTSTANDING_GENERATION += 1;
+  OUTSTANDING_SCOPE = null;
+  const section = document.getElementById("outstanding-cards-section");
+  if (section) section.classList.add("d-none");
+  const table = document.getElementById("outstanding-cards-table");
+  if (table) table.innerHTML = "";
+  const badge = document.getElementById("outstanding-count-badge");
+  if (badge) badge.textContent = "";
+  const deleteResult = document.getElementById("outstanding-delete-result");
+  if (deleteResult) deleteResult.innerHTML = "";
+  // Disabled until a list for THIS branch has actually loaded and set a scope.
+  // An enabled button over an empty or stale table is the dangerous state.
+  const deleteBtn = document.getElementById("btn-delete-outstanding");
+  if (deleteBtn) deleteBtn.disabled = true;
+}}
+
+// Back to being an ordinary Altegio page: no snapshot, a live card list and the
+// current branch's outstanding cards. Used when a from-preview load is refused,
+// so a rejected link does not leave a page that can no longer do anything.
+function returnToOrdinaryAltegioPage() {{
+  if (isEasyWeek()) return;
+  const companyId = document.getElementById("f-company").value;
+  CARD_TYPES_STATE = {{state: "idle", scope: null}};
+  loadCardTypes();
+  resetOutstandingPanel();
+  loadOutstandingCards(companyId);
+}}
+
+// An edited snapshot parameter. What is on screen was built from the old one,
+// and what is in flight was asked for the old one, so both go — and the
+// decision deliberately does not depend on a PREVIEW_CONTEXT existing, because
+// the dangerous moment is exactly the one where a request is still running and
+// there is no context yet.
+function onSnapshotFieldChange() {{
+  const now = snapshotSignature();
+  const inFlightStale = PREVIEW_IN_FLIGHT !== null &&
+    !(PREVIEW_IN_FLIGHT.signature && signatureMatches(PREVIEW_IN_FLIGHT.signature, now));
+  const shownStale = PREVIEW_CONTEXT !== null &&
+    !signatureMatches(PREVIEW_CONTEXT.signature, now);
+  if (inFlightStale || shownStale) {{
+    invalidatePreviewContext();
+  }} else {{
+    applyRunAvailability();
+  }}
+}}
+
+// The Run button, offered from exactly one place so the rule cannot drift.
+function applyRunAvailability() {{
+  const btn = document.getElementById("btn-run");
+  if (!btn) return;
+  const allowed = mayRunFromPreview(PREVIEW_CONTEXT, currentScope(), snapshotSignature());
+  btn.disabled = !allowed;
+  // EasyWeek never gets the button at all: the path behind it is closed.
+  btn.classList.toggle("d-none", currentScope().provider === "easyweek");
+}}
+
+// Is the page waiting for a preview? The spinner and the Create button say so,
+// and exactly one place decides it.
+function setPreviewBusy(busy) {{
+  const spinner = document.getElementById("preview-spinner");
+  if (spinner) spinner.classList.toggle("d-none", !busy);
+  const button = document.getElementById("btn-preview");
+  if (button) button.disabled = busy;
+}}
+
+// The from-preview prefill freezes the fields the loaded snapshot fixed.
+// Anything that takes that preview away has to give them back, or the operator
+// is left with a form they cannot edit and nothing on screen to explain why.
+// Each field returns to the state it would have had on a fresh page, which is
+// not simply "enabled": follow-up details follow their checkbox, and the card
+// type stays shut until a branch's types have actually loaded.
+function unlockSnapshotFields() {{
+  for (const id of ["f-company", "f-period-start", "f-period-end", "f-attribution"]) {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = false;
+  }}
+  const followupEnabled = document.getElementById("f-followup-enabled");
+  if (followupEnabled) followupEnabled.disabled = false;
+  const enabled = !!(followupEnabled && followupEnabled.checked);
+  for (const id of ["f-followup-delay", "f-followup-policy", "f-followup-template"]) {{
+    const el = document.getElementById(id);
+    if (el) el.disabled = !enabled;
+  }}
+  const cardSelect = document.getElementById("f-card-type");
+  if (cardSelect) {{
+    // Not "does an option happen to be there": the «из preview» option a
+    // prefill synthesises would pass that test and hand the operator a select
+    // holding one card that no longer belongs to anything.
+    cardSelect.disabled = cardTypesStatus() !== "ready";
+  }}
+}}
+
+// Take the preview off the screen. Kept apart from `invalidatePreviewContext`
+// because a rejected prefill needs exactly this WITHOUT losing the alert that
+// explains the rejection.
+function resetPreviewSurface() {{
+  PREVIEW_CONTEXT = null;
+  previewRunId = null;
+  PREVIEW_IN_FLIGHT = null;
+  const results = document.getElementById("preview-results");
+  if (results) results.classList.add("d-none");
+  const table = document.getElementById("recipients-table");
+  if (table) table.innerHTML = "";
+  const links = document.getElementById("preview-links");
+  if (links) links.innerHTML = "";
+  const breakdown = document.getElementById("excluded-breakdown");
+  if (breakdown) breakdown.innerHTML = "";
+  unlockSnapshotFields();
+  // Whatever was in flight no longer owns anything, so the page is idle. A new
+  // request that starts right after this raises the spinner again itself.
+  setPreviewBusy(false);
+  // Recipients belong to the preview that is going away. Revoke the read AND
+  // put its spinner out: refusing to let the old request hide it would leave it
+  // running forever.
+  RECIPIENTS_GENERATION += 1;
+  setRecipientsLoading(false);
+  applyRunAvailability();
+}}
+
+// Forget the preview on screen without touching the saved run. Called whenever
+// the screen stops describing it: another provider, another branch, an edited
+// snapshot field, a new preview. The CampaignRun itself stays in the database.
+function takeDownPreview() {{
+  // Moving the clock revokes everything in flight at once — preview, prefill,
+  // card types, recipients — so none of them can come back and paint over a
+  // page that has moved on. What the card select means afterwards is NOT
+  // decided here: that is the difference between the two callers below, and it
+  // is the whole reason they are two functions.
+  PAGE_EPOCH += 1;
+  resetPreviewSurface();
+  setAlert("preview-alert", "", "");
+}}
+
+// The select is showing a card that a snapshot froze, and that snapshot is
+// gone. The card is a leftover, not a list to choose from, so a real one is
+// fetched. A page whose list was already live keeps it: this is a recovery, not
+// a reload after every takedown.
+function recoverLiveCardTypes() {{
+  if (isEasyWeek()) return;
+  if (CARD_TYPES_STATE.state !== "snapshot") return;
+  CARD_TYPES_STATE = {{state: "idle", scope: null}};
+  loadCardTypes();
+}}
+
+// Discard the preview on screen with nothing replacing it: a provider switch, a
+// branch change, an edited parameter, a refused run.
+function invalidatePreviewContext() {{
+  takeDownPreview();
+  recoverLiveCardTypes();
+}}
+
+// Discard the preview on screen because a NEW request is replacing it. The same
+// takedown, with one deliberate difference: when the card in the outgoing
+// request came from a snapshot's frozen select, that card is carried over
+// rather than discarded and re-fetched.
+//
+// Fetching here is what broke repeat previews from an open `?from_preview=`.
+// The reload blanked the select synchronously, between the payload being built
+// and the signature being read — so the POST carried the frozen card while the
+// signature carried none, and the answer was either thrown away or accepted as
+// a preview whose Run could never be offered.
+function revokePreviewFor(captured) {{
+  takeDownPreview();
+  if (captured.fromFrozenSnapshot) {{
+    // The replacement already holds this card, in its payload and in its
+    // signature. The select keeps showing it, and no list is fetched.
+    CARD_TYPES_STATE = {{state: "snapshot", scope: captured.scope}};
+    return;
+  }}
+  recoverLiveCardTypes();
+}}
+
 function buildPayload() {{
   // ВАЖНО: эта функция читает значения полей через JS .value — включая disabled элементы.
   // HTML form submit НЕ используется. Disabled поля не теряются из payload.
   // Это позволяет lock-логике prefill блокировать UI, но включать зафиксированные
   // значения из preview-снимка в JSON-запрос к backend.
-  const companyId = parseInt(document.getElementById("f-company").value, 10);
-  // location_id == company_id (один dropdown для обоих)
-  const locationId = companyId;
+  const easyweek = isEasyWeek();
+  const companyId = easyweek
+    ? parseInt(document.getElementById("f-ew-company").value, 10)
+    : parseInt(document.getElementById("f-company").value, 10);
+  // Altegio: location_id == company_id (один dropdown для обоих).
+  // EasyWeek: филиал определяется сервером по company_id через registry —
+  // location UUID в запрос не попадает.
+  const locationId = easyweek ? null : companyId;
   const cardTypeEl = document.getElementById("f-card-type");
   const cardTypeId = cardTypeEl.value || null;
   const periodStartDate = document.getElementById("f-period-start").value;
@@ -4199,8 +5208,8 @@ function buildPayload() {{
     return null;
   }}
 
-  // Follow-up настройки
-  const followupEnabled = document.getElementById("f-followup-enabled").checked;
+  // Follow-up настройки (Altegio-only: для EasyWeek follow-up закрыт)
+  const followupEnabled = !easyweek && document.getElementById("f-followup-enabled").checked;
   const followupDelay = parseInt(document.getElementById("f-followup-delay").value, 10) || null;
   const followupPolicy = document.getElementById("f-followup-policy").value || null;
   // Если не указан — подставить дефолт по company
@@ -4214,7 +5223,7 @@ function buildPayload() {{
     provider: document.getElementById("f-provider").value,
     company_id: companyId,
     location_id: locationId,
-    card_type_id: cardTypeId,
+    card_type_id: easyweek ? null : cardTypeId,
     period_start: periodStartDate + "T00:00:00Z",
     period_end: periodEndDate + "T23:59:59Z",
     attribution_window_days: attribution,
@@ -4244,19 +5253,41 @@ function escHtml(s) {{
 // Outstanding cards (previous-period loyalty cards cleanup)
 // ---------------------------------------------------------------------------
 
+// Bumped for EVERY load, not only on a provider change. Two branches in a row
+// otherwise share one generation, so a slow answer for the previous company can
+// still repaint the screen of the current one — and the panel it repaints is
+// the one that deletes real loyalty cards.
+let OUTSTANDING_GENERATION = 0;
+
+// What the table on screen is actually showing. Checked again immediately
+// before Delete, because "the list I looked at" and "the branch selected now"
+// are two different facts, and only the first one describes what would be
+// deleted.
+let OUTSTANDING_SCOPE = null;
+
 async function loadOutstandingCards(companyId) {{
   const section = document.getElementById("outstanding-cards-section");
   const tableEl = document.getElementById("outstanding-cards-table");
   const badge   = document.getElementById("outstanding-count-badge");
   section.classList.add("d-none");
   tableEl.innerHTML = "";
+  OUTSTANDING_SCOPE = null;
+  const deleteBtnEl = document.getElementById("btn-delete-outstanding");
+  if (deleteBtnEl) deleteBtnEl.disabled = true;
 
+  // Loyalty cards are an Altegio concept. EasyWeek has none, so there is
+  // nothing to read and nothing to offer deleting.
+  if (isEasyWeek()) return {{ok: true, state: "empty", count: 0}};
   if (!companyId) return {{ok: true, state: "empty", count: 0}};
 
+  const generation = ++OUTSTANDING_GENERATION;
+  const scope = {{provider: "altegio", companyId: String(companyId)}};
+  OUTSTANDING_SCOPE = null;
   let data;
   try {{
     const resp = await fetch(
-      "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id=" + companyId
+      "/ops/campaigns/outstanding-cards?campaign_code=new_clients_monthly&company_id="
+        + companyId + "&provider=altegio"
     );
     if (!resp.ok) {{
       return {{ok: false, state: "failed", error: resp.statusText}};
@@ -4266,9 +5297,24 @@ async function loadOutstandingCards(companyId) {{
     return {{ok: false, state: "failed", error: String(e)}};
   }}
 
+  // Usable only if this is still the newest request AND the selection has not
+  // moved underneath it. Either check alone lets a late answer for another
+  // branch paint the current one.
+  const currentCompany = String(document.getElementById("f-company").value || "");
+  if (generation !== OUTSTANDING_GENERATION || isEasyWeek() || currentCompany !== scope.companyId) {{
+    return {{ok: true, state: "empty", count: 0}};
+  }}
+
   if (!data.cards || data.cards.length === 0) {{
     return {{ok: true, state: "empty", count: 0}};
   }}
+
+  // From here the table on screen belongs to this scope, and Delete may only
+  // act within it. Until this line runs — an empty list, an error, a stale
+  // answer — the button stays disabled.
+  OUTSTANDING_SCOPE = scope;
+  const okDeleteBtn = document.getElementById("btn-delete-outstanding");
+  if (okDeleteBtn) okDeleteBtn.disabled = false;
 
   badge.textContent = data.cards.length + " карт";
   section.classList.remove("d-none");
@@ -4302,6 +5348,14 @@ function outstandingSelectAll(checked) {{
 }}
 
 async function deleteOutstandingCards() {{
+  // Checked here, not only by hiding the button: this call deletes real
+  // loyalty cards, and a stale click or a scripted one must not reach it while
+  // the form is on a provider that has no cards at all.
+  if (isEasyWeek()) {{
+    setAlert("outstanding-delete-result", "warning",
+      "Карты лояльности относятся только к Altegio. Для EasyWeek очистка недоступна.");
+    return;
+  }}
   const btn = document.getElementById("btn-delete-outstanding");
   if (btn.disabled) return;
 
@@ -4314,6 +5368,19 @@ async function deleteOutstandingCards() {{
   const excludedIds = Array.from(document.querySelectorAll(".oc-check:not(:checked)"))
     .map(cb => parseInt(cb.dataset.recipient, 10));
   const companyId = parseInt(document.getElementById("f-company").value, 10);
+
+  // The rows on screen were loaded for one branch. If the selection has moved
+  // since, deleting would send THIS branch's id with THAT branch's exclusions —
+  // which is how the wrong cards get deleted. Fail closed and make the operator
+  // reload.
+  if (!OUTSTANDING_SCOPE
+      || OUTSTANDING_SCOPE.provider !== "altegio"
+      || OUTSTANDING_SCOPE.companyId !== String(companyId)) {{
+    setAlert("outstanding-delete-result", "warning",
+      "Список карт относится к другому филиалу или провайдеру. Загрузите список заново "
+      + "перед удалением.");
+    return;
+  }}
 
   btn.disabled = true;
   btn.textContent = "⏳ Удаление…";
@@ -4328,6 +5395,7 @@ async function deleteOutstandingCards() {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
       body: JSON.stringify({{
+        provider: "altegio",
         campaign_code: "new_clients_monthly",
         company_id: companyId,
         exclude_recipient_ids: excludedIds,
@@ -4435,10 +5503,13 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # operator finds out before they click.
         canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
 
-        # Follow-up eligibility aggregation
+        # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
+        # not computed: it is Altegio follow-up machinery, and running it would
+        # spend work deciding something that cannot happen.
+        report = None
         try:
             report = await run_report(session, run_id)
-            followup_eligibility = report.get("followup_eligibility", {})
+            followup_eligibility = {} if run.provider == PROVIDER_EASYWEEK else report.get("followup_eligibility", {})
         except Exception:
             followup_eligibility = {}
 
@@ -4489,7 +5560,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # Bounded to the displayed funnel set (<= _FUNNEL_TABLE_LIMIT rows).
         candidate_now = utcnow()
         final_preview: dict[int, FollowupFinalEligibilityResult] = {}
-        if run.followup_policy:
+        if run.followup_policy and run.provider != PROVIDER_EASYWEEK:
             for _r in funnel_recipients:
                 if _r.followup_status is not None:
                     continue
@@ -4592,18 +5663,25 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             if is_easyweek
             else "Это preview-run. Запустите send-real или отредактируйте snapshot."
         )
-        add_label = "➕ Add test recipient" if is_easyweek else "➕ Add recipient"
-        add_header = (
-            "➕ Добавить настроенный test recipient (§36.11)" if is_easyweek else "➕ Добавить получателя в snapshot"
+        add_label = "➕ Add recipient"
+        # §36.11 and §37.1 are two different decisions with two different
+        # contracts, so they get two buttons. One "Add" that picked an endpoint
+        # by itself would hide which of them an operator just took.
+        test_recipient_button = (
+            '<button class="btn btn-outline-warning btn-sm" '
+            "onclick=\"showAddRecipientForm('test')\">🧪 Add test recipient</button>"
+            if is_easyweek
+            else ""
         )
-        # Said plainly, because the difference matters: this is not "add any
-        # customer", and the row it creates is not proof of an entitlement.
+        add_header = "➕ Добавить получателя вручную (§37.1)" if is_easyweek else "➕ Добавить получателя в snapshot"
+        # Said plainly, because the difference matters: a manual addition is an
+        # operator's decision and proves nothing about a first visit.
         add_hint = (
             '<div class="alert alert-secondary small py-2">'
-            "Добавляется <b>только заранее настроенный тестовый аккаунт</b> для controlled "
-            "voucher delivery canary. Customer UUID берётся из серверной конфигурации и не "
-            "принимается из браузера; телефон вводится для проверки совпадения. Это "
-            "test-identity исключение, а не доказанный campaign entitlement."
+            "Ручное добавление — <b>решение оператора</b>, а не доказательство первого визита. "
+            "Введите телефон: сервер сам найдёт клиента в EasyWeek, перепроверит его прямым "
+            "чтением и запишет строку с основанием <code>operator_manual_selection</code>. "
+            "Customer UUID из браузера не принимается."
             "</div>"
             if is_easyweek
             else ""
@@ -4628,12 +5706,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <button class="btn btn-outline-danger btn-sm"
           onclick="deleteAndRedirect({run_id})">🗑 Delete</button>
   <button class="btn btn-outline-secondary btn-sm"
-          onclick="showAddRecipientForm()">{add_label}</button>
+          onclick="showAddRecipientForm('manual')">{add_label}</button>
+  {test_recipient_button}
 </div>
 <div id="add-recipient-form" class="card mb-3 d-none">
-  <div class="card-header">{add_header}</div>
+  <div class="card-header" id="add-recipient-header">{add_header}</div>
   <div class="card-body">
-    {add_hint}
+    <div id="add-recipient-hint">{add_hint}</div>
+    <div id="add-recipient-test-hint" class="alert alert-warning small py-2 d-none">
+      Добавляется <b>только заранее настроенный тестовый аккаунт</b> controlled voucher
+      delivery canary (§36.11). Customer UUID берётся из серверной конфигурации;
+      телефон вводится для проверки совпадения. Это test-identity исключение, а не
+      доказанный entitlement и не обычный получатель.
+    </div>
     <div class="row g-2 align-items-end">
       <div class="col-auto">
         <label class="form-label small mb-1">Phone</label>
@@ -4656,6 +5741,9 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <span>Preview run (status={run.status!r}). Действия недоступны.</span>
 </div>
 """
+
+    # Rendered into the page script so the browser never guesses the provider.
+    is_easyweek_js = "true" if run.provider == PROVIDER_EASYWEEK else "false"
 
     # Notice for preview runs: visible on direct link, not in the general list
     preview_notice_block = ""
@@ -4711,8 +5799,11 @@ async def ops_campaign_run_detail(run_id: int) -> str:
       <dd class="col-sm-9">{_esc(_fmt_dt(run.created_at, tz))}</dd>
       <dt class="col-sm-3">Completed</dt>
       <dd class="col-sm-9">{_esc(_fmt_dt(run.completed_at, tz))}</dd>
-      <dt class="col-sm-3">Card Type ID</dt>
-      <dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>
+{
+        ""
+        if run.provider == PROVIDER_EASYWEEK
+        else f'<dt class="col-sm-3">Card Type ID</dt><dd class="col-sm-9">{_esc(str(run.card_type_id or "—"))}</dd>'
+    }
       <dt class="col-sm-3">Attribution Window</dt>
       <dd class="col-sm-9">{run.attribution_window_days} days</dd>
 {
@@ -4728,13 +5819,16 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 """
 
     # --- Progress block ---
-    progress_block = _metric_cards(
-        [
-            ("Seen", run.total_clients_seen or 0, "secondary"),
-            ("Candidates", run.candidates_count or 0, "info"),
-            ("Queued", run.queued_count or 0, "primary"),
-        ]
-    )
+    progress_metrics = [
+        ("Seen", run.total_clients_seen or 0, "secondary"),
+        ("Candidates", run.candidates_count or 0, "info"),
+    ]
+    if run.provider != PROVIDER_EASYWEEK:
+        # `Queued` is the first stage of the Altegio delivery pipeline. For
+        # EasyWeek that pipeline is closed, and a zero under it reads as a stage
+        # that simply has not started yet.
+        progress_metrics.append(("Queued", run.queued_count or 0, "primary"))
+    progress_block = _metric_cards(progress_metrics)
     progress_block = f"""
 <div class="card mb-3">
   <div class="card-header">📈 Progress</div>
@@ -4756,7 +5850,21 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("Opted-out after", run.opted_out_after_count or 0, "danger"),
         ]
     )
-    delivery_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Delivery counters are the Altegio send path's own. For EasyWeek they
+        # would be a row of zeros presented as a working feature, which is worse
+        # than saying plainly that the path is closed.
+        delivery_block = """
+<div class="card mb-3">
+  <div class="card-header">📨 Delivery — закрыто (§37.1)</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">EasyWeek send-real, jobs, Outbox и массовая доставка закрыты.
+    §37.1 открывает только preview и редактор snapshot.</p>
+  </div>
+</div>
+"""
+    else:
+        delivery_block = f"""
 <div class="card mb-3">
   <div class="card-header">📨 Delivery</div>
   <div class="card-body">
@@ -4773,7 +5881,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             ("Cleanup failed", run.cleanup_failed_count or 0, "danger"),
         ]
     )
-    loyalty_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Loyalty cards are an Altegio concept: EasyWeek has none to issue,
+        # delete or fail at.
+        loyalty_block = """
+<div class="card mb-3">
+  <div class="card-header">🎁 Loyalty — не применяется</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">Карты лояльности относятся только к Altegio.</p>
+  </div>
+</div>
+"""
+    else:
+        loyalty_block = f"""
 <div class="card mb-3">
   <div class="card-header">🎁 Loyalty</div>
   <div class="card-body">
@@ -4802,19 +5922,38 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 """
 
     # --- Excluded block ---
-    excluded_block = _metric_cards(
-        [
-            ("Opted out", run.excluded_opted_out or 0, "warning"),
-            ("No phone", run.excluded_no_phone or 0, "secondary"),
-            ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
-            ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
-            ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
-            ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
-            ("Has records before", run.excluded_has_records_before or 0, "secondary"),
-            ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
-        ]
-    )
-    excluded_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # EasyWeek's reasons are its own and the vocabulary grows. A fixed
+        # Altegio list here showed zeros for reasons that cannot happen and hid
+        # the ones that did, so this renders whatever the run actually recorded.
+        by_reason = dict(((report or {}).get("excluded") or {}).get("by_reason") or {})
+        excluded_block = (
+            _metric_cards([(code, count, "secondary") for code, count in sorted(by_reason.items())])
+            if by_reason
+            else '<p class="text-muted mb-0">Исключённых получателей нет.</p>'
+        )
+        excluded_block = f"""
+<div class="card mb-3">
+  <div class="card-header">🚫 Excluded (EasyWeek)</div>
+  <div class="card-body">
+    {excluded_block}
+  </div>
+</div>
+"""
+    else:
+        excluded_block = _metric_cards(
+            [
+                ("Opted out", run.excluded_opted_out or 0, "warning"),
+                ("No phone", run.excluded_no_phone or 0, "secondary"),
+                ("Invalid phone", run.excluded_invalid_phone or 0, "secondary"),
+                ("No WA", run.excluded_no_whatsapp or 0, "secondary"),
+                ("Multiple lash records", run.excluded_multiple_records or 0, "secondary"),
+                ("No confirmed lash", run.excluded_no_confirmed_record or 0, "secondary"),
+                ("Has records before", run.excluded_has_records_before or 0, "secondary"),
+                ("CRM unavailable", getattr(run, "excluded_crm_unavailable", 0) or 0, "danger"),
+            ]
+        )
+        excluded_block = f"""
 <div class="card mb-3">
   <div class="card-header">🚫 Excluded</div>
   <div class="card-body">
@@ -4883,7 +6022,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         else ""
     )
 
-    followup_block = f"""
+    if run.provider == PROVIDER_EASYWEEK:
+        # Follow-up is Altegio job/outbox machinery. Showing its schedule for an
+        # EasyWeek run would present a closed path as a configured one.
+        followup_block = """
+<div class="card mb-3">
+  <div class="card-header">🔁 Follow-up — закрыто (§37.1)</div>
+  <div class="card-body">
+    <p class="text-muted mb-0">Follow-up, retry, resume и scheduling для EasyWeek не открыты.</p>
+  </div>
+</div>
+"""
+    else:
+        followup_block = f"""
 <div class="card mb-3">
   <div class="card-header">🔁 Follow-up schedule / auto-run</div>
   <div class="card-body">
@@ -5146,13 +6297,56 @@ async function deleteAndRedirect(runId) {{
   }}
 }}
 
-function showAddRecipientForm() {{
+// Which of the two contracts the operator asked for. Never inferred: §37.1
+// adds whoever they typed on an explicitly weaker basis, §36.11 adds the one
+// configured canary account, and an endpoint chosen automatically would hide
+// which of those just happened.
+let ADD_RECIPIENT_MODE = "manual";
+
+function showAddRecipientForm(mode) {{
+  ADD_RECIPIENT_MODE = (mode === "test") ? "test" : "manual";
+  const isTest = ADD_RECIPIENT_MODE === "test";
+  const header = document.getElementById("add-recipient-header");
+  if (header) {{
+    header.textContent = isTest
+      ? "🧪 Добавить настроенный test recipient (§36.11)"
+      : "➕ Добавить получателя вручную (§37.1)";
+  }}
+  const manualHint = document.getElementById("add-recipient-hint");
+  const testHint = document.getElementById("add-recipient-test-hint");
+  if (manualHint) manualHint.classList.toggle("d-none", isTest);
+  if (testHint) testHint.classList.toggle("d-none", !isTest);
+  document.getElementById("add-recipient-alert").innerHTML = "";
   document.getElementById("add-recipient-form").classList.remove("d-none");
 }}
 function hideAddRecipientForm() {{
   document.getElementById("add-recipient-form").classList.add("d-none");
   document.getElementById("add-recipient-alert").innerHTML = "";
 }}
+
+// Which contract this page's Add button follows. Rendered by the server so the
+// browser never has to guess the provider from a URL.
+const IS_EASYWEEK = {is_easyweek_js};
+
+// Stable reason codes turned into sentences. The codes are what a wrapper
+// branches on; an operator should not have to read them.
+const MANUAL_ADD_REASONS = {{
+  "manual_recipient_phone_unusable": "Телефон не распознан. Введите номер в международном формате.",
+  "manual_recipient_run_not_found": "Preview не найден.",
+  "manual_recipient_run_not_easyweek": "Этот preview не относится к EasyWeek.",
+  "manual_recipient_run_not_editable": "Preview больше нельзя редактировать.",
+  "manual_recipient_branch_unknown": "Филиал этого preview не настроен на сервере.",
+  "manual_recipient_preview_frozen": "Preview занят controlled voucher canary — редактирование закрыто.",
+  "manual_recipient_customer_absent": "В EasyWeek нет клиента с таким номером. Клиент не создаётся автоматически.",
+  "manual_recipient_customer_ambiguous": "На этот номер в EasyWeek приходится несколько клиентов.",
+  "manual_recipient_customer_unproven": "EasyWeek не подтвердил клиента. Повторите позже.",
+  "manual_recipient_customer_name_missing": "У клиента в EasyWeek не заполнено имя — оно нужно для шаблона.",
+  "manual_recipient_local_client_absent": "Клиента с таким номером нет в локальной базе этого филиала.",
+  "manual_recipient_local_client_ambiguous": "В локальной базе несколько клиентов с этим номером.",
+  "manual_recipient_opted_out": "Клиент отказался от сообщений WhatsApp.",
+  "manual_recipient_rows_ambiguous": "В snapshot уже есть конфликтующие строки для этого клиента.",
+  "manual_recipient_identity_not_accepted": "Идентификатор клиента из браузера не принимается.",
+}};
 
 async function submitAddRecipient(runId) {{
   const phone = document.getElementById("add-phone").value.trim();
@@ -5168,7 +6362,13 @@ async function submitAddRecipient(runId) {{
   const body = {{}};
   if (phone) body.phone = phone;
   if (cid) body.altegio_client_id = parseInt(cid);
-  const resp = await fetch("/ops/campaigns/runs/" + runId + "/recipients/add", {{
+  // §37.1 for EasyWeek: a separate endpoint from the §36.11 canary one, which
+  // adds only the configured test account and must keep refusing everything
+  // else. Altegio keeps its own long-standing contract.
+  const endpoint = (IS_EASYWEEK && ADD_RECIPIENT_MODE === "manual")
+    ? "/ops/campaigns/runs/" + runId + "/recipients/add-manual"
+    : "/ops/campaigns/runs/" + runId + "/recipients/add";
+  const resp = await fetch(endpoint, {{
     method: "POST",
     headers: {{"Content-Type": "application/json"}},
     body: JSON.stringify(body),
@@ -5177,15 +6377,22 @@ async function submitAddRecipient(runId) {{
   if (resp.ok) {{
     const rid = (data.recipient && data.recipient.id) || data.recipient_id;
     const what = data.action ? (' (' + data.action + ')') : '';
+    const count = (data.candidates_count === undefined || data.candidates_count === null)
+      ? ''
+      : ' Активных получателей: ' + data.candidates_count + '.';
     alertEl.innerHTML = '<div class="alert alert-success py-1 mb-0">Получатель добавлен (id=' +
-      rid + ')' + what + '. <a href="">Обновите страницу.</a></div>';
+      rid + ')' + what + '.' + count + ' <a href="">Обновите страницу.</a></div>';
   }} else {{
     // The EasyWeek path answers with a stable reason code and never with a
     // phone number, a name or a customer UUID.
-    const detail = typeof data.detail === "object"
-      ? (data.detail.reason || data.detail.message || JSON.stringify(data.detail))
-      : (data.detail || JSON.stringify(data));
-    alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + detail + '</div>';
+    const code = (typeof data.detail === "object" && data.detail) ? data.detail.reason : null;
+    const detail = MANUAL_ADD_REASONS[code]
+      || code
+      || (typeof data.detail === "object"
+          ? (data.detail.message || JSON.stringify(data.detail))
+          : (data.detail || JSON.stringify(data)));
+    const safe = String(detail).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    alertEl.innerHTML = '<div class="alert alert-danger py-1 mb-0">Ошибка: ' + safe + '</div>';
   }}
 }}
 
@@ -5294,7 +6501,11 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             (
                 "status",
                 "Status",
-                "select:candidate,card_issued,skipped,queued,cleanup_failed",
+                # EasyWeek rows are only ever candidates or skipped: the other
+                # statuses are stages of a delivery pipeline it does not have.
+                "select:candidate,skipped"
+                if run.provider == PROVIDER_EASYWEEK
+                else "select:candidate,card_issued,skipped,queued,cleanup_failed",
                 status_filter,
             ),
             ("excluded_reason", "Excluded Reason", "text", excluded_reason_filter),
@@ -5307,24 +6518,52 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
     is_editable_preview = (
         run.mode == "preview" and run.status == "completed" and not used_as_source and not canary_locked
     )
-    # Retry button доступен для send-real runs (не для preview)
-    is_send_real = run.mode == "send-real"
+    # Retry button доступен для send-real runs (не для preview). EasyWeek has no
+    # send path to retry into.
+    is_send_real = run.mode == "send-real" and run.provider != PROVIDER_EASYWEEK
 
-    base_cols = [
-        "ID",
-        "Client ID",
-        "Name",
-        "Phone",
-        "Status",
-        "Excluded Reason",
-        "Card #",
-        "Msg Job ID",
-        "Sent",
-        "Read",
-        "Replied",
-        "Booked",
-        "Followup",
-    ]
+    is_easyweek_run = run.provider == PROVIDER_EASYWEEK
+    if is_easyweek_run:
+        # Cards, jobs and the delivery timestamps belong to the Altegio send
+        # path. For EasyWeek every one of them is permanently empty, and a
+        # column of dashes reads as "not yet" rather than "not applicable".
+        base_cols = [
+            "ID",
+            "Client ID",
+            "Name",
+            "Phone",
+            "Status",
+            "Basis",
+            "Excluded Reason",
+            # Kept apart from the two above on purpose: the basis says how the
+            # row got here, `Excluded Reason` says what it is now, and this says
+            # what the segmenter had decided before an operator overrode it.
+            # Collapsing any two of them would lose which is which.
+            "Было исключено автоматически",
+            "EasyWeek customer",
+            "Лок. клиент",
+        ]
+    else:
+        base_cols = [
+            "ID",
+            "Client ID",
+            "Name",
+            "Phone",
+            "Status",
+            # §37.1: on what grounds this row is here. `auto` was proven by the
+            # segmenter, `manual` is an operator's decision, `test` is the one
+            # approved canary account — three different things that would
+            # otherwise look identical in a list.
+            "Basis",
+            "Excluded Reason",
+            "Card #",
+            "Msg Job ID",
+            "Sent",
+            "Read",
+            "Replied",
+            "Booked",
+            "Followup",
+        ]
     extra_cols: list[str] = []
     if is_editable_preview:
         extra_cols.append("")
@@ -5334,24 +6573,47 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
 
     rows = []
     for r in recipients:
-        row = [
-            str(r.id),
-            str(r.client_id or ""),
-            _esc(r.display_name or ""),
-            _esc(r.phone_e164 or ""),
-            _status_badge(r.status),
-            _esc(r.excluded_reason or ""),
-            _esc(r.loyalty_card_number or ""),
-            str(r.message_job_id or ""),
-            _esc(_fmt_dt(r.sent_at, tz)),
-            _esc(_fmt_dt(r.read_at, tz)),
-            _esc(_fmt_dt(r.replied_at, tz)),
-            _esc(_fmt_dt(r.booked_after_at, tz)),
-            _esc(r.followup_status or ""),
-        ]
+        if is_easyweek_run:
+            row = [
+                str(r.id),
+                str(r.client_id or ""),
+                _esc(r.display_name or ""),
+                _esc(r.phone_e164 or ""),
+                _status_badge(r.status),
+                _basis_badge(r, with_audit_column=True),
+                _esc(r.excluded_reason or "—"),
+                _esc(r.auto_excluded_reason or "—"),
+                # Presence only: the customer UUID is never rendered.
+                "✓" if r.easyweek_customer_uuid is not None else "—",
+                "✓" if r.local_client_found else "—",
+            ]
+        else:
+            row = [
+                str(r.id),
+                str(r.client_id or ""),
+                _esc(r.display_name or ""),
+                _esc(r.phone_e164 or ""),
+                _status_badge(r.status),
+                _basis_badge(r),
+                _esc(r.excluded_reason or ""),
+                _esc(r.loyalty_card_number or ""),
+                str(r.message_job_id or ""),
+                _esc(_fmt_dt(r.sent_at, tz)),
+                _esc(_fmt_dt(r.read_at, tz)),
+                _esc(_fmt_dt(r.replied_at, tz)),
+                _esc(_fmt_dt(r.booked_after_at, tz)),
+                _esc(r.followup_status or ""),
+            ]
         if is_editable_preview:
+            # Remove is for ACTIVE candidates. A row the segmenter already
+            # excluded has nothing to remove, and offering the button would
+            # invite an operator to overwrite the reason it was excluded for.
             if r.excluded_reason == "manual_removed":
                 row.append('<span class="text-muted small">removed</span>')
+            elif r.excluded_reason:
+                row.append(f'<span class="text-muted small">excluded: {_esc(r.excluded_reason)}</span>')
+            elif r.status != "candidate":
+                row.append(f'<span class="text-muted small">{_esc(r.status or "")}</span>')
             else:
                 row.append(
                     f'<button class="btn btn-sm btn-outline-danger" '

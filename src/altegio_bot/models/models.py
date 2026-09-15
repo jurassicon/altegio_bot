@@ -1211,6 +1211,25 @@ class CampaignRun(Base):
     )
 
 
+# On what grounds a campaign recipient is in a snapshot (§37.1). Three answers,
+# and the difference between them is the difference between a proof, an approved
+# stand-in and a human decision:
+#
+#   earned_first_visit        the segmenter proved a first visit (§33)
+#   owner_test_account        the one pre-configured canary account (§36.11)
+#   operator_manual_selection an operator typed a phone number (§37.1)
+#
+# The last one is NOT evidence of a first visit and must never be reported as
+# one. It exists because the transitional August list has no EasyWeek data to be
+# proven from — EasyWeek only started on 1 September — so a person decides, and
+# the row says that a person decided.
+RECIPIENT_BASIS_EARNED = "earned_first_visit"
+RECIPIENT_BASIS_TEST = "owner_test_account"
+RECIPIENT_BASIS_MANUAL = "operator_manual_selection"
+RECIPIENT_BASES = (RECIPIENT_BASIS_EARNED, RECIPIENT_BASIS_TEST, RECIPIENT_BASIS_MANUAL)
+_RECIPIENT_BASIS_SQL = ", ".join(f"'{value}'" for value in RECIPIENT_BASES)
+
+
 class CampaignRecipient(Base):
     """
     Снимок сегментации и результат рассылки для одного клиента.
@@ -1286,6 +1305,74 @@ class CampaignRecipient(Base):
             "easyweek_test_customer_uuid",
             unique=True,
             postgresql_where=text("easyweek_test_customer_uuid IS NOT NULL"),
+        ),
+        # §37.1. A closed basis vocabulary, and the invariants that keep the
+        # three apart. Stated as equivalences, not implications: a basis without
+        # its identity column is as wrong as an identity column without its
+        # basis, and either one would let a row misdescribe how it got here.
+        CheckConstraint(
+            f"recipient_basis IN ({_RECIPIENT_BASIS_SQL})",
+            name="ck_campaign_recipients_basis",
+        ),
+        CheckConstraint(
+            f"recipient_basis = '{RECIPIENT_BASIS_EARNED}' OR provider = 'easyweek'",
+            name="ck_campaign_recipients_basis_provider",
+        ),
+        CheckConstraint(
+            f"(recipient_basis = '{RECIPIENT_BASIS_TEST}') = (easyweek_test_customer_uuid IS NOT NULL)",
+            name="ck_campaign_recipients_basis_test_binding",
+        ),
+        CheckConstraint(
+            f"(recipient_basis = '{RECIPIENT_BASIS_MANUAL}') = (easyweek_customer_uuid IS NOT NULL)",
+            name="ck_campaign_recipients_basis_manual_binding",
+        ),
+        # A manual selection must not be able to look like earned proof. Not
+        # "happens to have none" — cannot have any, so no later code path can
+        # fill these in and turn an operator's decision into a first visit
+        # nobody made.
+        CheckConstraint(
+            f"recipient_basis <> '{RECIPIENT_BASIS_MANUAL}' OR ("
+            "source_easyweek_event_id IS NULL "
+            "AND source_record_id IS NULL "
+            "AND source_booking_uuid IS NULL "
+            "AND source_visits_total IS NULL "
+            "AND source_visits_total_updated_at IS NULL)",
+            name="ck_campaign_recipients_manual_has_no_source_proof",
+        ),
+        # The original automatic verdict is audit, and audit belongs to the row
+        # that actually overrode one: an operator's manual inclusion. Anywhere
+        # else it would be a reason attached to a decision nobody made.
+        CheckConstraint(
+            f"auto_excluded_reason IS NULL OR (provider = 'easyweek' AND recipient_basis = '{RECIPIENT_BASIS_MANUAL}')",
+            name="ck_campaign_recipients_auto_excluded_basis",
+        ),
+        # An ACTIVE earned EasyWeek candidate is a claim that the segmenter
+        # proved a first visit, and the proof is those five columns together.
+        # The segmenter already works this way — it attaches the proof exactly
+        # when the row is eligible — so this states the rule rather than adding
+        # one, and stops any later path from producing a proof-free row that
+        # still says `earned`.
+        CheckConstraint(
+            f"NOT (provider = 'easyweek' AND recipient_basis = '{RECIPIENT_BASIS_EARNED}' "
+            "AND status = 'candidate' AND excluded_reason IS NULL) OR ("
+            "source_easyweek_event_id IS NOT NULL "
+            "AND source_record_id IS NOT NULL "
+            "AND source_booking_uuid IS NOT NULL "
+            "AND source_visits_total IS NOT NULL "
+            "AND source_visits_total_updated_at IS NOT NULL)",
+            name="ck_campaign_recipients_active_earned_has_proof",
+        ),
+        # One ACTIVE row per proven customer per run. Keyed on the customer UUID
+        # rather than the phone: one number can legitimately belong to two
+        # customers, which is an ambiguity the add path refuses outright — but
+        # the database must not depend on that refusal being remembered.
+        Index(
+            "uq_campaign_recipients_manual_customer_per_run",
+            "provider",
+            "campaign_run_id",
+            "easyweek_customer_uuid",
+            unique=True,
+            postgresql_where=text("easyweek_customer_uuid IS NOT NULL"),
         ),
     )
 
@@ -1389,6 +1476,27 @@ class CampaignRecipient(Base):
         PostgresUUID(as_uuid=True),
         nullable=True,
     )
+
+    # §37.1: how this row got into the snapshot. Typed, because every report
+    # that shows a recipient has to be able to say whether a first visit was
+    # proven, an approved test account was substituted, or a person decided.
+    recipient_basis: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text(f"'{RECIPIENT_BASIS_EARNED}'"),
+    )
+
+    # The EasyWeek customer an operator's manual selection was proven against,
+    # live, before the row was written. NULL for every other basis.
+    easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(
+        PostgresUUID(as_uuid=True),
+        nullable=True,
+    )
+
+    # What the segmenter had decided before an operator included this person
+    # anyway. Kept so an override never erases the reason it overrode: the row
+    # still says "the automatic answer was X, and a human said yes regardless".
+    auto_excluded_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # -----------------------------------------------------------------------
     # Loyalty-карты
