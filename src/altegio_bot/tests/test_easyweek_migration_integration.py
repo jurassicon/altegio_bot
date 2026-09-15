@@ -1131,7 +1131,14 @@ async def test_campaign_provider_migration_backfills_and_enforces_identity(temp_
     with pytest.raises(IntegrityError) as mismatch:
         await _exec(
             temp_db_url,
-            "UPDATE campaign_recipients SET provider = 'easyweek' WHERE id = 920001",
+            # Keep the probe valid under the later §37.1 recipient-basis CHECKs.
+            # An active earned EasyWeek candidate without source proof is
+            # correctly rejected by its CHECK before PostgreSQL reaches the
+            # composite provider FK, which would make this test assert the
+            # ordering of independent constraints instead of the FK itself.
+            "UPDATE campaign_recipients "
+            "SET provider = 'easyweek', status = 'skipped' "
+            "WHERE id = 920001",
         )
     assert _CAMPAIGN_PROVIDER_FK in str(mismatch.value)
 
