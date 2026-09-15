@@ -595,7 +595,11 @@ async def test_the_ui_stops_offering_edits_once_the_canary_holds_the_preview(
 
     page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
 
-    assert "voucher delivery canary" in page
+    # Two canaries can hold a preview now, so the page names which one rather
+    # than saying "a canary" and leaving the operator to guess which command to
+    # reach for.
+    assert "voucher canary" in page
+    assert "§36" in page
     # The helper functions still exist in the page script; what must be gone is
     # every control wired to them.
     for gone in ('onclick="showAddRecipientForm(', 'onclick="discardAndRefresh(', 'onclick="deleteAndRedirect('):

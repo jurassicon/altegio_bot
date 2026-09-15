@@ -2813,3 +2813,386 @@ class EasyWeekCampaignVoucherDeliveryAttempt(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# §37.2: controlled MANUAL-BASIS voucher delivery canary
+# ---------------------------------------------------------------------------
+# §36 delivers to somebody whose first visit earned the voucher, or to the one
+# pre-configured test account. This canary delivers to a real customer an
+# OPERATOR picked by hand in a preview.
+#
+# The state vocabulary is the same shape, because the sequence of irreversible
+# things that can happen to €15 and to a person's phone is the same. It is
+# repeated rather than imported so that a future change to one canary cannot
+# silently redefine the durable states of the other.
+MANUAL_VOUCHER_PLANNED = "planned"
+MANUAL_VOUCHER_CREATE_CLAIMED = "create_claimed"
+MANUAL_VOUCHER_CREATE_UNKNOWN = "create_unknown"
+MANUAL_VOUCHER_CREATE_REJECTED = "create_rejected"
+MANUAL_VOUCHER_CREATED = "created"
+MANUAL_VOUCHER_PAY_CLAIMED = "pay_claimed"
+MANUAL_VOUCHER_PAY_UNKNOWN = "pay_unknown"
+MANUAL_VOUCHER_PAY_REJECTED = "pay_rejected"
+MANUAL_VOUCHER_PAID = "paid"
+MANUAL_VOUCHER_SEND_CLAIMED = "send_claimed"
+MANUAL_VOUCHER_SEND_UNKNOWN = "send_unknown"
+MANUAL_VOUCHER_SEND_REJECTED = "send_rejected"
+MANUAL_VOUCHER_PROVIDER_ACCEPTED = "provider_accepted"
+MANUAL_VOUCHER_DELIVERED = "delivered"
+MANUAL_VOUCHER_READ = "read"
+MANUAL_VOUCHER_REFUND_CLAIMED = "refund_claimed"
+MANUAL_VOUCHER_REFUND_UNKNOWN = "refund_unknown"
+MANUAL_VOUCHER_REFUND_REJECTED = "refund_rejected"
+MANUAL_VOUCHER_REFUNDED = "refunded"
+MANUAL_VOUCHER_MANUALLY_CLEANED = "manually_cleaned"
+MANUAL_VOUCHER_AMBIGUOUS = "ambiguous"
+
+MANUAL_VOUCHER_STATUSES = (
+    MANUAL_VOUCHER_PLANNED,
+    MANUAL_VOUCHER_CREATE_CLAIMED,
+    MANUAL_VOUCHER_CREATE_UNKNOWN,
+    MANUAL_VOUCHER_CREATE_REJECTED,
+    MANUAL_VOUCHER_CREATED,
+    MANUAL_VOUCHER_PAY_CLAIMED,
+    MANUAL_VOUCHER_PAY_UNKNOWN,
+    MANUAL_VOUCHER_PAY_REJECTED,
+    MANUAL_VOUCHER_PAID,
+    MANUAL_VOUCHER_SEND_CLAIMED,
+    MANUAL_VOUCHER_SEND_UNKNOWN,
+    MANUAL_VOUCHER_SEND_REJECTED,
+    MANUAL_VOUCHER_PROVIDER_ACCEPTED,
+    MANUAL_VOUCHER_DELIVERED,
+    MANUAL_VOUCHER_READ,
+    MANUAL_VOUCHER_REFUND_CLAIMED,
+    MANUAL_VOUCHER_REFUND_UNKNOWN,
+    MANUAL_VOUCHER_REFUND_REJECTED,
+    MANUAL_VOUCHER_REFUNDED,
+    MANUAL_VOUCHER_MANUALLY_CLEANED,
+    MANUAL_VOUCHER_AMBIGUOUS,
+)
+
+_MANUAL_VOUCHER_STATUS_SQL = ", ".join(f"'{value}'" for value in MANUAL_VOUCHER_STATUSES)
+
+# The only basis this canary serves. A column rather than an implication,
+# because every stage plan, the identity match and the operator report read it —
+# and because a row must state, durably, that what stands behind it is a
+# person's decision and not a proven first visit.
+MANUAL_VOUCHER_BASIS = RECIPIENT_BASIS_MANUAL
+
+
+class EasyWeekManualVoucherDeliveryLedger(Base):
+    """The one durable row of the manual-basis voucher delivery canary (§37.2).
+
+    What makes this different from §36 is not the machinery — it is what stands
+    behind the row. §36 acts on an entitlement somebody earned by visiting, or
+    on the owner's test account. Here an operator looked at a preview, typed a
+    phone number, and decided. That decision is a legitimate reason to send one
+    controlled voucher; it is not evidence of a first visit, and this table is
+    built so it can never be mistaken for one.
+
+    Hence: no ``source_booking_uuid`` column at all. There is no visit to point
+    at, and a nullable column would be an invitation to fill it with a borrowed,
+    random or customer-shaped value. The absence is structural.
+
+    Uniqueness, for two different mistakes
+    --------------------------------------
+    ``canary_scope`` is unique, so a rerun, a second operator and a resumed
+    crash all collide on one row rather than starting a second canary.
+
+    The entitlement key is the customer plus the campaign PERIOD — provider,
+    company, campaign code, EasyWeek customer UUID and both period bounds. A
+    manual selection has no booking to be unique about, so the thing that must
+    not repeat is "this person, this campaign, this month". A fresh preview of
+    the same August wave produces new row ids for the same human being, and that
+    is exactly the mistake a scope-only rule would miss.
+
+    Nothing here is the voucher
+    ---------------------------
+    The code is a bearer secret and is never a column. What is stored is a keyed
+    MAC bound to this row and this order, plus the id of the key that made it.
+    No name, phone, e-mail, message text or template parameter is stored: the
+    recipient is addressed by id, re-proven live before every external step.
+    """
+
+    __tablename__ = "easyweek_manual_voucher_delivery_ledger"
+
+    __table_args__ = (
+        # 1. One canary, ever.
+        UniqueConstraint("canary_scope", name="uq_ew_manual_voucher_scope"),
+        # 2. One voucher per person per campaign period, whatever run proposes
+        # it. Not partial: every row of this table has a customer and a period,
+        # because that is the only identity a manual selection has.
+        UniqueConstraint(
+            "provider",
+            "company_id",
+            "campaign_code",
+            "easyweek_customer_uuid",
+            "campaign_period_start",
+            "campaign_period_end",
+            name="uq_ew_manual_voucher_entitlement",
+        ),
+        # 3-5. A result may belong to exactly one canary row.
+        UniqueConstraint("target_order_uuid", name="uq_ew_manual_voucher_target_order"),
+        UniqueConstraint("outbound_intent_uuid", name="uq_ew_manual_voucher_intent"),
+        UniqueConstraint("provider_message_id", name="uq_ew_manual_voucher_provider_message"),
+        # 6. The recipient must belong to the run this row names, under the same
+        # provider. Composite FKs, because two separate ones would each be
+        # satisfied by rows that have nothing to do with each other.
+        ForeignKeyConstraint(
+            ["campaign_run_id", "provider"],
+            ["campaign_runs.id", "campaign_runs.provider"],
+            name="fk_ew_manual_voucher_run_provider",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["campaign_recipient_id", "provider"],
+            ["campaign_recipients.id", "campaign_recipients.provider"],
+            name="fk_ew_manual_voucher_recipient_provider",
+            ondelete="RESTRICT",
+        ),
+        # 7. A closed status vocabulary. An unknown string is not a state.
+        CheckConstraint(
+            f"status IN ({_MANUAL_VOUCHER_STATUS_SQL})",
+            name="ck_ew_manual_voucher_status",
+        ),
+        # 8. EasyWeek-only, Karlsruhe-only, manual-basis-only, by construction.
+        # The company id is a literal here rather than configuration: this canary
+        # was approved for one branch, and a misconfigured environment must not
+        # be able to point a real payment at another one.
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_manual_voucher_provider"),
+        CheckConstraint("company_id = 322579", name="ck_ew_manual_voucher_company"),
+        CheckConstraint(
+            f"recipient_basis = '{RECIPIENT_BASIS_MANUAL}'",
+            name="ck_ew_manual_voucher_basis",
+        ),
+        # 9. A campaign period is an interval, and an entitlement key built on a
+        # backwards one would be meaningless.
+        CheckConstraint(
+            "campaign_period_start < campaign_period_end",
+            name="ck_ew_manual_voucher_period_order",
+        ),
+        # 10. Stage order. A stage cannot be attempted before it was claimed,
+        # nor verified before it was attempted.
+        CheckConstraint(
+            "(create_attempted_at IS NULL OR create_claimed_at IS NOT NULL) "
+            "AND (create_verified_at IS NULL OR create_attempted_at IS NOT NULL) "
+            "AND (pay_attempted_at IS NULL OR pay_claimed_at IS NOT NULL) "
+            "AND (pay_verified_at IS NULL OR pay_attempted_at IS NOT NULL) "
+            "AND (send_attempted_at IS NULL OR send_claimed_at IS NOT NULL) "
+            "AND (refund_attempted_at IS NULL OR refund_claimed_at IS NOT NULL) "
+            "AND (refund_verified_at IS NULL OR refund_attempted_at IS NOT NULL)",
+            name="ck_ew_manual_voucher_stage_order",
+        ),
+        # 11. Money cannot move before the order it pays for was proven to exist.
+        CheckConstraint(
+            "pay_claimed_at IS NULL OR (create_verified_at IS NOT NULL AND target_order_uuid IS NOT NULL)",
+            name="ck_ew_manual_voucher_pay_needs_created",
+        ),
+        # 12. Nothing may be sent before the voucher is proven paid for, proven
+        # bound to this row by MAC, and proven still deliverable by a live guard
+        # taken AFTER the payment. The ordering is a constraint, not a comment:
+        # a guard from before the payment says nothing about the person now.
+        CheckConstraint(
+            "send_claimed_at IS NULL OR ("
+            "pay_verified_at IS NOT NULL "
+            "AND voucher_code_hmac IS NOT NULL "
+            "AND hmac_key_id IS NOT NULL "
+            "AND live_guard_reproven_at IS NOT NULL "
+            "AND live_guard_reproven_at >= pay_verified_at)",
+            name="ck_ew_manual_voucher_send_needs_paid",
+        ),
+        # 13. Acceptance is something Meta said, so it needs both the attempt we
+        # made and the identifier Meta answered with.
+        CheckConstraint(
+            "provider_accepted_at IS NULL OR (send_attempted_at IS NOT NULL AND provider_message_id IS NOT NULL)",
+            name="ck_ew_manual_voucher_accepted_needs_attempt",
+        ),
+        # 14-15. The webhook ladder. Delivered needs acceptance; read needs
+        # delivery. A provider reporting them out of order proves nothing new.
+        CheckConstraint(
+            "delivered_at IS NULL OR provider_accepted_at IS NOT NULL",
+            name="ck_ew_manual_voucher_delivered_needs_accepted",
+        ),
+        CheckConstraint(
+            "read_at IS NULL OR delivered_at IS NOT NULL",
+            name="ck_ew_manual_voucher_read_needs_delivered",
+        ),
+        # 16-17. A refund is only ever the pre-send escape hatch. Once a message
+        # may be in a customer's hands the money stays where it is.
+        CheckConstraint(
+            "refund_claimed_at IS NULL OR ("
+            "provider_accepted_at IS NULL "
+            "AND delivered_at IS NULL "
+            "AND read_at IS NULL "
+            "AND send_attempted_at IS NULL)",
+            name="ck_ew_manual_voucher_refund_is_pre_send",
+        ),
+        CheckConstraint(
+            f"status <> '{MANUAL_VOUCHER_REFUNDED}' OR ("
+            "provider_accepted_at IS NULL AND delivered_at IS NULL AND read_at IS NULL)",
+            name="ck_ew_manual_voucher_refunded_never_sent",
+        ),
+        # 18. At most one delivery attempt in the lifetime of this row. Not a
+        # retry budget: a counter that can only be zero or one.
+        CheckConstraint(
+            "send_attempt_count >= 0 AND send_attempt_count <= 1",
+            name="ck_ew_manual_voucher_single_attempt",
+        ),
+        CheckConstraint(
+            "(send_attempt_count = 0) = (send_attempted_at IS NULL)",
+            name="ck_ew_manual_voucher_attempt_count_matches",
+        ),
+        # 19. A MAC without the key that made it cannot be verified later.
+        CheckConstraint(
+            "(voucher_code_hmac IS NULL) = (hmac_key_id IS NULL)",
+            name="ck_ew_manual_voucher_hmac_pair",
+        ),
+        Index("ix_ew_manual_voucher_status", "status"),
+        Index("ix_ew_manual_voucher_recipient", "campaign_recipient_id"),
+        Index("ix_ew_manual_voucher_run", "campaign_run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- identity ----------------------------------------------------------
+    canary_scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    # WHICH approved baseline this row was planned against. A later canary with
+    # a different service count is a different configuration, and a row that
+    # cannot say which one it trusted could not be audited afterwards.
+    baseline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    recipient_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # The exact preview recipient an operator chose, and the run it came from.
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # The person, and the wave they were selected for. Together with the
+    # campaign these are the entitlement key: a manual selection has no booking.
+    easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    campaign_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- the frozen EasyWeek identity this canary may act on ----------------
+    location_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    staffer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    payment_account_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    voucher_template_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    # Recomputable, non-personal, and findable in the EasyWeek dashboard.
+    reconciliation_marker: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- results -----------------------------------------------------------
+    target_order_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    outbound_intent_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # -- the voucher, as a keyed proof and nothing else ---------------------
+    voucher_code_hmac: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hmac_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- state -------------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manual_cleanup_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    manual_cleanup_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- operator authorisation provenance ---------------------------------
+    create_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pay_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deliver_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refund_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- claim / attempt / verification, per stage -------------------------
+    create_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    pay_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # The live guard taken immediately before sending, after the payment.
+    live_guard_reproven_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    provider_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    refund_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- safe evidence -----------------------------------------------------
+    # Shape facts, proof labels and reason codes. Never a value, never a body,
+    # never a template parameter, never the code.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekManualVoucherDeliveryAttempt(Base):
+    """One redacted outbound intent, written and committed BEFORE the send.
+
+    Its own table rather than an ``OutboxMessage``, for the same reason as §36:
+    the outbox is swept by a generic worker whose purpose is to retry what it
+    finds, and the one property this row must have is that nothing may ever pick
+    it up and send it again. A separate table the worker has never heard of
+    needs no proof of that.
+
+    It stores no message. No rendered body, no parameter list, no voucher code —
+    so nothing downstream could re-render the message even if it tried.
+    """
+
+    __tablename__ = "easyweek_manual_voucher_delivery_attempts"
+
+    __table_args__ = (
+        UniqueConstraint("intent_uuid", name="uq_ew_manual_voucher_attempt_intent"),
+        ForeignKeyConstraint(
+            ["ledger_id"],
+            ["easyweek_manual_voucher_delivery_ledger.id"],
+            name="fk_ew_manual_voucher_attempt_ledger",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "outcome IN ('claimed', 'provider_accepted', 'unknown', 'rejected')",
+            name="ck_ew_manual_voucher_attempt_outcome",
+        ),
+        CheckConstraint(
+            "outcome <> 'provider_accepted' OR provider_message_id IS NOT NULL",
+            name="ck_ew_manual_voucher_attempt_accepted_has_id",
+        ),
+        Index("ix_ew_manual_voucher_attempt_ledger", "ledger_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ledger_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    intent_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+
+    # Enough to audit WHICH approved template was used, and nothing about what
+    # it said to whom.
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    meta_template_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_language: Mapped[str] = mapped_column(String(8), nullable=False)
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

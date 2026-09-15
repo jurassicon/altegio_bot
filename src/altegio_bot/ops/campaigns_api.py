@@ -54,7 +54,6 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     TEST_CUSTOMER_UNCONFIGURED,
     TEST_RECIPIENT_DISABLED,
 )
-from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
 from altegio_bot.campaigns.easyweek_voucher_delivery.test_recipient import add_test_recipient_to_preview
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.gift_card_readiness import probe_gift_card_readiness
@@ -62,6 +61,7 @@ from altegio_bot.campaigns.loyalty_cleanup import (
     bulk_delete_outstanding_cards,
     find_outstanding_campaign_cards,
 )
+from altegio_bot.campaigns.preview_freeze import preview_is_locked_by_any_canary
 from altegio_bot.campaigns.provider import (
     CampaignProviderRefusal,
     require_campaign_execution_provider,
@@ -1388,7 +1388,7 @@ async def get_run(run_id: int) -> dict[str, Any]:
                 )
             )
             used_as_source = int(src_count or 0) > 0
-        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
+        canary_locked = await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
 
     result = _run_detail(run, used_as_source=used_as_source, canary_locked=canary_locked)
     result["execution_job"] = execution_job

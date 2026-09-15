@@ -330,18 +330,31 @@ def template_counters(template_payload: object) -> dict[str, int] | None:
     return counters
 
 
-def frozen_template_mismatches(template_payload: object) -> tuple[str, ...]:
+def frozen_template_mismatches(
+    template_payload: object,
+    *,
+    facts: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
     """Field names whose value is not the frozen fact the owner approved.
 
     Only NAMES are returned. A mismatch could be an operator editing the product
     mid-canary, and the observed value belongs in the EasyWeek UI, not in a
     report that gets pasted into a ticket.
+
+    ``facts`` names WHICH approved baseline to compare against. It defaults to
+    the §35 one, which is the configuration that canary was run and proved
+    against; §37.2 carries its own, separately versioned, because a later
+    read-only probe observed a different service count. Neither baseline is
+    allowed to adapt to what it reads — that is the whole point of comparing —
+    so a second baseline is a second literal a reviewer sees, never a value
+    derived from the response.
     """
+    expected_facts = FROZEN_TEMPLATE_FACTS if facts is None else facts
     template = _object(template_payload)
     mismatched: list[str] = []
     if template.get("uuid") != EASYWEEK_VOUCHER_TEMPLATE_UUID:
         mismatched.append("uuid")
-    for name, expected in FROZEN_TEMPLATE_FACTS.items():
+    for name, expected in expected_facts.items():
         observed = template.get(name)
         if expected is None:
             if observed is not None:
@@ -356,17 +369,25 @@ def frozen_template_mismatches(template_payload: object) -> tuple[str, ...]:
     return tuple(mismatched)
 
 
-def immutable_template_digest(template_payload: object) -> str:
+def immutable_template_digest(
+    template_payload: object,
+    *,
+    facts: dict[str, Any] | None = None,
+) -> str:
     """A digest over the frozen CONFIGURATION only — never over the counters.
 
     That separation is the point. A counter moves when a voucher is issued,
     which is the product working; folding it into this digest would turn every
     successful create into an apparent template edit and would strand the refund
     behind a fake drift alarm.
+
+    ``facts`` selects which baseline's field set is covered, so that a canary
+    signs the fields ITS baseline froze and not somebody else's.
     """
+    expected_facts = FROZEN_TEMPLATE_FACTS if facts is None else facts
     template = _object(template_payload)
     material: dict[str, Any] = {"uuid": template.get("uuid")}
-    for name in sorted(FROZEN_TEMPLATE_FACTS):
+    for name in sorted(expected_facts):
         material[name] = template.get(name)
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 

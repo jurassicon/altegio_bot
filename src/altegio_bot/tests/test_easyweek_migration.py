@@ -95,6 +95,10 @@ _CANONICAL_PROVIDER_TABLES = (
     "campaign_runs",
     "campaign_recipients",
     "easyweek_campaign_voucher_delivery_ledger",
+    # §37.2's ledger is provider-scoped for the same reason as §36's: it names a
+    # campaign row, and a row that did not say which provider it belongs to
+    # could be joined to the wrong one.
+    "easyweek_manual_voucher_delivery_ledger",
 )
 
 # (table, pre-PR-3 constraint, provider-scoped replacement)
