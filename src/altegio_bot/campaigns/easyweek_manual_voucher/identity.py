@@ -103,6 +103,12 @@ HMAC_KEY_INVALID: Final = "manual_voucher_hmac_key_invalid"
 # -- the message it would be delivered with --------------------------------
 TEMPLATE_UNPROVEN: Final = "manual_voucher_template_unproven"
 SENDER_UNPROVEN: Final = "manual_voucher_sender_unproven"
+# The approved template takes three positional parameters and the third is a
+# booking link. A message that cannot be filled completely is not one to send,
+# and an empty string in that slot would be a link to nowhere in a real
+# customer's WhatsApp.
+BOOKING_LINK_UNPROVEN: Final = "manual_voucher_booking_link_unproven"
+TEMPLATE_PARAMETERS_UNPROVEN: Final = "manual_voucher_template_parameters_unproven"
 
 # -- who it would be delivered to ------------------------------------------
 # Deliberately separate codes: "the run is not one we serve", "the row is not a
@@ -117,6 +123,13 @@ CUSTOMER_IDENTITY_NOT_CURRENT: Final = "manual_voucher_customer_identity_not_cur
 CUSTOMER_PHONE_NOT_CURRENT: Final = "manual_voucher_customer_phone_not_current"
 CUSTOMER_NAME_MISSING: Final = "manual_voucher_customer_name_missing"
 LOCAL_CLIENT_UNPROVEN: Final = "manual_voucher_local_client_unproven"
+# Two EasyWeek customers answer to this number — a couple, a family phone, a
+# duplicated import. Not something to pick a winner from when the prize is a
+# real €15 code.
+CUSTOMER_AMBIGUOUS: Final = "manual_voucher_customer_ambiguous"
+# The workspace-wide read did not finish, or did not happen: an unfinished read
+# is not an absence and not a proof.
+CUSTOMER_LOOKUP_UNDETERMINED: Final = "manual_voucher_customer_lookup_undetermined"
 RECIPIENT_OPTED_OUT: Final = "manual_voucher_recipient_opted_out"
 LIVE_GUARD_UNCERTAIN: Final = "manual_voucher_live_guard_uncertain"
 
@@ -139,6 +152,13 @@ ORDER_STATE_UNATTRIBUTABLE: Final = "manual_voucher_order_state_unattributable"
 # under a pending payment, and the operator has to decide, not the tool.
 BASELINE_DRIFT: Final = "manual_voucher_baseline_drift"
 BASELINE_COUNTERS_UNREADABLE: Final = "manual_voucher_baseline_counters_unreadable"
+
+# -- reconciliation of an unknown create --------------------------------------
+# Zero matches is not "it was not created": the walk may simply not have seen
+# it. Several matches is a full stop. Both stay unknown.
+MARKER_SEARCH_UNRESOLVED: Final = "manual_voucher_marker_search_unresolved"
+MARKER_SEARCH_AMBIGUOUS: Final = "manual_voucher_marker_search_ambiguous"
+MARKER_SEARCH_INCOMPLETE: Final = "manual_voucher_marker_search_incomplete"
 
 # -- the send ---------------------------------------------------------------
 DELIVERY_ALREADY_ATTEMPTED: Final = "manual_voucher_delivery_already_attempted"

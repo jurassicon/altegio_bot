@@ -50,7 +50,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_eligibility import BookingReader
 from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
+    CUSTOMER_AMBIGUOUS,
     CUSTOMER_IDENTITY_NOT_CURRENT,
+    CUSTOMER_LOOKUP_UNDETERMINED,
     CUSTOMER_NAME_MISSING,
     CUSTOMER_PHONE_NOT_CURRENT,
     CUSTOMER_UUID_MISSING,
@@ -64,7 +66,12 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     RECIPIENT_UNPROVEN,
     RUN_UNPROVEN,
 )
-from altegio_bot.easyweek_migration.customer_api import read_customer_card
+from altegio_bot.easyweek_migration.customer_api import (
+    LOOKUP_AMBIGUOUS,
+    LOOKUP_FOUND,
+    lookup_customer_by_phone,
+    read_customer_card,
+)
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_MANUAL,
@@ -249,10 +256,39 @@ async def prove_manual_recipient(
         return ManualRecipientProof(False, (RECIPIENT_OPTED_OUT,), checks=checks)
     checks["not_opted_out"] = True
 
-    # -- and only now, the live read -----------------------------------------
-    # Every failure mode of this call — 404, auth, timeout, 429, 5xx, malformed
-    # body, a phone that does not match — is the same answer: we do not know who
-    # this is, so nothing external happens.
+    # -- and only now, the live reads ----------------------------------------
+    # First: does this number still resolve to exactly ONE EasyWeek customer,
+    # workspace-wide? The stored UUID says who we meant; it does not say that
+    # nobody else has since been created on the same number, and issuing a €15
+    # code to "one of two people" is not something to resolve by picking first.
+    #
+    # The walk is complete or it is nothing: an unfinished listing is not an
+    # absence, and the row never handed over may be the duplicate.
+    try:
+        lookup = await lookup_customer_by_phone(client_reader, destination)
+    except Exception:  # noqa: BLE001 - an unread workspace proves nothing
+        checks["customer_unambiguous"] = False
+        return ManualRecipientProof(False, (CUSTOMER_LOOKUP_UNDETERMINED,), checks=checks)
+    if lookup.outcome == LOOKUP_AMBIGUOUS:
+        checks["customer_unambiguous"] = False
+        return ManualRecipientProof(False, (CUSTOMER_AMBIGUOUS,), checks=checks)
+    if lookup.outcome != LOOKUP_FOUND or lookup.uuid is None:
+        # Absent, unusable, first name missing, or undetermined by an auth
+        # error, a timeout, a 429, a 5xx or an unfinished page walk. None of
+        # them proves anything, and all of them mean zero external writes.
+        checks["customer_unambiguous"] = False
+        return ManualRecipientProof(False, (CUSTOMER_LOOKUP_UNDETERMINED,), checks=checks)
+    if lookup.uuid != customer_uuid:
+        # The number now belongs to a different customer than the one the
+        # preview recorded.
+        checks["customer_unambiguous"] = False
+        return ManualRecipientProof(False, (CUSTOMER_IDENTITY_NOT_CURRENT,), checks=checks)
+    checks["customer_unambiguous"] = True
+
+    # Second: the direct read of that exact UUID. A listing row is a summary;
+    # the card is the workspace's own answer about this one customer.
+    # Every failure mode — 404, auth, timeout, 429, 5xx, malformed body, a phone
+    # that does not match — is the same answer: we do not know who this is.
     try:
         payload = await client_reader.get_customer(customer_uuid)
     except Exception:  # noqa: BLE001 - every read failure is one refusal

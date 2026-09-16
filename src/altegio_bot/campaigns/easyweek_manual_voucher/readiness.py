@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     ACCOUNT_UNCONFIGURED,
+    BOOKING_LINK_UNPROVEN,
     CANARY_DISABLED,
     SENDER_UNPROVEN,
     STAFFER_UNCONFIGURED,
@@ -49,6 +50,7 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import binding_key_reason
+from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
 
@@ -85,6 +87,7 @@ class ManualPrerequisites:
     key_reason: str | None = None
     template_reason: str | None = None
     sender_reason: str | None = None
+    booking_link_reason: str | None = None
     delivery_checks_applied: bool = True
     # Needed to act, never printed.
     staffer_uuid: str | None = None
@@ -93,6 +96,9 @@ class ManualPrerequisites:
     phone_number_id: str | None = None
     meta_template_name: str | None = None
     template_language: str | None = None
+    # The third template parameter. Server-resolved from the reviewed registry;
+    # a browser never supplies it and it is never defaulted to an empty string.
+    booking_link: str | None = None
 
     @property
     def reasons(self) -> tuple[str, ...]:
@@ -101,7 +107,15 @@ class ManualPrerequisites:
             self.account_reason,
         ]
         if self.delivery_checks_applied:
-            found.extend([self.staffer_reason, self.key_reason, self.template_reason, self.sender_reason])
+            found.extend(
+                [
+                    self.staffer_reason,
+                    self.key_reason,
+                    self.template_reason,
+                    self.sender_reason,
+                    self.booking_link_reason,
+                ]
+            )
         return tuple(dict.fromkeys([reason for reason in found if reason is not None]))
 
     @property
@@ -123,6 +137,10 @@ class ManualPrerequisites:
             "hmac_key_usable": applicable(self.key_reason),
             "template_proven": applicable(self.template_reason),
             "sender_proven": applicable(self.sender_reason),
+            # Presence only: the link is a real public URL, and a report is
+            # pasted into tickets.
+            "booking_link_proven": applicable(self.booking_link_reason),
+            "template_parameter_count": 3,
             "template_code": VOUCHER_TEMPLATE_CODE,
             "meta_template_name": self.meta_template_name,
             "template_language": self.template_language,
@@ -164,6 +182,15 @@ async def prove_prerequisites(
 
     staffer_uuid = _canonical(settings.easyweek_manual_voucher_staffer_uuid)
     key_reason = binding_key_reason()
+
+    # The third parameter of the approved template. It comes from the same
+    # server-side registry the preview branch came from — never from a request,
+    # never a constant in this module, and never an empty string standing in for
+    # a link that is not configured.
+    registry = configured_easyweek_locations()
+    location = registry.locations.get(company_id) if registry.ready else None
+    booking_link = (location.booking_page_url or "").strip() if location is not None else ""
+    booking_link_reason = None if booking_link.startswith("https://") else BOOKING_LINK_UNPROVEN
 
     rows = list(
         (
@@ -211,6 +238,8 @@ async def prove_prerequisites(
         key_reason=key_reason,
         template_reason=template_reason,
         sender_reason=None if sender_ok else SENDER_UNPROVEN,
+        booking_link_reason=booking_link_reason,
+        booking_link=booking_link or None,
         delivery_checks_applied=True,
         staffer_uuid=staffer_uuid,
         payment_account_uuid=account_uuid,

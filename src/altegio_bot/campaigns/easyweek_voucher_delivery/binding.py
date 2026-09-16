@@ -49,7 +49,13 @@ from altegio_bot.settings import settings
 
 # Domain separation. A MAC made here can never be mistaken for, or reused as, a
 # MAC made by some other part of this codebase with the same key.
+#
+# §37.2 shares the secret but not the label: the two canaries bind the same code
+# under different domains, so one's stored MAC can never verify the other's code
+# even with an identical key. `_DOMAIN` stays the default, byte for byte, so
+# every MAC §36 has already written keeps verifying.
 _DOMAIN: Final = b"altegio_bot/easyweek_voucher_delivery/voucher_code/v1"
+MANUAL_VOUCHER_DOMAIN: Final = b"altegio_bot/easyweek_manual_voucher/voucher_code/v1"
 
 # Anything shorter is not a key. 32 bytes is the output width of the hash, and a
 # secret narrower than the digest it keys is the weakest link by construction.
@@ -132,15 +138,19 @@ def voucher_code_mac(
     voucher_template_uuid: str,
     key: str | None = None,
     key_id: str | None = None,
+    domain: bytes = _DOMAIN,
 ) -> tuple[str, str]:
     """``(key_id, hex MAC)`` for this code in this exact place.
 
     The code is consumed here and is not retained by this module: nothing is
     cached, logged or attached to the returned value.
+
+    ``domain`` names WHICH canary is binding. It defaults to §36's label so that
+    every MAC already stored keeps verifying unchanged; §37.2 passes its own.
     """
     identifier, secret = load_binding_key(key=key, key_id=key_id)
     material = _encode(
-        _DOMAIN,
+        domain,
         identifier.encode("utf-8"),
         ledger_uuid.encode("utf-8"),
         target_order_uuid.encode("utf-8"),
@@ -160,6 +170,7 @@ def voucher_code_matches(
     voucher_template_uuid: str,
     key: str | None = None,
     key_id: str | None = None,
+    domain: bytes = _DOMAIN,
 ) -> bool:
     """Is this the code the stored binding was made from?
 
@@ -175,6 +186,7 @@ def voucher_code_matches(
         voucher_template_uuid=voucher_template_uuid,
         key=key,
         key_id=key_id,
+        domain=domain,
     )
     if not expected_mac or not expected_key_id:
         return False
@@ -186,6 +198,7 @@ def voucher_code_matches(
 
 
 __all__ = [
+    "MANUAL_VOUCHER_DOMAIN",
     "MIN_KEY_BYTES",
     "VoucherBindingKeyError",
     "binding_key_reason",

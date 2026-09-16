@@ -52,7 +52,10 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     MANUAL_VOUCHER_SCHEMA_VERSION,
     MANUAL_VOUCHER_SCOPE,
 )
-from altegio_bot.campaigns.easyweek_voucher_delivery.binding import voucher_code_matches
+from altegio_bot.campaigns.easyweek_voucher_delivery.binding import (
+    MANUAL_VOUCHER_DOMAIN,
+    voucher_code_matches,
+)
 from altegio_bot.models.models import (
     MANUAL_VOUCHER_AMBIGUOUS,
     MANUAL_VOUCHER_CREATE_CLAIMED,
@@ -78,6 +81,8 @@ from altegio_bot.models.models import (
     MANUAL_VOUCHER_STATUSES,
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_MANUAL,
+    CampaignRecipient,
+    CampaignRun,
     EasyWeekManualVoucherDeliveryAttempt,
     EasyWeekManualVoucherDeliveryLedger,
 )
@@ -116,7 +121,13 @@ STATUS_RANK: Final[dict[str, int]] = {
 CREATE_CLAIMABLE_FROM: Final = frozenset({MANUAL_VOUCHER_PLANNED, MANUAL_VOUCHER_CREATE_REJECTED})
 PAY_CLAIMABLE_FROM: Final = frozenset({MANUAL_VOUCHER_CREATED, MANUAL_VOUCHER_PAY_REJECTED})
 SEND_CLAIMABLE_FROM: Final = frozenset({MANUAL_VOUCHER_PAID})
-REFUND_CLAIMABLE_FROM: Final = frozenset({MANUAL_VOUCHER_PAID, MANUAL_VOUCHER_REFUND_REJECTED})
+# A refund is claimable from `pay_unknown` too. The money has probably moved and
+# the artifact could not be proven — which is precisely when getting it back
+# matters most. It is still pre-send only, and the CHECK constraint says so
+# independently.
+REFUND_CLAIMABLE_FROM: Final = frozenset(
+    {MANUAL_VOUCHER_PAID, MANUAL_VOUCHER_PAY_UNKNOWN, MANUAL_VOUCHER_REFUND_REJECTED}
+)
 
 # States in which something may still have reached EasyWeek or Meta.
 UNRESOLVED_STATUSES: Final = frozenset(
@@ -402,10 +413,55 @@ async def open_canary(
     any money moves. A second recipient — or the same person through a fresh
     preview of the same campaign period — collides with a database constraint
     rather than with a check somebody could forget to write.
+
+    Atomic with the freeze it causes
+    --------------------------------
+    Writing this row is what stops the preview being edited, so the run and the
+    recipient are re-proven HERE, under the very row lock the editor takes, in
+    the same transaction that inserts. Without that, an operator's Remove and
+    this insert can both pass their checks against a world that no longer
+    exists, and the canary opens on a recipient somebody just removed.
+
+    The lock order is the editor's, deliberately: ``CampaignRun`` FOR UPDATE
+    first, then everything else. Two paths that take the same locks in the same
+    order queue; two that disagree deadlock.
+
+    Returns a snapshot with ``exists=False`` when the run or the recipient no
+    longer qualifies — the caller must treat that as a refusal, not as an empty
+    ledger.
     """
     async with session_maker() as session:
         async with session.begin():
+            # 1. The editor's lock, taken first and held for the transaction.
+            run = await session.get(CampaignRun, identity.campaign_run_id, with_for_update=True)
+            if (
+                run is None
+                or run.provider != PROVIDER_EASYWEEK
+                or run.mode != "preview"
+                or run.status != "completed"
+                or run.campaign_code != identity.campaign_code
+                or identity.company_id not in (run.company_ids or [])
+            ):
+                return _snapshot(None)
+
+            # 2. Under that lock, the recipient as it is NOW. A Remove that won
+            # the race has already set `status='skipped'`, and this is where
+            # that becomes visible rather than in a check taken seconds ago.
             existing = await _row(session, for_update=True)
+            if existing is None:
+                recipient = await session.get(CampaignRecipient, identity.campaign_recipient_id)
+                if (
+                    recipient is None
+                    or recipient.provider != PROVIDER_EASYWEEK
+                    or recipient.campaign_run_id != run.id
+                    or recipient.company_id != identity.company_id
+                    or recipient.status != "candidate"
+                    or recipient.is_opted_out
+                    or (recipient.recipient_basis or "") != RECIPIENT_BASIS_MANUAL
+                    or _text(recipient.easyweek_customer_uuid) != identity.easyweek_customer_uuid
+                ):
+                    return _snapshot(None)
+
             if existing is not None:
                 return _snapshot(existing)
             now = utcnow()
@@ -725,7 +781,90 @@ async def binding_matches(
             ledger_uuid=MANUAL_VOUCHER_SCOPE,
             target_order_uuid=target_order_uuid,
             voucher_template_uuid=_text(row.voucher_template_uuid) or "",
+            domain=MANUAL_VOUCHER_DOMAIN,
         )
+
+
+async def apply_webhook_transition(
+    session: AsyncSession,
+    *,
+    provider_message_id: str,
+    status: str,
+) -> RecordOutcome:
+    """The webhook transition, inside a transaction the CALLER owns.
+
+    Used by the WhatsApp status worker, which already holds a session for the
+    whole callback batch. Opening a second one there would mean two connections
+    racing over the same rows in one logical unit of work — and the row this
+    canary owns has no ``OutboxMessage`` behind it, so this is the only place
+    its delivered and read can ever be observed.
+    """
+    if status not in (MANUAL_VOUCHER_DELIVERED, MANUAL_VOUCHER_READ):
+        raise ValueError("unsupported webhook transition")
+    now = utcnow()
+    # `no_autoflush` matters rather than being defensive: this runs inside
+    # somebody else's transaction, and an ordinary query would flush whatever
+    # they have pending at a moment they did not choose.
+    with session.no_autoflush:
+        row = await _row_by_message(session, provider_message_id)
+        if row is None:
+            # Not ours, and nothing to write. Leave the caller's unit of work
+            # exactly as it was found.
+            return RecordOutcome(applied=False, reason=RECORD_MISSING_ROW, snapshot=_snapshot(None))
+    return await _apply_webhook_row(session, row, provider_message_id=provider_message_id, status=status, now=now)
+
+
+async def _row_by_message(
+    session: AsyncSession, provider_message_id: str
+) -> EasyWeekManualVoucherDeliveryLedger | None:
+    """The one row Meta's identifier names, locked. Matched on nothing else."""
+    if not provider_message_id:
+        return None
+    return (
+        await session.execute(
+            select(EasyWeekManualVoucherDeliveryLedger)
+            .where(EasyWeekManualVoucherDeliveryLedger.provider_message_id == provider_message_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _apply_webhook_row(
+    session: AsyncSession,
+    row: EasyWeekManualVoucherDeliveryLedger | None,
+    *,
+    provider_message_id: str,
+    status: str,
+    now: datetime,
+) -> RecordOutcome:
+    if row is None or not row.provider_message_id:
+        return RecordOutcome(applied=False, reason=RECORD_MISSING_ROW, snapshot=_snapshot(row))
+    if row.provider_message_id != provider_message_id:
+        return RecordOutcome(applied=False, reason=RECORD_STALE_STATE, snapshot=_snapshot(row))
+    if STATUS_RANK[status] < STATUS_RANK[row.status]:
+        # A duplicate, or a callback that arrived out of order. Acceptance is
+        # what Meta said and a later webhook cannot unsay it.
+        return RecordOutcome(applied=False, reason=RECORD_WOULD_REGRESS, snapshot=_snapshot(row))
+    if row.provider_accepted_at is None:
+        # A callback can land beside the commit that recorded acceptance. The
+        # identifier only exists because Meta answered with it, so the callback
+        # itself is the proof — and refusing here would silently lose a status.
+        row.provider_accepted_at = now
+    if row.delivered_at is None:
+        # Read implies delivered. Recording read without it would leave a row
+        # the database itself refuses, so this same callback stamps both.
+        row.delivered_at = now
+    if status == MANUAL_VOUCHER_READ and row.read_at is None:
+        row.read_at = now
+    row.status = status
+    row.reconciliation_required = False
+    # A delivered or read message means the voucher reached its person: there is
+    # no open draft left for anybody to close by hand. Forced rather than left
+    # alone, because the flag was set back when the order was still a draft.
+    row.manual_cleanup_required = False
+    row.updated_at = now
+    await session.flush()
+    return RecordOutcome(applied=True, reason=RECORD_APPLIED, snapshot=_snapshot(row))
 
 
 async def record_webhook_transition(
@@ -733,45 +872,27 @@ async def record_webhook_transition(
     *,
     provider_message_id: str,
     status: str,
-) -> bool:
-    """Climb the delivered/read ladder from a webhook, monotonically.
+) -> RecordOutcome:
+    """Apply a delivered/read webhook to the one message it names.
 
-    Matched on the exact provider message id and nothing else. A duplicate, an
-    out-of-order pair or a status we already passed changes nothing: acceptance
-    is what Meta said, and a later webhook cannot unsay it.
+    The session-owning variant, for callers that hold no transaction of their
+    own. Same rules: matched on the exact provider message id, monotonic by
+    rank, and idempotent for a duplicate.
     """
     if status not in (MANUAL_VOUCHER_DELIVERED, MANUAL_VOUCHER_READ):
-        return False
+        raise ValueError("unsupported webhook transition")
     now = utcnow()
     async with session_maker() as session:
         async with session.begin():
-            row = (
-                await session.execute(
-                    select(EasyWeekManualVoucherDeliveryLedger)
-                    .where(EasyWeekManualVoucherDeliveryLedger.provider_message_id == provider_message_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                return False
-            if STATUS_RANK[status] <= STATUS_RANK[row.status]:
-                return False
-            if status == MANUAL_VOUCHER_DELIVERED:
-                if row.provider_accepted_at is None:
-                    return False
-                row.delivered_at = row.delivered_at or now
-            else:
-                if row.delivered_at is None:
-                    return False
-                row.read_at = row.read_at or now
-            row.status = status
-            row.updated_at = now
-            await session.flush()
-            return True
+            row = await _row_by_message(session, provider_message_id)
+            return await _apply_webhook_row(
+                session, row, provider_message_id=provider_message_id, status=status, now=now
+            )
 
 
 __all__ = [
     "CREATE_CLAIMABLE_FROM",
+    "apply_webhook_transition",
     "PAY_CLAIMABLE_FROM",
     "REFUND_CLAIMABLE_FROM",
     "SEND_CLAIMABLE_FROM",

@@ -8,6 +8,7 @@ order, message id or artifact value belongs in this repository.
 from __future__ import annotations
 
 import itertools
+import json
 import uuid as uuid_module
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +31,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import (
 )
 from altegio_bot.easyweek_voucher_identity import (
     EASYWEEK_VOUCHER_TEMPLATE_UUID,
+    KARLSRUHE_LOCATION_UUID,
     SUPPORTED_VOUCHER_PRICE_MINOR,
 )
 from altegio_bot.models.models import (
@@ -72,9 +74,27 @@ PERIOD_START = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
 PERIOD_END = datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 
+BOOKING_LINK = "https://karlsruhe.example.invalid/"
+
+
+def location_map(*, booking_link: str = BOOKING_LINK) -> str:
+    """The server-side registry, as the settings string the loader reads."""
+    return json.dumps(
+        {
+            "karlsruhe": {
+                "location_id": COMPANY_ID,
+                "location_uuid": KARLSRUHE_LOCATION_UUID,
+                "meta_template_prefix": "ka",
+                "booking_page_url": booking_link,
+            }
+        }
+    )
+
+
 @pytest.fixture
 def manual_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fence open and both identities configured — the acting case."""
+    """The fence open and every identity configured — the acting case."""
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
     monkeypatch.setattr(settings, "easyweek_manual_voucher_canary_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_manual_voucher_staffer_uuid", STAFFER_UUID, raising=False)
     monkeypatch.setattr(settings, "easyweek_manual_voucher_account_uuid", ACCOUNT_UUID, raising=False)
@@ -88,6 +108,25 @@ def manual_request(*, run_id: int, recipient_id: int) -> ManualCanaryRequest:
         staffer_uuid=STAFFER_UUID,
         payment_account_uuid=ACCOUNT_UUID,
     )
+
+
+def customers_page(
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    current: int = 1,
+    last: int = 1,
+    total: int | None = None,
+) -> dict[str, Any]:
+    """One page of ``GET /customers?phone=`` as the strict reader expects it."""
+    listed = [customer_payload()] if rows is None else rows
+    return {
+        "data": listed,
+        "meta": {
+            "current_page": current,
+            "last_page": last,
+            "total": len(listed) if total is None else total,
+        },
+    }
 
 
 def customer_payload(**changes: Any) -> dict[str, Any]:
@@ -180,12 +219,38 @@ class FakeReader:
         customer: dict[str, Any] | Exception | None = None,
         orders: dict[str, Any] | None = None,
         template: dict[str, Any] | Exception | None = None,
+        customer_pages: list[dict[str, Any]] | Exception | None = None,
+        order_pages: list[dict[str, Any]] | Exception | None = None,
     ) -> None:
         self.customer = customer if customer is not None else customer_payload()
         self.orders: dict[str, Any] = orders or {}
         self.template = template if template is not None else template_payload()
+        # The workspace-wide phone listing, page by page. One page holding one
+        # customer is the ordinary case; a test hands two rows or two pages to
+        # express an ambiguity or an unfinished walk.
+        self.customer_pages = customer_pages if customer_pages is not None else [customers_page()]
+        self.order_pages = order_pages if order_pages is not None else [orders_page()]
         self.customer_calls: list[str] = []
         self.order_calls: list[str] = []
+        self.listing_calls: list[int] = []
+
+    async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(self.customer_pages, Exception):
+            raise self.customer_pages
+        page = int(params.get("page", 1))
+        self.listing_calls.append(page)
+        if page > len(self.customer_pages):
+            raise AssertionError(f"the walk asked for page {page} beyond the fixture")
+        return self.customer_pages[page - 1]
+
+    async def list_location_customer_orders(
+        self, *, location_uuid: str, customer_uuid: str, page: int = 1
+    ) -> dict[str, Any]:
+        if isinstance(self.order_pages, Exception):
+            raise self.order_pages
+        if page > len(self.order_pages):
+            raise AssertionError(f"the walk asked for page {page} beyond the fixture")
+        return self.order_pages[page - 1]
 
     async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
         self.customer_calls.append(customer_uuid)
@@ -261,6 +326,37 @@ class FakeSender:
         self.calls += 1
         self.saw_code = VOUCHER_CODE_SENTINEL in params
         return self.outcome
+
+
+async def marker_order(session_maker, *, marker: str, **changes: Any) -> dict[str, Any]:
+    """An order whose ``created_at`` falls inside the ledger's create window.
+
+    Built from the window the ledger actually recorded rather than from a fixed
+    constant: the window is anchored on the real clock at claim time, and a row
+    dated from a constant would fall outside it and be correctly ignored.
+    """
+    from sqlalchemy import select as _select
+
+    from altegio_bot.models.models import EasyWeekManualVoucherDeliveryLedger
+
+    async with session_maker() as session:
+        row = (await session.execute(_select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+        start, end = row.create_window_start, row.create_window_end
+    middle = start + (end - start) / 2
+    return voucher_order(marker=marker, created_at=middle.isoformat(), **changes)
+
+
+def orders_page(
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    current: int = 1,
+    last: int = 1,
+) -> dict[str, Any]:
+    """One page of ``GET /orders`` as the §35 page walker expects it."""
+    return {
+        "data": rows or [],
+        "meta": {"current_page": current, "last_page": last, "per_page": 100},
+    }
 
 
 def unknown_outcome(reason: str = "timeout") -> DeliveryOutcome:
@@ -373,10 +469,13 @@ async def seed_template_and_sender(session_maker, *, company_id: int = COMPANY_I
 
 __all__ = [
     "ACCOUNT_UUID",
+    "BOOKING_LINK",
     "COMPANY_ID",
+    "CUSTOMER_NAME",
     "EW_CUSTOMER_UUID",
     "NOW",
     "ORDER_UUID",
+    "OTHER_ORDER_UUID",
     "OTHER_CUSTOMER_UUID",
     "PERIOD_END",
     "PERIOD_START",
@@ -389,8 +488,12 @@ __all__ = [
     "FakeSender",
     "manual_configuration",
     "customer_payload",
+    "customers_page",
     "issued_voucher",
+    "location_map",
     "manual_request",
+    "marker_order",
+    "orders_page",
     "rejected_outcome",
     "seed_manual_recipient",
     "seed_template_and_sender",
