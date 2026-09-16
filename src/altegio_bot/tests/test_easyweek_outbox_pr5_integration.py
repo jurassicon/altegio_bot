@@ -26,6 +26,7 @@ cross-tenant leak waiting for the two spaces to overlap.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -8620,12 +8621,68 @@ def _karlsruhe_pair_snapshot():
     )
 
 
-async def _seed_karlsruhe_pair_job(db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> MessageJob:
+class _KarlsruheLiveReader:
+    """The GET-only client the PR-7.5 send-time proof is allowed to use.
+
+    Nothing is stubbed by default beyond the exact proven booking and
+    catalogue: a test that expects a successful send has to say so explicitly,
+    so "it sent" can never again mean "nothing asked EasyWeek".
+    """
+
+    def __init__(
+        self,
+        *,
+        booking: dict[str, Any] | None = None,
+        catalog: list[dict[str, Any]] | None = None,
+        booking_error: Exception | None = None,
+        catalog_error: Exception | None = None,
+    ) -> None:
+        self._booking = booking if booking is not None else _karlsruhe_pair_booking_payload()
+        self._catalog = catalog if catalog is not None else _karlsruhe_pair_catalog()
+        self._booking_error = booking_error
+        self._catalog_error = catalog_error
+        self.booking_calls: list[str] = []
+        self.catalog_calls: list[tuple[str, int]] = []
+
+    async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
+        self.booking_calls.append(booking_uuid)
+        if self._booking_error is not None:
+            raise self._booking_error
+        return self._booking
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        self.catalog_calls.append((location_uuid, page))
+        if self._catalog_error is not None:
+            raise self._catalog_error
+        return {
+            "data": self._catalog,
+            "meta": {"current_page": 1, "last_page": 1, "total": len(self._catalog)},
+        }
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _install_karlsruhe_reader(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> _KarlsruheLiveReader:
+    """Arm the live EasyWeek proof with an explicit, inspectable answer."""
+    clear_multi_service_catalog_cache()
+    reader = _KarlsruheLiveReader(**kwargs)
+    monkeypatch.setattr(ow, "EasyWeekClient", lambda *args, **kwargs: reader)
+    return reader
+
+
+async def _seed_karlsruhe_pair_job(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    job_type: str = "record_created",
+) -> MessageJob:
     monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
     job = await _seed_easyweek_happy_path(
         db,
         company_id=KARLSRUHE_COMPANY_ID,
-        meta_template_name=KARLSRUHE_CREATED_TEMPLATE,
+        job_type=job_type,
+        meta_template_name=f"kitilash_ka_{job_type}_v1",
         services=((11, f"{KARLSRUHE_SHELLAC}, {KARLSRUHE_PEDIKUERE_GEL}", "93.00"),),
         total_cost="93.00",
     )
@@ -8697,12 +8754,17 @@ async def test_open_fences_render_a_resource_shadow_pair_once_each_with_one_tota
         raising=False,
     )
     job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    reader = _install_karlsruhe_reader(monkeypatch)
 
     params = await _run_and_get_params(db, capture, job)
 
     assert params[4] == f"{KARLSRUHE_SHELLAC} — 42.00€, {KARLSRUHE_PEDIKUERE_GEL} — 51.00€"
     assert params[5] == "93.00"
     assert params[4].count(KARLSRUHE_PEDIKUERE_GEL) == 1
+    # The send happened only because the live booking and the full catalogue
+    # were read and re-proved first.
+    assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+    assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]
 
 
 async def test_a_nagelservice_resource_shadow_pair_never_reaches_meta_or_outbox(
@@ -8715,6 +8777,7 @@ async def test_a_nagelservice_resource_shadow_pair_never_reaches_meta_or_outbox(
     monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
     job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    reader = _install_karlsruhe_reader(monkeypatch)
 
     await _run_job(db, job)
 
@@ -8723,6 +8786,8 @@ async def test_a_nagelservice_resource_shadow_pair_never_reaches_meta_or_outbox(
     assert "category_not_allowed" in (job.last_error or "")
     assert capture.template_calls == capture.text_calls == []
     assert await _outbox_rows(db, job) == []
+    # Category suppression is decided locally, before the live read is spent.
+    assert reader.booking_calls == []
 
 
 @pytest.mark.parametrize(
@@ -8744,6 +8809,11 @@ async def test_a_held_pair_job_for_a_canceled_record_is_not_sent_once_the_fence_
     record guard must still cancel a `record_created` locally, without a Meta or
     Chatwoot attempt, while `record_canceled` remains the one lifecycle message
     a deleted record is allowed to produce.
+
+    The successful `record_canceled` send is deliberately armed with an explicit
+    live booking and catalogue answer: a version 2 projection may never reach
+    the provider on `Record.raw` alone, so "it sent" must mean "EasyWeek was
+    asked and agreed", not "nothing asked".
     """
     monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
@@ -8753,23 +8823,12 @@ async def test_a_held_pair_job_for_a_canceled_record_is_not_sent_once_the_fence_
         json.dumps([KARLSRUHE_SERVICE_CATEGORY]),
         raising=False,
     )
-    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
-    job = await _seed_easyweek_happy_path(
-        db,
-        company_id=KARLSRUHE_COMPANY_ID,
-        job_type=job_type,
-        meta_template_name=f"kitilash_ka_{job_type}_v1",
-        services=((11, f"{KARLSRUHE_SHELLAC}, {KARLSRUHE_PEDIKUERE_GEL}", "93.00"),),
-        total_cost="93.00",
-    )
-    snapshot = _karlsruhe_pair_snapshot()
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch, job_type=job_type)
     record = await db.get(Record, job.record_id)
     assert record is not None
-    record.raw = record_raw_with_multi_service_snapshot(record_raw_with_services_count(record.raw, 2), snapshot)
-    record.total_cost = Decimal(_KARLSRUHE_TOTAL) / Decimal(100)
     record.is_deleted = True
-    job.payload = multi_service_job_payload(snapshot)
     await db.flush()
+    reader = _install_karlsruhe_reader(monkeypatch)
 
     await _run_job(db, job)
 
@@ -8780,3 +8839,259 @@ async def test_a_held_pair_job_for_a_canceled_record_is_not_sent_once_the_fence_
         assert await _outbox_rows(db, job) == []
     else:
         assert len(capture.template_calls) == 1
+        # `record_canceled` still had to re-prove the pair against the live
+        # booking and the full live catalogue before the single attempt.
+        assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+        assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]
+
+
+# ===========================================================================
+# Review defect 2: a version 2 lifecycle job may not reach Meta on Record.raw
+# alone.  §38.3 requires the live booking, the full live catalogue and the
+# current static contract to agree again before the first attempt and before
+# every delivery retry.
+# ===========================================================================
+
+
+def _open_karlsruhe_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_allowed_service_categories",
+        json.dumps([KARLSRUHE_SERVICE_CATEGORY]),
+        raising=False,
+    )
+
+
+async def _assert_refused_before_provider(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    job: MessageJob,
+) -> None:
+    """No send, no attempt, no audit row — terminally or by safe requeue.
+
+    A deterministic mismatch cancels the job; an unreadable catalogue requeues
+    it. Both are refusals, and neither may cost a provider attempt.
+    """
+    assert job.status in {"canceled", "queued"}
+    assert job.attempts == 0
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+@pytest.mark.parametrize("job_type", ["record_created", "record_updated", "record_canceled"])
+async def test_live_booking_service_drift_blocks_every_v2_lifecycle_job(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+    job_type: str,
+) -> None:
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch, job_type=job_type)
+    drifted = _karlsruhe_pair_booking_payload()
+    drifted["ordered_services"][0]["price"] = 4300
+    drifted["ordered_services"][0]["original_price"] = 4300
+    reader = _install_karlsruhe_reader(monkeypatch, booking=drifted)
+
+    await _run_job(db, job)
+
+    await _assert_refused_before_provider(db, capture, job)
+    assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    ["rename", "missing", "duplicate", "category_drift"],
+)
+async def test_live_catalogue_drift_blocks_a_v2_lifecycle_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+    mutate: str,
+) -> None:
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    catalog = _karlsruhe_pair_catalog()
+    if mutate == "rename":
+        next(row for row in catalog if row["name"] == KARLSRUHE_PEDIKUERE_GEL)["name"] = "Pediküre mit Gel"
+    elif mutate == "missing":
+        catalog = [row for row in catalog if row["name"] != KARLSRUHE_PEDIKUERE_GEL]
+    elif mutate == "duplicate":
+        catalog.append({**next(row for row in catalog if row["name"] == KARLSRUHE_PEDIKUERE_GEL)})
+    else:
+        next(row for row in catalog if row["name"] == KARLSRUHE_PEDIKUERE_GEL)["category"] = {
+            "name": "Wimpernverlängerung"
+        }
+    reader = _install_karlsruhe_reader(monkeypatch, catalog=catalog)
+
+    await _run_job(db, job)
+
+    await _assert_refused_before_provider(db, capture, job)
+    assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]
+
+
+async def test_business_field_drift_between_resource_copies_blocks_a_v2_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+) -> None:
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    drifted = _karlsruhe_pair_booking_payload()
+    # The two pedicure rows no longer agree on a known business field, so they
+    # are two real services again, not one row and its technical copy.
+    drifted["ordered_services"][2]["duration"] = {"value": 75, "label": "minutes"}
+    drifted["ordered_services"][2]["original_duration"] = {"value": 75, "label": "minutes"}
+    _install_karlsruhe_reader(monkeypatch, booking=drifted)
+
+    await _run_job(db, job)
+
+    await _assert_refused_before_provider(db, capture, job)
+
+
+async def test_a_contract_revision_or_digest_mismatch_blocks_a_v2_send(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+) -> None:
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    raw = copy.deepcopy(record.raw)
+    raw["easyweek"]["multi_service_snapshot"]["resource_shadow_proof"]["contract_revision"] = 99
+    record.raw = raw
+    await db.flush()
+    reader = _install_karlsruhe_reader(monkeypatch)
+
+    await _run_job(db, job)
+
+    await _assert_refused_before_provider(db, capture, job)
+    # A projection the current contract cannot explain is refused locally; the
+    # live read is never even spent on it.
+    assert reader.booking_calls == []
+
+
+@pytest.mark.parametrize("failure", ["booking", "catalog"])
+async def test_an_easyweek_outage_requeues_a_v2_lifecycle_job_without_attempts(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+    failure: str,
+) -> None:
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    outage = EasyWeekRetryableError("upstream unavailable", operation="get_booking")
+    reader = _install_karlsruhe_reader(
+        monkeypatch,
+        booking_error=outage if failure == "booking" else None,
+        catalog_error=outage if failure == "catalog" else None,
+    )
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+    assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+
+
+async def test_a_delivery_retry_re_proves_the_live_pair(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+) -> None:
+    """A positive result is never carried over to the next attempt.
+
+    The job below has already spent an attempt, which is exactly the state a
+    delivery retry arrives in. The live proof still has to run and still has to
+    refuse, or a booking that changed between two attempts would be described
+    by the older, already-accepted projection.
+    """
+    _open_karlsruhe_send(monkeypatch)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch)
+    job.attempts = 1
+    job.last_error = "transient provider failure"
+    await db.flush()
+
+    drifted = _karlsruhe_pair_booking_payload()
+    drifted["ordered_services"][0]["price"] = 4300
+    drifted["ordered_services"][0]["original_price"] = 4300
+    reader = _install_karlsruhe_reader(monkeypatch, booking=drifted)
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 1
+    assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_a_version_one_lifecycle_job_does_not_gain_the_new_api_guard(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durlach/Rastatt pairs keep the PR-7.4 contract exactly as it was."""
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Erste Leistung, Zweite Leistung", "95.00"),),
+        total_cost="95.00",
+    )
+    await _attach_outbox_pair(db, job)
+    reader = _install_karlsruhe_reader(monkeypatch)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    assert len(capture.template_calls) == 1
+    assert reader.booking_calls == []
+    assert reader.catalog_calls == []
+
+
+async def test_a_v2_reminder_makes_exactly_one_live_proof_not_two(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    _karlsruhe_branch: None,
+) -> None:
+    """The reminder guard's single booking read also carries the pair proof."""
+    _open_karlsruhe_send(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    job = await _seed_karlsruhe_pair_job(db, monkeypatch, job_type="reminder_24h")
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    record.starts_at = REMINDER_STARTS_AT
+    job.payload = {
+        **job.payload,
+        "booking_uuid": str(KARLSRUHE_BOOKING_UUID),
+        "record_starts_at": REMINDER_STARTS_AT.isoformat(),
+    }
+    await db.flush()
+    booking = {
+        **_karlsruhe_pair_booking_payload(),
+        "start_time": REMINDER_STARTS_AT.isoformat(),
+        "is_canceled": False,
+        "is_completed": False,
+    }
+    reader = _install_karlsruhe_reader(monkeypatch, booking=booking)
+
+    await _run_job(db, job)
+
+    assert job.status == "done", job.last_error
+    # One booking read and one catalogue read for the whole attempt: the
+    # lifecycle verifier must not add a second pass on top of the guard.
+    assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
+    assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]

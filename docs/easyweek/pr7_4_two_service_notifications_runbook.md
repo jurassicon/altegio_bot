@@ -382,14 +382,52 @@ SQL
 Новых `queued` lifecycle/reminder jobs у этих записей быть не должно, равно как
 и новых `OutboxMessage` и Meta/Chatwoot attempts.
 
-## 18. Controlled canary
+## 18. Controlled suppression canary
 
-До любой отправки проверить штатный будущий canary на заранее разрешённом
-тестовом получателе, категория которого входит в текущий allowlist. Его webhook
-должен создать digest-bound job со snapshot version 2, а закрытый
-`EASYWEEK_MULTI_SERVICE_SEND_ENABLED` — удержать её в `queued` с `attempts=0`,
-без Outbox и без Meta/Chatwoot. Renderer обязан показать обе услуги по одному
-разу с индивидуальными ценами и одной итоговой суммой.
+Это **suppression canary**, а не send canary. Любая настоящая version 2
+проекция состоит только из услуг статического Karlsruhe-контракта, а все они
+относятся к категории `Nagelservice`, которой нет в production allowlist.
+Значит корректно доказанная resource-shadow запись обязана завершиться
+`multi_service_category_not_allowed` и не может создать job — ожидать здесь
+queued job или клиентский рендер означало бы временно разрешить `Nagelservice`,
+что запрещено §38.6.
+
+Создать одну контролируемую будущую Karlsruhe booking ровно из двух разных
+услуг контракта (одна из них — resource-backed, например
+`Pediküre mit Gel-Lack`) и проверить:
+
+1. Record получил `multi_service_snapshot` с `version: 2`;
+2. structural proof прошёл — запись видна в preflight как
+   `structurally_proven`, а не `ambiguous`;
+3. eligibility завершилась `multi_service_category_not_allowed`;
+4. для этой записи отсутствуют `MessageJob`, `OutboxMessage`, Meta и Chatwoot
+   attempts;
+5. `EASYWEEK_ALLOWED_SERVICE_CATEGORIES` не изменялся.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot exec -T postgres sh -lc \
+  'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+\pset pager off
+SELECT r.id,
+       r.raw #>> '{easyweek,multi_service_snapshot,version}' AS snapshot_version,
+       (SELECT count(*) FROM message_jobs j WHERE j.record_id = r.id) AS jobs,
+       (SELECT count(*) FROM outbox_messages o WHERE o.record_id = r.id) AS outbox
+FROM records r
+WHERE r.provider = 'easyweek' AND r.company_id = 322579
+ORDER BY r.id DESC
+LIMIT 5;
+SQL
+```
+
+Ожидается `snapshot_version = 2`, `jobs = 0`, `outbox = 0`.
+
+Runtime rendering и фактическая отправка version 2 пары доказываются
+автоматизированными integration-тестами
+(`test_open_fences_render_a_resource_shadow_pair_once_each_with_one_total`,
+`test_a_v2_reminder_makes_exactly_one_live_proof_not_two`), а не production-
+процедурой: воспроизводить их на проде потребовало бы временно разрешить
+`Nagelservice`, чего этот PR не допускает.
 
 ## 19. Rollback нового fence
 
@@ -414,11 +452,18 @@ fence их не касается.
 ## 20. Запрет на открытие общего send fence
 
 `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true` запрещено включать, пока
-одновременно не зелёные все три проверки:
+одновременно не зелёные все три выполнимые проверки:
 
-1. multi-service preflight (`ready=true`);
-2. общий reminder preflight (`ready=true`);
-3. controlled canary.
+1. multi-service preflight (`ready=true`) из §16;
+2. общий reminder preflight (`ready=true`) из §7;
+3. существующий PR-7.4 send canary из §8 — на разрешённой категории и обычной
+   version 1 паре.
+
+Пункт 3 намеренно остаётся PR-7.4 canary версии 1: он и есть проверка общего
+send fence. Suppression canary из §18 к нему не относится и send-canary не
+является. Открытие общего send fence не требует и не разрешает менять
+`EASYWEEK_ALLOWED_SERVICE_CATEGORIES`: ни один из этих шагов не добавляет
+`Nagelservice` в allowlist.
 
 Отдельно: шесть `deadline_expired` reminder jobs `13934`–`13939` — это
 операторское rollout-состояние, а не дефект resource-shadow. Данный PR их не

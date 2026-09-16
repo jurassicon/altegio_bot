@@ -277,11 +277,29 @@ def test_the_resource_shadow_fence_is_read_through_one_shared_resolver() -> None
     assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(easyweek_multi_service)
     assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(outbox_worker)
     assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(preflight)
-    for module in (worker, easyweek_reminder_guard, preflight):
+    for module in (worker, easyweek_reminder_guard, preflight, outbox_worker):
         source = inspect.getsource(module)
+        # No consumer may carry its own copy of the static service table.
         assert "KARLSRUHE" not in source
         assert "resolve_resource_shadow_contract" not in source
-        assert "prove_exactly_two_service_snapshot" in source or "fetch_and_prove" in source
+        assert (
+            "prove_exactly_two_service_snapshot" in source
+            or "fetch_and_prove" in source
+            or "verify_live_multi_service_snapshot" in source
+        )
+
+
+def test_both_send_paths_reuse_the_one_live_pair_verifier() -> None:
+    """Reminders and lifecycle jobs must not form separate live opinions.
+
+    PR-7.5 requires a version 2 projection to be re-proved against the live
+    booking, the full live catalogue and the current contract before every
+    provider attempt. Both send paths go through the same helper, so neither
+    can be relaxed without the other.
+    """
+    for module in (easyweek_reminder_guard, outbox_worker):
+        assert "verify_live_multi_service_snapshot" in inspect.getsource(module)
+    assert "snapshot_requires_live_proof" in inspect.getsource(outbox_worker)
 
 
 def test_both_resource_shadow_consumers_are_recreated_together() -> None:

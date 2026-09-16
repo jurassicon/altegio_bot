@@ -432,6 +432,7 @@ class _ResourceShadowContext:
 
     contract: ResourceShadowContract
     primary_service_id: int
+    normalized_contract_names: frozenset[str]
     normalized_resource_names: frozenset[str]
 
 
@@ -511,6 +512,11 @@ def _resource_shadow_context(
     if not _catalog_proves_contract(contract, catalog_rows):
         return None
 
+    normalized_contract = {
+        normalized for name in contract.service_names if (normalized := _normalized_name(name)) is not None
+    }
+    if len(normalized_contract) != len(contract.service_names):
+        return None
     normalized_resources = {
         normalized
         for name in contract.resource_backed_service_names
@@ -521,6 +527,7 @@ def _resource_shadow_context(
     return _ResourceShadowContext(
         contract=contract,
         primary_service_id=service_id,
+        normalized_contract_names=frozenset(normalized_contract),
         normalized_resource_names=frozenset(normalized_resources),
     )
 
@@ -552,6 +559,15 @@ def _collapse_resource_shadow(
     second_occurrence = len(lines) - 1 - names[::-1].index(duplicated)
     remaining = [line for index, line in enumerate(lines) if index != second_occurrence]
     if len(remaining) != 2 or remaining[0].normalized_name == remaining[1].normalized_name:
+        return None
+
+    # BOTH surviving services must be owner-approved, not just the duplicate.
+    # Proving only the repeated row would let an arbitrary catalogue service
+    # ride along as the second business line: the contract is what decides that
+    # a repeated name is a technical copy, and it can only decide that for the
+    # names it actually names.  Exact normalized equality only — no prefix,
+    # substring, fuzzy or category-only admission.
+    if any(line.normalized_name not in shadow.normalized_contract_names for line in remaining):
         return None
     return remaining[0], remaining[1]
 
@@ -863,12 +879,19 @@ def _resource_shadow_proof_from_snapshot(
     value: object,
     *,
     location_uuid: str,
-    primary_line: MultiServiceLine,
+    lines: tuple[MultiServiceLine, MultiServiceLine],
 ) -> tuple[ResourceShadowProof | None, str | None]:
     """Re-prove a stored version 2 projection against the CURRENT contract.
 
     A revision bump, a digest change, a moved location or a primary id the
     table no longer knows all hold the job instead of silently adapting it.
+
+    The stored digest only proves the projection has not been altered since it
+    was written; it cannot prove the projection was reachable.  So the contract
+    is re-applied to the LINES as well: a hand-built, digest-valid version 2
+    snapshot naming a service outside the contract, or naming no resource-backed
+    service at all, describes a shape this path can never produce and is refused
+    here — before any renderer or provider attempt sees it.
     """
     if not isinstance(value, Mapping):
         return None, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
@@ -894,7 +917,22 @@ def _resource_shadow_proof_from_snapshot(
     if contract is None or contract.revision != revision or contract.digest != contract_digest:
         return None, MULTI_SERVICE_CONTRACT_MISMATCH
     contract_primary = contract.numeric_service_names.get(primary_service_id)
-    if contract_primary is None or _normalized_name(contract_primary) != primary_line.normalized_name:
+    if contract_primary is None or _normalized_name(contract_primary) != lines[0].normalized_name:
+        return None, MULTI_SERVICE_CONTRACT_MISMATCH
+
+    contract_names = {
+        normalized for name in contract.service_names if (normalized := _normalized_name(name)) is not None
+    }
+    resource_names = {
+        normalized
+        for name in contract.resource_backed_service_names
+        if (normalized := _normalized_name(name)) is not None
+    }
+    if any(line.normalized_name not in contract_names for line in lines):
+        return None, MULTI_SERVICE_CONTRACT_MISMATCH
+    # A version 2 projection exists only because one resource-backed row was
+    # collapsed.  Two contract manicures can never have produced it.
+    if not any(line.normalized_name in resource_names for line in lines):
         return None, MULTI_SERVICE_CONTRACT_MISMATCH
     return (
         ResourceShadowProof(
@@ -985,7 +1023,7 @@ def multi_service_snapshot_from_record_raw(raw: object) -> tuple[MultiServiceSna
         proof, proof_error = _resource_shadow_proof_from_snapshot(
             value.get(MULTI_SERVICE_SNAPSHOT_PROOF_KEY),
             location_uuid=location_uuid,
-            primary_line=lines[0],
+            lines=(lines[0], lines[1]),
         )
         if proof is None:
             return None, proof_error
@@ -1162,7 +1200,91 @@ def multi_service_send_guard(
     return error
 
 
+@dataclass(frozen=True)
+class LiveSnapshotVerdict:
+    """A PII-free send-time verdict over one live booking and catalogue read."""
+
+    reason: str | None
+    recoverable: bool = False
+
+    @property
+    def proven(self) -> bool:
+        return self.reason is None
+
+
+def snapshot_requires_live_proof(snapshot: MultiServiceSnapshot | None) -> bool:
+    """True for a resource-aware projection, which may never be sent unproven.
+
+    A version 1 exact pair keeps the PR-7.4 contract, where the reminder guard
+    is the only live re-proof.  A version 2 projection was reached through the
+    static contract, so §38.3 requires the live booking, the full live catalogue
+    and the current contract to agree again before the FIRST provider attempt
+    and before every delivery retry.
+    """
+    return snapshot is not None and snapshot.resource_shadow_proof is not None
+
+
+async def verify_live_multi_service_snapshot(
+    *,
+    client: MultiServiceReader,
+    booking_payload: object,
+    snapshot: MultiServiceSnapshot,
+    location_uuid: object,
+    record_total_cost: Decimal | None,
+    company_id: object,
+) -> LiveSnapshotVerdict:
+    """Re-prove a durable projection against the live booking and catalogue.
+
+    The booking body is passed in rather than fetched, so a caller that already
+    read it — the reminder guard does, to judge status and start time — spends
+    exactly one ``GET /bookings/{uuid}`` per attempt instead of two.
+
+    The synthetic pair below is built only from the projection itself, so the
+    same shared resolver, the same static contract and the same catalogue reader
+    run here as at planning time.  Nothing re-reads a webhook field, and no
+    second dictionary of service names exists to drift.
+    """
+    try:
+        catalog_rows = await read_catalog_rows_cached(client, location_uuid=str(location_uuid))
+        live = prove_exactly_two_service_snapshot(
+            webhook=WebhookServicePair(
+                booking_uuid=uuid.UUID(snapshot.booking_uuid),
+                location_uuid=str(location_uuid),
+                service_name=snapshot.lines[0].display_name,
+                service_related=snapshot.lines[1].display_name,
+                services_description=f"{snapshot.lines[0].display_name}, {snapshot.lines[1].display_name}",
+                services_count=2,
+                quantity=2,
+                booking_currency=snapshot.lines[0].currency,
+                total_cost=record_total_cost,
+                company_id=company_id,
+                service_id=(
+                    snapshot.resource_shadow_proof.primary_service_id
+                    if snapshot.resource_shadow_proof is not None
+                    else None
+                ),
+            ),
+            booking_payload=booking_payload,
+            catalog_rows=catalog_rows,
+        )
+    except MultiServiceProofError as exc:
+        return LiveSnapshotVerdict(exc.reason, exc.recoverable)
+    except (ValueError, AttributeError, TypeError):
+        # A malformed durable projection is a local defect, never a reason to
+        # send: fail closed rather than reaching the provider on a guess.
+        return LiveSnapshotVerdict(MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
+    except Exception:  # noqa: BLE001 — no exception text may reach last_error
+        return LiveSnapshotVerdict(MULTI_SERVICE_CATALOG_UNAVAILABLE, recoverable=True)
+
+    if live.version != snapshot.version or live.digest != snapshot.digest:
+        return LiveSnapshotVerdict(MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
+    return LiveSnapshotVerdict(None)
+
+
 __all__ = [name for name in globals() if name.startswith("MULTI_SERVICE_")] + [
+    "LiveSnapshotVerdict",
+    "snapshot_requires_live_proof",
+    "verify_live_multi_service_snapshot",
     "EXACT_PAIR_PROOF_KIND",
     "MultiServiceLine",
     "MultiServiceProofError",

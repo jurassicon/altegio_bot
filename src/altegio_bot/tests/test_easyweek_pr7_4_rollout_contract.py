@@ -189,7 +189,7 @@ def test_runbook_pins_the_resource_shadow_rollout_and_rollback() -> None:
         "allowed=0",
         "ready=true",
         "multi_service_category_not_allowed",
-        "Controlled canary",
+        "Controlled suppression canary",
         "Rollback нового fence",
         "13934",
         "13939",
@@ -202,6 +202,49 @@ def test_runbook_pins_the_resource_shadow_rollout_and_rollback() -> None:
     gate = text.split("## 20. Запрет на открытие общего send fence", 1)[1]
     for required in ("multi-service preflight", "reminder preflight", "canary"):
         assert required in gate
+
+
+def test_the_resource_shadow_canary_is_a_suppression_canary_not_a_send_canary() -> None:
+    """The observed shapes are Nagelservice, so a v2 canary cannot send.
+
+    Expecting a queued version 2 job or a customer-facing render in production
+    would require temporarily allowing `Nagelservice`, which §38.6 forbids. The
+    runbook therefore has to ask for proven suppression, and to say that the
+    runtime render is proved by tests rather than on production.
+    """
+    text = RUNBOOK.read_text(encoding="utf-8")
+    canary = text.split("## 18. Controlled suppression canary", 1)[1].split("## 19.", 1)[0]
+    for required in (
+        "suppression canary",
+        "multi_service_category_not_allowed",
+        "`version: 2`",
+        "structurally_proven",
+        "не изменялся",
+        "integration-тестами",
+    ):
+        assert required in canary
+    # It must demand the ABSENCE of the queue the old text asked for.
+    for required in ("`jobs = 0`", "`outbox = 0`", "отсутствуют"):
+        assert required in canary
+
+    gate = text.split("## 20. Запрет на открытие общего send fence", 1)[1]
+    # The shared send fence keeps its own PR-7.4 version 1 canary, and neither
+    # step may be described as changing the production allowlist.
+    assert "PR-7.4 send canary" in gate
+    assert "version 1" in gate
+    for forbidden in (
+        "EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[",
+        'EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Nagelservice"]',
+    ):
+        assert forbidden not in text
+
+
+def test_the_runbook_never_asks_to_allow_the_suppressed_category() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("EASYWEEK_ALLOWED_SERVICE_CATEGORIES"):
+            raise AssertionError(f"runbook assigns the category allowlist: {stripped}")
 
 
 def test_env_example_exposes_the_third_closed_fence() -> None:

@@ -63,11 +63,8 @@ from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
-    MultiServiceProofError,
-    WebhookServicePair,
-    prove_exactly_two_service_snapshot,
-    read_catalog_rows_cached,
     resolve_effective_multi_service_snapshot,
+    verify_live_multi_service_snapshot,
 )
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.easyweek_service_category import services_count_from_record_raw
@@ -541,40 +538,19 @@ async def verify_reminder_is_current(
     if not current.proven or snapshot is None:
         return current
 
-    try:
-        catalog_rows = await read_catalog_rows_cached(client, location_uuid=location.location_uuid)  # type: ignore[arg-type]
-        live = prove_exactly_two_service_snapshot(
-            webhook=WebhookServicePair(
-                booking_uuid=booking_uuid,
-                location_uuid=location.location_uuid,
-                service_name=snapshot.lines[0].display_name,
-                service_related=snapshot.lines[1].display_name,
-                services_description=f"{snapshot.lines[0].display_name}, {snapshot.lines[1].display_name}",
-                services_count=2,
-                quantity=2,
-                booking_currency=snapshot.lines[0].currency,
-                total_cost=getattr(record, "total_cost", None),
-                # PR-7.5: a resource-aware snapshot carries the contract
-                # identity it was proved with, so this re-proof runs through the
-                # SAME resolver — static contract, live booking and live
-                # catalogue — rather than a send-time shortcut.  A version 1
-                # snapshot passes ``None`` and keeps the PR-7.4 path.
-                company_id=getattr(record, "company_id", None),
-                service_id=(
-                    snapshot.resource_shadow_proof.primary_service_id
-                    if snapshot.resource_shadow_proof is not None
-                    else None
-                ),
-            ),
-            booking_payload=payload,
-            catalog_rows=catalog_rows,
-        )
-    except MultiServiceProofError as exc:
-        if exc.recoverable:
-            return GuardResult(GuardOutcome.RETRYABLE_UNAVAILABLE, exc.reason)
-        return GuardResult(GuardOutcome.MULTI_SERVICE_MISMATCH, exc.reason)
-    except Exception:
-        return GuardResult(GuardOutcome.RETRYABLE_UNAVAILABLE, "multi_service_catalog_unavailable")
-    if live.digest != snapshot.digest:
-        return GuardResult(GuardOutcome.MULTI_SERVICE_MISMATCH, MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
-    return current
+    # One shared verifier, and the booking body this guard already read: the
+    # reminder path spends exactly one GET per attempt, and it cannot form a
+    # different opinion about the pair than the lifecycle path does.
+    verdict = await verify_live_multi_service_snapshot(
+        client=client,  # type: ignore[arg-type]
+        booking_payload=payload,
+        snapshot=snapshot,
+        location_uuid=location.location_uuid,
+        record_total_cost=getattr(record, "total_cost", None),
+        company_id=getattr(record, "company_id", None),
+    )
+    if verdict.proven:
+        return current
+    if verdict.recoverable:
+        return GuardResult(GuardOutcome.RETRYABLE_UNAVAILABLE, verdict.reason or "multi_service_catalog_unavailable")
+    return GuardResult(GuardOutcome.MULTI_SERVICE_MISMATCH, verdict.reason or MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
