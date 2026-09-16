@@ -554,6 +554,17 @@ async def verify_reminder_is_current(
                 quantity=2,
                 booking_currency=snapshot.lines[0].currency,
                 total_cost=getattr(record, "total_cost", None),
+                # PR-7.5: a resource-aware snapshot carries the contract
+                # identity it was proved with, so this re-proof runs through the
+                # SAME resolver — static contract, live booking and live
+                # catalogue — rather than a send-time shortcut.  A version 1
+                # snapshot passes ``None`` and keeps the PR-7.4 path.
+                company_id=getattr(record, "company_id", None),
+                service_id=(
+                    snapshot.resource_shadow_proof.primary_service_id
+                    if snapshot.resource_shadow_proof is not None
+                    else None
+                ),
             ),
             booking_payload=payload,
             catalog_rows=catalog_rows,

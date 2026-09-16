@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot import easyweek_resource_shadow_contract as resource_shadow_contract
 from altegio_bot.easyweek_multi_service_recovery import build_recovery_plan
 from altegio_bot.scripts import easyweek_multi_service_preflight as preflight
 from altegio_bot.scripts import easyweek_multi_service_reminder_recovery as recovery_cli
@@ -126,3 +127,88 @@ def test_recovery_runner_is_an_ops_only_one_off_with_private_state_mount() -> No
     assert any("easyweek.env" in str(item) for item in service["env_file"])
     assert any(":/recovery" in item for item in service["volumes"])
     assert "easyweek_multi_service_reminder_recovery" in " ".join(service["entrypoint"])
+
+
+# ===========================================================================
+# PR-7.5: the Karlsruhe resource-shadow fence
+# ===========================================================================
+
+
+def test_the_resource_shadow_fence_defaults_false_and_is_independent() -> None:
+    fields = Settings.model_fields
+    assert fields["easyweek_resource_shadow_proof_enabled"].default is False
+    # Three separate switches, not one widened flag.
+    assert fields["easyweek_multi_service_notifications_enabled"].default is False
+    assert fields["easyweek_multi_service_send_enabled"].default is False
+
+
+@_PLAN_PRESENT
+def test_canonical_plan_records_the_normative_resource_shadow_scope() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    section = text.split("### 38.6 Ревизия 38 — production evidence корректирует исходную гипотезу", 1)[1]
+    for required in (
+        "company_id=322579",
+        "8395fab6-7ee8-4702-88d9-fd78f92539c1",
+        "1030228",
+        "1030246",
+        "Hygienische Pediküre für Damen",
+        "Pediküre mit Gel-Lack",
+        "Pediküre Mit French",
+        "multi_service_duplicate_ambiguous",
+        "multi_service_category_not_allowed",
+        "catalog UUID не хардкодится",
+        "Durlach и Rastatt поведение не меняется",
+        "default-false kill switch",
+        "13934",
+    ):
+        assert required in section
+
+
+def test_the_static_contract_lives_in_one_module_with_provenance() -> None:
+    source = inspect.getsource(resource_shadow_contract)
+    assert "8395fab6-7ee8-4702-88d9-fd78f92539c1" in source
+    assert "322579" in source
+    # Catalogue service UUIDs are resolved live, never pinned.
+    assert source.count("uuid.UUID") == 1
+    for marker in ("Provenance", "revision", "digest"):
+        assert marker in source
+    # A contract module cannot reach the database, the API or a sender.
+    for forbidden in ("select(", "session", "httpx", "requests", "EasyWeekClient"):
+        assert forbidden not in source
+
+
+def test_runbook_pins_the_resource_shadow_rollout_and_rollback() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    for required in (
+        "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false",
+        "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true",
+        "easyweek_multi_service_preflight",
+        "structurally_proven=17",
+        "disallowed_by_category=17",
+        "ambiguous=0",
+        "allowed=0",
+        "ready=true",
+        "multi_service_category_not_allowed",
+        "Controlled canary",
+        "Rollback нового fence",
+        "13934",
+        "13939",
+    ):
+        assert required in text
+    # The rollback section closes the NEW fence first.
+    rollback = text.split("## 19. Rollback нового fence", 1)[1]
+    assert "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false" in rollback
+    # Opening the shared send fence stays gated on all three green checks.
+    gate = text.split("## 20. Запрет на открытие общего send fence", 1)[1]
+    for required in ("multi-service preflight", "reminder preflight", "canary"):
+        assert required in gate
+
+
+def test_env_example_exposes_the_third_closed_fence() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false") == 1
+
+
+def test_both_services_that_read_the_new_fence_are_documented_in_compose() -> None:
+    text = COMPOSE.read_text(encoding="utf-8")
+    assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED") == 2

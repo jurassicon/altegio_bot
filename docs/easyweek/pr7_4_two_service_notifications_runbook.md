@@ -251,3 +251,176 @@ review/retention/campaign. Если нужно также остановить �
 отдельно вернуть `EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=false` и
 пересоздать inbox и outbox. Rollback не удаляет records, jobs, snapshot или
 apply report; их судьба — отдельное операторское решение.
+
+---
+
+# PR-7.5 — Karlsruhe resource-shadow proof: rollout и rollback
+
+Эта часть добавляет **третий независимый fence**
+`EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED`. Он не расширяет контракт двух услуг,
+не меняет `EASYWEEK_ALLOWED_SERVICE_CATEGORIES`, не включает отправку и не
+трогает Durlach, Rastatt и Altegio. Единственная его задача — позволить общему
+PR-7.4 proof распознать техническую resource-строку одного owner-approved
+статического контракта Karlsruhe, чтобы 16 записей перестали быть
+`multi_service_duplicate_ambiguous` и дошли до обычной all-categories
+eligibility.
+
+Ожидаемый результат для этих записей — `multi_service_category_not_allowed`.
+Это доказанное безопасное подавление, а не разрешение отправлять `Nagelservice`.
+
+## 13. Deploy: новый fence закрыт
+
+До пересоздания контейнеров проверить в `easyweek.env`:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false
+```
+
+При `false` поведение полностью совпадает с текущим PR-7.4: те же snapshot v1,
+те же digests, те же jobs, те же fail-closed причины.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot config --quiet
+docker compose -p altegio_bot up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+## 14. Проверка code/profile/catalog contract до открытия fence
+
+Статический контракт лежит в коде (`easyweek_resource_shadow_contract.py`) и
+проверяется в diff владельцем. Он ограничен `provider=easyweek`,
+`company_id=322579` и location UUID `8395fab6-7ee8-4702-88d9-fd78f92539c1`;
+catalog UUID не хардкодятся и разрешаются заново по точному имени в полном
+живом каталоге.
+
+Сверить точную таблицу и revision в diff, затем убедиться, что живой каталог
+отдаёт каждое имя ровно один раз и с категорией `Nagelservice`:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+При закрытом fence этот прогон обязан по-прежнему показывать стабильную
+причину `multi_service_duplicate_ambiguous` и `ready=false`. Отсутствие
+изменений здесь — и есть доказательство, что deploy ничего не поменял.
+
+## 15. Открыть ТОЛЬКО resource-shadow fence
+
+Send fence остаётся закрытым:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+`docker compose restart` не перечитывает `env_file`, поэтому используется
+`up -d --force-recreate` обоих сервисов: planning читает флаг в inbox, а общий
+outbox читает его же для удержания resource-aware jobs.
+
+## 16. Повторный multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+Ожидаемый наблюдённый baseline — ориентир для этого rollout, а не хардкод:
+
+```text
+active_multi_service=17
+checked=17
+structurally_proven=17
+allowed=0
+disallowed_by_category=17
+contract_excluded=0
+ambiguous=0
+stale_snapshot_digest=0
+unexplained=0
+truncated=false
+ready=true
+```
+
+Ключевой переход — `ambiguous=16 → 0` при `allowed=0`. Если `allowed` перестал
+быть нулём, остановиться: это означало бы изменение category allowlist, которое
+данный PR не разрешает.
+
+## 17. Ожидаемое category suppression
+
+Для всех Karlsruhe записей корректный исход — `multi_service_category_not_allowed`.
+Проверить, что ни одна из них не получила обязательств:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot exec -T postgres sh -lc \
+  'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+\pset pager off
+SELECT j.status, count(*)
+FROM message_jobs j
+JOIN records r ON r.id = j.record_id
+WHERE j.provider = 'easyweek' AND r.company_id = 322579
+GROUP BY j.status ORDER BY j.status;
+SQL
+```
+
+Новых `queued` lifecycle/reminder jobs у этих записей быть не должно, равно как
+и новых `OutboxMessage` и Meta/Chatwoot attempts.
+
+## 18. Controlled canary
+
+До любой отправки проверить штатный будущий canary на заранее разрешённом
+тестовом получателе, категория которого входит в текущий allowlist. Его webhook
+должен создать digest-bound job со snapshot version 2, а закрытый
+`EASYWEEK_MULTI_SERVICE_SEND_ENABLED` — удержать её в `queued` с `attempts=0`,
+без Outbox и без Meta/Chatwoot. Renderer обязан показать обе услуги по одному
+разу с индивидуальными ценами и одной итоговой суммой.
+
+## 19. Rollback нового fence
+
+При любой аномалии закрыть сначала именно новый fence:
+
+```dotenv
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+docker compose -p altegio_bot ps altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+Уже созданные resource-aware jobs (snapshot version 2) остаются `queued`, не
+расходуют attempts и не вызывают внешние сервисы. Обычные Durlach/Rastatt пары
+версии 1, single-service и Altegio продолжают работать без изменений: новый
+fence их не касается.
+
+## 20. Запрет на открытие общего send fence
+
+`EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true` запрещено включать, пока
+одновременно не зелёные все три проверки:
+
+1. multi-service preflight (`ready=true`);
+2. общий reminder preflight (`ready=true`);
+3. controlled canary.
+
+Отдельно: шесть `deadline_expired` reminder jobs `13934`–`13939` — это
+операторское rollout-состояние, а не дефект resource-shadow. Данный PR их не
+восстанавливает, не отменяет и не отправляет; их судьба требует отдельного
+операторского решения вне этого PR и не является условием его завершения.

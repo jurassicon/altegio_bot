@@ -54,8 +54,11 @@ from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek
 from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_DISABLED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_JOB_VERSION_KEY,
+    MULTI_SERVICE_RESOURCE_SHADOW_DISABLED,
     MULTI_SERVICE_SEND_DISABLED,
     MULTI_SERVICE_SNAPSHOT_MISSING,
+    MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
     MultiServiceSnapshot,
     ServiceEligibilityPurpose,
     evaluate_service_eligibility,
@@ -666,6 +669,27 @@ def _easyweek_multi_service_fence_reason() -> str | None:
     return None
 
 
+def _easyweek_resource_shadow_fence_reason() -> str | None:
+    """PR-7.5 fence, which holds ONLY resource-aware (version 2) pair jobs.
+
+    Deliberately separate from the two PR-7.4 fences: closing it must not touch
+    an ordinary Durlach/Rastatt pair job, and reopening it must not imply
+    permission to send. A held job keeps `queued`, its `run_at` and zero
+    attempts, exactly like the established fences above.
+    """
+    if not bool(settings.easyweek_resource_shadow_proof_enabled):
+        return MULTI_SERVICE_RESOURCE_SHADOW_DISABLED
+    return None
+
+
+def _claims_resource_shadow_pair(payload: object) -> bool:
+    """True when this job's immutable payload names the version 2 projection."""
+    return (
+        isinstance(payload, dict)
+        and payload.get(MULTI_SERVICE_JOB_VERSION_KEY) == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    )
+
+
 async def _lock_next_jobs(
     session: AsyncSession,
     batch_size: int,
@@ -708,6 +732,21 @@ async def _lock_next_jobs(
             & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_DIGEST_KEY)
         )
         stmt = stmt.where(~multi_rows)
+
+    # PR-7.5 send fence, narrower still: only jobs whose immutable payload names
+    # the version 2 resource-aware projection. Version 1 pair jobs, single
+    # service jobs and every Altegio job stay claimable.
+    if _easyweek_resource_shadow_fence_reason() is not None:
+        resource_rows = (
+            (MessageJob.provider == PROVIDER_EASYWEEK)
+            & (MessageJob.job_type.in_(EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES))
+            & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_VERSION_KEY)
+            & (
+                MessageJob.payload[MULTI_SERVICE_JOB_VERSION_KEY].astext
+                == str(MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION)
+            )
+        )
+        stmt = stmt.where(~resource_rows)
 
     # PR-9 send fence, the same shape and for the same reason: with the fence
     # shut an EasyWeek review is not claimed AT ALL, so it keeps its `queued`
@@ -3274,7 +3313,9 @@ async def _run_job_logic(
     payload = job.payload if isinstance(job.payload, dict) else {}
     claims_multi_service = MULTI_SERVICE_JOB_DIGEST_KEY in payload
     effective_multi_service_snapshot: MultiServiceSnapshot | None = None
-    multi_service_fence_reason = _easyweek_multi_service_fence_reason()
+    multi_service_fence_reason = _easyweek_multi_service_fence_reason() or (
+        _easyweek_resource_shadow_fence_reason() if _claims_resource_shadow_pair(payload) else None
+    )
     if (
         claims_multi_service
         and job_provider == PROVIDER_EASYWEEK

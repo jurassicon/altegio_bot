@@ -736,6 +736,8 @@ async def build_recovery_plan(
                             quantity=booking.service_quantity,
                             booking_currency=booking.booking_currency,
                             total_cost=record.total_cost,
+                            company_id=record.company_id,
+                            service_id=booking.service_id,
                         )
                         snapshot = prove_exactly_two_service_snapshot(
                             webhook=webhook_pair,

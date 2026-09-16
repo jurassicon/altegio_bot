@@ -48,8 +48,15 @@ from altegio_bot.easyweek_reminder_guard import (
     classify_client_error,
     verify_reminder_is_current,
 )
+from altegio_bot.easyweek_resource_shadow_contract import (
+    KARLSRUHE_COMPANY_ID,
+    KARLSRUHE_LOCATION_UUID,
+    KARLSRUHE_NUMERIC_SERVICE_NAMES,
+    KARLSRUHE_SERVICE_CATEGORY,
+)
 from altegio_bot.easyweek_service_category import record_raw_with_services_count
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK, MessageJob, Record
+from altegio_bot.settings import settings
 
 BOOKING = uuid.UUID("11111111-2222-4333-8444-555555555555")
 OTHER_BOOKING = uuid.UUID("99999999-8888-4777-8666-555555555555")
@@ -643,3 +650,153 @@ def test_every_reason_is_a_short_stable_prefixed_code(outcome: GuardOutcome) -> 
     assert result.reason.startswith("easyweek_reminder_guard:")
     assert outcome.value in result.reason
     assert len(result.reason) < 120
+
+
+# ---------------------------------------------------------------------------
+# PR-7.5: the send-time guard re-proves the resource-shadow contract itself.
+#
+# The synthetic pair the guard rebuilds carries the numeric primary id the
+# version 2 snapshot recorded, so the SAME resolver runs here as in the inbox
+# worker and the preflight — no send-time shortcut and no second dictionary.
+# ---------------------------------------------------------------------------
+
+KARLSRUHE_SHELLAC = "Maniküre mit Gel-Lack / Shellac"
+KARLSRUHE_PEDIKUERE_GEL = "Pediküre mit Gel-Lack"
+_KARLSRUHE_PRICES = {KARLSRUHE_SHELLAC: 4200, KARLSRUHE_PEDIKUERE_GEL: 5100}
+_KARLSRUHE_TOTAL = sum(_KARLSRUHE_PRICES.values())
+
+
+def _karlsruhe_location() -> EasyWeekLocation:
+    return EasyWeekLocation(
+        name="karlsruhe",
+        location_id=KARLSRUHE_COMPANY_ID,
+        location_uuid=KARLSRUHE_LOCATION_UUID,
+        meta_template_prefix="ka",
+        booking_page_url="https://booking.example.invalid/karlsruhe",
+    )
+
+
+def _karlsruhe_catalog() -> list[dict[str, Any]]:
+    return [
+        {
+            "uuid": f"cccccccc-0000-4000-8000-{index:012d}",
+            "name": name,
+            "currency": "EUR",
+            "price": _KARLSRUHE_PRICES.get(name, 3000),
+            "duration": {"value": 60, "label": "minutes"},
+            "category": {"name": KARLSRUHE_SERVICE_CATEGORY},
+        }
+        for index, name in enumerate(sorted(KARLSRUHE_NUMERIC_SERVICE_NAMES.values()))
+    ]
+
+
+def _karlsruhe_api(*, second_price: int | None = None) -> dict[str, Any]:
+    prices = dict(_KARLSRUHE_PRICES)
+    if second_price is not None:
+        prices[KARLSRUHE_PEDIKUERE_GEL] = second_price
+    rows = []
+    for index, name in enumerate([KARLSRUHE_SHELLAC, KARLSRUHE_PEDIKUERE_GEL, KARLSRUHE_PEDIKUERE_GEL]):
+        row = _pair_line(f"dddddddd-0000-4000-8000-{index:012d}", name, prices[name], 60)
+        row["resource"] = {"uuid": f"eeeeeeee-0000-4000-8000-{index:012d}"}
+        rows.append(row)
+    total = prices[KARLSRUHE_SHELLAC] + prices[KARLSRUHE_PEDIKUERE_GEL]
+    return _api(
+        location_uuid=KARLSRUHE_LOCATION_UUID,
+        currency="EUR",
+        order={"subtotal": total, "total": total},
+        ordered_services=rows,
+    )
+
+
+def _stored_karlsruhe_pair() -> tuple[MessageJob, Record]:
+    snapshot = prove_exactly_two_service_snapshot(
+        webhook=WebhookServicePair(
+            booking_uuid=BOOKING,
+            location_uuid=KARLSRUHE_LOCATION_UUID,
+            service_name=KARLSRUHE_SHELLAC,
+            service_related=KARLSRUHE_PEDIKUERE_GEL,
+            services_description=f"{KARLSRUHE_SHELLAC}, {KARLSRUHE_PEDIKUERE_GEL}",
+            services_count=2,
+            quantity=2,
+            booking_currency="EUR",
+            total_cost=Decimal(_KARLSRUHE_TOTAL) / Decimal(100),
+            company_id=KARLSRUHE_COMPANY_ID,
+            service_id=1030234,
+        ),
+        booking_payload=_karlsruhe_api(),
+        catalog_rows=_karlsruhe_catalog(),
+    )
+    record = _record(company_id=KARLSRUHE_COMPANY_ID)
+    record.total_cost = Decimal(_KARLSRUHE_TOTAL) / Decimal(100)
+    record.raw = record_raw_with_multi_service_snapshot(record_raw_with_services_count({}, 2), snapshot)
+    job = _job(company_id=KARLSRUHE_COMPANY_ID)
+    job.payload.update(multi_service_job_payload(snapshot))
+    return job, record
+
+
+class KarlsruheFakeReader(FakeReader):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.catalog_calls: list[tuple[str, int]] = []
+
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        self.catalog_calls.append((location_uuid, page))
+        rows = _karlsruhe_catalog()
+        return {"data": rows, "meta": {"current_page": 1, "last_page": 1, "total": len(rows)}}
+
+
+@pytest.fixture
+def _karlsruhe_fence_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+
+
+async def test_resource_aware_reminder_reproves_the_live_shape_and_contract(
+    _karlsruhe_fence_open: None,
+) -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_karlsruhe_pair()
+    reader = KarlsruheFakeReader(_karlsruhe_api())
+
+    result = await _verify(job=job, record=record, location=_karlsruhe_location(), reader=reader)
+
+    assert result.outcome is GuardOutcome.PROVEN_CURRENT
+    assert reader.calls == [str(BOOKING)]
+    assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]
+
+
+async def test_resource_aware_reminder_is_refused_when_the_live_pair_changed(
+    _karlsruhe_fence_open: None,
+) -> None:
+    clear_multi_service_catalog_cache()
+    job, record = _stored_karlsruhe_pair()
+    reader = KarlsruheFakeReader(_karlsruhe_api(second_price=5200))
+
+    result = await _verify(job=job, record=record, location=_karlsruhe_location(), reader=reader)
+
+    assert result.outcome is GuardOutcome.MULTI_SERVICE_MISMATCH
+    assert result.proven is False
+
+
+async def test_send_time_guard_uses_the_same_fence_as_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot proved while the fence was open is not re-provable once shut.
+
+    The outbox never reaches this point with the fence closed — the claim query
+    and the race guard hold a version 2 job first — but the guard itself must
+    not become a second, more permissive opinion.
+    """
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    job, record = _stored_karlsruhe_pair()
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", False, raising=False)
+    clear_multi_service_catalog_cache()
+
+    result = await _verify(
+        job=job,
+        record=record,
+        location=_karlsruhe_location(),
+        reader=KarlsruheFakeReader(_karlsruhe_api()),
+    )
+
+    assert result.outcome is GuardOutcome.MULTI_SERVICE_MISMATCH
+    assert result.proven is False

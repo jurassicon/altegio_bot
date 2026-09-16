@@ -798,6 +798,8 @@ async def sync_multi_service_snapshot(
         quantity=booking.service_quantity,
         booking_currency=booking.booking_currency,
         total_cost=record.total_cost,
+        company_id=record.company_id,
+        service_id=booking.service_id,
     )
     try:
         client = EasyWeekClient()

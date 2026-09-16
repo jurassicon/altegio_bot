@@ -31,7 +31,9 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_CATALOG_UNAVAILABLE,
     MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_JOB_VERSION_KEY,
     MULTI_SERVICE_SNAPSHOT_KEY,
+    MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
     MultiServiceProofError,
     MultiServiceReader,
     MultiServiceSnapshot,
@@ -244,13 +246,14 @@ def _record_job_consistency(
         report.open_jobs += 1
         payload = job.payload if isinstance(job.payload, Mapping) else {}
         claims_pair = MULTI_SERVICE_JOB_DIGEST_KEY in payload
-        safely_held = (
-            claims_pair
-            and not bool(settings.easyweek_multi_service_send_enabled)
-            and job.status == "queued"
-            and job.attempts == 0
-            and job.locked_at is None
+        # A resource-aware job additionally answers to the PR-7.5 fence, so it
+        # is legitimately held while EITHER fence is closed.  The two are
+        # independent: closing one must not make the other's jobs unexplained.
+        fenced = not bool(settings.easyweek_multi_service_send_enabled) or (
+            payload.get(MULTI_SERVICE_JOB_VERSION_KEY) == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+            and not bool(settings.easyweek_resource_shadow_proof_enabled)
         )
+        safely_held = claims_pair and fenced and job.status == "queued" and job.attempts == 0 and job.locked_at is None
         if safely_held:
             report.jobs_held_by_send_fence += 1
         else:
@@ -346,6 +349,8 @@ async def run_preflight(
             quantity=booking.service_quantity,
             booking_currency=booking.booking_currency,
             total_cost=record.total_cost,
+            company_id=record.company_id,
+            service_id=booking.service_id,
         )
         try:
             try:
