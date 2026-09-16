@@ -392,35 +392,136 @@ SQL
 queued job или клиентский рендер означало бы временно разрешить `Nagelservice`,
 что запрещено §38.6.
 
-Создать одну контролируемую будущую Karlsruhe booking ровно из двух разных
-услуг контракта (одна из них — resource-backed, например
-`Pediküre mit Gel-Lack`) и проверить:
+### 18.1 Зафиксировать exact identity canary booking
 
-1. Record получил `multi_service_snapshot` с `version: 2`;
-2. structural proof прошёл — запись видна в preflight как
-   `structurally_proven`, а не `ambiguous`;
-3. eligibility завершилась `multi_service_category_not_allowed`;
-4. для этой записи отсутствуют `MessageJob`, `OutboxMessage`, Meta и Chatwoot
-   attempts;
-5. `EASYWEEK_ALLOWED_SERVICE_CATEGORIES` не изменялся.
+Создать одну контролируемую будущую Karlsruhe booking ровно из двух разных
+услуг контракта, одна из которых resource-backed (например
+`Pediküre mit Gel-Lack`), и **выписать точный booking UUID этой записи** до
+любой диагностики.
+
+Дальше весь canary привязан только к этому UUID. В реальном филиале между
+созданием booking и запросом появляются другие записи, поэтому запрещено
+искать canary по «последним записям», `ORDER BY ... LIMIT`, имени клиента,
+телефону, времени без UUID или ручным визуальным сопоставлением нескольких
+строк: любой более старый resource-shadow Record с `jobs = 0` и `outbox = 0`
+дал бы ложноположительный результат.
+
+### 18.2 Identity-bound проверка Record
+
+Подставить выписанный UUID в первую строку и выполнить блок целиком. UUID
+передаётся как значение psql-переменной (`:'canary'`), а не склейкой SQL.
+
+Первый запрос — жёсткая проверка identity: если по полному
+`provider` + `company_id` + `easyweek_booking_uuid` найдено не ровно одна
+запись, он падает с делением на ноль, и `ON_ERROR_STOP=1` останавливает весь
+блок до печати деталей.
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot exec -T postgres sh -lc \
-  'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+CANARY_BOOKING_UUID='PASTE-CANARY-BOOKING-UUID-HERE'
+docker compose -p altegio_bot exec -T \
+  -e CANARY_BOOKING_UUID="$CANARY_BOOKING_UUID" postgres sh -lc \
+  'psql -X -v ON_ERROR_STOP=1 -v canary="$CANARY_BOOKING_UUID" -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
 \pset pager off
-SELECT r.id,
-       r.raw #>> '{easyweek,multi_service_snapshot,version}' AS snapshot_version,
-       (SELECT count(*) FROM message_jobs j WHERE j.record_id = r.id) AS jobs,
+SELECT 1 / (count(*) = 1)::int AS exactly_one_canary_record
+FROM records
+WHERE provider = 'easyweek'
+  AND company_id = 322579
+  AND easyweek_booking_uuid = :'canary'::uuid;
+
+SELECT r.id                                                              AS record_id,
+       r.company_id                                                      AS company_id,
+       r.easyweek_booking_uuid                                           AS booking_uuid,
+       r.raw #>> '{easyweek,services_count}'                             AS services_count,
+       r.raw #>> '{easyweek,multi_service_snapshot,version}'             AS snapshot_version,
+       r.raw #>> '{easyweek,multi_service_snapshot,digest}'              AS snapshot_digest,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,proof_kind}'       AS proof_kind,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,contract_revision}' AS contract_revision,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,contract_digest}'   AS contract_digest,
+       jsonb_array_length(r.raw #> '{easyweek,multi_service_snapshot,lines}')                AS snapshot_lines,
+       r.raw #>> '{easyweek,multi_service_snapshot,lines,0,category}'    AS line_1_category,
+       r.raw #>> '{easyweek,multi_service_snapshot,lines,1,category}'    AS line_2_category,
+       (SELECT count(*) FROM message_jobs j WHERE j.record_id = r.id)    AS jobs,
        (SELECT count(*) FROM outbox_messages o WHERE o.record_id = r.id) AS outbox
 FROM records r
-WHERE r.provider = 'easyweek' AND r.company_id = 322579
-ORDER BY r.id DESC
-LIMIT 5;
+WHERE r.provider = 'easyweek'
+  AND r.company_id = 322579
+  AND r.easyweek_booking_uuid = :'canary'::uuid;
 SQL
 ```
 
-Ожидается `snapshot_version = 2`, `jobs = 0`, `outbox = 0`.
+Запрос печатает только технические поля. Имя клиента, телефон, e-mail, notes,
+ссылки и любые другие PII в вывод не попадают.
+
+Ожидаемый результат — ровно одна строка, и в ней одновременно:
+
+```text
+services_count    = 2
+snapshot_version  = 2
+proof_kind        = karlsruhe_resource_shadow
+contract_revision = <текущая revision из easyweek_resource_shadow_contract.py>
+contract_digest   = <непустой 64-символьный hex>
+snapshot_lines    = 2
+line_1_category   = Nagelservice
+line_2_category   = Nagelservice
+jobs              = 0
+outbox            = 0
+```
+
+### 18.3 Suppression reason того же Record
+
+Взять `record_id` из §18.2 — не из журнала, не «на глаз» — и проверить, что
+именно для него inbox worker записал точный стабильный reason:
+
+```bash
+cd /opt/altegio_bot
+CANARY_RECORD_ID='PASTE-CANARY-RECORD-ID-FROM-18.2-HERE'
+docker compose -p altegio_bot logs --no-color --since 24h \
+  altegio-easyweek-inbox-worker \
+  | grep -E "record_id=${CANARY_RECORD_ID}[^0-9].*reason=multi_service_category_not_allowed"
+```
+
+Требуется хотя бы одна строка `easyweek lifecycle suppressed` или
+`easyweek reminders suppressed`, содержащая одновременно точный
+`record_id=<canary record_id>` и точный
+`reason=multi_service_category_not_allowed`.
+
+Строка `category_not_allowed` без этого `record_id` доказательством не
+является: она может относиться к любой другой из 17 записей. Пустой вывод
+grep — это **не** PASS, а STOP.
+
+### 18.4 Structural proof остаётся отдельной проверкой
+
+Общий preflight из §16 read-only и печатает только агрегаты. Он доказывает,
+что во всём scope нет `ambiguous` и `unexplained`, но не доказывает, что
+конкретная canary booking — та самая запись, которая стала
+`structurally_proven`. Identity-bound запрос из §18.2 доказывает обратное:
+именно этот Record получил version 2 snapshot и ноль обязательств, но ничего
+не говорит об остальном scope.
+
+Это разные утверждения, и нужны оба: агрегатный preflight `ready=true` **и**
+зелёный identity-bound canary.
+
+### 18.5 Fail-closed условия остановки rollout
+
+Rollout останавливается, если верно хотя бы одно:
+
+- exact canary Record не найден;
+- найдено больше одной записи по полному identity;
+- `multi_service_snapshot` отсутствует или `snapshot_version` не равен `2`;
+- отсутствуют `proof_kind`, `contract_revision` или `contract_digest`;
+- `proof_kind` не равен `karlsruhe_resource_shadow`;
+- `contract_revision` не совпадает с текущей revision в коде;
+- `snapshot_lines` не равен `2`;
+- хотя бы одна из `line_1_category` / `line_2_category` не `Nagelservice`;
+- `jobs` или `outbox` больше нуля;
+- в логах нет строки с exact `record_id` и
+  `reason=multi_service_category_not_allowed`;
+- `EASYWEEK_ALLOWED_SERVICE_CATEGORIES` изменился;
+- preflight из §16 не `ready=true` либо canary остаётся `ambiguous`.
+
+При любом из этих условий выполнить rollback из §19 и не открывать общий send
+fence.
 
 Runtime rendering и фактическая отправка version 2 пары доказываются
 автоматизированными integration-тестами

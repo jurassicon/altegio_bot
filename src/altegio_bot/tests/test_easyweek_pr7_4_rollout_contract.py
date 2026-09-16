@@ -204,6 +204,25 @@ def test_runbook_pins_the_resource_shadow_rollout_and_rollback() -> None:
         assert required in gate
 
 
+def _runbook_section(title: str) -> str:
+    """The text of one runbook section, up to the next top-level heading."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert title in text, f"missing runbook section: {title}"
+    after = text.split(title, 1)[1]
+    remainder = [part for part in after.split("\n## ") if part]
+    return remainder[0] if len(after.split("\n## ")) > 1 else after
+
+
+def _fenced_blocks(section: str) -> str:
+    """Only the copy-paste command blocks, so prose cannot satisfy a check."""
+    parts = section.split("```")
+    return "\n".join(parts[index] for index in range(1, len(parts), 2))
+
+
+CANARY_TITLE = "## 18. Controlled suppression canary"
+SEND_FENCE_TITLE = "## 20. Запрет на открытие общего send fence"
+
+
 def test_the_resource_shadow_canary_is_a_suppression_canary_not_a_send_canary() -> None:
     """The observed shapes are Nagelservice, so a v2 canary cannot send.
 
@@ -212,31 +231,172 @@ def test_the_resource_shadow_canary_is_a_suppression_canary_not_a_send_canary() 
     runbook therefore has to ask for proven suppression, and to say that the
     runtime render is proved by tests rather than on production.
     """
-    text = RUNBOOK.read_text(encoding="utf-8")
-    canary = text.split("## 18. Controlled suppression canary", 1)[1].split("## 19.", 1)[0]
+    canary = _runbook_section(CANARY_TITLE)
     for required in (
         "suppression canary",
         "multi_service_category_not_allowed",
-        "`version: 2`",
         "structurally_proven",
-        "не изменялся",
         "integration-тестами",
     ):
         assert required in canary
-    # It must demand the ABSENCE of the queue the old text asked for.
-    for required in ("`jobs = 0`", "`outbox = 0`", "отсутствуют"):
-        assert required in canary
 
-    gate = text.split("## 20. Запрет на открытие общего send fence", 1)[1]
+
+def test_the_canary_is_bound_to_the_exact_canary_booking_uuid() -> None:
+    """A rollout check that matches "some record" proves nothing.
+
+    Between creating the controlled booking and running the query, a live
+    branch produces other records — including older resource-shadow ones with
+    no jobs and no outbox rows. Every canary statement must therefore select on
+    the full provider/company/booking identity.
+    """
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    # The operator has to write the exact UUID down before any diagnosis.
+    assert "booking UUID" in canary
+    assert "CANARY_BOOKING_UUID=" in blocks
+
+    # Every SELECT over `records` carries the whole identity triple.
+    record_selects = [
+        statement
+        for statement in blocks.split(";")
+        if "FROM records" in statement.replace("\n", " ") or "FROM records r" in statement.replace("\n", " ")
+    ]
+    assert len(record_selects) >= 2, "expected an identity assertion and a detail query"
+    for statement in record_selects:
+        flattened = " ".join(statement.split())
+        assert "provider = 'easyweek'" in flattened
+        assert "company_id = 322579" in flattened
+        assert "easyweek_booking_uuid = :'canary'::uuid" in flattened
+
+    # The UUID travels as a psql value, never as concatenated SQL text.
+    assert ":'canary'" in blocks
+    assert "||" not in blocks
+    assert "$CANARY_BOOKING_UUID" in blocks
+
+
+def test_the_canary_never_guesses_which_record_it_found() -> None:
+    """The defect this replaced: ORDER BY r.id DESC LIMIT 5 over the company."""
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+    flattened = " ".join(blocks.split())
+
+    for forbidden in ("ORDER BY", "LIMIT", "ORDER BY r.id DESC", "LIMIT 5"):
+        assert forbidden not in flattened, f"canary must not rank or truncate: {forbidden}"
+
+    # Exactly one match is asserted by the SQL itself, not by eyeballing rows.
+    assert "exactly_one_canary_record" in blocks
+    assert "1 / (count(*) = 1)::int" in flattened
+    assert "ON_ERROR_STOP=1" in blocks
+
+
+def test_the_canary_prints_only_safe_technical_fields() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    for required in (
+        "AS record_id",
+        "AS company_id",
+        "AS booking_uuid",
+        "AS services_count",
+        "AS snapshot_version",
+        "AS snapshot_digest",
+        "AS proof_kind",
+        "AS contract_revision",
+        "AS contract_digest",
+        "AS snapshot_lines",
+        "AS line_1_category",
+        "AS line_2_category",
+        "AS jobs",
+        "AS outbox",
+    ):
+        assert required in blocks, f"canary does not report {required}"
+
+    # No customer-facing column may be selected.
+    lowered = blocks.lower()
+    for forbidden in (
+        "customer",
+        "phone",
+        "email",
+        "display_name",
+        "notes",
+        "comment",
+        "short_link",
+        "booking_page",
+        "manage_link",
+    ):
+        assert forbidden not in lowered, f"canary query would print PII: {forbidden}"
+
+
+def test_the_canary_states_one_unambiguous_expected_result() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    for required in (
+        "services_count = 2",
+        "snapshot_version = 2",
+        "proof_kind = karlsruhe_resource_shadow",
+        "contract_revision =",
+        "contract_digest =",
+        "snapshot_lines = 2",
+        "line_1_category = Nagelservice",
+        "line_2_category = Nagelservice",
+        "jobs = 0",
+        "outbox = 0",
+    ):
+        assert required in flattened, f"canary does not pin the expected {required}"
+    assert "ровно одна строка" in flattened
+
+
+def test_the_suppression_reason_is_bound_to_the_exact_record_id() -> None:
+    """A lone `category_not_allowed` line belongs to any of the 17 records."""
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    assert "CANARY_RECORD_ID=" in blocks
+    assert "record_id=${CANARY_RECORD_ID}" in blocks
+    assert "reason=multi_service_category_not_allowed" in blocks
+    # The record id comes from the identity-bound query, not from the log.
+    assert "18.2" in canary
+    flattened = " ".join(canary.split())
+    assert "доказательством не является" in flattened
+    assert "не** PASS" in flattened or "не PASS" in flattened
+
+
+def test_the_canary_and_the_aggregate_preflight_are_both_required() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    assert "read-only" in flattened
+    assert "агрегат" in flattened
+    assert "нужны оба" in flattened
+
+
+def test_the_canary_lists_its_fail_closed_stop_conditions() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    for required in (
+        "не найден",
+        "больше одной записи",
+        "snapshot_lines",
+        "Nagelservice",
+        "EASYWEEK_ALLOWED_SERVICE_CATEGORIES",
+        "ready=true",
+    ):
+        assert required in flattened, f"missing stop condition: {required}"
+    assert "rollback" in flattened.lower()
+
+
+def test_the_shared_send_fence_keeps_its_own_version_one_canary() -> None:
+    gate = _runbook_section(SEND_FENCE_TITLE)
     # The shared send fence keeps its own PR-7.4 version 1 canary, and neither
     # step may be described as changing the production allowlist.
     assert "PR-7.4 send canary" in gate
     assert "version 1" in gate
+    assert "send-canary не" in " ".join(gate.split())
     for forbidden in (
         "EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[",
         'EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Nagelservice"]',
     ):
-        assert forbidden not in text
+        assert forbidden not in RUNBOOK.read_text(encoding="utf-8")
 
 
 def test_the_runbook_never_asks_to_allow_the_suppressed_category() -> None:
