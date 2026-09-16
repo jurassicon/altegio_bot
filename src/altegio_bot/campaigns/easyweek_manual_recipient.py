@@ -484,9 +484,9 @@ def _reuse(
 
 async def _frozen(session: AsyncSession, run_id: int) -> bool:
     """Has a voucher canary attached itself to this preview?"""
-    from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
+    from altegio_bot.campaigns.preview_freeze import preview_is_locked_by_any_canary
 
-    return await preview_is_locked_by_canary(session, campaign_run_id=run_id)
+    return await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
 
 
 async def _locked_reason(session_maker: async_sessionmaker[AsyncSession], run_id: int) -> str:

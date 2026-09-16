@@ -805,6 +805,29 @@ class Settings(BaseSettings):
     # refusal, never a wildcard and never a guess.
     easyweek_voucher_delivery_test_customer_uuid: str = ""
 
+    # --- §37.2: controlled MANUAL-BASIS voucher delivery canary ---------------
+    # §36 delivers to an account whose entitlement was earned, or to the one
+    # pre-configured test identity. This canary delivers to somebody an operator
+    # picked by hand in a preview — a real customer, chosen by a human, with no
+    # first-visit proof behind them.
+    #
+    # That is a different decision, so it gets a different fence. Turning on the
+    # §36 canary must never be what authorises sending a voucher to a manually
+    # selected person, and turning this one on must not reopen §36 either.
+    #
+    # False everywhere by default. With it false every stage refuses before any
+    # HTTP request — EasyWeek and Meta alike — including the read-only plan.
+    easyweek_manual_voucher_canary_enabled: bool = False
+
+    # Who performs the sale and which POS account is charged. Production UUIDs
+    # have no business in a repository: they arrive at run time, are validated as
+    # canonical UUIDs, are used in memory to build one request, and survive into
+    # the ledger and the report only as salted fingerprints.
+    #
+    # Empty by default so that an unset variable is a refusal, never a guess.
+    easyweek_manual_voucher_staffer_uuid: str = ""
+    easyweek_manual_voucher_account_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

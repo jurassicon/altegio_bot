@@ -10,13 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
-from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
 from altegio_bot.campaigns.loyalty_cleanup import (
     cleanup_campaign_cards,
     make_card_number,
     make_card_text,
     resolve_or_issue_loyalty_card,
 )
+from altegio_bot.campaigns.preview_freeze import preview_is_locked_by_any_canary
 from altegio_bot.campaigns.provider import (
     CampaignProviderRefusal,
     require_campaign_execution_provider,
@@ -1598,7 +1598,7 @@ async def discard_preview_run(run_id: int) -> None:
             # frozen. Deleting or discarding it does not undo a created or paid
             # voucher — it makes the delivery and the refund unprovable and
             # strands a real €15 with no way to finish and no way to reverse.
-            if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+            if await preview_is_locked_by_any_canary(session, campaign_run_id=run_id):
                 raise ValueError(
                     f"Preview run {run_id} используется controlled voucher delivery canary — "
                     "редактирование и удаление запрещены."
@@ -2602,7 +2602,7 @@ async def delete_preview_run(run_id: int) -> None:
             # frozen. Deleting or discarding it does not undo a created or paid
             # voucher — it makes the delivery and the refund unprovable and
             # strands a real €15 with no way to finish and no way to reverse.
-            if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+            if await preview_is_locked_by_any_canary(session, campaign_run_id=run_id):
                 raise ValueError(
                     f"Preview run {run_id} используется controlled voucher delivery canary — "
                     "редактирование и удаление запрещены."
@@ -2656,7 +2656,7 @@ async def lock_editable_preview(session: AsyncSession, run_id: int) -> CampaignR
     # recipient id) and re-proves that pair before every external step, so an
     # edit here does not undo a created or paid voucher — it makes the delivery
     # and the refund unprovable and strands a real €15.
-    if await preview_is_locked_by_canary(session, campaign_run_id=run_id):
+    if await preview_is_locked_by_any_canary(session, campaign_run_id=run_id):
         raise ValueError(
             f"Preview run {run_id} используется controlled voucher delivery canary — "
             "редактирование и удаление запрещены."

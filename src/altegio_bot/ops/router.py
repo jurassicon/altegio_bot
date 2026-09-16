@@ -17,14 +17,16 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import SQLAlchemyError
 
-from altegio_bot.campaigns.easyweek_voucher_delivery.ledger import preview_is_locked_by_canary
+from altegio_bot.campaigns.easyweek_manual_voucher.ledger import preview_is_locked_by_manual_canary
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
     classify_followup_candidate,
     followup_run_at,
 )
+from altegio_bot.campaigns.preview_freeze import preview_is_locked_by_any_canary
 from altegio_bot.campaigns.reports import monthly_dashboard, run_report
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_locations import configured_easyweek_locations
@@ -37,6 +39,7 @@ from altegio_bot.models.models import (
     CampaignRecipient,
     CampaignRun,
     EasyWeekCampaignVoucherDeliveryLedger,
+    EasyWeekManualVoucherDeliveryLedger,
     MessageJob,
     OutboxMessage,
 )
@@ -3066,13 +3069,19 @@ async def ops_campaigns_list(request: Request) -> str:
             )
             used_as_source_ids = {row[0] for row in (await session.execute(src_stmt)).all() if row[0] is not None}
 
+        # Both canaries freeze a preview, for the same reason and with the same
+        # consequence, so the list asks about both. A preview held by either one
+        # is offered no edit at all.
         canary_locked_ids: set[int] = set()
         if preview_ids:
-            locked_stmt = select(EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id).where(
-                EasyWeekCampaignVoucherDeliveryLedger.campaign_run_id.in_(preview_ids),
-                EasyWeekCampaignVoucherDeliveryLedger.provider == PROVIDER_EASYWEEK,
-            )
-            canary_locked_ids = {row[0] for row in (await session.execute(locked_stmt)).all() if row[0] is not None}
+            for model in (EasyWeekCampaignVoucherDeliveryLedger, EasyWeekManualVoucherDeliveryLedger):
+                locked_stmt = select(model.campaign_run_id).where(
+                    model.campaign_run_id.in_(preview_ids),
+                    model.provider == PROVIDER_EASYWEEK,
+                )
+                canary_locked_ids |= {
+                    row[0] for row in (await session.execute(locked_stmt)).all() if row[0] is not None
+                }
 
     filter_form = _filter_form(
         "/ops/campaigns",
@@ -3395,6 +3404,68 @@ def _parse_from_preview(raw: str | None) -> int | None:
     if number <= 0 or number > _MAX_RUN_ID:
         return None
     return number
+
+
+@router.get("/docs/manual-voucher-canary", response_class=HTMLResponse)
+async def ops_manual_voucher_canary_page() -> str:
+    """Read-only status of the §37.2 canary, and where its runbook lives.
+
+    Deliberately a page with nothing to click. The canary is driven one stage at
+    a time from a terminal, each stage behind its own freshly approved plan, and
+    a button here would be precisely the one-click "pay and send" this phase
+    exists to avoid. What an operator needs from a browser is the durable state
+    and the name of the document that tells them what to type.
+    """
+    from altegio_bot.campaigns.easyweek_manual_voucher import runner as manual_runner
+
+    try:
+        report = await manual_runner.run_status(SessionLocal)
+        state: dict[str, Any] = report.as_safe_dict()
+    except SQLAlchemyError:
+        # A status page that 500s tells an operator less than one that says the
+        # state could not be read. No SQL and no exception text reach the page.
+        state = {"ledger": {}, "recipient_basis": None, "first_visit_proof": None}
+    ledger = state.get("ledger") or {}
+
+    rows = [
+        (
+            "Fence (EASYWEEK_MANUAL_VOUCHER_CANARY_ENABLED)",
+            "открыт" if settings.easyweek_manual_voucher_canary_enabled else "закрыт",
+        ),
+        ("Ledger", "есть" if ledger.get("exists") else "нет"),
+        ("Статус", ledger.get("status") or "—"),
+        ("Basis", state.get("recipient_basis") or "—"),
+        ("First-visit proof", state.get("first_visit_proof") or "—"),
+        ("Preview run", str(ledger.get("campaign_run_id") or "—")),
+        ("Recipient", str(ledger.get("campaign_recipient_id") or "—")),
+        ("Baseline", ledger.get("baseline_version") or "—"),
+        ("Marker", ledger.get("reconciliation_marker") or "—"),
+        ("Заказ записан", "да" if ledger.get("target_order_recorded") else "нет"),
+        ("Попыток отправки", str(ledger.get("send_attempt_count", 0))),
+        ("Требуется reconcile", "да" if ledger.get("reconciliation_required") else "нет"),
+        ("Требуется ручная очистка", "да" if ledger.get("manual_cleanup_required") else "нет"),
+    ]
+    table = "".join(
+        f"<tr><th class='text-nowrap'>{_esc(name)}</th><td><code>{_esc(str(value))}</code></td></tr>"
+        for name, value in rows
+    )
+
+    body = f"""
+<h1 class="h4 mb-3">Controlled manual-basis voucher canary (§37.2)</h1>
+<div class="alert alert-secondary">
+  Один вручную выбранный получатель, один ваучер €15, одно сообщение.
+  Страница только читает состояние: все стадии выполняются из CLI
+  <code>easyweek_manual_voucher_canary</code>, каждая — по отдельно
+  утверждённому плану.
+</div>
+<table class="table table-sm w-auto">{table}</table>
+<div class="alert alert-warning">
+  <b>Инструкция:</b> <code>docs/easyweek/MANUAL_VOUCHER_CANARY_RUNBOOK.md</code> в репозитории.
+  Массовая отправка не разрешена: <code>campaign_send_authorized=false</code>,
+  <code>bulk_delivery_authorized=false</code>, <code>ready_for_send=false</code>.
+</div>
+"""
+    return _page("Manual voucher canary", body)
 
 
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
@@ -5521,7 +5592,12 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # A preview the §36 canary has attached itself to is frozen. The backend
         # refuses the edits under a row lock; not offering the buttons is how an
         # operator finds out before they click.
-        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
+        canary_locked = await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
+        # Which one, for the operator reading the page. Two canaries can hold a
+        # preview and they are driven by different commands, so "a canary" is
+        # not enough to act on.
+        manual_locked = await preview_is_locked_by_manual_canary(session, campaign_run_id=run_id)
+        canary_label = "§37.2, ручной выбор" if manual_locked else "§36"
 
         # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
         # not computed: it is Altegio follow-up machinery, and running it would
@@ -5658,10 +5734,16 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # Editing or deleting this preview would not undo a created or paid
         # voucher — it would make the delivery and the refund unprovable and
         # strand a real €15.
-        preview_actions_block = """
+        #
+        # Read-only on purpose. The canary is driven from a terminal, one stage
+        # at a time, each behind its own approved plan; a button here would be
+        # exactly the one-click "pay and send" this phase must not have.
+        preview_actions_block = f"""
 <div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
-  <span>Этот preview занят controlled voucher delivery canary (§36).
-        Add, Remove, Discard и Delete заблокированы бэкендом до завершения canary.</span>
+  <span>Этот preview занят controlled voucher canary ({_esc(canary_label)}).
+        Add, Remove, Discard и Delete заблокированы бэкендом до завершения canary.
+        Статус и стадии — только из операторского CLI.</span>
+  <a href="/ops/docs/manual-voucher-canary" class="btn btn-sm btn-outline-secondary">Инструкция</a>
 </div>
 """
     elif run.mode == "preview" and run.status == "completed":
@@ -6544,7 +6626,7 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 )
             )
             used_as_source = int(src_count or 0) > 0
-        canary_locked = await preview_is_locked_by_canary(session, campaign_run_id=run_id)
+        canary_locked = await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
 
         conditions: list[Any] = [
             CampaignRecipient.campaign_run_id == run_id,
