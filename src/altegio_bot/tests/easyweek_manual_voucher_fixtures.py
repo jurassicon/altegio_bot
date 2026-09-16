@@ -442,9 +442,25 @@ async def seed_manual_recipient(
 
 
 async def seed_template_and_sender(session_maker, *, company_id: int = COMPANY_ID) -> None:
-    """The approved Meta template row and an active sender line."""
+    """The approved Meta template row and an active sender line.
+
+    Idempotent: a test that seeds more than one canary in one database would
+    otherwise collide on the sender's provider/company/code uniqueness, which is
+    a fact about the fixture rather than about anything under test.
+    """
     async with session_maker() as session:
+        # One explicit transaction around the read AND the writes: the SELECT
+        # autobegins, and opening a second transaction on top of it is the very
+        # error §36.10 hit in production.
         async with session.begin():
+            existing = await session.scalar(
+                select(WhatsAppSender.id)
+                .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
+                .where(WhatsAppSender.company_id == company_id)
+                .where(WhatsAppSender.sender_code == "default")
+            )
+            if existing is not None:
+                return
             session.add(
                 MessageTemplate(
                     provider=PROVIDER_EASYWEEK,

@@ -46,7 +46,12 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     manual_marker,
 )
 from altegio_bot.campaigns.easyweek_manual_voucher.ledger import ManualCanaryIdentity
-from altegio_bot.easyweek_client import EasyWeekError
+from altegio_bot.easyweek_client import (
+    EasyWeekAuthError,
+    EasyWeekError,
+    EasyWeekNotFoundError,
+    EasyWeekPermanentError,
+)
 from altegio_bot.easyweek_voucher_identity import (
     EASYWEEK_VOUCHER_TEMPLATE_UUID,
     KARLSRUHE_LOCATION_UUID,
@@ -2622,3 +2627,284 @@ async def test_the_create_claim_itself_raises_the_cleanup_flag(session_maker) ->
     assert row.status == "create_claimed"
     assert row.manual_cleanup_required is True
     assert row.reconciliation_required is True
+
+
+# ---------------------------------------------------------------------------
+# A proven refusal created nothing, and says so
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        pytest.param(EasyWeekPermanentError("invalid", operation="create", status_code=422), id="422-validation"),
+        pytest.param(EasyWeekAuthError("denied", operation="create", status_code=403), id="403-auth"),
+        pytest.param(EasyWeekNotFoundError("gone", operation="create", status_code=404), id="404-not-found"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_proven_create_refusal_leaves_nothing_to_clean_up(
+    session_maker, manual_configuration, binding_key, refusal
+) -> None:
+    """The claim raised both flags; this answer proves no draft followed."""
+    report, (run_id, recipient_id), _reader, mutator = await _create(session_maker, mutator=FakeMutator(create=refusal))
+
+    assert report.outcome == "rejected"
+    assert mutator.calls == ["create"]
+    payload = report.as_safe_dict()
+    assert payload["reasons"] == ["manual_voucher_mutation_rejected"]
+    assert payload["reconciliation_required"] is False
+    assert payload["manual_cleanup_required"] is False
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_rejected"
+    assert row.reconciliation_required is False
+    assert row.manual_cleanup_required is False
+    assert row.reason_code == "manual_voucher_mutation_rejected"
+    # The audit of what was attempted does not regress.
+    assert row.create_claimed_at is not None
+    assert row.create_attempted_at is not None
+    assert row.create_verified_at is None
+    assert row.target_order_uuid is None
+    assert row.voucher_code_hmac is None
+    # And the stage is claimable again, by the existing contract.
+    assert row.status in ledger_module.CREATE_CLAIMABLE_FROM
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_create_exits_with_the_refusal_code_not_the_cleanup_one(
+    session_maker, manual_configuration, binding_key, monkeypatch
+) -> None:
+    report, (run_id, recipient_id), reader, _m = await _create(
+        session_maker,
+        mutator=FakeMutator(create=EasyWeekPermanentError("invalid", operation="create", status_code=422)),
+    )
+    assert report.outcome == "rejected"
+
+    import altegio_bot.scripts.easyweek_manual_voucher_canary as cli
+
+    assert cli._exit_for(report) == 4
+
+    # And a later status/reconcile does not start asking for a manual cleanup.
+    request = manual_request(run_id=run_id, recipient_id=recipient_id)
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(installed, _reconcile_argv(request))
+    assert code == 0, (printed["outcome"], printed["reasons"])
+    assert printed["manual_cleanup_required"] is False
+
+
+@pytest.mark.parametrize(
+    "unknown",
+    [
+        pytest.param(EasyWeekVoucherMutationUnknown("timeout"), id="timeout"),
+        pytest.param(EasyWeekVoucherMutationUnknown("429"), id="rate-limited"),
+        pytest.param(EasyWeekVoucherMutationUnknown("503"), id="server-error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unproven_outcome_still_keeps_both_flags_up(
+    session_maker, manual_configuration, binding_key, unknown
+) -> None:
+    """The classification is untouched: only proven refusals clear the flags."""
+    report, _ids, _reader, _m = await _create(session_maker, mutator=FakeMutator(create=unknown))
+
+    assert report.outcome == "unknown"
+    payload = report.as_safe_dict()
+    assert payload["reconciliation_required"] is True
+    assert payload["manual_cleanup_required"] is True
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown"
+    assert row.reconciliation_required is True
+    assert row.manual_cleanup_required is True
+    assert row.status not in ledger_module.CREATE_CLAIMABLE_FROM
+
+
+# ---------------------------------------------------------------------------
+# A draft the operator already closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("closed", [pytest.param("cancelled", id="cancelled"), pytest.param("refunded", id="refunded")])
+@pytest.mark.asyncio
+async def test_a_closed_order_under_a_known_uuid_is_recorded_as_cleaned(
+    session_maker, manual_configuration, binding_key, monkeypatch, closed
+) -> None:
+    """The order this canary named is closed. That is the outcome, not a wall."""
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    # A closed order need not still carry the voucher it once issued.
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker, status=closed, vouchers=[])
+
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(installed, _reconcile_argv(request))
+
+    assert code == 0, (printed["outcome"], printed["reasons"])
+    assert printed["outcome"] == "observed"
+    assert printed["reconciliation_required"] is False
+    assert printed["manual_cleanup_required"] is False
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "manually_cleaned"
+    assert row.manual_cleanup_observed_at is not None
+    assert row.reconciliation_required is False
+    assert row.manual_cleanup_required is False
+    # Nothing was invented for a closed order.
+    assert row.voucher_code_hmac is None
+    assert row.hmac_key_id is None
+    assert row.create_verified_at is None
+    # And no identifier or secret reached the report.
+    for secret in (str(ORDER_UUID), str(EW_CUSTOMER_UUID), VOUCHER_CODE_SENTINEL):
+        assert secret not in str(printed)
+
+
+@pytest.mark.asyncio
+async def test_a_marker_search_that_finds_a_closed_order_records_the_cleanup(
+    session_maker, manual_configuration, binding_key, monkeypatch
+) -> None:
+    """No UUID in the ledger: the complete, single-match walk finds it closed."""
+    request, reader, marker = await _unknown_create(session_maker)
+    closed = await marker_order(session_maker, marker=marker, status="cancelled", vouchers=[])
+    reader.order_pages = [orders_page([closed])]
+    reader.orders[str(ORDER_UUID)] = closed
+
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(installed, _reconcile_argv(request))
+
+    assert code == 0, (printed["outcome"], printed["reasons"])
+    assert printed["outcome"] == "observed"
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "manually_cleaned"
+    assert str(row.target_order_uuid) == str(ORDER_UUID)
+    assert row.manual_cleanup_observed_at is not None
+    assert row.voucher_code_hmac is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param("marker", id="another-canary-marker"),
+        pytest.param("customer", id="another-customer"),
+        pytest.param("paid", id="paid-not-closed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_closed_order_that_is_not_ours_is_never_a_cleanup(
+    session_maker, manual_configuration, binding_key, monkeypatch, broken
+) -> None:
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    if broken == "marker":
+        answer = voucher_order(marker="ewmv1-somebodyelse", status="cancelled", vouchers=[])
+    elif broken == "customer":
+        answer = voucher_order(
+            marker=marker, status="cancelled", vouchers=[], customer={"uuid": str(OTHER_CUSTOMER_UUID)}
+        )
+    else:
+        answer = voucher_order(marker=marker, status="paid", vouchers=[])
+    reader.orders[str(ORDER_UUID)] = answer
+
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(installed, _reconcile_argv(request))
+
+    assert code == 3, (broken, printed["outcome"], printed["reasons"])
+    assert printed["outcome"] == "unknown"
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown", broken
+    assert row.manual_cleanup_observed_at is None, broken
+    assert row.manual_cleanup_required is True, broken
+
+
+@pytest.mark.parametrize(
+    ("pages", "expected"),
+    [
+        pytest.param([orders_page([], current=1, last=2)], "manual_voucher_marker_search_incomplete", id="incomplete"),
+        pytest.param(None, "manual_voucher_marker_search_ambiguous", id="ambiguous"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unusable_marker_walk_is_never_a_cleanup(
+    session_maker, manual_configuration, binding_key, monkeypatch, pages, expected
+) -> None:
+    request, reader, marker = await _unknown_create(session_maker)
+    if pages is None:
+        reader.order_pages = [
+            orders_page(
+                [
+                    await marker_order(session_maker, marker=marker, status="cancelled", vouchers=[]),
+                    await marker_order(
+                        session_maker, marker=marker, status="cancelled", vouchers=[], order_uuid=OTHER_ORDER_UUID
+                    ),
+                ]
+            )
+        ]
+    else:
+        reader.order_pages = pages
+
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(installed, _reconcile_argv(request))
+
+    assert code == 3
+    assert expected in printed["reasons"]
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown"
+    assert row.manual_cleanup_observed_at is None
+
+
+@pytest.mark.asyncio
+async def test_reconciling_a_cleaned_canary_again_changes_nothing(
+    session_maker, manual_configuration, binding_key, monkeypatch
+) -> None:
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker, status="cancelled", vouchers=[])
+
+    installed = _install_cli(monkeypatch, session_maker, reader)
+    first, first_code = await _run_cli(installed, _reconcile_argv(request))
+    assert first_code == 0
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+        observed_at, updated_at = row.manual_cleanup_observed_at, row.updated_at
+
+    second, second_code = await _run_cli(installed, _reconcile_argv(request))
+
+    assert second_code == 0, (second["outcome"], second["reasons"])
+    assert second["outcome"] == "observed"
+    assert second["reasons"] == []
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "manually_cleaned"
+    assert row.manual_cleanup_observed_at == observed_at
+    assert row.updated_at == updated_at, "an idempotent reconcile rewrote the row"
+
+
+@pytest.mark.asyncio
+async def test_no_recovery_path_opens_a_mutation_transport(
+    session_maker, manual_configuration, binding_key, monkeypatch
+) -> None:
+    """Every branch of the recovery, with both transports booby-trapped.
+
+    `_install_cli` replaces the mutation and delivery clients with functions
+    that raise, so a second CREATE — or any send — fails the test rather than
+    being asserted about afterwards.
+    """
+    for status, vouchers in (("cancelled", []), ("refunded", []), ("open", None), ("paid", [])):
+        request, reader, marker = await _create_unknown_with_uuid(session_maker)
+        reader.orders[str(ORDER_UUID)] = voucher_order(
+            marker=marker, status=status, **({} if vouchers is None else {"vouchers": vouchers})
+        )
+        # The order can already be named, so listing orders would be a slower
+        # way to learn nothing — and here it is an outright failure.
+        reader.order_pages = AssertionError("the recovery listed orders it could name")
+        installed = _install_cli(monkeypatch, session_maker, reader)
+        printed, _code = await _run_cli(installed, _reconcile_argv(request))
+        assert printed["external_effect_attempted"] is False, status
+
+        # A fresh canary for the next case: this one is spent.
+        async with session_maker() as session:
+            async with session.begin():
+                await session.execute(text("DELETE FROM easyweek_manual_voucher_delivery_attempts"))
+                await session.execute(text("DELETE FROM easyweek_manual_voucher_delivery_ledger"))

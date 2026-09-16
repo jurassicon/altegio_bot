@@ -760,20 +760,36 @@ async def run_create(
             baseline=baseline.as_safe_dict(),
         )
     except EasyWeekError:
-        # A proven pre-action refusal: the server said no before doing anything,
-        # so this stage — and only this stage — may be claimed again.
+        # A proven pre-action refusal: the endpoint's own validation declined
+        # before acting, so this stage — and only this stage — may be claimed
+        # again.
+        #
+        # The claim raised both flags before the request left, because at that
+        # moment an open draft might follow. This answer proves one did not:
+        # only 400/401/403/404/422 carrying this API's own refusal envelope
+        # reach here, and the transport turns every outcome that does NOT prove
+        # inaction — timeout, reset, redirect, 409, 429, 5xx, an unattributable
+        # 4xx, an unreadable 2xx — into `EasyWeekVoucherMutationUnknown`, which
+        # is caught above and keeps both flags up.
+        #
+        # So the flags come down HERE, in the same compare-and-set that records
+        # the refusal. Leaving them up would send an operator looking through
+        # the EasyWeek dashboard for a draft the server refused to create.
         outcome = await ledger_module.record_outcome(
             session_maker,
             status=MANUAL_VOUCHER_CREATE_REJECTED,
             expected_statuses=frozenset({MANUAL_VOUCHER_CREATE_CLAIMED}),
             reason_code=MUTATION_REJECTED,
             reconciliation_required=False,
+            manual_cleanup_required=False,
         )
         return StageReport(
             stage=STAGE_CREATE,
             outcome="rejected",
             reasons=[MUTATION_REJECTED],
             external_effect_attempted=True,
+            reconciliation_required=False,
+            manual_cleanup_required=False,
             ledger=outcome.snapshot.as_safe_dict(),
             baseline=baseline.as_safe_dict(),
         )
@@ -1511,26 +1527,36 @@ async def _prove_lost_create(
     candidate: str,
     baseline: BaselineProof,
 ) -> tuple[list[str], str | None, list[dict[str, Any]]]:
-    """The one proof path from ``create_unknown`` to ``created``.
+    """The proof path out of ``create_unknown``, with two safe destinations.
 
     Shared by both ways of arriving here — the ledger already knew the order
     UUID, or a marker search just found it — because they differ only in how the
     candidate was obtained and not at all in what has to be true about it.
 
-    What must hold, all of it, before the status moves:
+    Three things are required whatever the order turns out to be, and they are
+    what makes the order OURS rather than merely readable:
 
-    * the exact UUID we asked for came back;
-    * the order carries OUR marker and names the customer the ledger names;
-    * it is open;
-    * it carries one provable voucher line at the approved template and price;
-    * and the code it issued is bound to this row.
+    * the exact canonical UUID we asked for came back;
+    * the order carries OUR reconciliation marker;
+    * it names the customer the ledger was opened for.
 
-    That last clause is the part that used to be impossible. A create whose
-    answer was lost never wrote a MAC, so asking "does the stored MAC match?"
-    could only ever answer no. The binding is therefore CREATED here when there
-    is none — from the code read out of this very readback — and only VERIFIED
-    when one already exists. A stored MAC that disagrees is never overwritten:
-    two different codes for one order is a question for a human.
+    Then the remote state decides which of two conclusions is available:
+
+    ``open`` → ``created``. The strict path, unchanged: one provable voucher
+    line at the approved template and price, the code read in memory, and the
+    binding created when there is none or verified when there is. A stored MAC
+    that disagrees is never overwritten — two different codes for one order is a
+    question for a human. The draft still exists, so the cleanup flag stays up.
+
+    ``cancelled`` or ``refunded`` → ``manually_cleaned``. The operator closed
+    the draft in the EasyWeek dashboard, which is exactly what the marker is
+    printed for. Demanding a voucher line here would strand the row forever: a
+    closed order need not still carry the artifact it once issued, and the thing
+    being proven is not what the voucher was — it is that OUR order is closed.
+    No code is read, no MAC is written, and nothing is mutated remotely: this
+    records an observation about something a human already did.
+
+    Anything else — paid, unknown, unattributable — stays ``create_unknown``.
     """
     reasons: list[str] = []
     observations: list[dict[str, Any]] = []
@@ -1550,19 +1576,36 @@ async def _prove_lost_create(
     )
     observations.append(observation.as_safe_dict())
 
-    identity_proven = (
-        order.get("comment") == snapshot.reconciliation_marker
-        and observation.order_customer_binding_proven
-        and observation.voucher_line_proven
-    )
-    if not identity_proven:
-        reasons.append(ORDER_UNPROVEN)
+    # Ours, or not ours. Asked before the state is even looked at, because a
+    # closed order belonging to somebody else is not our cleanup and an open one
+    # belonging to somebody else is not our voucher.
+    if order.get("comment") != snapshot.reconciliation_marker or not observation.order_customer_binding_proven:
+        return [ORDER_UNPROVEN], state, observations
+
+    if state in (ORDER_CANCELLED, ORDER_REFUNDED):
+        await ledger_module.record_outcome(
+            session_maker,
+            status=MANUAL_VOUCHER_MANUALLY_CLEANED,
+            expected_statuses=frozenset({MANUAL_VOUCHER_CREATE_UNKNOWN}),
+            target_order_uuid=candidate,
+            reconciliation_required=False,
+            manual_cleanup_required=False,
+            manual_cleanup_observed=True,
+            evidence={
+                "manual_cleanup_readback": observation.as_safe_dict(),
+                "baseline": baseline.as_safe_dict(),
+            },
+        )
         return reasons, state, observations
+
     if state != ORDER_OPEN:
-        # Attributable, but not in the state a create recovery may conclude
-        # from. Whatever it is now, a human decides what that means.
-        reasons.append(ORDER_STATE_UNATTRIBUTABLE)
-        return reasons, state, observations
+        # Paid, or a state this canary cannot attribute to itself. Whatever it
+        # is now, a human decides what it means.
+        return [ORDER_STATE_UNATTRIBUTABLE], state, observations
+
+    # -- the open order: the strict path, unchanged --------------------------
+    if not observation.voucher_line_proven:
+        return [ARTIFACT_UNPROVEN], state, observations
 
     # The code exists here, in memory, and nowhere else.
     code = _voucher_code(payload)
@@ -1726,7 +1769,12 @@ async def run_reconcile(
                     )
                     del code
             proven = identity_proven and binding_proven
-            if not proven:
+            # Complained about only where it would decide something. A row that
+            # is already settled — manually cleaned, refunded, sent — is read
+            # here for the report, and a closed order need not still carry the
+            # artifact it once issued. Reporting that as a problem would make a
+            # second reconcile of a finished canary look unfinished.
+            if not proven and snapshot.status in ledger_module.UNRESOLVED_STATUSES:
                 reasons.append(ARTIFACT_UNPROVEN)
 
             # Only the transitions a readback PROVES, and only forwards. The
