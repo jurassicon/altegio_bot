@@ -456,6 +456,11 @@ async def _advance_to_paid(session_maker, *, run_id: int, recipient_id: int) -> 
         status=MANUAL_VOUCHER_PAID,
         expected_statuses=frozenset({"pay_claimed"}),
         verified_field="pay_verified_at",
+        # The claim raised both flags; a proven payment lowers them, exactly as
+        # `run_pay` does. A helper that left them up would leave the row in a
+        # state production never produces.
+        reconciliation_required=False,
+        manual_cleanup_required=False,
     )
     assert outcome.applied, outcome.reason
 
@@ -1899,3 +1904,721 @@ async def test_the_stored_binding_is_bound_to_this_row_and_this_order(
     assert not await ledger_module.binding_matches(
         session_maker, voucher_code=VOUCHER_CODE_SENTINEL, target_order_uuid=str(OTHER_ORDER_UUID)
     )
+
+
+# ---------------------------------------------------------------------------
+# Recovering a create whose result was unknown
+# ---------------------------------------------------------------------------
+
+
+async def _create_unknown_with_uuid(session_maker, *, readback: dict | None = None):
+    """A create that named an order but could not prove it on the first read.
+
+    The 2xx carried a UUID; the immediate readback did not prove the artifact,
+    so the row is `create_unknown` WITH a target order — and with no MAC, which
+    is the state that used to be unrecoverable.
+    """
+    run_id, recipient_id = await seed_manual_recipient(session_maker)
+    await seed_template_and_sender(session_maker)
+    request = manual_request(run_id=run_id, recipient_id=recipient_id)
+    marker = manual_marker(preview_run_id=run_id, campaign_recipient_id=recipient_id)
+    # The first readback answers with an order whose voucher line is unreadable.
+    unprovable = readback if readback is not None else voucher_order(marker=marker, vouchers=[])
+    reader = FakeReader(orders={str(ORDER_UUID): unprovable})
+    mutator = FakeMutator(create=VoucherMutationResponse(http_status=201, envelope={"uuid": str(ORDER_UUID)}))
+
+    async with session_maker() as session:
+        plan, _, _, _ = await runner_module.build_stage_plan(
+            session, session_maker, stage=STAGE_CREATE, request=request, reader=reader, order_reader=reader
+        )
+        assert plan.ready, plan.reasons
+        report = await runner_module.run_create(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    assert report.outcome == "unknown", report.reasons
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown"
+    assert str(row.target_order_uuid) == str(ORDER_UUID)
+    assert row.voucher_code_hmac is None, "the unknown create wrote a binding it could not have"
+    return request, reader, marker
+
+
+@pytest.mark.asyncio
+async def test_a_known_order_uuid_is_recovered_and_bound_on_the_next_reconcile(
+    session_maker, manual_configuration, binding_key
+) -> None:
+    """The blocker: this row could never leave `create_unknown`.
+
+    It had a target order but no MAC, and the reconcile asked whether the code
+    matched a binding that had never been written — which can only answer no.
+    """
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+
+    # The order is readable now.
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker)
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "observed", report.reasons
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == MANUAL_VOUCHER_CREATED
+    assert row.create_verified_at is not None
+    # The binding was CREATED from this readback, under this canary's domain.
+    assert row.voucher_code_hmac is not None and row.hmac_key_id == "test-key-1"
+    assert await ledger_module.binding_matches(
+        session_maker, voucher_code=VOUCHER_CODE_SENTINEL, target_order_uuid=str(ORDER_UUID)
+    )
+    # A proven-but-unpaid draft still needs a hand.
+    assert row.manual_cleanup_required is True
+    # And nothing secret reached the report.
+    printed = str(report.as_safe_dict())
+    for secret in (VOUCHER_CODE_SENTINEL, row.voucher_code_hmac, str(ORDER_UUID)):
+        assert secret not in printed
+
+
+@pytest.mark.asyncio
+async def test_a_known_uuid_never_triggers_a_marker_listing_or_a_second_create(
+    session_maker, manual_configuration, binding_key
+) -> None:
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker)
+    # Any listing at all is a failure: the order can already be named.
+    reader.order_pages = AssertionError("the recovery listed orders for an order it could name")
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "observed", report.reasons
+    # Reconcile has no mutator by construction — it cannot create — and the
+    # order was read exactly by its UUID.
+    assert reader.order_calls.count(str(ORDER_UUID)) >= 1
+    assert report.as_safe_dict()["external_effect_attempted"] is False
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param("marker", id="another-canary-marker"),
+        pytest.param("customer", id="another-customer"),
+        pytest.param("voucher", id="unreadable-voucher-line"),
+        pytest.param("two-vouchers", id="two-voucher-entries"),
+        pytest.param("price", id="wrong-price"),
+        pytest.param("paid", id="not-open-any-more"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_known_uuid_that_does_not_prove_out_stays_unknown(
+    session_maker, manual_configuration, binding_key, broken
+) -> None:
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+
+    if broken == "marker":
+        answer = voucher_order(marker="ewmv1-somebodyelse")
+    elif broken == "customer":
+        answer = voucher_order(marker=marker, customer={"uuid": str(OTHER_CUSTOMER_UUID)})
+    elif broken == "voucher":
+        answer = voucher_order(marker=marker, vouchers=[{"code": ""}])
+    elif broken == "two-vouchers":
+        answer = voucher_order(marker=marker, vouchers=[issued_voucher(), issued_voucher()])
+    elif broken == "price":
+        answer = voucher_order(marker=marker, vouchers=[issued_voucher(price=999)])
+    else:
+        answer = voucher_order(marker=marker, status="paid")
+    reader.orders[str(ORDER_UUID)] = answer
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "unknown", (broken, report.reasons)
+    assert report.reasons, broken
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown", broken
+    assert row.voucher_code_hmac is None, f"{broken}: a binding was written for an unproven order"
+    assert row.manual_cleanup_required is True, broken
+
+
+@pytest.mark.asyncio
+async def test_a_disagreeing_binding_is_never_overwritten(session_maker, manual_configuration, binding_key) -> None:
+    """Two different codes for one order is a question for a human."""
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+
+    # A first recovery binds the code the order issued.
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker)
+    await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+        bound = row.voucher_code_hmac
+    assert bound is not None
+
+    # Put the row back into `create_unknown` and let the order answer with a
+    # DIFFERENT code — the shape of somebody having re-issued underneath us.
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+            row.status = "create_unknown"
+            row.reconciliation_required = True
+    reader.orders[str(ORDER_UUID)] = voucher_order(
+        marker=marker, vouchers=[issued_voucher(code="SENTINEL-DIFFERENT-CODE-xyz")]
+    )
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "unknown"
+    assert "manual_voucher_binding_mismatch" in report.reasons
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown"
+    assert row.voucher_code_hmac == bound, "a disagreeing readback overwrote the binding"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_hmac_key_is_a_named_refusal_not_a_crash(
+    session_maker, manual_configuration, monkeypatch
+) -> None:
+    """No `binding_key` fixture here: the key is simply not configured."""
+    from pydantic import SecretStr
+
+    from altegio_bot.settings import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(live_settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker)
+
+    # The key disappears between the create and the recovery.
+    monkeypatch.setattr(live_settings, "easyweek_voucher_delivery_hmac_key", SecretStr(""), raising=False)
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "unknown"
+    assert "manual_voucher_hmac_key_missing" in report.reasons
+    # A stable code, not a database failure and not a traceback.
+    assert "manual_voucher_database_unavailable" not in report.reasons
+    assert "Traceback" not in str(report.as_safe_dict())
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown"
+
+
+# ---------------------------------------------------------------------------
+# An unresolved reconcile is not a success
+# ---------------------------------------------------------------------------
+
+
+def _install_cli(monkeypatch, session_maker, reader):
+    """Point the operator CLI at this test's database and fake transports.
+
+    Only the session and the read transport are replaced. The parser, the fence
+    check, the request build, the dispatch and the exit mapping are the shipped
+    ones — that is the whole point of asking the CLI rather than the runner.
+    """
+    import altegio_bot.scripts.easyweek_manual_voucher_canary as cli
+
+    class _Reader:
+        async def __aenter__(self):
+            return reader
+
+        async def __aexit__(self, *exc):
+            return None
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("a reconcile opened a mutation transport")
+
+    monkeypatch.setattr(cli, "SessionLocal", session_maker)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _Reader())
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", _forbidden)
+    monkeypatch.setattr(cli, "VoucherDeliveryClient", _forbidden)
+    return cli
+
+
+async def _run_cli(cli, argv: list[str]) -> tuple[dict, int]:
+    """Drive the CLI the way it drives itself, and read back (payload, code).
+
+    ``main()`` itself calls :func:`asyncio.run`, which cannot be nested inside
+    the test's running loop; everything it does around that call — parse, fence,
+    dispatch, map the exit code — is exercised here directly.
+    """
+    args = cli._build_parser().parse_args(argv)
+    return await cli._dispatch(args)
+
+
+def _reconcile_argv(request) -> list[str]:
+    return [
+        "reconcile",
+        "--preview-run-id",
+        str(request.preview_run_id),
+        "--campaign-recipient-id",
+        str(request.campaign_recipient_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_create_reconcile_exits_three(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    """No matches: the order may exist and nobody can say. Never exit 0."""
+    request, reader, _marker = await _unknown_create(session_maker)
+    reader.order_pages = [orders_page([])]
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+    assert report.outcome == "unknown"
+    assert "manual_voucher_marker_search_unresolved" in report.reasons
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 3, printed
+    assert printed["outcome"] == "unknown"
+    assert printed["reasons"]
+    assert printed["reconciliation_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("pages", "expected"),
+    [
+        pytest.param(
+            [orders_page([], current=1, last=2)], "manual_voucher_marker_search_incomplete", id="incomplete-walk"
+        ),
+        pytest.param(None, "manual_voucher_marker_search_ambiguous", id="ambiguous-walk"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_incomplete_or_ambiguous_walk_exits_three(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys, pages, expected
+) -> None:
+    request, reader, marker = await _unknown_create(session_maker)
+    if pages is None:
+        reader.order_pages = [
+            orders_page(
+                [
+                    await marker_order(session_maker, marker=marker),
+                    await marker_order(session_maker, marker=marker, order_uuid=OTHER_ORDER_UUID),
+                ]
+            )
+        ]
+    else:
+        reader.order_pages = pages
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 3
+    assert printed["outcome"] == "unknown"
+    assert expected in printed["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_a_pay_unknown_over_a_still_open_order_exits_three(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    """The payment did not land. That is unresolved, not observed."""
+    report, (run_id, recipient_id), reader, _m = await _create(session_maker)
+    assert report.outcome == "created"
+    request = manual_request(run_id=run_id, recipient_id=recipient_id)
+    marker = manual_marker(preview_run_id=run_id, campaign_recipient_id=recipient_id)
+    # Into pay_unknown through the real claim, from `created` where a payment
+    # is actually claimable.
+    claim = await ledger_module.claim_pay(session_maker, identity=_identity(run_id, recipient_id), plan_digest="d")
+    assert claim.granted
+    await ledger_module.record_outcome(
+        session_maker,
+        status="pay_unknown",
+        expected_statuses=frozenset({"pay_claimed"}),
+        reason_code="manual_voucher_mutation_unknown",
+        reconciliation_required=True,
+    )
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker, status="open")
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 3
+    assert printed["outcome"] == "unknown"
+    assert printed["ledger"]["status"] == "pay_unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_send_unknown_is_never_resolved_by_reading_an_order(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    """Whether Meta delivered is not a fact the POS system holds."""
+    request, reader, marker = await _paid_and_ready(session_maker)
+    sender = FakeSender(unknown_outcome("timeout"))
+    async with session_maker() as session:
+        plan, _, _, _ = await runner_module.build_stage_plan(
+            session, session_maker, stage=STAGE_DELIVER, request=request, reader=reader, order_reader=reader
+        )
+        await runner_module.run_deliver(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            sender=sender,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 3
+    assert printed["outcome"] == "unknown"
+    assert "manual_voucher_mutation_unknown" in printed["reasons"]
+    assert printed["ledger"]["status"] == MANUAL_VOUCHER_SEND_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_create_exits_six_because_a_draft_is_open(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    """Proven, nothing outstanding to reconcile — but a draft needs a hand."""
+    request, reader, marker = await _create_unknown_with_uuid(session_maker)
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker)
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 6, (printed["outcome"], printed["reasons"])
+    assert printed["outcome"] == "observed"
+    assert printed["reconciliation_required"] is False
+    assert printed["manual_cleanup_required"] is True
+    assert printed["ledger"]["status"] == MANUAL_VOUCHER_CREATED
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_paid_and_a_resolved_refund_exit_zero(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    request, reader, marker = await _paid_and_ready(session_maker)
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+    assert code == 0, printed
+    assert printed["outcome"] == "observed"
+    assert printed["ledger"]["status"] == MANUAL_VOUCHER_PAID
+
+    # And the same once the money is back.
+    await ledger_module.claim_refund(
+        session_maker,
+        identity=_identity(request.preview_run_id, request.campaign_recipient_id),
+        plan_digest="d",
+    )
+    await ledger_module.record_outcome(
+        session_maker,
+        status="refund_unknown",
+        expected_statuses=frozenset({"refund_claimed"}),
+        reconciliation_required=True,
+    )
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker, status="refunded")
+
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+    assert code == 0, printed
+    assert printed["outcome"] == "observed"
+    assert printed["ledger"]["status"] == "refunded"
+
+
+@pytest.mark.asyncio
+async def test_a_manually_cleaned_draft_exits_zero(
+    session_maker, manual_configuration, binding_key, monkeypatch, capsys
+) -> None:
+    report, (run_id, recipient_id), reader, _m = await _create(session_maker)
+    assert report.outcome == "created"
+    request = manual_request(run_id=run_id, recipient_id=recipient_id)
+    marker = manual_marker(preview_run_id=run_id, campaign_recipient_id=recipient_id)
+    reader.orders[str(ORDER_UUID)] = voucher_order(marker=marker, status="refunded")
+
+    cli = _install_cli(monkeypatch, session_maker, reader)
+    printed, code = await _run_cli(cli, _reconcile_argv(request))
+
+    assert code == 0, printed
+    assert printed["outcome"] == "observed"
+    assert printed["ledger"]["status"] == "manually_cleaned"
+    assert printed["manual_cleanup_required"] is False
+
+
+# ---------------------------------------------------------------------------
+# A claimed create may have left a draft, whatever came back
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("timeout", id="timeout"),
+        pytest.param("reset", id="connection-reset"),
+        pytest.param("no-uuid", id="2xx-without-a-uuid"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_unknown_create_asks_for_cleanup_and_reconcile(
+    session_maker, manual_configuration, binding_key, failure
+) -> None:
+    if failure == "no-uuid":
+        mutator = FakeMutator(create=VoucherMutationResponse(http_status=201, envelope={}))
+    else:
+        mutator = FakeMutator(create=EasyWeekVoucherMutationUnknown(failure))
+
+    report, _ids, _reader, _m = await _create(session_maker, mutator=mutator)
+
+    assert report.outcome == "unknown", report.reasons
+    payload = report.as_safe_dict()
+    assert payload["reconciliation_required"] is True, failure
+    assert payload["manual_cleanup_required"] is True, failure
+    assert payload["external_effect_attempted"] is True, failure
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_unknown", failure
+    assert row.manual_cleanup_required is True, failure
+    assert row.reconciliation_required is True, failure
+    # One attempt left the process, and the state it left behind cannot be
+    # claimed again.
+    assert row.create_attempted_at is not None
+    assert row.status not in ledger_module.CREATE_CLAIMABLE_FROM
+
+
+@pytest.mark.asyncio
+async def test_a_search_that_found_nothing_does_not_clear_the_cleanup_flag(
+    session_maker, manual_configuration, binding_key
+) -> None:
+    """Zero matches is not proof that no order exists."""
+    request, reader, _marker = await _unknown_create(session_maker)
+    reader.order_pages = [orders_page([])]
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "unknown"
+    assert report.as_safe_dict()["manual_cleanup_required"] is True
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.manual_cleanup_required is True
+    assert row.status == "create_unknown"
+
+
+@pytest.mark.asyncio
+async def test_the_cleanup_flag_is_cleared_only_by_proof(session_maker, manual_configuration, binding_key) -> None:
+    """Paid, refunded and a proven manual closure — and nothing else."""
+    # Paid clears it.
+    _request, _reader, _marker = await _paid_and_ready(session_maker)
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == MANUAL_VOUCHER_PAID
+    assert row.manual_cleanup_required is False
+
+
+# ---------------------------------------------------------------------------
+# When Meta accepted, and who may say so
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_is_timestamped_by_the_write_that_records_it(
+    session_maker, manual_configuration, binding_key
+) -> None:
+    request, reader, _marker = await _paid_and_ready(session_maker)
+    sender = FakeSender()
+
+    before = utcnow()
+    async with session_maker() as session:
+        plan, _, _, _ = await runner_module.build_stage_plan(
+            session, session_maker, stage=STAGE_DELIVER, request=request, reader=reader, order_reader=reader
+        )
+        report = await runner_module.run_deliver(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            sender=sender,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    after = utcnow()
+    assert report.outcome == "provider_accepted"
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    # Present immediately, before any webhook exists, and of this moment.
+    assert row.provider_accepted_at is not None
+    assert before <= row.provider_accepted_at <= after
+    assert row.delivered_at is None and row.read_at is None
+    assert row.provider_message_id == PROVIDER_MESSAGE_ID
+    # And the report says so without printing the identifier.
+    assert row.provider_message_id not in str(report.as_safe_dict())
+
+
+@pytest.mark.asyncio
+async def test_webhooks_never_move_the_acceptance_timestamp(session_maker, manual_configuration, binding_key) -> None:
+    from altegio_bot.workers.whatsapp_inbox_worker import _handle_delivery_statuses
+
+    request, reader, _marker = await _paid_and_ready(session_maker)
+    sender = FakeSender()
+    async with session_maker() as session:
+        plan, _, _, _ = await runner_module.build_stage_plan(
+            session, session_maker, stage=STAGE_DELIVER, request=request, reader=reader, order_reader=reader
+        )
+        await runner_module.run_deliver(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            sender=sender,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+        accepted_at = row.provider_accepted_at
+    assert accepted_at is not None
+
+    # Delivered, then read, then a duplicate and an out-of-order delivered.
+    for batch in (
+        [{"status": "delivered", "provider_message_id": PROVIDER_MESSAGE_ID}],
+        [{"status": "read", "provider_message_id": PROVIDER_MESSAGE_ID}],
+        [
+            {"status": "read", "provider_message_id": PROVIDER_MESSAGE_ID},
+            {"status": "delivered", "provider_message_id": PROVIDER_MESSAGE_ID},
+        ],
+    ):
+        async with session_maker() as session:
+            async with session.begin():
+                await _handle_delivery_statuses(session, None, batch)
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "read"
+    assert row.provider_accepted_at == accepted_at, "a webhook moved the acceptance timestamp"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [pytest.param("rejected", id="meta-rejected"), pytest.param("unknown", id="meta-unknown")],
+)
+@pytest.mark.asyncio
+async def test_a_send_that_was_not_accepted_has_no_acceptance_timestamp(
+    session_maker, manual_configuration, binding_key, outcome
+) -> None:
+    request, reader, _marker = await _paid_and_ready(session_maker)
+    sender = FakeSender(rejected_outcome() if outcome == "rejected" else unknown_outcome())
+
+    async with session_maker() as session:
+        plan, _, _, _ = await runner_module.build_stage_plan(
+            session, session_maker, stage=STAGE_DELIVER, request=request, reader=reader, order_reader=reader
+        )
+        report = await runner_module.run_deliver(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            sender=sender,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    assert report.outcome == outcome
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.provider_accepted_at is None
+    assert row.provider_message_id is None
+    assert row.delivered_at is None and row.read_at is None
+    # The one attempt is still spent.
+    assert row.send_attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_message_id_changes_nothing_at_all(session_maker, manual_configuration, binding_key) -> None:
+    from altegio_bot.workers.whatsapp_inbox_worker import _handle_delivery_statuses
+
+    await _accepted_row(session_maker)
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+        before = (row.status, row.provider_accepted_at, row.delivered_at, row.read_at)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _handle_delivery_statuses(
+                session,
+                None,
+                [
+                    {"status": "delivered", "provider_message_id": "wamid.NOT_OURS_0001"},
+                    {"status": "read", "provider_message_id": "wamid.NOT_OURS_0002"},
+                ],
+            )
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert (row.status, row.provider_accepted_at, row.delivered_at, row.read_at) == before
+
+
+def test_the_exit_code_mapping_is_never_optimistic() -> None:
+    """The number a wrapper acts on, pinned directly.
+
+    The reconcile path already reports `unknown` for anything unresolved, so the
+    outstanding-reconciliation clause is a second line of defence for any stage
+    that might one day return a proven outcome with work still pending. Asserted
+    here rather than left to a future caller to discover.
+    """
+    import altegio_bot.scripts.easyweek_manual_voucher_canary as cli
+
+    def code_for(**changes) -> int:
+        return cli._exit_for(runner_module.StageReport(stage="reconcile", **changes))
+
+    assert code_for(outcome="unknown") == 3
+    assert code_for(outcome="observed", reconciliation_required=True) == 3
+    assert code_for(outcome="refused") == 4
+    assert code_for(outcome="rejected") == 4
+    # Proven, nothing outstanding, and a draft still open in the POS.
+    assert code_for(outcome="observed", manual_cleanup_required=True) == 6
+    assert code_for(outcome="observed") == 0
+    # And an unresolved state never borrows the cleanup code.
+    assert code_for(outcome="unknown", manual_cleanup_required=True) == 3
+
+
+@pytest.mark.asyncio
+async def test_the_create_claim_itself_raises_the_cleanup_flag(session_maker) -> None:
+    """Before any answer exists, and therefore before any answer can be lost.
+
+    The claim commits before the request leaves, so from that instant an open
+    draft may exist in the POS. Asserted at the claim rather than at an outcome
+    because the outcomes that matter most are the ones that never arrive.
+    """
+    run_id, recipient_id = await seed_manual_recipient(session_maker)
+    identity = _identity(run_id, recipient_id)
+    opened = await ledger_module.open_canary(session_maker, identity=identity)
+    assert opened.exists and opened.manual_cleanup_required is False
+
+    window = utcnow()
+    claim = await ledger_module.claim_create(
+        session_maker,
+        identity=identity,
+        plan_digest="d",
+        create_window_start=window - timedelta(minutes=30),
+        create_window_end=window + timedelta(minutes=30),
+    )
+    assert claim.granted
+
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekManualVoucherDeliveryLedger))).scalar_one()
+    assert row.status == "create_claimed"
+    assert row.manual_cleanup_required is True
+    assert row.reconciliation_required is True

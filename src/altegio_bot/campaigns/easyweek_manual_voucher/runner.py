@@ -53,6 +53,8 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     BINDING_MISMATCH,
     CANARY_SCOPE_ALREADY_CONSUMED,
     DELIVERY_ALREADY_ATTEMPTED,
+    HMAC_KEY_INVALID,
+    HMAC_KEY_MISSING,
     IDENTITY_BINDING_MISMATCH,
     KARLSRUHE_COMPANY_ID,
     LEDGER_IDENTITY_INCOMPLETE,
@@ -69,6 +71,7 @@ from altegio_bot.campaigns.easyweek_manual_voucher.identity import (
     ORDER_NOT_PAYABLE,
     ORDER_STATE_UNATTRIBUTABLE,
     ORDER_UNPROVEN,
+    RECONCILE_UNRESOLVED,
     REFUND_FORBIDDEN_AFTER_SEND,
     SNAPSHOT_NOT_FROZEN,
     STAGE_CREATE,
@@ -84,7 +87,11 @@ from altegio_bot.campaigns.easyweek_manual_voucher.readiness import (
     ManualPrerequisites,
     prove_prerequisites,
 )
-from altegio_bot.campaigns.easyweek_voucher_delivery.binding import MANUAL_VOUCHER_DOMAIN, voucher_code_mac
+from altegio_bot.campaigns.easyweek_voucher_delivery.binding import (
+    MANUAL_VOUCHER_DOMAIN,
+    VoucherBindingKeyError,
+    voucher_code_mac,
+)
 from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import DELIVERY_REJECTED, DeliveryOutcome
 from altegio_bot.easyweek_client import EasyWeekError
 from altegio_bot.easyweek_voucher_canary.artifact import observe_artifact
@@ -703,6 +710,10 @@ async def run_create(
         return _refusal(STAGE_CREATE, [SNAPSHOT_NOT_FROZEN], opened, baseline=baseline)
 
     window_start = utcnow()
+    # The claim is committed before the request leaves, and from that instant an
+    # open draft may exist in the POS. The cleanup flag goes up HERE rather than
+    # when an answer comes back: the answers that never come back are exactly
+    # the ones that leave a draft behind.
     claim = await ledger_module.claim_create(
         session_maker,
         identity=identity,
@@ -727,12 +738,16 @@ async def run_create(
             marker=request.marker,
         )
     except EasyWeekVoucherMutationUnknown:
+        # A timeout or a connection reset says nothing about whether the order
+        # was created. It may exist, unpaid, in the dashboard — so both flags
+        # stay up until an exact readback proves otherwise.
         outcome = await ledger_module.record_outcome(
             session_maker,
             status=MANUAL_VOUCHER_CREATE_UNKNOWN,
             expected_statuses=frozenset({MANUAL_VOUCHER_CREATE_CLAIMED}),
             reason_code=MUTATION_UNKNOWN,
             reconciliation_required=True,
+            manual_cleanup_required=True,
         )
         return StageReport(
             stage=STAGE_CREATE,
@@ -740,6 +755,7 @@ async def run_create(
             reasons=[MUTATION_UNKNOWN],
             external_effect_attempted=True,
             reconciliation_required=True,
+            manual_cleanup_required=True,
             ledger=outcome.snapshot.as_safe_dict(),
             baseline=baseline.as_safe_dict(),
         )
@@ -1241,6 +1257,12 @@ async def run_deliver(
             status=MANUAL_VOUCHER_PROVIDER_ACCEPTED,
             expected_statuses=frozenset({MANUAL_VOUCHER_SEND_CLAIMED}),
             provider_message_id=outcome_meta.provider_message_id,
+            # Stamped by the very compare-and-set that records the acceptance,
+            # not left for a webhook to invent afterwards. A message Meta
+            # accepted at 12:00 was accepted at 12:00 whether or not a delivered
+            # callback ever arrives — and a row that says `provider_accepted`
+            # with no timestamp is a row that cannot answer when.
+            verified_field="provider_accepted_at",
             reconciliation_required=False,
             attempt_outcome="provider_accepted",
         )
@@ -1421,31 +1443,25 @@ async def run_refund(
     )
 
 
-async def _resolve_unknown_create(
-    session_maker: async_sessionmaker[AsyncSession],
+async def _find_lost_order(
     *,
     snapshot: ledger_module.LedgerSnapshot,
     order_reader: Any,
-    baseline: BaselineProof,
-) -> tuple[list[str], str | None, list[dict[str, Any]]]:
-    """Find the order an unknown CREATE may have left behind. Reads only.
+) -> tuple[str | None, list[str], list[dict[str, Any]]]:
+    """Which order a create whose answer was lost may have left behind.
 
-    Never re-creates. The walk is scoped by branch and customer exactly as §35
-    proved it must be — no staffer filter, no server-side date filter — and the
-    marker, the bounded window and the customer are proven locally, row by row.
+    Only reached when the ledger holds no UUID at all. The walk is scoped by
+    branch and customer exactly as §35 proved it must be — no staffer filter, no
+    server-side date filter — and the marker, the bounded window and the
+    customer are proven locally, row by row.
 
-    What it may conclude is narrow on purpose:
+    Returns ``(candidate, reasons, observations)``. A candidate is one complete
+    walk with exactly one match; everything else is a reason and no candidate:
 
-    * one match, complete walk → read that exact UUID back and prove it fully;
-    * zero matches → unresolved. Not "it was not created": the walk may simply
+    * zero matches → unresolved. NOT "it was not created": the walk may simply
       not have seen it, and a create we cannot see is not a create we can deny;
     * several matches, or an incomplete walk → a full stop for a human.
-
-    Being open is not enough to promote the row. The singleton artifact has to
-    be provable and the code re-bound, because everything downstream — the
-    payment gate and the send — verifies against that binding.
     """
-    reasons: list[str] = []
     observations: list[dict[str, Any]] = []
 
     if (
@@ -1455,7 +1471,7 @@ async def _resolve_unknown_create(
         or snapshot.create_window_start is None
         or snapshot.create_window_end is None
     ):
-        return [LEDGER_IDENTITY_INCOMPLETE], None, observations
+        return None, [LEDGER_IDENTITY_INCOMPLETE], observations
 
     try:
         match = await find_marker_orders(
@@ -1467,7 +1483,7 @@ async def _resolve_unknown_create(
             window_end=datetime.fromisoformat(snapshot.create_window_end),
         )
     except Exception:  # noqa: BLE001 - an unread listing proves nothing
-        return [MARKER_SEARCH_INCOMPLETE], None, observations
+        return None, [MARKER_SEARCH_INCOMPLETE], observations
 
     observations.append(
         {
@@ -1479,13 +1495,46 @@ async def _resolve_unknown_create(
         }
     )
     if not match.complete:
-        return [MARKER_SEARCH_INCOMPLETE], None, observations
+        return None, [MARKER_SEARCH_INCOMPLETE], observations
     if match.count > 1:
-        return [MARKER_SEARCH_AMBIGUOUS], None, observations
+        return None, [MARKER_SEARCH_AMBIGUOUS], observations
     if not match.resolved or match.order_uuid is None:
-        return [MARKER_SEARCH_UNRESOLVED], None, observations
+        return None, [MARKER_SEARCH_UNRESOLVED], observations
+    return match.order_uuid, [], observations
 
-    candidate = match.order_uuid
+
+async def _prove_lost_create(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    snapshot: ledger_module.LedgerSnapshot,
+    order_reader: Any,
+    candidate: str,
+    baseline: BaselineProof,
+) -> tuple[list[str], str | None, list[dict[str, Any]]]:
+    """The one proof path from ``create_unknown`` to ``created``.
+
+    Shared by both ways of arriving here — the ledger already knew the order
+    UUID, or a marker search just found it — because they differ only in how the
+    candidate was obtained and not at all in what has to be true about it.
+
+    What must hold, all of it, before the status moves:
+
+    * the exact UUID we asked for came back;
+    * the order carries OUR marker and names the customer the ledger names;
+    * it is open;
+    * it carries one provable voucher line at the approved template and price;
+    * and the code it issued is bound to this row.
+
+    That last clause is the part that used to be impossible. A create whose
+    answer was lost never wrote a MAC, so asking "does the stored MAC match?"
+    could only ever answer no. The binding is therefore CREATED here when there
+    is none — from the code read out of this very readback — and only VERIFIED
+    when one already exists. A stored MAC that disagrees is never overwritten:
+    two different codes for one order is a question for a human.
+    """
+    reasons: list[str] = []
+    observations: list[dict[str, Any]] = []
+
     payload, order_reason = await _exact_order(order_reader, candidate)
     if order_reason is not None:
         return [order_reason], None, observations
@@ -1494,37 +1543,59 @@ async def _resolve_unknown_create(
     state = classify_order(payload)[0]
     observation = observe_artifact(
         payload,
-        stage="create_marker_readback",
-        expected_customer_uuid=snapshot.easyweek_customer_uuid,
+        stage="create_recovery_readback",
+        expected_customer_uuid=snapshot.easyweek_customer_uuid or "",
         expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
         expected_price_minor=SUPPORTED_VOUCHER_PRICE_MINOR,
     )
     observations.append(observation.as_safe_dict())
 
-    proven = (
+    identity_proven = (
         order.get("comment") == snapshot.reconciliation_marker
         and observation.order_customer_binding_proven
         and observation.voucher_line_proven
-        and state == ORDER_OPEN
     )
-    if not proven:
-        reasons.append(ORDER_UNPROVEN if state == ORDER_OPEN else ORDER_STATE_UNATTRIBUTABLE)
+    if not identity_proven:
+        reasons.append(ORDER_UNPROVEN)
+        return reasons, state, observations
+    if state != ORDER_OPEN:
+        # Attributable, but not in the state a create recovery may conclude
+        # from. Whatever it is now, a human decides what that means.
+        reasons.append(ORDER_STATE_UNATTRIBUTABLE)
         return reasons, state, observations
 
-    # The artifact is provable, so the code is readable — and the binding has to
-    # be restored before the row is promoted. A `created` row with no MAC would
-    # be a row the payment gate cannot verify and the send would refuse anyway.
+    # The code exists here, in memory, and nowhere else.
     code = _voucher_code(payload)
     if code is None:
         return [ARTIFACT_UNPROVEN], state, observations
-    key_id, mac = voucher_code_mac(
-        voucher_code=code,
-        ledger_uuid=ledger_module.MANUAL_VOUCHER_SCOPE,
-        target_order_uuid=candidate,
-        voucher_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-        domain=MANUAL_VOUCHER_DOMAIN,
-    )
-    del code
+
+    try:
+        if snapshot.voucher_binding_recorded:
+            # A binding already exists — from a first attempt that got this far
+            # — so this readback must agree with it rather than replace it.
+            matched = await ledger_module.binding_matches(
+                session_maker,
+                voucher_code=code,
+                target_order_uuid=candidate,
+            )
+            del code
+            if not matched:
+                return [BINDING_MISMATCH], state, observations
+            key_id = mac = None
+        else:
+            key_id, mac = voucher_code_mac(
+                voucher_code=code,
+                ledger_uuid=ledger_module.MANUAL_VOUCHER_SCOPE,
+                target_order_uuid=candidate,
+                voucher_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+                domain=MANUAL_VOUCHER_DOMAIN,
+            )
+            del code
+    except VoucherBindingKeyError as unusable:
+        # A missing or unusable key is a deployment fault with a stable name.
+        # It is not a database failure and it is not a traceback in an operator
+        # report — and it leaves the row exactly where it was.
+        return [HMAC_KEY_MISSING if unusable.reason.endswith("missing") else HMAC_KEY_INVALID], state, observations
 
     await ledger_module.record_outcome(
         session_maker,
@@ -1535,13 +1606,49 @@ async def _resolve_unknown_create(
         hmac_key_id=key_id,
         verified_field="create_verified_at",
         reconciliation_required=False,
+        # The draft is proven to exist and is not paid for: still somebody's to
+        # close if the canary stops here.
         manual_cleanup_required=True,
         evidence={
-            "create_marker_readback": observation.as_safe_dict(),
+            "create_recovery_readback": observation.as_safe_dict(),
             "baseline": baseline.as_safe_dict(),
         },
     )
     return reasons, state, observations
+
+
+async def _recover_unknown_create(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    snapshot: ledger_module.LedgerSnapshot,
+    order_reader: Any,
+    baseline: BaselineProof,
+) -> tuple[list[str], str | None, list[dict[str, Any]]]:
+    """Resolve a create whose result is unknown. Reads only; never re-creates.
+
+    A known UUID is read directly: listing the customer's orders to find an
+    order we can already name would be a slower way to learn nothing.
+    """
+    if snapshot.target_order_uuid is not None:
+        return await _prove_lost_create(
+            session_maker,
+            snapshot=snapshot,
+            order_reader=order_reader,
+            candidate=snapshot.target_order_uuid,
+            baseline=baseline,
+        )
+
+    candidate, reasons, observations = await _find_lost_order(snapshot=snapshot, order_reader=order_reader)
+    if candidate is None:
+        return reasons, None, observations
+    proof_reasons, state, proof_observations = await _prove_lost_create(
+        session_maker,
+        snapshot=snapshot,
+        order_reader=order_reader,
+        candidate=candidate,
+        baseline=baseline,
+    )
+    return [*reasons, *proof_reasons], state, [*observations, *proof_observations]
 
 
 async def run_reconcile(
@@ -1569,18 +1676,20 @@ async def run_reconcile(
     reasons: list[str] = []
     state: str | None = None
 
-    if snapshot.target_order_uuid is None:
-        if snapshot.status == MANUAL_VOUCHER_CREATE_UNKNOWN:
-            # A create whose answer was lost before it named an order. Look for
-            # it by marker rather than guessing, and never send a second CREATE.
-            search_reasons, state, search_observations = await _resolve_unknown_create(
-                session_maker,
-                snapshot=snapshot,
-                order_reader=order_reader,
-                baseline=baseline,
-            )
-            reasons.extend(search_reasons)
-            observations.extend(search_observations)
+    if snapshot.status == MANUAL_VOUCHER_CREATE_UNKNOWN:
+        # A create whose result is unknown, whether or not it managed to name an
+        # order first. One proof path either way, and never a second CREATE.
+        recovery_reasons, state, recovery_observations = await _recover_unknown_create(
+            session_maker,
+            snapshot=snapshot,
+            order_reader=order_reader,
+            baseline=baseline,
+        )
+        reasons.extend(recovery_reasons)
+        observations.extend(recovery_observations)
+    elif snapshot.target_order_uuid is None:
+        # Nothing to read back and no create to recover.
+        pass
     else:
         payload, order_reason = await _exact_order(order_reader, snapshot.target_order_uuid)
         if order_reason is not None:
@@ -1620,21 +1729,10 @@ async def run_reconcile(
             if not proven:
                 reasons.append(ARTIFACT_UNPROVEN)
 
-            # Only the transitions a readback PROVES, and only forwards.
-            if state == ORDER_OPEN and snapshot.status == MANUAL_VOUCHER_CREATE_UNKNOWN and proven:
-                await ledger_module.record_outcome(
-                    session_maker,
-                    status=MANUAL_VOUCHER_CREATED,
-                    expected_statuses=frozenset({MANUAL_VOUCHER_CREATE_UNKNOWN}),
-                    verified_field="create_verified_at",
-                    reconciliation_required=False,
-                    manual_cleanup_required=True,
-                    evidence={
-                        "reconcile_readback": observation.as_safe_dict(),
-                        "baseline": baseline.as_safe_dict(),
-                    },
-                )
-            elif state == ORDER_PAID and snapshot.status == MANUAL_VOUCHER_PAY_UNKNOWN and proven:
+            # Only the transitions a readback PROVES, and only forwards. The
+            # create recovery is not here: it owns `create_unknown` above,
+            # because that state may have no binding to verify yet.
+            if state == ORDER_PAID and snapshot.status == MANUAL_VOUCHER_PAY_UNKNOWN and proven:
                 await ledger_module.record_outcome(
                     session_maker,
                     status=MANUAL_VOUCHER_PAID,
@@ -1662,33 +1760,44 @@ async def run_reconcile(
                     reconciliation_required=False,
                     manual_cleanup_required=False,
                 )
-            elif state in (ORDER_CANCELLED, ORDER_REFUNDED) and snapshot.status in (
-                MANUAL_VOUCHER_CREATED,
-                MANUAL_VOUCHER_CREATE_UNKNOWN,
-            ):
+            elif state in (ORDER_CANCELLED, ORDER_REFUNDED) and snapshot.status == MANUAL_VOUCHER_CREATED:
                 # The operator closed the draft by hand in the dashboard. That
                 # is an OBSERVATION, not something this tool did, and it is
                 # recorded as exactly that — with no second mutation.
                 await ledger_module.record_outcome(
                     session_maker,
                     status=MANUAL_VOUCHER_MANUALLY_CLEANED,
-                    expected_statuses=frozenset({MANUAL_VOUCHER_CREATED, MANUAL_VOUCHER_CREATE_UNKNOWN}),
+                    expected_statuses=frozenset({MANUAL_VOUCHER_CREATED}),
                     reconciliation_required=False,
                     manual_cleanup_required=False,
                     manual_cleanup_observed=True,
                     evidence={"manual_cleanup": observation.as_safe_dict()},
                 )
 
+    # The FINAL state, read after everything this reconcile may have written.
+    # What the report says is decided by that, not by how far the code got.
     snapshot = await ledger_module.load(session_maker)
+
     # A send whose outcome is unknown is NOT reconciled by reading an order:
     # whether Meta delivered the message is not a fact the POS system holds.
     # The report says so rather than quietly clearing the flag.
     if snapshot.status == MANUAL_VOUCHER_SEND_UNKNOWN:
         reasons.append(MUTATION_UNKNOWN)
 
+    # "Observed" is not "resolved". A reconcile that ran and left the row in an
+    # unresolved state — or still asking to be reconciled — reports `unknown`,
+    # and its exit code says so. Reporting success here is how an operator, or a
+    # wrapper reading the exit code, concludes that a possible open draft, a
+    # possible payment or a possible customer message has been dealt with.
+    unresolved = snapshot.reconciliation_required or snapshot.status in ledger_module.UNRESOLVED_STATUSES
+    if unresolved and not reasons:
+        # It ran, it changed nothing, and it cannot say why in more specific
+        # terms. That still is not success.
+        reasons.append(RECONCILE_UNRESOLVED)
+
     return StageReport(
         stage="reconcile",
-        outcome="observed",
+        outcome="unknown" if unresolved else "observed",
         reasons=reasons,
         external_effect_attempted=False,
         reconciliation_required=snapshot.reconciliation_required,

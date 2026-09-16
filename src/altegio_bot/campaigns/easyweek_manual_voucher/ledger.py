@@ -557,7 +557,14 @@ async def claim_create(
         digest_field="create_plan_digest",
         claimed_field="create_claimed_at",
         attempted_field="create_attempted_at",
-        extra={"create_window_start": create_window_start, "create_window_end": create_window_end},
+        extra={
+            "create_window_start": create_window_start,
+            "create_window_end": create_window_end,
+            # From this committed claim onwards an open draft may exist in the
+            # POS. Cleared only by a proven payment, a proven refund, or a
+            # proven manual closure — never by a search that found nothing.
+            "manual_cleanup_required": True,
+        },
     )
 
 

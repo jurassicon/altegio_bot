@@ -160,6 +160,11 @@ MARKER_SEARCH_UNRESOLVED: Final = "manual_voucher_marker_search_unresolved"
 MARKER_SEARCH_AMBIGUOUS: Final = "manual_voucher_marker_search_ambiguous"
 MARKER_SEARCH_INCOMPLETE: Final = "manual_voucher_marker_search_incomplete"
 
+# The reconcile ran and the uncertainty it was asked about is still there. Its
+# own code, because "we looked and cannot say" is not the same as any of the
+# specific things that could be wrong.
+RECONCILE_UNRESOLVED: Final = "manual_voucher_reconcile_unresolved"
+
 # -- the send ---------------------------------------------------------------
 DELIVERY_ALREADY_ATTEMPTED: Final = "manual_voucher_delivery_already_attempted"
 DELIVERY_OUTCOME_UNKNOWN: Final = "manual_voucher_delivery_outcome_unknown"

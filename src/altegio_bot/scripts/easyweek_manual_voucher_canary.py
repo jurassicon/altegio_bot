@@ -214,12 +214,19 @@ async def _run_reconcile(request: ManualCanaryRequest) -> tuple[dict[str, Any], 
 
 
 def _exit_for(report: runner_module.StageReport) -> int:
-    if report.outcome == "unknown":
+    """The number a wrapper acts on. Never optimistic.
+
+    ``3`` means something may have happened and nobody can say what — including
+    a reconcile that ran and resolved nothing. ``6`` is reserved for the proven
+    case: the state IS known, no reconciliation is outstanding, and an open
+    draft is sitting in the POS waiting for a human. ``0`` means the requested
+    stage did what it said, and never anything more than that.
+    """
+    if report.outcome == "unknown" or report.reconciliation_required:
         return EXIT_UNKNOWN
     if report.outcome in ("refused", "rejected"):
         return EXIT_CONTRACT_MISMATCH
     if report.manual_cleanup_required:
-        # Proven, and something is still open in the POS that a human must close.
         return EXIT_MANUAL_CLEANUP
     return EXIT_OK
 
