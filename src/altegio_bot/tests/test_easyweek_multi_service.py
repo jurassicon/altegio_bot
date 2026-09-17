@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import uuid
 from decimal import Decimal
@@ -9,10 +10,12 @@ import pytest
 
 from altegio_bot.easyweek_client import EasyWeekRetryableError
 from altegio_bot.easyweek_multi_service import (
+    EXACT_PAIR_PROOF_KIND,
     MULTI_SERVICE_BUSINESS_COUNT_MISMATCH,
     MULTI_SERVICE_CATALOG_MATCH_MISSING,
     MULTI_SERVICE_CATEGORY_AMBIGUOUS,
     MULTI_SERVICE_CATEGORY_NOT_ALLOWED,
+    MULTI_SERVICE_CONTRACT_MISMATCH,
     MULTI_SERVICE_CURRENCY_MISMATCH,
     MULTI_SERVICE_CUSTOM_DURATION_EXCLUSION_NOT_PROVEN,
     MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED,
@@ -21,13 +24,18 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_DISCOUNT_UNSUPPORTED,
     MULTI_SERVICE_DUPLICATE_AMBIGUOUS,
     MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_JOB_VERSION_KEY,
     MULTI_SERVICE_NAMES_NOT_DISTINCT,
     MULTI_SERVICE_ORDERED_SERVICES_MALFORMED,
     MULTI_SERVICE_QUANTITY_UNSUPPORTED,
     MULTI_SERVICE_RECORD_COUNT_MISMATCH,
     MULTI_SERVICE_RELATED_MISSING,
     MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
+    MULTI_SERVICE_SNAPSHOT_KEY,
     MULTI_SERVICE_SNAPSHOT_MISSING,
+    MULTI_SERVICE_SNAPSHOT_PROOF_KEY,
+    MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
+    MULTI_SERVICE_SNAPSHOT_VERSION,
     MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED,
     MULTI_SERVICE_TOTAL_MISMATCH,
     MultiServiceProofError,
@@ -45,6 +53,17 @@ from altegio_bot.easyweek_multi_service import (
     record_raw_with_multi_service_snapshot,
     resolve_effective_multi_service_snapshot,
 )
+from altegio_bot.easyweek_resource_shadow_contract import (
+    KARLSRUHE_COMPANY_ID,
+    KARLSRUHE_CONTRACT_REVISION,
+    KARLSRUHE_LOCATION_UUID,
+    KARLSRUHE_NUMERIC_SERVICE_NAMES,
+    KARLSRUHE_RESOURCE_BACKED_SERVICE_NAMES,
+    KARLSRUHE_SERVICE_CATEGORY,
+    RESOURCE_SHADOW_PROOF_KIND,
+    resolve_resource_shadow_contract,
+)
+from altegio_bot.settings import settings
 
 BOOKING_UUID = uuid.UUID("11111111-2222-4333-8444-555555555555")
 OTHER_BOOKING_UUID = uuid.UUID("99999999-2222-4333-8444-555555555555")
@@ -707,3 +726,731 @@ def test_bad_allowlist_is_recoverable_and_never_allows_pair(allowlist: str) -> N
     )
     assert result.allowed is False
     assert result.recoverable_configuration is True
+
+
+# ---------------------------------------------------------------------------
+# PR-7.5: the Karlsruhe resource-shadow proof
+#
+# The 16 production bookings behind this section all report webhook
+# services_count=2 / quantity=2 and return three ordered rows in which one
+# pedicure name appears twice.  The two pedicure rows agree on every business
+# field and differ only in technical API fields, so the PR-7.4 full-row
+# signature digest cannot recognise them as one business line.  The fixtures
+# below therefore give EVERY row its own technical field: none of these shapes
+# can accidentally fall through to the established exact-signature path.
+# ---------------------------------------------------------------------------
+
+KARLSRUHE_BOOKING_UUID = uuid.UUID("77777777-2222-4333-8444-555555555555")
+KARLSRUHE_CATEGORY_UUID = "60000000-0000-4000-8000-000000000001"
+
+MANIKUERE_DAMEN = "Hygienische Maniküre für Damen"
+MANIKUERE_HERREN = "Hygienische Maniküre für Herren"
+MANIKUERE_SHELLAC = "Maniküre mit Gel-Lack / Shellac"
+MANIKUERE_FRENCH = "Maniküre mit French/Design"
+PEDIKUERE_DAMEN = "Hygienische Pediküre für Damen"
+PEDIKUERE_GEL = "Pediküre mit Gel-Lack"
+PEDIKUERE_FRENCH = "Pediküre Mit French"
+
+# One deterministic price/duration per contract name; the exact numbers are
+# fixture values, never production data.
+_KARLSRUHE_SERVICE_FACTS = {
+    MANIKUERE_DAMEN: (2500, 30),
+    MANIKUERE_HERREN: (2700, 35),
+    MANIKUERE_SHELLAC: (4200, 60),
+    MANIKUERE_FRENCH: (4900, 70),
+    PEDIKUERE_DAMEN: (3800, 50),
+    PEDIKUERE_GEL: (5100, 75),
+    PEDIKUERE_FRENCH: (5600, 80),
+}
+
+# Exactly the six shapes the production audit observed, plus the control pair.
+OBSERVED_KARLSRUHE_SHAPES = [
+    [MANIKUERE_DAMEN, PEDIKUERE_DAMEN, PEDIKUERE_DAMEN],
+    [PEDIKUERE_DAMEN, PEDIKUERE_DAMEN, MANIKUERE_FRENCH],
+    [PEDIKUERE_DAMEN, PEDIKUERE_DAMEN, MANIKUERE_SHELLAC],
+    [MANIKUERE_SHELLAC, PEDIKUERE_DAMEN, PEDIKUERE_DAMEN],
+    [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL],
+    [PEDIKUERE_GEL, PEDIKUERE_GEL, MANIKUERE_DAMEN],
+]
+CONTROL_KARLSRUHE_PAIR = [MANIKUERE_SHELLAC, PEDIKUERE_GEL]
+
+_KARLSRUHE_SERVICE_IDS = {name: service_id for service_id, name in KARLSRUHE_NUMERIC_SERVICE_NAMES.items()}
+
+
+@pytest.fixture
+def karlsruhe_fence_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+
+
+def _karlsruhe_catalog(
+    *,
+    drop: str | None = None,
+    rename: tuple[str, str] | None = None,
+    duplicate: str | None = None,
+    category_override: tuple[str, str] | None = None,
+    extra_service: str | None = None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, name in enumerate(sorted(KARLSRUHE_NUMERIC_SERVICE_NAMES.values())):
+        if name == drop:
+            continue
+        display = rename[1] if rename is not None and rename[0] == name else name
+        category = KARLSRUHE_SERVICE_CATEGORY
+        if category_override is not None and category_override[0] == name:
+            category = category_override[1]
+        rows.append(
+            {
+                "uuid": f"40000000-0000-4000-8000-{index:012d}",
+                "name": display,
+                "category": {"uuid": KARLSRUHE_CATEGORY_UUID, "name": category},
+            }
+        )
+    if duplicate is not None:
+        rows.append(
+            {
+                "uuid": "40000000-0000-4000-8000-000000000099",
+                "name": duplicate,
+                "category": {"uuid": KARLSRUHE_CATEGORY_UUID, "name": KARLSRUHE_SERVICE_CATEGORY},
+            }
+        )
+    if extra_service is not None:
+        rows.append(
+            {
+                "uuid": "40000000-0000-4000-8000-000000000098",
+                "name": extra_service,
+                "category": {"uuid": KARLSRUHE_CATEGORY_UUID, "name": KARLSRUHE_SERVICE_CATEGORY},
+            }
+        )
+    return rows
+
+
+def _karlsruhe_business_names(names: list[str]) -> list[str]:
+    """The names that survive removing only the SECOND repeated occurrence."""
+    business: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        if names.count(name) == 2:
+            seen.add(name)
+        business.append(name)
+    return business
+
+
+def _karlsruhe_rows(names: list[str], *, technical_drift: bool = True) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, name in enumerate(names):
+        price, minutes = _KARLSRUHE_SERVICE_FACTS[name]
+        row = _line(name, price, minutes, f"50000000-0000-4000-8000-{index:012d}")
+        if technical_drift:
+            # An API field this module does not model.  It differs for every
+            # row, including between a service and its resource copy.
+            row["resource"] = {"uuid": f"51000000-0000-4000-8000-{index:012d}", "position": index}
+        rows.append(row)
+    return rows
+
+
+def _karlsruhe_case(
+    names: list[str],
+    *,
+    business_names: list[str] | None = None,
+    catalog: list[dict[str, object]] | None = None,
+    technical_drift: bool = True,
+    total_override: int | None = None,
+    **pair_overrides: object,
+):
+    business = business_names if business_names is not None else _karlsruhe_business_names(names)
+    rows = _karlsruhe_rows(names, technical_drift=technical_drift)
+    total = (
+        total_override if total_override is not None else sum(_KARLSRUHE_SERVICE_FACTS[name][0] for name in business)
+    )
+    values: dict[str, object] = {
+        "booking_uuid": KARLSRUHE_BOOKING_UUID,
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "service_name": business[0],
+        "service_related": business[1] if len(business) > 1 else None,
+        "services_description": ", ".join(business),
+        "services_count": 2,
+        "quantity": 2,
+        "booking_currency": "EUR",
+        "total_cost": Decimal(total) / Decimal(100),
+        "company_id": KARLSRUHE_COMPANY_ID,
+        "service_id": _KARLSRUHE_SERVICE_IDS.get(business[0]),
+    }
+    values.update(pair_overrides)
+    pair = WebhookServicePair(**values)  # type: ignore[arg-type]
+    booking = {
+        "uuid": str(KARLSRUHE_BOOKING_UUID),
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "currency": "EUR",
+        "order": {"subtotal": total, "total": total},
+        "ordered_services": rows,
+    }
+    return pair, booking, (catalog if catalog is not None else _karlsruhe_catalog())
+
+
+def _replace_pair(pair: WebhookServicePair, **overrides: object) -> WebhookServicePair:
+    values = {field: getattr(pair, field) for field in pair.__dataclass_fields__}
+    values.update(overrides)
+    return WebhookServicePair(**values)  # type: ignore[arg-type]
+
+
+def _prove_karlsruhe(names: list[str], **kwargs: object):
+    pair, booking, catalog = _karlsruhe_case(names, **kwargs)  # type: ignore[arg-type]
+    return prove_exactly_two_service_snapshot(
+        webhook=pair,
+        booking_payload=booking,
+        catalog_rows=catalog,
+    )
+
+
+def _karlsruhe_reason(names: list[str], **kwargs: object) -> str:
+    with pytest.raises(MultiServiceProofError) as caught:
+        _prove_karlsruhe(names, **kwargs)
+    return caught.value.reason
+
+
+@pytest.mark.parametrize("names", OBSERVED_KARLSRUHE_SHAPES, ids=lambda value: "-".join(value))
+def test_every_observed_karlsruhe_shape_collapses_to_its_business_pair(
+    karlsruhe_fence_open: None,
+    names: list[str],
+) -> None:
+    business = _karlsruhe_business_names(names)
+    snapshot = _prove_karlsruhe(names)
+
+    assert [line.display_name for line in snapshot.lines] == business
+    assert snapshot.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert snapshot.proof_kind == RESOURCE_SHADOW_PROOF_KIND
+    proof = snapshot.resource_shadow_proof
+    assert proof is not None
+    assert proof.company_id == KARLSRUHE_COMPANY_ID
+    assert proof.contract_revision == KARLSRUHE_CONTRACT_REVISION
+    assert len(proof.contract_digest) == 64
+    assert proof.primary_service_id == _KARLSRUHE_SERVICE_IDS[business[0]]
+    assert snapshot.total_minor == sum(_KARLSRUHE_SERVICE_FACTS[name][0] for name in business)
+    # Every category is proved from the live catalogue, not from the contract.
+    assert {line.category for line in snapshot.lines} == {KARLSRUHE_SERVICE_CATEGORY}
+
+
+def test_control_ordinary_karlsruhe_pair_keeps_the_version_one_projection(
+    karlsruhe_fence_open: None,
+) -> None:
+    snapshot = _prove_karlsruhe(CONTROL_KARLSRUHE_PAIR)
+    assert [line.display_name for line in snapshot.lines] == CONTROL_KARLSRUHE_PAIR
+    assert snapshot.version == MULTI_SERVICE_SNAPSHOT_VERSION
+    assert snapshot.resource_shadow_proof is None
+    assert snapshot.proof_kind == EXACT_PAIR_PROOF_KIND
+    assert MULTI_SERVICE_SNAPSHOT_PROOF_KEY not in snapshot.as_dict()
+
+
+@pytest.mark.parametrize("resource_name", sorted(KARLSRUHE_RESOURCE_BACKED_SERVICE_NAMES))
+def test_all_three_resource_backed_names_are_accepted_as_the_duplicate(
+    karlsruhe_fence_open: None,
+    resource_name: str,
+) -> None:
+    snapshot = _prove_karlsruhe([MANIKUERE_HERREN, resource_name, resource_name])
+    assert [line.display_name for line in snapshot.lines] == [MANIKUERE_HERREN, resource_name]
+
+
+def test_resource_duplicate_is_accepted_as_primary_and_as_secondary(
+    karlsruhe_fence_open: None,
+) -> None:
+    secondary = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    primary = _prove_karlsruhe([PEDIKUERE_GEL, PEDIKUERE_GEL, MANIKUERE_SHELLAC])
+
+    assert [line.display_name for line in secondary.lines] == [MANIKUERE_SHELLAC, PEDIKUERE_GEL]
+    assert [line.display_name for line in primary.lines] == [PEDIKUERE_GEL, MANIKUERE_SHELLAC]
+    # The reversed order is a different booking, so it is a different digest.
+    assert secondary.digest != primary.digest
+
+
+def test_hidden_technical_fields_may_differ_but_business_fields_may_not(
+    karlsruhe_fence_open: None,
+) -> None:
+    names = [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    pair, booking, catalog = _karlsruhe_case(names)
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    # The two resource rows are NOT byte-identical: the established
+    # exact-signature path cannot be what accepts them.
+    assert rows[1] != rows[2]
+    rows[2]["resource"] = {"uuid": "51000000-0000-4000-8000-000000009999", "position": 9}
+    rows[2]["internal_note_id"] = 4242
+
+    snapshot = prove_exactly_two_service_snapshot(
+        webhook=pair,
+        booking_payload=booking,
+        catalog_rows=catalog,
+    )
+    assert [line.display_name for line in snapshot.lines] == [MANIKUERE_SHELLAC, PEDIKUERE_GEL]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"currency": "CHF"}, MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+        ({"price": 9999, "original_price": 9999}, MULTI_SERVICE_DUPLICATE_AMBIGUOUS),
+        ({"original_price": 9999}, MULTI_SERVICE_CUSTOM_PRICE_UNSUPPORTED),
+        ({"quantity": 2}, MULTI_SERVICE_QUANTITY_UNSUPPORTED),
+        ({"discount": 100}, MULTI_SERVICE_DISCOUNT_UNSUPPORTED),
+        (
+            {"duration": {"value": 99, "label": "minutes"}, "original_duration": {"value": 99, "label": "minutes"}},
+            MULTI_SERVICE_DUPLICATE_AMBIGUOUS,
+        ),
+        ({"duration": {"value": 99, "label": "minutes"}}, MULTI_SERVICE_CUSTOM_DURATION_UNSUPPORTED),
+    ],
+)
+def test_every_known_business_field_mismatch_between_resource_copies_fails_closed(
+    karlsruhe_fence_open: None,
+    mutation: dict[str, object],
+    expected: str,
+) -> None:
+    names = [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    pair, booking, catalog = _karlsruhe_case(names)
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    rows[2].update(mutation)
+
+    with pytest.raises(MultiServiceProofError) as caught:
+        prove_exactly_two_service_snapshot(webhook=pair, booking_payload=booking, catalog_rows=catalog)
+    assert caught.value.reason == expected
+
+
+def test_duplicate_manicure_and_unknown_duplicate_name_stay_ambiguous(
+    karlsruhe_fence_open: None,
+) -> None:
+    # A manicure is in the contract but is NOT resource-backed.
+    assert _karlsruhe_reason([PEDIKUERE_GEL, MANIKUERE_SHELLAC, MANIKUERE_SHELLAC]) == (
+        MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    )
+    # A name the contract does not know at all, present in the live catalogue.
+    unknown = "Wimpernverlängerung Auffüllen"
+    pair, booking, _unused = _karlsruhe_case([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    rows[1]["name"] = unknown
+    rows[2]["name"] = unknown
+    pair = _replace_pair(pair, service_related=unknown, services_description=f"{MANIKUERE_SHELLAC}, {unknown}")
+    with pytest.raises(MultiServiceProofError) as caught:
+        prove_exactly_two_service_snapshot(
+            webhook=pair,
+            booking_payload=booking,
+            catalog_rows=_karlsruhe_catalog(extra_service=unknown),
+        )
+    assert caught.value.reason == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+
+
+def test_three_identical_rows_three_distinct_services_and_four_rows_fail_closed(
+    karlsruhe_fence_open: None,
+) -> None:
+    assert (
+        _karlsruhe_reason(
+            [PEDIKUERE_GEL, PEDIKUERE_GEL, PEDIKUERE_GEL],
+            business_names=[PEDIKUERE_GEL, MANIKUERE_SHELLAC],
+        )
+        == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    )
+    assert (
+        _karlsruhe_reason(
+            [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_DAMEN],
+            business_names=[MANIKUERE_SHELLAC, PEDIKUERE_GEL],
+        )
+        == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    )
+    assert (
+        _karlsruhe_reason(
+            [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL, PEDIKUERE_GEL],
+            business_names=[MANIKUERE_SHELLAC, PEDIKUERE_GEL],
+        )
+        == MULTI_SERVICE_BUSINESS_COUNT_MISMATCH
+    )
+
+
+def test_two_identical_real_rows_never_become_a_pair(karlsruhe_fence_open: None) -> None:
+    assert (
+        _karlsruhe_reason(
+            [PEDIKUERE_GEL, PEDIKUERE_GEL],
+            business_names=[MANIKUERE_SHELLAC, PEDIKUERE_GEL],
+        )
+        == MULTI_SERVICE_BUSINESS_COUNT_MISMATCH
+    )
+
+
+@pytest.mark.parametrize(
+    "service_id",
+    [None, "1030234", True, 999999, _KARLSRUHE_SERVICE_IDS[PEDIKUERE_GEL]],
+    ids=["missing", "string", "bool", "unknown", "mismatching"],
+)
+def test_primary_numeric_service_id_must_be_exact_and_match_the_name(
+    karlsruhe_fence_open: None,
+    service_id: object,
+) -> None:
+    assert (
+        _karlsruhe_reason([MANIKUERE_SHELLAC, PEDIKUERE_DAMEN, PEDIKUERE_DAMEN], service_id=service_id)
+        == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    )
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        [],
+        _karlsruhe_catalog(drop=PEDIKUERE_DAMEN),
+        _karlsruhe_catalog(duplicate=PEDIKUERE_GEL),
+        _karlsruhe_catalog(rename=(MANIKUERE_SHELLAC, "Maniküre mit Gel-Lack")),
+        _karlsruhe_catalog(category_override=(PEDIKUERE_GEL, "Wimpernverlängerung")),
+    ],
+    ids=["empty", "missing", "duplicated", "renamed", "category-drift"],
+)
+def test_an_incomplete_or_drifted_catalogue_closes_the_resource_path(
+    karlsruhe_fence_open: None,
+    catalog: list[dict[str, object]],
+) -> None:
+    reason = _karlsruhe_reason([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL], catalog=catalog)
+    # Either the contract cannot be proved (ambiguous duplicate) or the pair's
+    # own category cannot be read; both are fail-closed and carry no value.
+    assert reason in {MULTI_SERVICE_DUPLICATE_AMBIGUOUS, MULTI_SERVICE_CATALOG_MATCH_MISSING}
+
+
+def test_the_global_fence_alone_decides_whether_the_path_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", False, raising=False)
+    assert _karlsruhe_reason(names) == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    assert _prove_karlsruhe(names).version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"company_id": 308697},
+        {"company_id": None},
+        {"company_id": str(KARLSRUHE_COMPANY_ID)},
+        {"location_uuid": "b9d689f2-0e41-47cd-812a-e3c33197753d"},
+    ],
+    ids=["other-company", "missing-company", "string-company", "durlach-location"],
+)
+def test_no_other_provider_company_or_location_may_borrow_the_contract(
+    karlsruhe_fence_open: None,
+    overrides: dict[str, object],
+) -> None:
+    names = [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    if "location_uuid" in overrides:
+        pair, booking, catalog = _karlsruhe_case(names, **overrides)  # type: ignore[arg-type]
+        booking["location_uuid"] = overrides["location_uuid"]
+        with pytest.raises(MultiServiceProofError) as caught:
+            prove_exactly_two_service_snapshot(webhook=pair, booking_payload=booking, catalog_rows=catalog)
+        assert caught.value.reason == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+        return
+    assert _karlsruhe_reason(names, **overrides) == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+
+
+def test_a_proven_nagelservice_pair_is_still_suppressed_by_the_category_allowlist(
+    karlsruhe_fence_open: None,
+) -> None:
+    snapshot = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, snapshot)
+
+    suppressed = evaluate_service_eligibility(
+        record_raw=raw,
+        allowed_categories_raw='["Wimpernverlängerung"]',
+        purpose=ServiceEligibilityPurpose.LIFECYCLE_REMINDER,
+    )
+    assert suppressed.allowed is False
+    assert suppressed.reason == MULTI_SERVICE_CATEGORY_NOT_ALLOWED
+    assert suppressed.recoverable_configuration is False
+
+    # And the structural proof itself is genuinely complete: with the category
+    # allowed the SAME snapshot passes, which is what makes the suppression a
+    # category decision rather than a hidden structural failure.
+    allowed = evaluate_service_eligibility(
+        record_raw=raw,
+        allowed_categories_raw=f'["{KARLSRUHE_SERVICE_CATEGORY}"]',
+        purpose=ServiceEligibilityPurpose.LIFECYCLE_REMINDER,
+    )
+    assert allowed.allowed is True
+
+
+def test_a_version_two_snapshot_round_trips_and_is_bound_to_the_live_contract(
+    karlsruhe_fence_open: None,
+) -> None:
+    snapshot = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, snapshot)
+
+    parsed, error = multi_service_snapshot_from_record_raw(raw)
+    assert error is None
+    assert parsed == snapshot
+
+    stored = raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY]
+    assert stored["version"] == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert stored[MULTI_SERVICE_SNAPSHOT_PROOF_KEY]["proof_kind"] == RESOURCE_SHADOW_PROOF_KIND
+    # No raw API row and no technical API field reaches the durable projection.
+    serialized = json.dumps(stored)
+    assert '"resource":' not in serialized
+    assert "51000000-0000-4000-8000" not in serialized
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"contract_revision": KARLSRUHE_CONTRACT_REVISION + 1},
+        {"contract_digest": "f" * 64},
+        {"primary_service_id": _KARLSRUHE_SERVICE_IDS[PEDIKUERE_FRENCH]},
+        {"company_id": 308697},
+    ],
+    ids=["revision", "digest", "primary-id", "company"],
+)
+def test_contract_drift_holds_a_stored_version_two_snapshot(
+    karlsruhe_fence_open: None,
+    mutation: dict[str, object],
+) -> None:
+    snapshot = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, snapshot)
+    raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY][MULTI_SERVICE_SNAPSHOT_PROOF_KEY].update(mutation)
+
+    parsed, error = multi_service_snapshot_from_record_raw(raw)
+    assert parsed is None
+    assert error == MULTI_SERVICE_CONTRACT_MISMATCH
+
+
+def test_a_version_one_snapshot_claiming_a_contract_is_refused() -> None:
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, _prove())
+    raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY][MULTI_SERVICE_SNAPSHOT_PROOF_KEY] = {
+        "proof_kind": RESOURCE_SHADOW_PROOF_KIND,
+        "company_id": KARLSRUHE_COMPANY_ID,
+        "contract_revision": KARLSRUHE_CONTRACT_REVISION,
+        "contract_digest": "a" * 64,
+        "primary_service_id": _KARLSRUHE_SERVICE_IDS[MANIKUERE_SHELLAC],
+    }
+    parsed, error = multi_service_snapshot_from_record_raw(raw)
+    assert parsed is None
+    assert error == MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+
+
+def test_closing_the_fence_does_not_invalidate_an_existing_version_one_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durlach/Rastatt pairs never depend on the PR-7.5 switch."""
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    with_fence_open = _prove()
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", False, raising=False)
+    with_fence_closed = _prove()
+
+    assert with_fence_open == with_fence_closed
+    assert with_fence_closed.version == MULTI_SERVICE_SNAPSHOT_VERSION
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, with_fence_closed)
+    assert multi_service_snapshot_from_record_raw(raw) == (with_fence_closed, None)
+
+
+def test_a_version_two_job_is_bound_to_its_version_two_snapshot(karlsruhe_fence_open: None) -> None:
+    snapshot = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    raw = record_raw_with_multi_service_snapshot({"easyweek": {"services_count": 2}}, snapshot)
+    payload = multi_service_job_payload(snapshot)
+    assert payload[MULTI_SERVICE_JOB_VERSION_KEY] == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+
+    resolved, error = resolve_effective_multi_service_snapshot(
+        record_raw=raw,
+        job_payload=payload,
+        record_total_cost=Decimal(snapshot.total_minor) / Decimal(100),
+        expected_booking_uuid=KARLSRUHE_BOOKING_UUID,
+        expected_location_uuid=KARLSRUHE_LOCATION_UUID,
+    )
+    assert error is None
+    assert resolved == snapshot
+
+    # A job that claims version 1 cannot consume the version 2 projection.
+    stale = dict(payload)
+    stale[MULTI_SERVICE_JOB_VERSION_KEY] = MULTI_SERVICE_SNAPSHOT_VERSION
+    assert (
+        multi_service_send_guard(
+            record_raw=raw,
+            job_payload=stale,
+            record_total_cost=Decimal(snapshot.total_minor) / Decimal(100),
+            expected_booking_uuid=KARLSRUHE_BOOKING_UUID,
+            expected_location_uuid=KARLSRUHE_LOCATION_UUID,
+        )
+        == MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED
+    )
+
+
+def test_the_static_contract_is_the_exact_owner_approved_table() -> None:
+    assert KARLSRUHE_COMPANY_ID == 322579
+    assert KARLSRUHE_LOCATION_UUID == "8395fab6-7ee8-4702-88d9-fd78f92539c1"
+    assert KARLSRUHE_NUMERIC_SERVICE_NAMES == {
+        1030228: "Hygienische Maniküre für Damen",
+        1030231: "Hygienische Maniküre für Herren",
+        1030234: "Maniküre mit Gel-Lack / Shellac",
+        1030237: "Maniküre mit French/Design",
+        1030240: "Hygienische Pediküre für Damen",
+        1030243: "Pediküre mit Gel-Lack",
+        1030246: "Pediküre Mit French",
+    }
+    assert KARLSRUHE_RESOURCE_BACKED_SERVICE_NAMES == frozenset(
+        {
+            "Hygienische Pediküre für Damen",
+            "Pediküre mit Gel-Lack",
+            "Pediküre Mit French",
+        }
+    )
+    # No catalogue UUID is pinned anywhere in the contract module.
+    assert "uuid" not in {name.casefold() for name in KARLSRUHE_NUMERIC_SERVICE_NAMES.values()}
+    assert (
+        resolve_resource_shadow_contract(
+            provider="altegio",
+            company_id=KARLSRUHE_COMPANY_ID,
+            location_uuid=KARLSRUHE_LOCATION_UUID,
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review defect 1: the SURVIVING pair must be owner-approved, not just the
+# duplicate.  Proving only the repeated row let an arbitrary catalogue service
+# ride along as the second business line.
+# ---------------------------------------------------------------------------
+
+UNKNOWN_NAIL_SERVICE = "Unknown Nail Service"
+
+
+def _unknown_singleton_case(*, resource_is_primary: bool):
+    """`[B,B,X]` / `[X,B,B]` where X is a live service outside the contract."""
+    rows: list[dict[str, object]] = []
+    names = (
+        [PEDIKUERE_GEL, PEDIKUERE_GEL, UNKNOWN_NAIL_SERVICE]
+        if resource_is_primary
+        else [UNKNOWN_NAIL_SERVICE, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    )
+    prices = {PEDIKUERE_GEL: _KARLSRUHE_SERVICE_FACTS[PEDIKUERE_GEL][0], UNKNOWN_NAIL_SERVICE: 3300}
+    for index, name in enumerate(names):
+        row = _line(name, prices[name], 60, f"70000000-0000-4000-8000-{index:012d}")
+        row["resource"] = {"uuid": f"71000000-0000-4000-8000-{index:012d}", "position": index}
+        rows.append(row)
+
+    business = [PEDIKUERE_GEL, UNKNOWN_NAIL_SERVICE] if resource_is_primary else [UNKNOWN_NAIL_SERVICE, PEDIKUERE_GEL]
+    total = prices[business[0]] + prices[business[1]]
+    pair = WebhookServicePair(
+        booking_uuid=KARLSRUHE_BOOKING_UUID,
+        location_uuid=KARLSRUHE_LOCATION_UUID,
+        service_name=business[0],
+        service_related=business[1],
+        services_description=f"{business[0]}, {business[1]}",
+        services_count=2,
+        quantity=2,
+        booking_currency="EUR",
+        total_cost=Decimal(total) / Decimal(100),
+        company_id=KARLSRUHE_COMPANY_ID,
+        # The webhook primary id is a real contract id whenever the primary is
+        # the contract service; the unknown-primary case has no contract id.
+        service_id=_KARLSRUHE_SERVICE_IDS.get(business[0]),
+    )
+    booking = {
+        "uuid": str(KARLSRUHE_BOOKING_UUID),
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "currency": "EUR",
+        "order": {"subtotal": total, "total": total},
+        "ordered_services": rows,
+    }
+    return pair, booking, _karlsruhe_catalog(extra_service=UNKNOWN_NAIL_SERVICE)
+
+
+@pytest.mark.parametrize("resource_is_primary", [True, False], ids=["resource-primary", "resource-secondary"])
+def test_an_unknown_surviving_service_never_becomes_a_resource_shadow_pair(
+    karlsruhe_fence_open: None,
+    resource_is_primary: bool,
+) -> None:
+    pair, booking, catalog = _unknown_singleton_case(resource_is_primary=resource_is_primary)
+    # The unknown service really is in the live catalogue: being catalogued is
+    # exactly what must NOT be enough.
+    assert any(row["name"] == UNKNOWN_NAIL_SERVICE for row in catalog)
+
+    with pytest.raises(MultiServiceProofError) as caught:
+        prove_exactly_two_service_snapshot(webhook=pair, booking_payload=booking, catalog_rows=catalog)
+    assert caught.value.reason == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+    assert UNKNOWN_NAIL_SERVICE not in str(caught.value)
+
+
+def _sign(unsigned: dict[str, object]) -> str:
+    """The module's canonical digest, recomputed so a forgery is truly valid."""
+    encoded = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _forged_v2_raw(lines: list[dict[str, object]], *, primary_service_id: int) -> dict[str, object]:
+    unsigned: dict[str, object] = {
+        "version": MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
+        "provider": "easyweek",
+        "booking_uuid": str(KARLSRUHE_BOOKING_UUID),
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "services_count": 2,
+        "lines": lines,
+        MULTI_SERVICE_SNAPSHOT_PROOF_KEY: {
+            "proof_kind": RESOURCE_SHADOW_PROOF_KIND,
+            "company_id": KARLSRUHE_COMPANY_ID,
+            "contract_revision": KARLSRUHE_CONTRACT_REVISION,
+            "contract_digest": _karlsruhe_contract_digest(),
+            "primary_service_id": primary_service_id,
+        },
+    }
+    return {"easyweek": {"services_count": 2, MULTI_SERVICE_SNAPSHOT_KEY: {**unsigned, "digest": _sign(unsigned)}}}
+
+
+def _karlsruhe_contract_digest() -> str:
+    snapshot = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    assert snapshot.resource_shadow_proof is not None
+    return snapshot.resource_shadow_proof.contract_digest
+
+
+def test_a_digest_valid_v2_snapshot_naming_an_unknown_service_is_refused(
+    karlsruhe_fence_open: None,
+) -> None:
+    """The stored digest proves integrity, never reachability."""
+    genuine = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    lines = [dict(line.as_dict()) for line in genuine.lines]
+    lines[1]["display_name"] = UNKNOWN_NAIL_SERVICE
+    lines[1]["normalized_name"] = UNKNOWN_NAIL_SERVICE.casefold()
+    raw = _forged_v2_raw(lines, primary_service_id=_KARLSRUHE_SERVICE_IDS[MANIKUERE_SHELLAC])
+
+    # The forgery is genuinely digest-valid, so only the contract can catch it.
+    stored = raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY]
+    assert stored["digest"] == _sign({key: value for key, value in stored.items() if key != "digest"})
+
+    parsed, error = multi_service_snapshot_from_record_raw(raw)
+    assert parsed is None
+    assert error == MULTI_SERVICE_CONTRACT_MISMATCH
+
+
+def test_a_digest_valid_v2_snapshot_without_a_resource_backed_line_is_refused(
+    karlsruhe_fence_open: None,
+) -> None:
+    """Two manicures can never have produced a collapsed resource shadow."""
+    genuine = _prove_karlsruhe([MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL])
+    lines = [dict(line.as_dict()) for line in genuine.lines]
+    lines[1]["display_name"] = MANIKUERE_FRENCH
+    lines[1]["normalized_name"] = MANIKUERE_FRENCH.casefold()
+    raw = _forged_v2_raw(lines, primary_service_id=_KARLSRUHE_SERVICE_IDS[MANIKUERE_SHELLAC])
+
+    parsed, error = multi_service_snapshot_from_record_raw(raw)
+    assert parsed is None
+    assert error == MULTI_SERVICE_CONTRACT_MISMATCH
+
+
+@pytest.mark.parametrize("resource_name", sorted(KARLSRUHE_RESOURCE_BACKED_SERVICE_NAMES))
+@pytest.mark.parametrize(
+    "partner",
+    [MANIKUERE_DAMEN, MANIKUERE_HERREN, MANIKUERE_SHELLAC, MANIKUERE_FRENCH],
+)
+def test_every_contract_name_still_pairs_with_every_resource_name(
+    karlsruhe_fence_open: None,
+    resource_name: str,
+    partner: str,
+) -> None:
+    """All seven contract names and all three resource names keep working."""
+    secondary = _prove_karlsruhe([partner, resource_name, resource_name])
+    primary = _prove_karlsruhe([resource_name, resource_name, partner])
+
+    assert [line.display_name for line in secondary.lines] == [partner, resource_name]
+    assert [line.display_name for line in primary.lines] == [resource_name, partner]
+    assert secondary.version == primary.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION

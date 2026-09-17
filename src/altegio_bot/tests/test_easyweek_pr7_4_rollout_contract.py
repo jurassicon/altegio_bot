@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot import easyweek_resource_shadow_contract as resource_shadow_contract
 from altegio_bot.easyweek_multi_service_recovery import build_recovery_plan
 from altegio_bot.scripts import easyweek_multi_service_preflight as preflight
 from altegio_bot.scripts import easyweek_multi_service_reminder_recovery as recovery_cli
@@ -126,3 +127,291 @@ def test_recovery_runner_is_an_ops_only_one_off_with_private_state_mount() -> No
     assert any("easyweek.env" in str(item) for item in service["env_file"])
     assert any(":/recovery" in item for item in service["volumes"])
     assert "easyweek_multi_service_reminder_recovery" in " ".join(service["entrypoint"])
+
+
+# ===========================================================================
+# PR-7.5: the Karlsruhe resource-shadow fence
+# ===========================================================================
+
+
+def test_the_resource_shadow_fence_defaults_false_and_is_independent() -> None:
+    fields = Settings.model_fields
+    assert fields["easyweek_resource_shadow_proof_enabled"].default is False
+    # Three separate switches, not one widened flag.
+    assert fields["easyweek_multi_service_notifications_enabled"].default is False
+    assert fields["easyweek_multi_service_send_enabled"].default is False
+
+
+@_PLAN_PRESENT
+def test_canonical_plan_records_the_normative_resource_shadow_scope() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    section = text.split("### 38.6 Ревизия 38 — production evidence корректирует исходную гипотезу", 1)[1]
+    for required in (
+        "company_id=322579",
+        "8395fab6-7ee8-4702-88d9-fd78f92539c1",
+        "1030228",
+        "1030246",
+        "Hygienische Pediküre für Damen",
+        "Pediküre mit Gel-Lack",
+        "Pediküre Mit French",
+        "multi_service_duplicate_ambiguous",
+        "multi_service_category_not_allowed",
+        "catalog UUID не хардкодится",
+        "Durlach и Rastatt поведение не меняется",
+        "default-false kill switch",
+        "13934",
+    ):
+        assert required in section
+
+
+def test_the_static_contract_lives_in_one_module_with_provenance() -> None:
+    source = inspect.getsource(resource_shadow_contract)
+    assert "8395fab6-7ee8-4702-88d9-fd78f92539c1" in source
+    assert "322579" in source
+    # Catalogue service UUIDs are resolved live, never pinned.
+    assert source.count("uuid.UUID") == 1
+    for marker in ("Provenance", "revision", "digest"):
+        assert marker in source
+    # A contract module cannot reach the database, the API or a sender.
+    for forbidden in ("select(", "session", "httpx", "requests", "EasyWeekClient"):
+        assert forbidden not in source
+
+
+def test_runbook_pins_the_resource_shadow_rollout_and_rollback() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    for required in (
+        "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false",
+        "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true",
+        "easyweek_multi_service_preflight",
+        "structurally_proven=17",
+        "disallowed_by_category=17",
+        "ambiguous=0",
+        "allowed=0",
+        "ready=true",
+        "multi_service_category_not_allowed",
+        "Controlled suppression canary",
+        "Rollback нового fence",
+        "13934",
+        "13939",
+    ):
+        assert required in text
+    # The rollback section closes the NEW fence first.
+    rollback = text.split("## 19. Rollback нового fence", 1)[1]
+    assert "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false" in rollback
+    # Opening the shared send fence stays gated on all three green checks.
+    gate = text.split("## 20. Запрет на открытие общего send fence", 1)[1]
+    for required in ("multi-service preflight", "reminder preflight", "canary"):
+        assert required in gate
+
+
+def _runbook_section(title: str) -> str:
+    """The text of one runbook section, up to the next top-level heading."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert title in text, f"missing runbook section: {title}"
+    after = text.split(title, 1)[1]
+    remainder = [part for part in after.split("\n## ") if part]
+    return remainder[0] if len(after.split("\n## ")) > 1 else after
+
+
+def _fenced_blocks(section: str) -> str:
+    """Only the copy-paste command blocks, so prose cannot satisfy a check."""
+    parts = section.split("```")
+    return "\n".join(parts[index] for index in range(1, len(parts), 2))
+
+
+CANARY_TITLE = "## 18. Controlled suppression canary"
+SEND_FENCE_TITLE = "## 20. Запрет на открытие общего send fence"
+
+
+def test_the_resource_shadow_canary_is_a_suppression_canary_not_a_send_canary() -> None:
+    """The observed shapes are Nagelservice, so a v2 canary cannot send.
+
+    Expecting a queued version 2 job or a customer-facing render in production
+    would require temporarily allowing `Nagelservice`, which §38.6 forbids. The
+    runbook therefore has to ask for proven suppression, and to say that the
+    runtime render is proved by tests rather than on production.
+    """
+    canary = _runbook_section(CANARY_TITLE)
+    for required in (
+        "suppression canary",
+        "multi_service_category_not_allowed",
+        "structurally_proven",
+        "integration-тестами",
+    ):
+        assert required in canary
+
+
+def test_the_canary_is_bound_to_the_exact_canary_booking_uuid() -> None:
+    """A rollout check that matches "some record" proves nothing.
+
+    Between creating the controlled booking and running the query, a live
+    branch produces other records — including older resource-shadow ones with
+    no jobs and no outbox rows. Every canary statement must therefore select on
+    the full provider/company/booking identity.
+    """
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    # The operator has to write the exact UUID down before any diagnosis.
+    assert "booking UUID" in canary
+    assert "CANARY_BOOKING_UUID=" in blocks
+
+    # Every SELECT over `records` carries the whole identity triple.
+    record_selects = [
+        statement
+        for statement in blocks.split(";")
+        if "FROM records" in statement.replace("\n", " ") or "FROM records r" in statement.replace("\n", " ")
+    ]
+    assert len(record_selects) >= 2, "expected an identity assertion and a detail query"
+    for statement in record_selects:
+        flattened = " ".join(statement.split())
+        assert "provider = 'easyweek'" in flattened
+        assert "company_id = 322579" in flattened
+        assert "easyweek_booking_uuid = :'canary'::uuid" in flattened
+
+    # The UUID travels as a psql value, never as concatenated SQL text.
+    assert ":'canary'" in blocks
+    assert "||" not in blocks
+    assert "$CANARY_BOOKING_UUID" in blocks
+
+
+def test_the_canary_never_guesses_which_record_it_found() -> None:
+    """The defect this replaced: ORDER BY r.id DESC LIMIT 5 over the company."""
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+    flattened = " ".join(blocks.split())
+
+    for forbidden in ("ORDER BY", "LIMIT", "ORDER BY r.id DESC", "LIMIT 5"):
+        assert forbidden not in flattened, f"canary must not rank or truncate: {forbidden}"
+
+    # Exactly one match is asserted by the SQL itself, not by eyeballing rows.
+    assert "exactly_one_canary_record" in blocks
+    assert "1 / (count(*) = 1)::int" in flattened
+    assert "ON_ERROR_STOP=1" in blocks
+
+
+def test_the_canary_prints_only_safe_technical_fields() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    for required in (
+        "AS record_id",
+        "AS company_id",
+        "AS booking_uuid",
+        "AS services_count",
+        "AS snapshot_version",
+        "AS snapshot_digest",
+        "AS proof_kind",
+        "AS contract_revision",
+        "AS contract_digest",
+        "AS snapshot_lines",
+        "AS line_1_category",
+        "AS line_2_category",
+        "AS jobs",
+        "AS outbox",
+    ):
+        assert required in blocks, f"canary does not report {required}"
+
+    # No customer-facing column may be selected.
+    lowered = blocks.lower()
+    for forbidden in (
+        "customer",
+        "phone",
+        "email",
+        "display_name",
+        "notes",
+        "comment",
+        "short_link",
+        "booking_page",
+        "manage_link",
+    ):
+        assert forbidden not in lowered, f"canary query would print PII: {forbidden}"
+
+
+def test_the_canary_states_one_unambiguous_expected_result() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    for required in (
+        "services_count = 2",
+        "snapshot_version = 2",
+        "proof_kind = karlsruhe_resource_shadow",
+        "contract_revision =",
+        "contract_digest =",
+        "snapshot_lines = 2",
+        "line_1_category = Nagelservice",
+        "line_2_category = Nagelservice",
+        "jobs = 0",
+        "outbox = 0",
+    ):
+        assert required in flattened, f"canary does not pin the expected {required}"
+    assert "ровно одна строка" in flattened
+
+
+def test_the_suppression_reason_is_bound_to_the_exact_record_id() -> None:
+    """A lone `category_not_allowed` line belongs to any of the 17 records."""
+    canary = _runbook_section(CANARY_TITLE)
+    blocks = _fenced_blocks(canary)
+
+    assert "CANARY_RECORD_ID=" in blocks
+    assert "record_id=${CANARY_RECORD_ID}" in blocks
+    assert "reason=multi_service_category_not_allowed" in blocks
+    # The record id comes from the identity-bound query, not from the log.
+    assert "18.2" in canary
+    flattened = " ".join(canary.split())
+    assert "доказательством не является" in flattened
+    assert "не** PASS" in flattened or "не PASS" in flattened
+
+
+def test_the_canary_and_the_aggregate_preflight_are_both_required() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    assert "read-only" in flattened
+    assert "агрегат" in flattened
+    assert "нужны оба" in flattened
+
+
+def test_the_canary_lists_its_fail_closed_stop_conditions() -> None:
+    canary = _runbook_section(CANARY_TITLE)
+    flattened = " ".join(canary.split())
+    for required in (
+        "не найден",
+        "больше одной записи",
+        "snapshot_lines",
+        "Nagelservice",
+        "EASYWEEK_ALLOWED_SERVICE_CATEGORIES",
+        "ready=true",
+    ):
+        assert required in flattened, f"missing stop condition: {required}"
+    assert "rollback" in flattened.lower()
+
+
+def test_the_shared_send_fence_keeps_its_own_version_one_canary() -> None:
+    gate = _runbook_section(SEND_FENCE_TITLE)
+    # The shared send fence keeps its own PR-7.4 version 1 canary, and neither
+    # step may be described as changing the production allowlist.
+    assert "PR-7.4 send canary" in gate
+    assert "version 1" in gate
+    assert "send-canary не" in " ".join(gate.split())
+    for forbidden in (
+        "EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[",
+        'EASYWEEK_ALLOWED_SERVICE_CATEGORIES=["Nagelservice"]',
+    ):
+        assert forbidden not in RUNBOOK.read_text(encoding="utf-8")
+
+
+def test_the_runbook_never_asks_to_allow_the_suppressed_category() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("EASYWEEK_ALLOWED_SERVICE_CATEGORIES"):
+            raise AssertionError(f"runbook assigns the category allowlist: {stripped}")
+
+
+def test_env_example_exposes_the_third_closed_fence() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false") == 1
+
+
+def test_both_services_that_read_the_new_fence_are_documented_in_compose() -> None:
+    text = COMPOSE.read_text(encoding="utf-8")
+    assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED") == 2

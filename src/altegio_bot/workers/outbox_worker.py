@@ -52,14 +52,23 @@ from altegio_bot.easyweek_branches import (
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import EasyWeekLocation, configured_easyweek_locations
 from altegio_bot.easyweek_multi_service import (
+    MULTI_SERVICE_API_UNAVAILABLE,
+    MULTI_SERVICE_CATALOG_UNAVAILABLE,
     MULTI_SERVICE_DISABLED,
     MULTI_SERVICE_JOB_DIGEST_KEY,
+    MULTI_SERVICE_JOB_VERSION_KEY,
+    MULTI_SERVICE_RESOURCE_SHADOW_DISABLED,
     MULTI_SERVICE_SEND_DISABLED,
+    MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH,
     MULTI_SERVICE_SNAPSHOT_MISSING,
+    MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
+    LiveSnapshotVerdict,
     MultiServiceSnapshot,
     ServiceEligibilityPurpose,
     evaluate_service_eligibility,
     resolve_effective_multi_service_snapshot,
+    snapshot_requires_live_proof,
+    verify_live_multi_service_snapshot,
 )
 from altegio_bot.easyweek_normalizer import extract_manage_link, normalize_booking_hash_id
 from altegio_bot.easyweek_policy import (
@@ -666,6 +675,27 @@ def _easyweek_multi_service_fence_reason() -> str | None:
     return None
 
 
+def _easyweek_resource_shadow_fence_reason() -> str | None:
+    """PR-7.5 fence, which holds ONLY resource-aware (version 2) pair jobs.
+
+    Deliberately separate from the two PR-7.4 fences: closing it must not touch
+    an ordinary Durlach/Rastatt pair job, and reopening it must not imply
+    permission to send. A held job keeps `queued`, its `run_at` and zero
+    attempts, exactly like the established fences above.
+    """
+    if not bool(settings.easyweek_resource_shadow_proof_enabled):
+        return MULTI_SERVICE_RESOURCE_SHADOW_DISABLED
+    return None
+
+
+def _claims_resource_shadow_pair(payload: object) -> bool:
+    """True when this job's immutable payload names the version 2 projection."""
+    return (
+        isinstance(payload, dict)
+        and payload.get(MULTI_SERVICE_JOB_VERSION_KEY) == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    )
+
+
 async def _lock_next_jobs(
     session: AsyncSession,
     batch_size: int,
@@ -708,6 +738,21 @@ async def _lock_next_jobs(
             & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_DIGEST_KEY)
         )
         stmt = stmt.where(~multi_rows)
+
+    # PR-7.5 send fence, narrower still: only jobs whose immutable payload names
+    # the version 2 resource-aware projection. Version 1 pair jobs, single
+    # service jobs and every Altegio job stay claimable.
+    if _easyweek_resource_shadow_fence_reason() is not None:
+        resource_rows = (
+            (MessageJob.provider == PROVIDER_EASYWEEK)
+            & (MessageJob.job_type.in_(EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES))
+            & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_VERSION_KEY)
+            & (
+                MessageJob.payload[MULTI_SERVICE_JOB_VERSION_KEY].astext
+                == str(MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION)
+            )
+        )
+        stmt = stmt.where(~resource_rows)
 
     # PR-9 send fence, the same shape and for the same reason: with the fence
     # shut an EasyWeek review is not claimed AT ALL, so it keeps its `queued`
@@ -1718,6 +1763,60 @@ async def _run_easyweek_reminder_guard(job: MessageJob, record: Record | None) -
             record=record,
             location=location,
             client=client,
+        )
+    finally:
+        await client.aclose()
+
+
+async def _run_easyweek_live_service_guard(
+    job: MessageJob,
+    record: Record | None,
+    snapshot: MultiServiceSnapshot,
+) -> LiveSnapshotVerdict:
+    """Re-prove a resource-aware pair against the live booking and catalogue.
+
+    PR-7.5 reached its projection through a static, owner-controlled service
+    table, so §38.3 requires the live booking, the full live catalogue and the
+    current contract to agree again before the FIRST provider attempt and before
+    every delivery retry.  Reminders already do this inside their own guard,
+    which reads the booking once; lifecycle jobs had no live read at all and
+    could reach Meta on ``Record.raw`` alone.  This closes exactly that.
+
+    Deliberately narrower than the reminder guard: it judges the SERVICES, not
+    the status or the start time.  ``record_canceled`` is the one lifecycle
+    message that legitimately describes a cancelled booking, and the existing
+    deleted-record guard already owns that decision.
+
+    Like the reminder guard, the GET-only client is built and closed per
+    attempt, so nothing long-lived holds the API key.
+    """
+    location, _profile, _err = _easyweek_owned_branch(job.company_id)
+    if location is None:
+        return LiveSnapshotVerdict(MULTI_SERVICE_CATALOG_UNAVAILABLE, recoverable=True)
+    owned_location_uuid = _canonical_uuid_or_none(location.location_uuid)
+    if owned_location_uuid is None or snapshot.location_uuid != str(owned_location_uuid):
+        return LiveSnapshotVerdict(MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH)
+
+    try:
+        client = EasyWeekClient()
+    except Exception as exc:  # noqa: BLE001 — mapped by class, text never kept
+        # Reuse the established typed mapping so a missing key, a 401 or a
+        # timeout keeps its recoverable/terminal meaning; only the PII-free
+        # reason code is multi-service scoped.
+        return LiveSnapshotVerdict(MULTI_SERVICE_API_UNAVAILABLE, classify_client_error(exc).recoverable)
+
+    try:
+        try:
+            booking_payload = await client.get_booking(snapshot.booking_uuid)
+        except Exception as exc:  # noqa: BLE001 — mapped by class, text never kept
+            return LiveSnapshotVerdict(MULTI_SERVICE_API_UNAVAILABLE, classify_client_error(exc).recoverable)
+        return await verify_live_multi_service_snapshot(
+            client=client,
+            booking_payload=booking_payload,
+            snapshot=snapshot,
+            location_uuid=location.location_uuid,
+            record_total_cost=getattr(record, "total_cost", None),
+            company_id=getattr(record, "company_id", None),
         )
     finally:
         await client.aclose()
@@ -3274,7 +3373,9 @@ async def _run_job_logic(
     payload = job.payload if isinstance(job.payload, dict) else {}
     claims_multi_service = MULTI_SERVICE_JOB_DIGEST_KEY in payload
     effective_multi_service_snapshot: MultiServiceSnapshot | None = None
-    multi_service_fence_reason = _easyweek_multi_service_fence_reason()
+    multi_service_fence_reason = _easyweek_multi_service_fence_reason() or (
+        _easyweek_resource_shadow_fence_reason() if _claims_resource_shadow_pair(payload) else None
+    )
     if (
         claims_multi_service
         and job_provider == PROVIDER_EASYWEEK
@@ -3781,6 +3882,47 @@ async def _run_job_logic(
                     job.company_id,
                     record.id,
                     guard.outcome.value,
+                )
+                return None
+
+        # PR-7.5: the same mandatory live proof for a resource-aware LIFECYCLE
+        # job. The reminder guard above already re-proved the pair on the single
+        # booking read it makes, so this runs only for the lifecycle types it
+        # does not cover, and never for a version 1 pair or a single service.
+        #
+        # Same position and same reason as the guard above: after every local
+        # proof and the category decision, before the phone, the template, the
+        # rendered body, `attempts += 1`, Meta, Chatwoot and any Outbox row.
+        elif job.job_type in EASYWEEK_LIFECYCLE_JOB_TYPES and snapshot_requires_live_proof(
+            effective_multi_service_snapshot
+        ):
+            # Non-None by construction: `snapshot_requires_live_proof` is False
+            # for None.
+            assert effective_multi_service_snapshot is not None
+            verdict = await _run_easyweek_live_service_guard(job, record, effective_multi_service_snapshot)
+            if not verdict.proven:
+                reason = verdict.reason or MULTI_SERVICE_SNAPSHOT_DIGEST_MISMATCH
+                if verdict.recoverable:
+                    requeued = _defer_easyweek_configuration(job, record, reason)
+                    logger.info(
+                        "EasyWeek lifecycle live service proof unavailable job_id=%s company_id=%s "
+                        "record_id=%s reason=%s outcome=%s",
+                        job.id,
+                        job.company_id,
+                        record.id,
+                        reason,
+                        "queued" if requeued else "deadline_canceled",
+                    )
+                    return None
+                job.status = "canceled"
+                job.locked_at = None
+                job.last_error = reason
+                logger.info(
+                    "EasyWeek lifecycle pair refused before send job_id=%s company_id=%s record_id=%s reason=%s",
+                    job.id,
+                    job.company_id,
+                    record.id,
+                    reason,
                 )
                 return None
 

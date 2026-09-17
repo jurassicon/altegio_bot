@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot import easyweek_multi_service, easyweek_reminder_guard
+from altegio_bot.scripts import easyweek_multi_service_preflight as preflight
 from altegio_bot.settings import Settings, settings
 from altegio_bot.workers import easyweek_inbox_worker as worker
 from altegio_bot.workers import outbox_worker
@@ -175,6 +177,7 @@ def test_env_example_documents_every_new_flag() -> None:
         "EASYWEEK_NOTIFICATIONS_ENABLED",
         "EASYWEEK_ALLOWED_SERVICE_CATEGORIES",
         "EASYWEEK_LOCATION_MAP",
+        "EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED",
     ):
         assert key in text, f"{key} is undocumented in easyweek.env.example"
 
@@ -185,6 +188,7 @@ def test_env_example_ships_fail_closed_values() -> None:
     assert "EASYWEEK_NOTIFICATIONS_ENABLED=false" in text
     assert "EASYWEEK_ALLOWED_SERVICE_CATEGORIES=[]" in text
     assert "EASYWEEK_LOCATION_MAP={}" in text
+    assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false") == 1
     assert "EASYWEEK_LOCATION_ID" not in text
     assert "EASYWEEK_LOCATION_UUID" not in text
     assert "EASYWEEK_BOOKING_PAGE_URL" not in text
@@ -192,7 +196,7 @@ def test_env_example_ships_fail_closed_values() -> None:
 
 def test_env_example_carries_no_real_secrets_or_production_values() -> None:
     text = ENV_EXAMPLE.read_text()
-    for value in ("305156", "308697", "315607", "a02a61bf", "b9d689f2", "cd91816d"):
+    for value in ("305156", "308697", "315607", "322579", "a02a61bf", "b9d689f2", "cd91816d", "8395fab6"):
         assert value not in text, "a real location identity must not be committed"
 
     assignments = {
@@ -251,6 +255,60 @@ def test_outbox_worker_reads_env_and_optional_easyweek_env() -> None:
 def test_both_category_guard_consumers_read_the_shared_setting() -> None:
     assert "settings.easyweek_allowed_service_categories" in inspect.getsource(worker)
     assert "settings.easyweek_allowed_service_categories" in inspect.getsource(outbox_worker)
+
+
+# ===========================================================================
+# PR-7.5 resource-shadow kill switch
+# ===========================================================================
+
+
+def test_the_resource_shadow_fence_defaults_to_off() -> None:
+    assert Settings.model_fields["easyweek_resource_shadow_proof_enabled"].default is False
+
+
+def test_the_resource_shadow_fence_is_read_through_one_shared_resolver() -> None:
+    """Inbox, preflight and send-time guard must not grow separate opinions.
+
+    Exactly one module decides whether the narrow path is open, and everything
+    that PROVES a pair goes through it.  The outbox worker and the preflight
+    read the flag for a different question — whether an already planned version
+    2 job is legitimately held — which is a queue decision, not a second proof.
+    """
+    assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(easyweek_multi_service)
+    assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(outbox_worker)
+    assert "easyweek_resource_shadow_proof_enabled" in inspect.getsource(preflight)
+    for module in (worker, easyweek_reminder_guard, preflight, outbox_worker):
+        source = inspect.getsource(module)
+        # No consumer may carry its own copy of the static service table.
+        assert "KARLSRUHE" not in source
+        assert "resolve_resource_shadow_contract" not in source
+        assert (
+            "prove_exactly_two_service_snapshot" in source
+            or "fetch_and_prove" in source
+            or "verify_live_multi_service_snapshot" in source
+        )
+
+
+def test_both_send_paths_reuse_the_one_live_pair_verifier() -> None:
+    """Reminders and lifecycle jobs must not form separate live opinions.
+
+    PR-7.5 requires a version 2 projection to be re-proved against the live
+    booking, the full live catalogue and the current contract before every
+    provider attempt. Both send paths go through the same helper, so neither
+    can be relaxed without the other.
+    """
+    for module in (easyweek_reminder_guard, outbox_worker):
+        assert "verify_live_multi_service_snapshot" in inspect.getsource(module)
+    assert "snapshot_requires_live_proof" in inspect.getsource(outbox_worker)
+
+
+def test_both_resource_shadow_consumers_are_recreated_together() -> None:
+    """The flag is documented on the two services that actually read it."""
+    compose_text = COMPOSE_FILE.read_text()
+    assert compose_text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED") == 2
+    for service in (WORKER_SERVICE, "altegio-outbox-worker"):
+        env_file = _compose()["services"][service]["env_file"]
+        assert {"path": "easyweek.env", "required": False} in env_file
 
 
 @pytest.mark.parametrize(

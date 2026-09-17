@@ -251,3 +251,322 @@ review/retention/campaign. Если нужно также остановить �
 отдельно вернуть `EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=false` и
 пересоздать inbox и outbox. Rollback не удаляет records, jobs, snapshot или
 apply report; их судьба — отдельное операторское решение.
+
+---
+
+# PR-7.5 — Karlsruhe resource-shadow proof: rollout и rollback
+
+Эта часть добавляет **третий независимый fence**
+`EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED`. Он не расширяет контракт двух услуг,
+не меняет `EASYWEEK_ALLOWED_SERVICE_CATEGORIES`, не включает отправку и не
+трогает Durlach, Rastatt и Altegio. Единственная его задача — позволить общему
+PR-7.4 proof распознать техническую resource-строку одного owner-approved
+статического контракта Karlsruhe, чтобы 16 записей перестали быть
+`multi_service_duplicate_ambiguous` и дошли до обычной all-categories
+eligibility.
+
+Ожидаемый результат для этих записей — `multi_service_category_not_allowed`.
+Это доказанное безопасное подавление, а не разрешение отправлять `Nagelservice`.
+
+## 13. Deploy: новый fence закрыт
+
+До пересоздания контейнеров проверить в `easyweek.env`:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false
+```
+
+При `false` поведение полностью совпадает с текущим PR-7.4: те же snapshot v1,
+те же digests, те же jobs, те же fail-closed причины.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot config --quiet
+docker compose -p altegio_bot up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+## 14. Проверка code/profile/catalog contract до открытия fence
+
+Статический контракт лежит в коде (`easyweek_resource_shadow_contract.py`) и
+проверяется в diff владельцем. Он ограничен `provider=easyweek`,
+`company_id=322579` и location UUID `8395fab6-7ee8-4702-88d9-fd78f92539c1`;
+catalog UUID не хардкодятся и разрешаются заново по точному имени в полном
+живом каталоге.
+
+Сверить точную таблицу и revision в diff, затем убедиться, что живой каталог
+отдаёт каждое имя ровно один раз и с категорией `Nagelservice`:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+При закрытом fence этот прогон обязан по-прежнему показывать стабильную
+причину `multi_service_duplicate_ambiguous` и `ready=false`. Отсутствие
+изменений здесь — и есть доказательство, что deploy ничего не поменял.
+
+## 15. Открыть ТОЛЬКО resource-shadow fence
+
+Send fence остаётся закрытым:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+`docker compose restart` не перечитывает `env_file`, поэтому используется
+`up -d --force-recreate` обоих сервисов: planning читает флаг в inbox, а общий
+outbox читает его же для удержания resource-aware jobs.
+
+## 16. Повторный multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+Ожидаемый наблюдённый baseline — ориентир для этого rollout, а не хардкод:
+
+```text
+active_multi_service=17
+checked=17
+structurally_proven=17
+allowed=0
+disallowed_by_category=17
+contract_excluded=0
+ambiguous=0
+stale_snapshot_digest=0
+unexplained=0
+truncated=false
+ready=true
+```
+
+Ключевой переход — `ambiguous=16 → 0` при `allowed=0`. Если `allowed` перестал
+быть нулём, остановиться: это означало бы изменение category allowlist, которое
+данный PR не разрешает.
+
+## 17. Ожидаемое category suppression
+
+Для всех Karlsruhe записей корректный исход — `multi_service_category_not_allowed`.
+Проверить, что ни одна из них не получила обязательств:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot exec -T postgres sh -lc \
+  'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+\pset pager off
+SELECT j.status, count(*)
+FROM message_jobs j
+JOIN records r ON r.id = j.record_id
+WHERE j.provider = 'easyweek' AND r.company_id = 322579
+GROUP BY j.status ORDER BY j.status;
+SQL
+```
+
+Новых `queued` lifecycle/reminder jobs у этих записей быть не должно, равно как
+и новых `OutboxMessage` и Meta/Chatwoot attempts.
+
+## 18. Controlled suppression canary
+
+Это **suppression canary**, а не send canary. Любая настоящая version 2
+проекция состоит только из услуг статического Karlsruhe-контракта, а все они
+относятся к категории `Nagelservice`, которой нет в production allowlist.
+Значит корректно доказанная resource-shadow запись обязана завершиться
+`multi_service_category_not_allowed` и не может создать job — ожидать здесь
+queued job или клиентский рендер означало бы временно разрешить `Nagelservice`,
+что запрещено §38.6.
+
+### 18.1 Зафиксировать exact identity canary booking
+
+Создать одну контролируемую будущую Karlsruhe booking ровно из двух разных
+услуг контракта, одна из которых resource-backed (например
+`Pediküre mit Gel-Lack`), и **выписать точный booking UUID этой записи** до
+любой диагностики.
+
+Дальше весь canary привязан только к этому UUID. В реальном филиале между
+созданием booking и запросом появляются другие записи, поэтому запрещено
+искать canary по «последним записям», `ORDER BY ... LIMIT`, имени клиента,
+телефону, времени без UUID или ручным визуальным сопоставлением нескольких
+строк: любой более старый resource-shadow Record с `jobs = 0` и `outbox = 0`
+дал бы ложноположительный результат.
+
+### 18.2 Identity-bound проверка Record
+
+Подставить выписанный UUID в первую строку и выполнить блок целиком. UUID
+передаётся как значение psql-переменной (`:'canary'`), а не склейкой SQL.
+
+Первый запрос — жёсткая проверка identity: если по полному
+`provider` + `company_id` + `easyweek_booking_uuid` найдено не ровно одна
+запись, он падает с делением на ноль, и `ON_ERROR_STOP=1` останавливает весь
+блок до печати деталей.
+
+```bash
+cd /opt/altegio_bot
+CANARY_BOOKING_UUID='PASTE-CANARY-BOOKING-UUID-HERE'
+docker compose -p altegio_bot exec -T \
+  -e CANARY_BOOKING_UUID="$CANARY_BOOKING_UUID" postgres sh -lc \
+  'psql -X -v ON_ERROR_STOP=1 -v canary="$CANARY_BOOKING_UUID" -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+\pset pager off
+SELECT 1 / (count(*) = 1)::int AS exactly_one_canary_record
+FROM records
+WHERE provider = 'easyweek'
+  AND company_id = 322579
+  AND easyweek_booking_uuid = :'canary'::uuid;
+
+SELECT r.id                                                              AS record_id,
+       r.company_id                                                      AS company_id,
+       r.easyweek_booking_uuid                                           AS booking_uuid,
+       r.raw #>> '{easyweek,services_count}'                             AS services_count,
+       r.raw #>> '{easyweek,multi_service_snapshot,version}'             AS snapshot_version,
+       r.raw #>> '{easyweek,multi_service_snapshot,digest}'              AS snapshot_digest,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,proof_kind}'       AS proof_kind,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,contract_revision}' AS contract_revision,
+       r.raw #>> '{easyweek,multi_service_snapshot,resource_shadow_proof,contract_digest}'   AS contract_digest,
+       jsonb_array_length(r.raw #> '{easyweek,multi_service_snapshot,lines}')                AS snapshot_lines,
+       r.raw #>> '{easyweek,multi_service_snapshot,lines,0,category}'    AS line_1_category,
+       r.raw #>> '{easyweek,multi_service_snapshot,lines,1,category}'    AS line_2_category,
+       (SELECT count(*) FROM message_jobs j WHERE j.record_id = r.id)    AS jobs,
+       (SELECT count(*) FROM outbox_messages o WHERE o.record_id = r.id) AS outbox
+FROM records r
+WHERE r.provider = 'easyweek'
+  AND r.company_id = 322579
+  AND r.easyweek_booking_uuid = :'canary'::uuid;
+SQL
+```
+
+Запрос печатает только технические поля. Имя клиента, телефон, e-mail, notes,
+ссылки и любые другие PII в вывод не попадают.
+
+Ожидаемый результат — ровно одна строка, и в ней одновременно:
+
+```text
+services_count    = 2
+snapshot_version  = 2
+proof_kind        = karlsruhe_resource_shadow
+contract_revision = <текущая revision из easyweek_resource_shadow_contract.py>
+contract_digest   = <непустой 64-символьный hex>
+snapshot_lines    = 2
+line_1_category   = Nagelservice
+line_2_category   = Nagelservice
+jobs              = 0
+outbox            = 0
+```
+
+### 18.3 Suppression reason того же Record
+
+Взять `record_id` из §18.2 — не из журнала, не «на глаз» — и проверить, что
+именно для него inbox worker записал точный стабильный reason:
+
+```bash
+cd /opt/altegio_bot
+CANARY_RECORD_ID='PASTE-CANARY-RECORD-ID-FROM-18.2-HERE'
+docker compose -p altegio_bot logs --no-color --since 24h \
+  altegio-easyweek-inbox-worker \
+  | grep -E "record_id=${CANARY_RECORD_ID}[^0-9].*reason=multi_service_category_not_allowed"
+```
+
+Требуется хотя бы одна строка `easyweek lifecycle suppressed` или
+`easyweek reminders suppressed`, содержащая одновременно точный
+`record_id=<canary record_id>` и точный
+`reason=multi_service_category_not_allowed`.
+
+Строка `category_not_allowed` без этого `record_id` доказательством не
+является: она может относиться к любой другой из 17 записей. Пустой вывод
+grep — это **не** PASS, а STOP.
+
+### 18.4 Structural proof остаётся отдельной проверкой
+
+Общий preflight из §16 read-only и печатает только агрегаты. Он доказывает,
+что во всём scope нет `ambiguous` и `unexplained`, но не доказывает, что
+конкретная canary booking — та самая запись, которая стала
+`structurally_proven`. Identity-bound запрос из §18.2 доказывает обратное:
+именно этот Record получил version 2 snapshot и ноль обязательств, но ничего
+не говорит об остальном scope.
+
+Это разные утверждения, и нужны оба: агрегатный preflight `ready=true` **и**
+зелёный identity-bound canary.
+
+### 18.5 Fail-closed условия остановки rollout
+
+Rollout останавливается, если верно хотя бы одно:
+
+- exact canary Record не найден;
+- найдено больше одной записи по полному identity;
+- `multi_service_snapshot` отсутствует или `snapshot_version` не равен `2`;
+- отсутствуют `proof_kind`, `contract_revision` или `contract_digest`;
+- `proof_kind` не равен `karlsruhe_resource_shadow`;
+- `contract_revision` не совпадает с текущей revision в коде;
+- `snapshot_lines` не равен `2`;
+- хотя бы одна из `line_1_category` / `line_2_category` не `Nagelservice`;
+- `jobs` или `outbox` больше нуля;
+- в логах нет строки с exact `record_id` и
+  `reason=multi_service_category_not_allowed`;
+- `EASYWEEK_ALLOWED_SERVICE_CATEGORIES` изменился;
+- preflight из §16 не `ready=true` либо canary остаётся `ambiguous`.
+
+При любом из этих условий выполнить rollback из §19 и не открывать общий send
+fence.
+
+Runtime rendering и фактическая отправка version 2 пары доказываются
+автоматизированными integration-тестами
+(`test_open_fences_render_a_resource_shadow_pair_once_each_with_one_total`,
+`test_a_v2_reminder_makes_exactly_one_live_proof_not_two`), а не production-
+процедурой: воспроизводить их на проде потребовало бы временно разрешить
+`Nagelservice`, чего этот PR не допускает.
+
+## 19. Rollback нового fence
+
+При любой аномалии закрыть сначала именно новый fence:
+
+```dotenv
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=false
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot up -d --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+docker compose -p altegio_bot ps altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+Уже созданные resource-aware jobs (snapshot version 2) остаются `queued`, не
+расходуют attempts и не вызывают внешние сервисы. Обычные Durlach/Rastatt пары
+версии 1, single-service и Altegio продолжают работать без изменений: новый
+fence их не касается.
+
+## 20. Запрет на открытие общего send fence
+
+`EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true` запрещено включать, пока
+одновременно не зелёные все три выполнимые проверки:
+
+1. multi-service preflight (`ready=true`) из §16;
+2. общий reminder preflight (`ready=true`) из §7;
+3. существующий PR-7.4 send canary из §8 — на разрешённой категории и обычной
+   version 1 паре.
+
+Пункт 3 намеренно остаётся PR-7.4 canary версии 1: он и есть проверка общего
+send fence. Suppression canary из §18 к нему не относится и send-canary не
+является. Открытие общего send fence не требует и не разрешает менять
+`EASYWEEK_ALLOWED_SERVICE_CATEGORIES`: ни один из этих шагов не добавляет
+`Nagelservice` в allowlist.
+
+Отдельно: шесть `deadline_expired` reminder jobs `13934`–`13939` — это
+операторское rollout-состояние, а не дефект resource-shadow. Данный PR их не
+восстанавливает, не отменяет и не отправляет; их судьба требует отдельного
+операторского решения вне этого PR и не является условием его завершения.

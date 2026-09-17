@@ -96,6 +96,8 @@ services:
   # PR-7.4 reads BOTH multi-service flags here: the shared outbox re-checks the
   # planning authority and the independent send fence before a digest-bound
   # lifecycle/reminder job can be claimed or reach any provider call.
+  # PR-7.5 adds EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED, read here too: closed,
+  # it holds ONLY resource-aware (snapshot version 2) pair jobs.
   #
   # This service is also the base image for the one-off review preflight
   # (`run --rm --no-deps --entrypoint /app/.venv/bin/python
@@ -201,6 +203,9 @@ services:
   # altegio-outbox-worker instead — recreate that one when flipping it.
   # PR-7.4: this service reads EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED;
   # the outbox worker reads EASYWEEK_MULTI_SERVICE_SEND_ENABLED.
+  # PR-7.5: EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED is read HERE (planning) and
+  # by altegio-outbox-worker (send-time re-proof and the version 2 hold), so
+  # both services must be recreated when it changes.
   #
   # PR-9: likewise EASYWEEK_REVIEWS_ENABLED (review PLANNING) is read here;
   # its send fence EASYWEEK_REVIEW_SEND_ENABLED belongs to the outbox worker.

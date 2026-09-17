@@ -622,6 +622,20 @@ class Settings(BaseSettings):
     easyweek_multi_service_notifications_enabled: bool = False
     easyweek_multi_service_send_enabled: bool = False
 
+    # --- PR-7.5: Karlsruhe resource-shadow proof -------------------------
+    # A third, independent default-false kill switch. It widens NOTHING on its
+    # own: it only lets the shared proof recognise the one owner-approved
+    # Karlsruhe contract's technical resource row, so bookings that today fail
+    # closed as `multi_service_duplicate_ambiguous` reach ordinary category
+    # eligibility instead. With it false every path behaves exactly as PR-7.4,
+    # and no location, workspace or job value can widen a global false.
+    #
+    # It is read by the EasyWeek inbox worker (planning), the read-only
+    # preflight, the operator recovery tool and the shared outbox worker, which
+    # additionally HOLDS an already planned resource-aware job — queued, zero
+    # attempts, no Meta/Chatwoot — while this flag is closed.
+    easyweek_resource_shadow_proof_enabled: bool = False
+
     # --- PR-9: review_3d --------------------------------------------------
     # Same two-flag shape as PR-8, and for the same reason: planning and sending
     # are turned on at different points in the rollout.

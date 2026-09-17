@@ -25,10 +25,18 @@ import altegio_bot.db as app_db
 from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_SNAPSHOT_KEY,
+    MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
+    MULTI_SERVICE_SNAPSHOT_VERSION,
     clear_multi_service_catalog_cache,
     multi_service_snapshot_from_record_raw,
 )
 from altegio_bot.easyweek_normalizer import NormalizationError, canonical_booking_uuid
+from altegio_bot.easyweek_resource_shadow_contract import (
+    KARLSRUHE_COMPANY_ID,
+    KARLSRUHE_LOCATION_UUID,
+    KARLSRUHE_NUMERIC_SERVICE_NAMES,
+    KARLSRUHE_SERVICE_CATEGORY,
+)
 from altegio_bot.easyweek_review import easyweek_review_dedupe_key
 from altegio_bot.easyweek_service_category import (
     EASYWEEK_RAW_NAMESPACE,
@@ -5945,3 +5953,234 @@ async def test_transitions_two_to_one_and_to_another_pair_update_the_proof(
         record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
         new_snapshot = multi_service_snapshot_from_record_raw(record.raw)[0]
     assert new_snapshot is not None and new_snapshot.digest != first_digest.digest
+
+
+# ===========================================================================
+# PR-7.5 Karlsruhe resource-shadow planning contract
+#
+# Same worker, same resolver, one extra default-false fence.  The proven pair
+# is Nagelservice, so the correct end state is a persisted structural proof and
+# ZERO MessageJob rows — the fix is safe suppression, not nail notifications.
+# ===========================================================================
+
+KARLSRUHE_SHELLAC = "Maniküre mit Gel-Lack / Shellac"
+KARLSRUHE_PEDIKUERE_GEL = "Pediküre mit Gel-Lack"
+KARLSRUHE_SHELLAC_ID = 1030234
+_KARLSRUHE_PRICES = {KARLSRUHE_SHELLAC: 4200, KARLSRUHE_PEDIKUERE_GEL: 5100}
+_KARLSRUHE_TOTAL = sum(_KARLSRUHE_PRICES.values())
+
+
+def _karlsruhe_location_map() -> str:
+    return json.dumps(
+        {
+            "test-branch": {
+                "location_id": TEST_LOCATION_ID,
+                "location_uuid": TEST_LOCATION_UUID,
+                "meta_template_prefix": "tb",
+                "booking_page_url": "https://booking.example.invalid/test",
+            },
+            "karlsruhe": {
+                "location_id": KARLSRUHE_COMPANY_ID,
+                "location_uuid": KARLSRUHE_LOCATION_UUID,
+                "meta_template_prefix": "ka",
+                "booking_page_url": "https://booking.example.invalid/karlsruhe",
+            },
+        }
+    )
+
+
+def _karlsruhe_webhook() -> dict[str, Any]:
+    payload = _multi_webhook(first=KARLSRUHE_SHELLAC, second=KARLSRUHE_PEDIKUERE_GEL, total_minor=_KARLSRUHE_TOTAL)
+    payload["location_id"] = KARLSRUHE_COMPANY_ID
+    payload["location_uuid"] = KARLSRUHE_LOCATION_UUID
+    payload["service_id"] = KARLSRUHE_SHELLAC_ID
+    payload["service_category"] = KARLSRUHE_SERVICE_CATEGORY
+    return payload
+
+
+def _karlsruhe_booking() -> dict[str, Any]:
+    rows = []
+    for index, name in enumerate([KARLSRUHE_SHELLAC, KARLSRUHE_PEDIKUERE_GEL, KARLSRUHE_PEDIKUERE_GEL]):
+        row = _multi_line(
+            line_uuid=f"6000000{index}-0000-4000-8000-000000000001",
+            name=name,
+            price=_KARLSRUHE_PRICES[name],
+            duration=60,
+        )
+        # A technical API field the proof does not model; it differs between
+        # the pedicure row and its resource copy.
+        row["resource"] = {"uuid": f"6100000{index}-0000-4000-8000-000000000001"}
+        rows.append(row)
+    return {
+        "uuid": TEST_BOOKING_UUID,
+        "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "currency": "EUR",
+        "order": {"subtotal": _KARLSRUHE_TOTAL, "total": _KARLSRUHE_TOTAL},
+        "ordered_services": rows,
+    }
+
+
+def _karlsruhe_catalog() -> list[dict[str, Any]]:
+    return [
+        _catalog_row(
+            service_uuid=f"aaaaaaaa-aaaa-4aaa-8aaa-{index:012d}",
+            name=name,
+            price=_KARLSRUHE_PRICES.get(name, 3000),
+            duration=60,
+            category=KARLSRUHE_SERVICE_CATEGORY,
+        )
+        for index, name in enumerate(sorted(KARLSRUHE_NUMERIC_SERVICE_NAMES.values()))
+    ]
+
+
+class _KarlsruheReader(_MultiReader):
+    async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        assert (location_uuid, page) == (KARLSRUHE_LOCATION_UUID, 1)
+        return {
+            "data": self.catalog,
+            "meta": {"current_page": 1, "last_page": 1, "total": len(self.catalog)},
+        }
+
+
+def _enable_karlsruhe_planning(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resource_shadow_enabled: bool,
+    allowed_categories: list[str] | None = None,
+    booking: dict[str, Any] | None = None,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", _karlsruhe_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "easyweek_resource_shadow_proof_enabled",
+        resource_shadow_enabled,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        settings,
+        "easyweek_allowed_service_categories",
+        json.dumps(allowed_categories if allowed_categories is not None else ["Fixture Category"]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker,
+        "EasyWeekClient",
+        lambda: _KarlsruheReader(booking if booking is not None else _karlsruhe_booking(), _karlsruhe_catalog()),
+    )
+
+
+async def test_karlsruhe_resource_shadow_is_proven_but_suppressed_by_category(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_karlsruhe_planning(monkeypatch, resource_shadow_enabled=True)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_karlsruhe_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="karlsruhe-resource-shadow",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+
+    snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and snapshot is not None
+    assert [line.display_name for line in snapshot.lines] == [KARLSRUHE_SHELLAC, KARLSRUHE_PEDIKUERE_GEL]
+    assert snapshot.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert snapshot.total_minor == _KARLSRUHE_TOTAL
+    # The whole point of PR-7.5: a Nagelservice pair reaches eligibility and is
+    # suppressed there, so no customer-facing obligation is ever created.
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
+async def test_karlsruhe_resource_shadow_stays_unproven_while_the_fence_is_closed(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_karlsruhe_planning(monkeypatch, resource_shadow_enabled=False)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_karlsruhe_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="karlsruhe-resource-shadow-fenced",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        event = (await session.execute(select(EasyWeekEvent))).scalars().one()
+
+    # Fail-closed exactly as PR-7.4 does today: no snapshot, no job, and the
+    # event is still processed rather than stuck.
+    assert MULTI_SERVICE_SNAPSHOT_KEY not in record.raw.get(EASYWEEK_RAW_NAMESPACE, {})
+    assert event.status == "processed"
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
+async def test_karlsruhe_resource_shadow_plans_digest_bound_jobs_when_the_category_is_allowed(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The structural proof is complete, which is what category suppression hides.
+
+    This is the only place the suite allows `Nagelservice`, and it exists to
+    prove that the suppression above is a category decision.  Production keeps
+    its own allowlist unchanged.
+    """
+    _enable_karlsruhe_planning(
+        monkeypatch,
+        resource_shadow_enabled=True,
+        allowed_categories=[KARLSRUHE_SERVICE_CATEGORY],
+    )
+    await _capture_and_process(
+        bound_session_local,
+        _in(_karlsruhe_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="karlsruhe-resource-shadow-allowed",
+    )
+
+    jobs = await _easyweek_jobs(bound_session_local)
+    assert {job.job_type for job in jobs} == {"record_created", "reminder_24h", "reminder_2h"}
+    versions = {job.payload.get("multi_service_snapshot_version") for job in jobs}
+    digests = {job.payload.get(MULTI_SERVICE_JOB_DIGEST_KEY) for job in jobs}
+    assert versions == {MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION}
+    assert len(digests) == 1 and None not in digests
+
+
+async def test_the_durlach_incident_pair_keeps_working_on_the_version_one_path(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Mascara Effekt` + `Augenbrauen zupfen und färben`, with the fence open.
+
+    The confirmed Durlach booking was never rejected; PR-7.5 must not move it
+    onto a new snapshot version or make it depend on the new switch.
+    """
+    first, second = "Mascara Effekt", "Augenbrauen zupfen und färben"
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    _enable_multi_planning(
+        monkeypatch,
+        booking=_multi_booking(first=first, second=second),
+        catalog=_multi_catalog(first=first, second=second),
+    )
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(first=first, second=second), days=3),
+        event_hint="booking-created",
+        payload_hash="durlach-incident-pair",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+
+    snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and snapshot is not None
+    assert [line.display_name for line in snapshot.lines] == [first, second]
+    assert snapshot.version == MULTI_SERVICE_SNAPSHOT_VERSION
+    assert snapshot.resource_shadow_proof is None
+    jobs = await _easyweek_jobs(bound_session_local)
+    assert {job.job_type for job in jobs} == {"record_created", "reminder_24h", "reminder_2h"}
