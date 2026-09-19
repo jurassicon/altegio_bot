@@ -242,6 +242,11 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         # It is an ops-profile, restart:no one-off with a private report mount;
         # it has no EasyWeek mutation method and is never started by normal up.
         "easyweek-multi-service-reminder-recovery",
+        # PR-7.5 snapshot recovery must re-prove each booking and its full
+        # catalogue immediately before replacing one durable projection. Same
+        # ops-profile, restart:no one-off with a private mount; it creates no
+        # job and no outbox row and has no EasyWeek mutation method.
+        "easyweek-multi-service-snapshot-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

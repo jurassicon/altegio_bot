@@ -570,3 +570,224 @@ send fence. Suppression canary из §18 к нему не относится и 
 операторское rollout-состояние, а не дефект resource-shadow. Данный PR их не
 восстанавливает, не отменяет и не отправляет; их судьба требует отдельного
 операторского решения вне этого PR и не является условием его завершения.
+
+---
+
+# PR-7.5 — operator-only recovery старых snapshot version 1
+
+Этот раздел применяется **после** §§13–20, когда resource-shadow fence уже
+открыт и повторный multi-service preflight показал
+`stale_snapshot_digest > 0` при `ambiguous=0`.
+
+Причина такого состояния штатная: записи, доказанные до resource-shadow proof,
+хранят корректный snapshot version 1, а сегодняшний общий resolver доказывает
+для них version 2. §38.3 запрещает молча адаптировать старый snapshot — его
+меняет только отдельный операторский recovery, описанный ниже.
+
+Единственная мутация recovery — замена ровно одного JSONB-ключа
+`Record.raw.easyweek.multi_service_snapshot`. Ни MessageJob, ни OutboxMessage,
+ни Client, ни RecordService, ни другие ключи `Record.raw` не меняются, и ни
+одного обращения к Meta, Chatwoot или mutation API не выполняется.
+
+## 21. Deploy с закрытыми production-флагами
+
+Recovery выполняется на уже задеплоенном коде этой ветки. Send fence обязан
+оставаться закрытым:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+## 22. Проверка фактических значений флагов в обоих workers
+
+Проверяются значения внутри уже запущенных контейнеров, а не содержимое файла:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot exec -T altegio-easyweek-inbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED'
+docker compose -p altegio_bot exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED'
+```
+
+Требуется `true`, `false`, `true` в обоих сервисах. Любое другое сочетание —
+STOP: apply откажется и при открытом send fence, и при закрытом proof fence.
+
+## 23. Приватный каталог для plan и apply report
+
+```bash
+cd /opt/altegio_bot
+install -d -m 0700 outputs/easyweek_multi_service_recovery
+test "$(stat -c '%a' outputs/easyweek_multi_service_recovery)" = "700"
+```
+
+## 24. Read-only plan
+
+`plan` не меняет ни одной строки: он завершает сессию rollback, делает paced
+live GET booking и полного каталога, строит target snapshot общим production
+resolver и замораживает scope.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot --profile ops run --rm --build \
+  easyweek-multi-service-snapshot-recovery plan \
+  --plan /recovery/snapshot-plan.json \
+  --apply-report /recovery/snapshot-apply.json \
+  --limit 500 \
+  --pause-sec 1.10
+```
+
+Ожидаемый первый production baseline — ориентир, а не хардкод:
+
+```text
+candidates=5
+source_version_1=5
+target_version_2=5
+blocked=0
+truncated=false
+apply_ready=true
+```
+
+stdout содержит только агрегаты, стабильные reason codes и технические Record
+ID. Booking UUID есть только в приватном файле: его нельзя коммитить,
+публиковать или прикладывать к общедоступным тикетам.
+
+## 25. Проверка ожидаемых technical Record IDs
+
+```bash
+cd /opt/altegio_bot
+jq '{candidates, source_version_1, target_version_2, blocked, truncated,
+     apply_ready, migrate_record_ids, blocked_record_ids, reasons}' \
+  outputs/easyweek_multi_service_recovery/snapshot-plan.json 2>/dev/null \
+  || jq '{summary, records: [.records[] | {record_id, disposition, refusal_reason,
+          source_snapshot_version, target_snapshot_version}]}' \
+       outputs/easyweek_multi_service_recovery/snapshot-plan.json
+```
+
+`migrate_record_ids` обязан совпасть с независимо установленным read-only SQL
+списком. При любом лишнем или недостающем Record остановиться и разобраться, а
+не применять план.
+
+## 26. Получение plan digest
+
+```bash
+cd /opt/altegio_bot
+PLAN_DIGEST="$(jq -r '.plan_digest' outputs/easyweek_multi_service_recovery/snapshot-plan.json)"
+test "${#PLAN_DIGEST}" = "64"
+echo "${PLAN_DIGEST}"
+```
+
+## 27. Apply с exact digest и confirmation phrase
+
+Apply перечитывает frozen plan, проверяет его digest, заново выполняет полный
+live booking/catalog proof, сравнивает весь текущий scope с замороженным,
+проверяет configuration и contract digest и возраст плана, и только потом, в
+одной транзакции, блокирует точные Record строки через `FOR UPDATE`, ещё раз
+проверяет state digests и полное отсутствие jobs/outbox и заменяет один ключ.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot --profile ops run --rm --build \
+  easyweek-multi-service-snapshot-recovery apply \
+  --plan /recovery/snapshot-plan.json \
+  --apply-report /recovery/snapshot-apply.json \
+  --plan-digest "$PLAN_DIGEST" \
+  --confirm "migrate easyweek multi-service snapshots $PLAN_DIGEST" \
+  --pause-sec 1.10 \
+  --max-snapshot-age-sec 600
+```
+
+Любой drift откатывает **всю** волну: частично обновлённых Records не бывает.
+
+## 28. Verify
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot --profile ops run --rm --build \
+  easyweek-multi-service-snapshot-recovery verify \
+  --plan /recovery/snapshot-plan.json \
+  --apply-report /recovery/snapshot-apply.json \
+  --pause-sec 1.10
+```
+
+Требуется `passed=true` и пустые `missing_record_ids`,
+`snapshot_mismatch_record_ids`, `live_proof_mismatch_record_ids`,
+`non_target_raw_changed_record_ids`, `unexpected_job_ids`,
+`unexpected_outbox_ids`, `still_version_1_record_ids`, при `counts_match=true`.
+
+## 29. Повторный multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+## 30. Ожидаемый переход preflight
+
+Ключевой инвариант, а не точные динамические числа:
+
+```text
+stale_snapshot_digest: 5 -> 0
+unexplained:           5 -> 0
+ambiguous:                  0
+truncated:              false
+ready:          false -> true
+```
+
+`active_multi_service` и `structurally_proven` могут отличаться от прежних 18 и
+15 из-за живой очереди — сравнивать нужно инварианты, а не зафиксированные
+числа. Если `allowed` перестал быть нулём, остановиться: это означало бы
+изменение category allowlist, которое не разрешено.
+
+## 31. Rollback и fail-closed условия
+
+У recovery нет «отмены»: он заменяет корректный доказанный v1 на корректный
+доказанный v2, и обратная замена так же потребовала бы отдельного доказанного
+плана. Поэтому вся защита стоит **до** мутации. Остановиться и не применять
+план, если верно хотя бы одно:
+
+- `apply_ready` не `true` или `blocked` больше нуля;
+- `truncated` не `false`;
+- `migrate_record_ids` не совпал с ожидаемым списком;
+- флаги в контейнерах не `true` / `false` / `true`;
+- plan старше `--max-snapshot-age-sec`;
+- plan digest или confirmation phrase не совпали;
+- apply отказал с любым `scope_drift`, `record_state_changed`,
+  `job_state_changed`, `outbox_state_changed` или `configuration_digest_changed`;
+- verify вернул `passed=false`.
+
+При отказе apply никакие Records не изменены: достаточно устранить причину и
+выполнить новый `plan`.
+
+## 32. Запрет ручного SQL по Record.raw
+
+Ручные `UPDATE` или `DELETE` по `records.raw` запрещены. Такой снимок не
+проходит live proof, не имеет plan digest и не отражается в apply report, а
+send-time guard и preflight его немедленно отвергнут.
+
+## 33. Запрет повторного использования старого plan
+
+Plan одноразовый. После любого deploy, изменения конфигурации, изменения
+contract revision или любого drift старый `snapshot-plan.json` использовать
+нельзя: нужен новый `plan` и новый digest. Bounded max snapshot age существует
+именно для этого.
+
+## 34. Запрет открытия общего send fence
+
+`EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true` остаётся запрещённым и после
+успешного snapshot recovery. Он требует всех независимых rollout gates из §20,
+а также отдельного безопасного решения по шести `deadline_expired` reminder
+jobs `13934`–`13939`. Эти шесть jobs не входят в snapshot recovery: данный
+change их не отменяет, не восстанавливает и не отправляет.

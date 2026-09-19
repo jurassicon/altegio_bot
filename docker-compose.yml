@@ -461,6 +461,39 @@ services:
     profiles:
       - ops
 
+  # PR-7.5 operator-only migration of proven pair snapshots from version 1 to
+  # the current version 2 projection. Records proved before the Karlsruhe
+  # resource-shadow proof keep a correct version 1 snapshot, which the
+  # multi-service preflight rightly reports as a stale digest; §38.3 resolves
+  # that only through a separate operator recovery, and this is it.
+  #
+  # plan and verify are read-only. apply replaces exactly one JSONB key,
+  # Record.raw.easyweek.multi_service_snapshot, and can create no MessageJob
+  # and no OutboxMessage. The private mount keeps the UUID-bearing 0600 plan
+  # and apply report outside the container and under git-ignored outputs/.
+  easyweek-multi-service-snapshot-recovery:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_MULTI_SERVICE_RECOVERY_STATE_DIR:-./outputs/easyweek_multi_service_recovery}:/recovery
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_multi_service_snapshot_recovery",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:
