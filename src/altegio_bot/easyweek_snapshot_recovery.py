@@ -114,7 +114,7 @@ from altegio_bot.models.models import (
 from altegio_bot.settings import settings
 
 PLAN_VERSION: Final = 1
-APPLY_REPORT_VERSION: Final = 1
+APPLY_REPORT_VERSION: Final = 2
 
 # Dispositions.  Only MIGRATE is a mutation.
 MIGRATE: Final = "migrate"
@@ -131,6 +131,16 @@ CONTRACT_DRIFT: Final = "contract_drift"
 CATEGORY_NOW_ALLOWED: Final = "category_now_allowed"
 JOBS_PRESENT: Final = "message_jobs_present"
 OUTBOX_PRESENT: Final = "outbox_messages_present"
+# The stored version 1 must be the SAME booking and the SAME business pair as
+# the version 2 that would replace it.  Recovery may upgrade a projection; it
+# may never quietly rebind or rewrite one.
+SOURCE_IDENTITY_MISMATCH: Final = "source_snapshot_identity_mismatch"
+SOURCE_BUSINESS_MISMATCH: Final = "source_snapshot_business_mismatch"
+
+# Outcomes of one apply invocation against one frozen plan.
+OUTCOME_APPLIED: Final = "applied"
+OUTCOME_ALREADY_APPLIED: Final = "already_applied"
+PARTIAL_APPLY_DETECTED: Final = "partial_apply_detected"
 
 _LIFECYCLE_HINTS: Final = (
     "booking-created",
@@ -415,6 +425,47 @@ def _contract_state(snapshot: MultiServiceSnapshot) -> dict[str, object]:
     }
 
 
+def _ordered_business_projection(snapshot: MultiServiceSnapshot) -> list[dict[str, object]]:
+    """The canonical business identity of a pair, in business order.
+
+    Everything ``MultiServiceLine`` models is included — display and normalized
+    name, category, currency, actual price, both durations and the business
+    signature digest — because an upgrade may change the projection's VERSION
+    and nothing about which two services it describes.
+    """
+    return [line.as_dict() for line in snapshot.lines]
+
+
+def _source_provenance_error(
+    record: Record,
+    *,
+    stored: MultiServiceSnapshot,
+    target: MultiServiceSnapshot,
+    contract_location_uuid: str,
+) -> str | None:
+    """Prove the stored v1 is the same booking and the same pair as the target.
+
+    Without this, any digest-valid version 1 would be replaced as soon as the
+    live resolver produced a version 2 — which would let recovery paper over a
+    misbound, corrupted or genuinely outdated business snapshot instead of
+    refusing it.  The only differences an upgrade may introduce are the
+    version, the top-level digest and the resource-shadow proof.
+    """
+    record_booking = str(record.easyweek_booking_uuid) if record.easyweek_booking_uuid is not None else None
+    if (
+        stored.booking_uuid != record_booking
+        or stored.booking_uuid != target.booking_uuid
+        or stored.location_uuid != contract_location_uuid
+        or stored.location_uuid != target.location_uuid
+    ):
+        return SOURCE_IDENTITY_MISMATCH
+    if len(stored.lines) != 2 or len(target.lines) != 2:
+        return SOURCE_BUSINESS_MISMATCH
+    if _ordered_business_projection(stored) != _ordered_business_projection(target):
+        return SOURCE_BUSINESS_MISMATCH
+    return None
+
+
 def _resource_shadow_is_current(record: Record, snapshot: MultiServiceSnapshot) -> bool:
     """The live projection really is a version 2 Karlsruhe resource shadow."""
     proof = snapshot.resource_shadow_proof
@@ -433,6 +484,64 @@ def _resource_shadow_is_current(record: Record, snapshot: MultiServiceSnapshot) 
         and proof.contract_revision == contract.revision
         and proof.contract_digest == contract.digest
     )
+
+
+async def _prove_record_live(
+    record: Record,
+    *,
+    client: SnapshotRecoveryReader,
+    location: Any,
+    session: AsyncSession,
+) -> tuple[MultiServiceSnapshot | None, str | None]:
+    """One live proof for one record, through the shared production resolver.
+
+    Used by both the plan phase and the idempotent reconcile, so the two can
+    never form different opinions about what the booking proves today.  There
+    is no second resolver here: this only orchestrates the event, the live
+    booking, the full catalogue and ``prove_exactly_two_service_snapshot``.
+    """
+    registry = configured_easyweek_locations()
+    events = await _latest_proof_events(session, [record])
+    event = events.get(record.easyweek_booking_uuid) if record.easyweek_booking_uuid is not None else None
+    if event is None:
+        return None, IDENTITY_MISMATCH
+    try:
+        booking = normalize_event(
+            event_hint=event.event_hint,
+            payload=event.payload,
+            body_truncated=bool(event.body_truncated),
+            location_registry=registry.locations,
+        )
+    except NormalizationError:
+        return None, IDENTITY_MISMATCH
+    if booking.booking_uuid != record.easyweek_booking_uuid or booking.company_id != record.company_id:
+        return None, IDENTITY_MISMATCH
+    try:
+        live_payload = await client.get_booking(str(record.easyweek_booking_uuid))
+        observed = read_booking_state(
+            live_payload,
+            booking_uuid=record.easyweek_booking_uuid,
+            location=location,
+        )
+        if isinstance(observed, GuardResult):
+            return None, IDENTITY_MISMATCH
+        if not observed.is_active:
+            return None, LIVE_BOOKING_NOT_ACTIVE
+        if _utc(observed.starts_at) != _utc(record.starts_at):
+            return None, IDENTITY_MISMATCH
+        catalog = await read_catalog_rows_cached(client, location_uuid=location.location_uuid)
+        return (
+            prove_exactly_two_service_snapshot(
+                webhook=_webhook_pair(record, booking, location.location_uuid),
+                booking_payload=live_payload,
+                catalog_rows=catalog,
+            ),
+            None,
+        )
+    except MultiServiceProofError as exc:
+        return None, exc.reason
+    except Exception:  # noqa: BLE001 — exception text can carry API material
+        return None, MULTI_SERVICE_API_UNAVAILABLE
 
 
 async def build_snapshot_recovery_plan(
@@ -549,8 +658,17 @@ async def build_snapshot_recovery_plan(
                             elif decision.reason != MULTI_SERVICE_CATEGORY_NOT_ALLOWED:
                                 refusal_reason = decision.reason
                             else:
-                                live = candidate
-                                disposition = MIGRATE
+                                provenance_error = _source_provenance_error(
+                                    record,
+                                    stored=stored,
+                                    target=candidate,
+                                    contract_location_uuid=contract.location_uuid,
+                                )
+                                if provenance_error is not None:
+                                    refusal_reason = provenance_error
+                                else:
+                                    live = candidate
+                                    disposition = MIGRATE
                 except MultiServiceProofError as exc:
                     refusal_reason = exc.reason
                 except Exception:  # noqa: BLE001 — exception text can carry API material
@@ -781,17 +899,38 @@ class SnapshotApplyResult:
     plan_digest: str
     migrated: tuple[dict[str, Any], ...]
     applied_at: datetime
+    outcome: str = OUTCOME_APPLIED
+
+    @property
+    def canonical_migrated(self) -> list[dict[str, Any]]:
+        """One canonical order for the report: ascending record id.
+
+        The plan is ordered by ``starts_at`` so the operator sees the queue in
+        time order, which is NOT numeric id order.  Serialising the report in
+        plan order and validating it in numeric order is how a successful apply
+        could still be followed by a guaranteed verify refusal, so the report
+        has exactly one order and every reader uses it.
+        """
+        return sorted(self.migrated, key=lambda row: int(row["record_id"]))
 
     def report(self) -> dict[str, Any]:
+        migrated = self.canonical_migrated
+        this_run = [int(row["record_id"]) for row in migrated if row.get("migrated_this_run")]
+        already = [int(row["record_id"]) for row in migrated if not row.get("migrated_this_run")]
         payload: dict[str, Any] = {
             "version": APPLY_REPORT_VERSION,
             "mode": "apply-report",
             "plan_version": PLAN_VERSION,
             "plan_digest": self.plan_digest,
-            "migrated": list(self.migrated),
-            "migrated_record_ids": [int(row["record_id"]) for row in self.migrated],
+            "outcome": self.outcome,
+            "migrated": migrated,
+            "migrated_record_ids": [int(row["record_id"]) for row in migrated],
+            "migrated_this_run_record_ids": this_run,
+            "already_applied_record_ids": already,
             "mutation_counts": {
-                "records_snapshot_migrated": len(self.migrated),
+                # Only a real write counts as a mutation. A reconciled rerun
+                # reports zero and never claims a mutation it did not make.
+                "records_snapshot_migrated": len(this_run),
                 "message_jobs_created": 0,
                 "message_jobs_changed": 0,
                 "outbox_messages_created": 0,
@@ -803,6 +942,27 @@ class SnapshotApplyResult:
             "applied_at": _timestamp(self.applied_at),
         }
         return {**payload, "report_digest": _digest(payload)}
+
+
+def _canonical_record_ids(value: object) -> list[int]:
+    """A strict list of unique record ids already in canonical order.
+
+    ``bool`` is rejected explicitly: it is an ``int`` subclass, and ``True``
+    silently becoming record 1 is exactly the kind of ambiguity this reader
+    exists to refuse.
+    """
+    if not isinstance(value, list):
+        raise RecoveryError("apply_report_record_ids_invalid")
+    ids: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise RecoveryError("apply_report_record_ids_invalid")
+        ids.append(int(item))
+    if len(set(ids)) != len(ids):
+        raise RecoveryError("apply_report_record_ids_invalid")
+    if ids != sorted(ids):
+        raise RecoveryError("apply_report_record_ids_invalid")
+    return ids
 
 
 def read_apply_report(path: str | Path, *, frozen: FrozenSnapshotPlan) -> dict[str, Any]:
@@ -820,10 +980,151 @@ def read_apply_report(path: str | Path, *, frozen: FrozenSnapshotPlan) -> dict[s
         raise RecoveryError("apply_report_digest_mismatch")
     if payload.get("plan_digest") != frozen.digest:
         raise RecoveryError("plan_apply_digest_mismatch")
+    if payload.get("outcome") not in (OUTCOME_APPLIED, OUTCOME_ALREADY_APPLIED):
+        raise RecoveryError("apply_report_malformed")
+
+    reported = _canonical_record_ids(payload.get("migrated_record_ids"))
+    migrated = payload.get("migrated")
+    if not isinstance(migrated, list):
+        raise RecoveryError("apply_report_record_ids_invalid")
+    inside = _canonical_record_ids([row.get("record_id") for row in migrated if isinstance(row, Mapping)])
+    if len(inside) != len(migrated):
+        raise RecoveryError("apply_report_record_ids_invalid")
+    # The list and the rows must name the same records, in the same canonical
+    # order; an ambiguous or duplicated report is never silently accepted.
+    if reported != inside:
+        raise RecoveryError("apply_report_record_ids_invalid")
+
     expected_ids = sorted(int(row["record_id"]) for row in frozen.migrate_rows)
-    if payload.get("migrated_record_ids") != expected_ids:
+    if reported != expected_ids:
         raise RecoveryError("plan_apply_digest_mismatch")
+
+    this_run = _canonical_record_ids(payload.get("migrated_this_run_record_ids"))
+    already = _canonical_record_ids(payload.get("already_applied_record_ids"))
+    if sorted(this_run + already) != expected_ids or set(this_run) & set(already):
+        raise RecoveryError("apply_report_record_ids_invalid")
     return payload
+
+
+def _plan_is_already_applied(frozen: FrozenSnapshotPlan, current: SnapshotRecoveryPlan) -> bool:
+    """True only when this exact plan has provably already landed in full.
+
+    The version 1 selection cannot see a migrated record any more, so after a
+    successful apply the rebuilt scope holds exactly the plan's non-migrating
+    rows and nothing else.  Anything other than that — a leftover migrating
+    row, a record that vanished, a brand new candidate — is not idempotency
+    and must not be mistaken for it.
+    """
+    if current.truncated:
+        return False
+    migrate_ids = {int(row["record_id"]) for row in frozen.migrate_rows}
+    if not migrate_ids:
+        return False
+    remaining_expected = [row for row in frozen.records if int(row["record_id"]) not in migrate_ids]
+    expected_ids = [int(row["record_id"]) for row in remaining_expected]
+    actual_ids = [int(row["record_id"]) for row in current.records]
+    if sorted(actual_ids) != sorted(expected_ids):
+        return False
+    # The rows that legitimately stayed version 1 must still be identical.
+    expected_views = sorted((_stable_view(row) for row in remaining_expected), key=lambda row: row["record_id"])
+    actual_views = sorted((_stable_view(row) for row in current.records), key=lambda row: row["record_id"])
+    return expected_views == actual_views
+
+
+async def _reconcile_already_applied(
+    session: AsyncSession,
+    *,
+    frozen: FrozenSnapshotPlan,
+    client: SnapshotRecoveryReader,
+    pause_sec: float,
+    sleep: Any,
+) -> list[dict[str, Any]]:
+    """Prove a repeat of the same plan needs no write, and mutate nothing.
+
+    Every promise the first run made is re-proved: identity, the exact frozen
+    target digest, the current contract, a fresh live proof, untouched
+    non-target state and the continued absence of any job or outbox row.  A
+    stored version 2 alone is never enough.
+    """
+    migrate_rows = {int(row["record_id"]): row for row in frozen.migrate_rows}
+    ids = sorted(migrate_rows)
+    registry = configured_easyweek_locations()
+    pause = sleep if sleep is not None else asyncio.sleep
+
+    reconciled: list[dict[str, Any]] = []
+    async with session.begin():
+        locked = list(
+            (
+                await session.execute(
+                    select(Record).where(Record.id.in_(ids)).order_by(Record.id.asc()).with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if [record.id for record in locked] != ids:
+            raise RecoveryError("record_state_changed")
+
+        clients, jobs, outboxes = await _scope_state(session, locked, lock=True)
+        service_state_digests = await _record_service_state_digests(session, locked, lock=True)
+        api_calls = 0
+        for record in locked:
+            row = migrate_rows[record.id]
+            client_row = clients.get(record.client_id) if record.client_id is not None else None
+            identity = _record_identity(record, client_row)
+            identity["location_uuid"] = row.get("location_uuid")
+            if (
+                identity != {key: row.get(key) for key in identity}
+                or _record_state_digest_without_snapshot(record) != row.get("record_state_digest")
+                or _client_state_digest(client_row) != row.get("client_state_digest")
+                or service_state_digests[record.id] != row.get("record_services_state_digest")
+            ):
+                raise RecoveryError("record_state_changed")
+            if jobs.get(record.id):
+                raise RecoveryError("job_state_changed")
+            if outboxes.get(record.id):
+                raise RecoveryError("outbox_state_changed")
+
+            stored, _error = multi_service_snapshot_from_record_raw(record.raw)
+            if stored is None:
+                raise RecoveryError("record_state_changed")
+            if stored.digest == row.get("source_snapshot_digest"):
+                # One record still unmigrated while the others are not: this
+                # is a partial apply, never an idempotent repeat.
+                raise RecoveryError(PARTIAL_APPLY_DETECTED)
+            if stored.digest != row.get("target_snapshot_digest") or not _resource_shadow_is_current(record, stored):
+                raise RecoveryError(PARTIAL_APPLY_DETECTED)
+
+            location = registry.locations.get(record.company_id) if registry.ready else None
+            if location is None:
+                raise RecoveryError("record_state_changed")
+            if api_calls:
+                await pause(pause_sec)
+            api_calls += 1
+            live, live_error = await _prove_record_live(
+                record,
+                client=client,
+                location=location,
+                session=session,
+            )
+            if live is None or live.digest != stored.digest:
+                raise RecoveryError(live_error or "scope_drift")
+
+            reconciled.append(
+                {
+                    "record_id": record.id,
+                    "company_id": int(row["company_id"]),
+                    "old_snapshot_version": row.get("source_snapshot_version"),
+                    "old_snapshot_digest": row.get("source_snapshot_digest"),
+                    "new_snapshot_version": stored.version,
+                    "new_snapshot_digest": stored.digest,
+                    "proof_kind": stored.proof_kind,
+                    "contract_revision": row.get("target_contract", {}).get("contract_revision"),
+                    "contract_digest": row.get("target_contract", {}).get("contract_digest"),
+                    "migrated_this_run": False,
+                }
+            )
+    return reconciled
 
 
 async def apply_snapshot_recovery_plan(
@@ -836,7 +1137,14 @@ async def apply_snapshot_recovery_plan(
     sleep: Any = None,
     max_age_sec: int = DEFAULT_MAX_SNAPSHOT_AGE_SEC,
 ) -> SnapshotApplyResult:
-    """Re-prove everything live, then replace exactly one key per record."""
+    """Re-prove everything live, then replace exactly one key per record.
+
+    An apply of the SAME frozen plan may legitimately run twice: the database
+    can commit and the one-off container can still die before its report is
+    written, leaving the operator with an undetermined result and the only
+    safe instinct — repeat the exact command.  So the run first decides which
+    of two proven states it is in, and refuses anything in between.
+    """
     fixed_now = _utc(now) if now is not None else None
     current = await build_snapshot_recovery_plan(
         session,
@@ -847,13 +1155,30 @@ async def apply_snapshot_recovery_plan(
         sleep=sleep,
     )
     boundary = fixed_now or _utc(datetime.now(timezone.utc))
-    compare_revalidated_plan(frozen, current)
+    already_applied = _plan_is_already_applied(frozen, current)
+    if not already_applied:
+        compare_revalidated_plan(frozen, current)
     age = (boundary - frozen.planned_at).total_seconds()
     if age < 0 or age > min(max_age_sec, MAX_SNAPSHOT_AGE_SEC):
         raise RecoveryError("plan_expired")
     _check_runtime_fences()
     # The plan phase is read-only; drop anything it loaded before the write.
     await session.rollback()
+
+    if already_applied:
+        reconciled = await _reconcile_already_applied(
+            session,
+            frozen=frozen,
+            client=client,
+            pause_sec=pause_sec,
+            sleep=sleep,
+        )
+        return SnapshotApplyResult(
+            plan_digest=frozen.digest,
+            migrated=tuple(reconciled),
+            applied_at=boundary,
+            outcome=OUTCOME_ALREADY_APPLIED,
+        )
 
     migrated: list[dict[str, Any]] = []
     async with session.begin():
@@ -867,6 +1192,19 @@ async def apply_snapshot_recovery_plan(
             # and it must still equal the frozen promise byte for byte.
             if target.digest != row.get("target_snapshot_digest") or target.as_dict() != row.get("target_snapshot"):
                 raise RecoveryError("scope_drift")
+            # Provenance is re-proved HERE, under the row lock, immediately
+            # before the write: a plan-time proof alone would leave a window.
+            locked_stored, _locked_error = multi_service_snapshot_from_record_raw(record.raw)
+            if locked_stored is None:
+                raise RecoveryError("record_state_changed")
+            provenance_error = _source_provenance_error(
+                record,
+                stored=locked_stored,
+                target=target,
+                contract_location_uuid=str(row.get("location_uuid")),
+            )
+            if provenance_error is not None:
+                raise RecoveryError(provenance_error)
             before = _raw_without_snapshot(record.raw)
             # The canonical helper replaces only this key and rebuilds the dict
             # so SQLAlchemy always sees the JSONB change.
@@ -884,6 +1222,7 @@ async def apply_snapshot_recovery_plan(
                     "proof_kind": target.proof_kind,
                     "contract_revision": row.get("target_contract", {}).get("contract_revision"),
                     "contract_digest": row.get("target_contract", {}).get("contract_digest"),
+                    "migrated_this_run": True,
                 }
             )
 
@@ -1012,9 +1351,16 @@ async def verify_snapshot_recovery(
     still_version_1 = sorted(record.id for record in remaining if record.id in set(expected_ids))
 
     mutation_counts = apply_report.get("mutation_counts", {})
+    this_run = apply_report.get("migrated_this_run_record_ids", [])
+    already = apply_report.get("already_applied_record_ids", [])
     counts_match = (
         isinstance(mutation_counts, Mapping)
-        and mutation_counts.get("records_snapshot_migrated") == len(expected_ids)
+        and isinstance(this_run, list)
+        and isinstance(already, list)
+        # A reconciled rerun migrated nothing, and says so; the two lists
+        # together still have to account for the whole frozen scope.
+        and mutation_counts.get("records_snapshot_migrated") == len(this_run)
+        and sorted(int(value) for value in this_run + already) == expected_ids
         and mutation_counts.get("message_jobs_created") == 0
         and mutation_counts.get("outbox_messages_created") == 0
     )
@@ -1043,6 +1389,9 @@ async def verify_snapshot_recovery(
         "unexpected_outbox_ids": sorted(unexpected_outboxes),
         "still_version_1_record_ids": still_version_1,
         "counts_match": counts_match,
+        "outcome": apply_report.get("outcome"),
+        "migrated_this_run_record_ids": sorted(int(value) for value in this_run) if isinstance(this_run, list) else [],
+        "already_applied_record_ids": sorted(int(value) for value in already) if isinstance(already, list) else [],
         "passed": passed,
     }
 
@@ -1060,7 +1409,12 @@ __all__ = [
     "MODE_PLAN",
     "MODE_VERIFY",
     "OUTBOX_PRESENT",
+    "OUTCOME_ALREADY_APPLIED",
+    "OUTCOME_APPLIED",
+    "PARTIAL_APPLY_DETECTED",
     "PLAN_VERSION",
+    "SOURCE_BUSINESS_MISMATCH",
+    "SOURCE_IDENTITY_MISMATCH",
     "RESOURCE_SHADOW_NOT_PROVEN",
     "SNAPSHOT_CURRENT",
     "SNAPSHOT_UNREADABLE",

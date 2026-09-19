@@ -68,6 +68,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+COMPOSE_PROJECT: Final = "altegio_bot"
+COMPOSE_FILES: Final = ("docker-compose.yml", "docker-compose.chatwoot-internal.yml")
+COMPOSE_SERVICE: Final = "easyweek-multi-service-snapshot-recovery"
+
+
+def apply_command(
+    *,
+    plan_path: str,
+    apply_report: str,
+    plan_digest: str,
+    max_snapshot_age_sec: int,
+) -> str:
+    """The one command that actually works on the production host.
+
+    Both production Compose files, the ops profile, a throwaway container and
+    the container-side ``/recovery`` paths — nothing here depends on a system
+    Python or on a host directory that does not exist.
+    """
+    files = " ".join(f"-f {name}" for name in COMPOSE_FILES)
+    return (
+        f"docker compose -p {COMPOSE_PROJECT} {files} --profile ops run --rm --build \\\n"
+        f"  {COMPOSE_SERVICE} apply \\\n"
+        f"  --plan {shlex.quote(plan_path)} \\\n"
+        f"  --apply-report {shlex.quote(apply_report)} \\\n"
+        f"  --plan-digest {plan_digest} \\\n"
+        f"  --confirm {shlex.quote(confirmation_phrase(plan_digest))} \\\n"
+        f"  --max-snapshot-age-sec {int(max_snapshot_age_sec)}"
+    )
+
+
 def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -110,12 +140,19 @@ async def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         if report["apply_ready"]:
+            # A bare `python -m ...` line would be a trap: this process is a
+            # one-off container that is already gone, the module is not on the
+            # host's Python, and /recovery only exists inside the container.
+            # So the command printed here is the real Compose command, with
+            # both production files, the ops profile and container paths.
             print(
-                "exact apply command:\n"
-                f"python -m altegio_bot.scripts.{PROG} apply "
-                f"--plan {shlex.quote(str(path))} --apply-report {shlex.quote(args.apply_report)} "
-                f"--plan-digest {plan.plan_digest} "
-                f"--confirm {shlex.quote(confirmation_phrase(plan.plan_digest))}",
+                "exact apply command (run from the repository root on the host):\n"
+                + apply_command(
+                    plan_path=str(path),
+                    apply_report=args.apply_report,
+                    plan_digest=plan.plan_digest,
+                    max_snapshot_age_sec=args.max_snapshot_age_sec,
+                ),
                 file=sys.stderr,
             )
         return 0 if report["apply_ready"] else 1

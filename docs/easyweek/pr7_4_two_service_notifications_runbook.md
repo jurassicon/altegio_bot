@@ -613,9 +613,9 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot exec -T altegio-easyweek-inbox-worker sh -lc \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker sh -lc \
   'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED'
-docker compose -p altegio_bot exec -T altegio-outbox-worker sh -lc \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
   'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED'
 ```
 
@@ -638,7 +638,7 @@ resolver и замораживает scope.
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot --profile ops run --rm --build \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml --profile ops run --rm --build \
   easyweek-multi-service-snapshot-recovery plan \
   --plan /recovery/snapshot-plan.json \
   --apply-report /recovery/snapshot-apply.json \
@@ -663,19 +663,47 @@ ID. Booking UUID есть только в приватном файле: его 
 
 ## 25. Проверка ожидаемых technical Record IDs
 
+Frozen plan хранит агрегаты в `.summary`, а dispositions — в `.records`.
+Команда ниже читает именно эту схему, вычисляет `migrate_record_ids` из
+`.records` и **падает с ненулевым кодом**, если хоть одно ожидание не
+выполнено. Список ожидаемых Record ID задаётся оператором из независимого
+read-only SQL — первый подтверждённый rollout дал `8205 8206 8207 8208 8238`.
+
 ```bash
 cd /opt/altegio_bot
-jq '{candidates, source_version_1, target_version_2, blocked, truncated,
-     apply_ready, migrate_record_ids, blocked_record_ids, reasons}' \
-  outputs/easyweek_multi_service_recovery/snapshot-plan.json 2>/dev/null \
-  || jq '{summary, records: [.records[] | {record_id, disposition, refusal_reason,
-          source_snapshot_version, target_snapshot_version}]}' \
-       outputs/easyweek_multi_service_recovery/snapshot-plan.json
+EXPECTED_MIGRATE_IDS='[8205,8206,8207,8208,8238]'
+jq -e --argjson expected "$EXPECTED_MIGRATE_IDS" '
+  (.summary | objects) as $s
+  | (.records | arrays) as $r
+  | {
+      candidates: $s.candidates,
+      source_version_1: $s.source_version_1,
+      target_version_2: $s.target_version_2,
+      blocked: $s.blocked,
+      truncated: $s.truncated,
+      apply_ready: $s.apply_ready,
+      migrate_record_ids: ([$r[] | select(.disposition == "migrate") | .record_id] | sort),
+      blocked_record_ids: ([$r[] | select(.disposition == "blocked") | .record_id] | sort),
+      reasons: ([$r[] | select(.refusal_reason != null) | .refusal_reason] | unique)
+    }
+  | select(
+      .candidates == 5
+      and .source_version_1 == 5
+      and .target_version_2 == 5
+      and .blocked == 0
+      and .truncated == false
+      and .apply_ready == true
+      and .migrate_record_ids == $expected
+    )
+' outputs/easyweek_multi_service_recovery/snapshot-plan.json
 ```
 
-`migrate_record_ids` обязан совпасть с независимо установленным read-only SQL
-списком. При любом лишнем или недостающем Record остановиться и разобраться, а
-не применять план.
+Вывод печатает только технические Record ID и стабильные reason codes: booking
+UUID, имена услуг, имена клиентов и телефоны в него не попадают.
+
+`jq -e` завершается ненулевым кодом, если `select` не пропустил объект или если
+`.summary`/`.records` отсутствуют либо имеют неверный тип. Пустой вывод — это
+STOP, а не PASS: остановиться, разобраться и не применять план.
 
 ## 26. Получение plan digest
 
@@ -696,7 +724,7 @@ live booking/catalog proof, сравнивает весь текущий scope �
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot --profile ops run --rm --build \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml --profile ops run --rm --build \
   easyweek-multi-service-snapshot-recovery apply \
   --plan /recovery/snapshot-plan.json \
   --apply-report /recovery/snapshot-apply.json \
@@ -708,11 +736,60 @@ docker compose -p altegio_bot --profile ops run --rm --build \
 
 Любой drift откатывает **всю** волну: частично обновлённых Records не бывает.
 
+## 27a. Неопределённый результат apply: повтор той же команды
+
+Контейнер apply одноразовый. Он может успеть закоммитить транзакцию и всё
+равно исчезнуть до того, как вывод дойдёт до оператора или apply report
+запишется. В этом случае **безопасно повторить ровно ту же команду из §27** с
+тем же frozen plan, тем же digest и той же фразой.
+
+Повтор различает три состояния и сам выбирает исход:
+
+1. Все целевые Records всё ещё exact source version 1, остальной scope не
+   изменился — обычный атомарный apply. В отчёте
+   `outcome = applied`, а `migrated_this_run_record_ids` содержит все ID.
+
+2. Все целевые Records уже имеют exact frozen target version 2 — повторное
+   доказательство identity, текущего contract, живого target digest,
+   неизменности всех нецелевых полей Record и отсутствия jobs/outbox, **без
+   единой мутации БД**. В отчёте `outcome = already_applied`,
+   `migrated_this_run_record_ids` пуст, `already_applied_record_ids` содержит
+   все ID, а `mutation_counts.records_snapshot_migrated = 0`. Этот прогон
+   заново записывает валидный apply report, пригодный для §28.
+
+3. Что-либо между: часть Records мигрирована, а часть нет; чужой version 2;
+   пропавший Record; появившийся job или outbox; изменённый соседний ключ
+   `Record.raw`; live booking/catalog/contract drift; новый v1 кандидат.
+   Это **не** идемпотентность: команда завершается ненулевым кодом со
+   стабильной причиной (`partial_apply_detected`, `record_state_changed`,
+   `job_state_changed`, `outbox_state_changed`, `scope_drift`) и ничего не
+   меняет.
+
+Различать исходы по отчёту:
+
+```bash
+cd /opt/altegio_bot
+jq -e '
+  select(
+    (.outcome == "applied" or .outcome == "already_applied")
+    and (.mutation_counts.message_jobs_created == 0)
+    and (.mutation_counts.outbox_messages_created == 0)
+    and ((.migrated_this_run_record_ids + .already_applied_record_ids) | sort) == (.migrated_record_ids | sort)
+  )
+  | {outcome, migrated_record_ids, migrated_this_run_record_ids,
+     already_applied_record_ids, mutation_counts}
+' outputs/easyweek_multi_service_recovery/snapshot-apply.json
+```
+
+Состояние 3 никогда не даёт отчёта: при нём файл не перезаписывается, а
+предыдущий отчёт (если он есть) остаётся прежним. Не «чинить» такое состояние
+повторными запусками — нужен новый `plan` и разбор причины.
+
 ## 28. Verify
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot --profile ops run --rm --build \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml --profile ops run --rm --build \
   easyweek-multi-service-snapshot-recovery verify \
   --plan /recovery/snapshot-plan.json \
   --apply-report /recovery/snapshot-apply.json \
@@ -728,7 +805,7 @@ docker compose -p altegio_bot --profile ops run --rm --build \
 
 ```bash
 cd /opt/altegio_bot
-docker compose -p altegio_bot run --rm --no-deps \
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
   --entrypoint /app/.venv/bin/python altegio-outbox-worker \
   -m altegio_bot.scripts.easyweek_multi_service_preflight \
   --limit 500 --pause-sec 1.10
@@ -779,10 +856,17 @@ send-time guard и preflight его немедленно отвергнут.
 
 ## 33. Запрет повторного использования старого plan
 
-Plan одноразовый. После любого deploy, изменения конфигурации, изменения
-contract revision или любого drift старый `snapshot-plan.json` использовать
-нельзя: нужен новый `plan` и новый digest. Bounded max snapshot age существует
-именно для этого.
+Plan одноразовый **для новой волны**. После любого deploy, изменения
+конфигурации, изменения contract revision или любого drift старый
+`snapshot-plan.json` использовать нельзя: нужен новый `plan` и новый digest.
+Bounded max snapshot age существует именно для этого.
+
+Единственное исключение — немедленный same-plan retry из §27a после
+неопределённого результата: та же команда, тот же digest, та же фраза, в
+пределах `--max-snapshot-age-sec`. Это не повторное применение плана: apply
+сам доказывает, что либо ещё ничего не записано, либо всё уже записано ровно
+этим планом, и во втором случае не выполняет ни одной мутации. Если план
+истёк — повтор запрещён, нужен новый `plan`.
 
 ## 34. Запрет открытия общего send fence
 

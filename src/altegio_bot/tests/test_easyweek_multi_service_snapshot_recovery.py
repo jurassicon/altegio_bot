@@ -10,10 +10,16 @@ the version 2 projection.  The multi-service preflight reports that as
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import json
+import shlex
+import shutil
+import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,6 +36,7 @@ from altegio_bot.easyweek_multi_service import (
     prove_exactly_two_service_snapshot,
     record_raw_with_multi_service_snapshot,
 )
+from altegio_bot.easyweek_multi_service_recovery import _digest, write_private_json
 from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_resource_shadow_contract import (
     KARLSRUHE_COMPANY_ID,
@@ -47,7 +54,11 @@ from altegio_bot.easyweek_snapshot_recovery import (
     LIVE_BOOKING_NOT_ACTIVE,
     MIGRATE,
     OUTBOX_PRESENT,
+    OUTCOME_ALREADY_APPLIED,
+    OUTCOME_APPLIED,
     SNAPSHOT_CURRENT,
+    SOURCE_BUSINESS_MISMATCH,
+    SOURCE_IDENTITY_MISMATCH,
     RecoveryError,
     apply_snapshot_recovery_plan,
     build_snapshot_recovery_plan,
@@ -64,6 +75,8 @@ from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_fixtures import booking_created_multi_service, set_booking_price
 
 pytestmark = pytest.mark.asyncio
+
+RUNBOOK = Path(__file__).resolve().parents[3] / "docs/easyweek/pr7_4_two_service_notifications_runbook.md"
 
 NOW = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
 STARTS_AT = NOW + timedelta(days=4)
@@ -259,7 +272,7 @@ class FakeReader:
         return None
 
 
-def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID):
+def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID, *, starts_at: datetime = STARTS_AT):
     """The projection these records really carry: proven, correct, version 1.
 
     Built from the two-row form the booking had when it was first proved, which
@@ -279,7 +292,7 @@ def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID):
             company_id=KARLSRUHE_COMPANY_ID,
             service_id=SHELLAC_ID,
         ),
-        booking_payload=_api(booking_uuid=booking_uuid, resource_shadow=False),
+        booking_payload=_api(booking_uuid=booking_uuid, starts_at=starts_at, resource_shadow=False),
         catalog_rows=_catalog(),
     )
     assert snapshot.version == MULTI_SERVICE_SNAPSHOT_VERSION
@@ -290,6 +303,7 @@ def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID):
 async def _seed(
     session,
     *,
+    record_id: int | None = None,
     booking_uuid: str = BOOKING_UUID,
     booking_id: int = BOOKING_ID,
     company_id: int = KARLSRUHE_COMPANY_ID,
@@ -318,9 +332,12 @@ async def _seed(
     if with_snapshot:
         raw = record_raw_with_multi_service_snapshot(
             raw,
-            snapshot_override if snapshot_override is not None else _stored_v1_snapshot(booking_uuid),
+            snapshot_override
+            if snapshot_override is not None
+            else _stored_v1_snapshot(booking_uuid, starts_at=starts_at),
         )
     record = Record(
+        id=record_id,
         provider=provider,
         company_id=company_id,
         altegio_record_id=booking_id,
@@ -1280,3 +1297,545 @@ async def test_the_recovery_module_has_no_send_or_mutation_capability() -> None:
         assert forbidden not in source
     # Exactly one write, through the canonical helper.
     assert source.count("record.raw = record_raw_with_multi_service_snapshot") == 1
+
+
+# ===========================================================================
+# Blocker 1: one canonical apply-report order
+#
+# The plan is ordered by starts_at so the operator reads the queue in time
+# order. In production that is NOT numeric id order, and serialising the
+# report in plan order while validating it in numeric order made a successful
+# apply guarantee a later verify refusal.
+# ===========================================================================
+
+# The confirmed production shape: ids ascend, start times do not.
+PRODUCTION_WAVE = (
+    (8205, datetime(2026, 10, 2, 9, 0, tzinfo=timezone.utc)),
+    (8206, datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc)),
+    (8207, datetime(2026, 12, 3, 9, 0, tzinfo=timezone.utc)),
+    (8208, datetime(2026, 12, 21, 9, 0, tzinfo=timezone.utc)),
+    (8238, datetime(2026, 10, 20, 9, 0, tzinfo=timezone.utc)),
+)
+PLAN_ORDER = [8205, 8238, 8206, 8207, 8208]
+CANONICAL_ORDER = [8205, 8206, 8207, 8208, 8238]
+
+
+def _wave_uuid(offset: int) -> str:
+    return f"7777777{offset}-2222-4333-8444-555555555555"
+
+
+def _wave_reader(**kwargs: Any) -> FakeReader:
+    """Live answers whose start time matches each record's own start."""
+    bookings = {
+        _wave_uuid(offset): _api(booking_uuid=_wave_uuid(offset), starts_at=starts_at, **kwargs)
+        for offset, (_record_id, starts_at) in enumerate(PRODUCTION_WAVE)
+    }
+    return FakeReader(bookings=bookings)
+
+
+async def _seed_production_wave(session) -> None:
+    for offset, (record_id, starts_at) in enumerate(PRODUCTION_WAVE):
+        await _seed(
+            session,
+            record_id=record_id,
+            booking_uuid=_wave_uuid(offset),
+            booking_id=BOOKING_ID + offset,
+            starts_at=starts_at,
+        )
+
+
+async def test_the_plan_keeps_start_time_order_and_the_report_is_canonical(session_maker, tmp_path) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+        frozen, path = await _freeze(tmp_path, plan)
+
+    # The plan really does present the queue in start-time order.
+    assert [int(row["record_id"]) for row in plan.records] == PLAN_ORDER
+    assert [int(row["record_id"]) for row in frozen.migrate_rows] == PLAN_ORDER
+
+    # Apply is its own container run, so its catalogue cache starts cold.
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        result = await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+
+    report = result.report()
+    assert [int(row["record_id"]) for row in report["migrated"]] == CANONICAL_ORDER
+    assert report["migrated_record_ids"] == CANONICAL_ORDER
+    assert report["migrated_this_run_record_ids"] == CANONICAL_ORDER
+    assert report["already_applied_record_ids"] == []
+
+    # The whole documented path, end to end.
+    report_path = write_private_json(report, tmp_path / "apply.json")
+    reread = read_apply_report(report_path, frozen=frozen)
+    assert reread["migrated_record_ids"] == CANONICAL_ORDER
+
+    async with session_maker() as session:
+        verified = await verify_snapshot_recovery(
+            session, frozen=frozen, apply_report=reread, client=_wave_reader(), pause_sec=0
+        )
+    assert verified["passed"] is True
+
+
+async def _report_for_wave(session_maker, tmp_path):
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+        frozen, _path = await _freeze(tmp_path, plan)
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        result = await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+    return frozen, result.report()
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["duplicate", "unsorted", "mismatch", "missing", "unexpected", "bool", "not-a-list"],
+)
+async def test_the_reader_refuses_an_ambiguous_apply_report(session_maker, tmp_path, corrupt: str) -> None:
+    frozen, report = await _report_for_wave(session_maker, tmp_path)
+    ids = list(report["migrated_record_ids"])
+
+    if corrupt == "duplicate":
+        report["migrated_record_ids"] = [ids[0], *ids]
+    elif corrupt == "unsorted":
+        report["migrated_record_ids"] = PLAN_ORDER
+        report["migrated"] = sorted(report["migrated"], key=lambda row: PLAN_ORDER.index(int(row["record_id"])))
+    elif corrupt == "mismatch":
+        report["migrated"] = report["migrated"][:-1]
+    elif corrupt == "missing":
+        report["migrated_record_ids"] = ids[:-1]
+        report["migrated"] = report["migrated"][:-1]
+        report["migrated_this_run_record_ids"] = ids[:-1]
+    elif corrupt == "unexpected":
+        report["migrated_record_ids"] = [*ids, 99999]
+        report["migrated"] = [*report["migrated"], {**report["migrated"][0], "record_id": 99999}]
+        report["migrated_this_run_record_ids"] = [*ids, 99999]
+    elif corrupt == "bool":
+        report["migrated_record_ids"] = [True, *ids[1:]]
+    else:
+        report["migrated_record_ids"] = {"ids": ids}
+
+    # Re-sign so only the semantic check can catch it.
+    unsigned = {key: value for key, value in report.items() if key != "report_digest"}
+    report["report_digest"] = _digest(unsigned)
+    path = write_private_json(report, tmp_path / "corrupt.json")
+
+    with pytest.raises(RecoveryError):
+        read_apply_report(path, frozen=frozen)
+
+
+# ===========================================================================
+# Blocker 2: the documented jq check has to actually run
+# ===========================================================================
+
+
+def _runbook_jq_command() -> str:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = text.split("## 25. Проверка ожидаемых technical Record IDs", 1)[1].split("## 26.", 1)[0]
+    blocks = [part for index, part in enumerate(section.split("```")) if index % 2 == 1]
+    assert len(blocks) == 1, "section 25 must document exactly one command block"
+    body = blocks[0]
+    assert body.startswith("bash\n")
+    return body[len("bash\n") :]
+
+
+def _run_runbook_jq(plan_payload: dict[str, Any], tmp_path, *, expected_ids: list[int]) -> subprocess.CompletedProcess:
+    command = _runbook_jq_command()
+    # Only the operator-supplied inputs are substituted; the jq program itself
+    # is executed exactly as the runbook prints it.
+    command = command.replace("cd /opt/altegio_bot\n", "")
+    command = command.replace(
+        "EXPECTED_MIGRATE_IDS='[8205,8206,8207,8208,8238]'",
+        f"EXPECTED_MIGRATE_IDS='{json.dumps(expected_ids, separators=(',', ':'))}'",
+    )
+    plan_file = tmp_path / "runbook-plan.json"
+    plan_file.write_text(json.dumps(plan_payload, ensure_ascii=False), encoding="utf-8")
+    command = command.replace(
+        "outputs/easyweek_multi_service_recovery/snapshot-plan.json",
+        shlex.quote(str(plan_file)),
+    )
+    return subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False)
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+async def test_the_documented_jq_check_passes_on_a_real_frozen_plan(session_maker, tmp_path) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+
+    result = _run_runbook_jq(plan.snapshot(), tmp_path, expected_ids=CANONICAL_ORDER)
+
+    assert result.returncode == 0, result.stderr
+    printed = json.loads(result.stdout)
+    assert printed["candidates"] == 5
+    assert printed["source_version_1"] == 5
+    assert printed["target_version_2"] == 5
+    assert printed["blocked"] == 0
+    assert printed["truncated"] is False
+    assert printed["apply_ready"] is True
+    assert printed["migrate_record_ids"] == CANONICAL_ORDER
+    assert printed["blocked_record_ids"] == []
+    # PII-free: no booking uuid, no service name, no customer data.
+    for forbidden in (BOOKING_UUID[:8], SHELLAC, PEDIKUERE_GEL, "+49000000777"):
+        assert forbidden not in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+@pytest.mark.parametrize(
+    "damage",
+    ["no-summary", "no-records", "blocked-record", "truncated", "wrong-ids"],
+)
+async def test_the_documented_jq_check_fails_loudly_on_a_bad_plan(session_maker, tmp_path, damage: str) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+    payload = plan.snapshot()
+    expected = CANONICAL_ORDER
+
+    if damage == "no-summary":
+        payload.pop("summary")
+    elif damage == "no-records":
+        payload.pop("records")
+    elif damage == "blocked-record":
+        payload["summary"]["blocked"] = 1
+        payload["records"][0]["disposition"] = "blocked"
+    elif damage == "truncated":
+        payload["summary"]["truncated"] = True
+    else:
+        expected = [1, 2, 3]
+
+    result = _run_runbook_jq(payload, tmp_path, expected_ids=expected)
+    assert result.returncode != 0, result.stdout
+
+
+# ===========================================================================
+# Blocker 3: the printed apply command must be runnable where it is printed
+# ===========================================================================
+
+
+async def test_the_cli_prints_a_real_compose_apply_command() -> None:
+    command = cli.apply_command(
+        plan_path="/recovery/snapshot-plan.json",
+        apply_report="/recovery/snapshot-apply.json",
+        plan_digest="a" * 64,
+        max_snapshot_age_sec=600,
+    )
+    for required in (
+        "docker compose",
+        "-p altegio_bot",
+        "-f docker-compose.yml",
+        "-f docker-compose.chatwoot-internal.yml",
+        "--profile ops",
+        "run --rm --build",
+        "easyweek-multi-service-snapshot-recovery apply",
+        "--plan /recovery/snapshot-plan.json",
+        "--apply-report /recovery/snapshot-apply.json",
+        f"--plan-digest {'a' * 64}",
+        "--max-snapshot-age-sec 600",
+    ):
+        assert required in command, f"printed command is missing {required}"
+    assert confirmation_phrase("a" * 64) in command
+    # The old trap: a host command that needs a system Python and a host
+    # /recovery directory that does not exist.
+    assert "python -m altegio_bot" not in command
+
+
+async def test_the_cli_never_calls_an_incomplete_command_exact() -> None:
+    source = inspect.getsource(cli)
+    exact_lines = [line for line in source.splitlines() if "exact apply command" in line]
+    assert exact_lines, "the CLI should still offer the operator an exact command"
+    assert "python -m altegio_bot.scripts" not in source.split("def apply_command", 1)[0]
+    # Whatever it labels exact is produced by the Compose builder.
+    assert "+ apply_command(" in source
+
+
+# ===========================================================================
+# Blocker 4: the replaced version 1 must be the same booking and the same pair
+# ===========================================================================
+
+
+def _tampered_v1(**overrides: Any):
+    """A digest-valid version 1 snapshot that is NOT the same projection."""
+    base = _stored_v1_snapshot()
+    lines = [copy.deepcopy(line.as_dict()) for line in base.lines]
+    booking_uuid = overrides.pop("booking_uuid", base.booking_uuid)
+    location_uuid = overrides.pop("location_uuid", base.location_uuid)
+    if overrides.pop("reverse_lines", False):
+        lines.reverse()
+    both_lines = overrides.pop("both_lines", False)
+    targets = range(len(lines)) if both_lines else (overrides.pop("line_index", 1),)
+    for index in targets:
+        for key, value in overrides.items():
+            lines[index][key] = value
+    unsigned = {
+        "version": MULTI_SERVICE_SNAPSHOT_VERSION,
+        "provider": "easyweek",
+        "booking_uuid": booking_uuid,
+        "location_uuid": location_uuid,
+        "services_count": 2,
+        "lines": lines,
+    }
+    encoded = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**unsigned, "digest": hashlib.sha256(encoded).hexdigest()}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"booking_uuid": "99999999-2222-4333-8444-555555555555"}, SOURCE_IDENTITY_MISMATCH),
+        ({"location_uuid": OTHER_LOCATION_UUID}, SOURCE_IDENTITY_MISMATCH),
+        ({"reverse_lines": True}, SOURCE_BUSINESS_MISMATCH),
+        ({"display_name": "Pediküre Mit French", "normalized_name": "pediküre mit french"}, SOURCE_BUSINESS_MISMATCH),
+        ({"category": "Wimpernverlängerung"}, SOURCE_BUSINESS_MISMATCH),
+        ({"currency": "CHF", "both_lines": True}, SOURCE_BUSINESS_MISMATCH),
+        ({"actual_price_minor": 5200}, SOURCE_BUSINESS_MISMATCH),
+        ({"actual_duration_minutes": 75, "original_duration_minutes": 75}, SOURCE_BUSINESS_MISMATCH),
+        # The canonical parser already forbids duration != original_duration,
+        # so this shape never reaches the provenance check.
+        ({"original_duration_minutes": 75}, "multi_service_snapshot_digest_mismatch"),
+        ({"business_signature_digest": "0" * 64}, SOURCE_BUSINESS_MISMATCH),
+    ],
+    ids=[
+        "other-booking",
+        "other-location",
+        "reversed-lines",
+        "other-service",
+        "other-category",
+        "other-currency",
+        "other-price",
+        "other-duration",
+        "other-original-duration",
+        "other-signature",
+    ],
+)
+async def test_a_stored_v1_from_a_different_projection_is_never_upgraded(
+    session_maker,
+    overrides: dict[str, Any],
+    expected: str,
+) -> None:
+    tampered = _tampered_v1(**overrides)
+    async with session_maker() as session:
+        async with session.begin():
+            record = await _seed(session)
+            raw = copy.deepcopy(record.raw)
+            raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY] = tampered
+            record.raw = raw
+        before = await _row_counts(session)
+
+    async with session_maker() as session:
+        plan = await _plan(session)
+
+    row = plan.records[0]
+    assert row["disposition"] == BLOCKED
+    assert row["refusal_reason"] == expected
+    assert plan.summary["apply_ready"] is False
+
+    async with session_maker() as session:
+        assert await _row_counts(session) == before
+        record = (await session.execute(select(Record))).scalars().one()
+        assert record.raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY] == tampered
+        assert (await session.execute(select(func.count()).select_from(MessageJob))).scalar_one() == 0
+        assert (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one() == 0
+
+
+async def test_the_production_shaped_pair_has_one_ordered_business_projection(session_maker) -> None:
+    """The positive control: only version, digest and proof may differ."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session)
+    async with session_maker() as session:
+        plan = await _plan(session)
+
+    row = plan.records[0]
+    assert row["disposition"] == MIGRATE
+    stored = _stored_v1_snapshot()
+    target = plan.proven[int(row["record_id"])]
+    assert [line.as_dict() for line in stored.lines] == [line.as_dict() for line in target.lines]
+    assert stored.booking_uuid == target.booking_uuid
+    assert stored.location_uuid == target.location_uuid
+    assert (stored.version, target.version) == (
+        MULTI_SERVICE_SNAPSHOT_VERSION,
+        MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION,
+    )
+    assert stored.digest != target.digest
+
+
+async def test_provenance_is_re_proved_under_the_record_lock(session_maker, tmp_path) -> None:
+    """A plan-time proof alone would leave a window before the write."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session)
+    async with session_maker() as session:
+        plan = await _plan(session)
+        frozen, _path = await _freeze(tmp_path, plan)
+
+    # Swap the stored snapshot for a different, digest-valid projection after
+    # the plan was frozen.
+    async with session_maker() as session:
+        async with session.begin():
+            record = (await session.execute(select(Record))).scalars().one()
+            raw = copy.deepcopy(record.raw)
+            raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY] = _tampered_v1(actual_price_minor=5200)
+            record.raw = raw
+
+    async with session_maker() as session:
+        with pytest.raises(RecoveryError):
+            await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+
+    async with session_maker() as session:
+        record = (await session.execute(select(Record))).scalars().one()
+        assert record.raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY]["version"] == MULTI_SERVICE_SNAPSHOT_VERSION
+
+
+# ===========================================================================
+# Blocker 5: repeating the SAME frozen plan after an undetermined result
+# ===========================================================================
+
+
+async def test_repeating_the_same_frozen_plan_reconciles_without_mutating(session_maker, tmp_path) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+        frozen, _path = await _freeze(tmp_path, plan)
+    clear_multi_service_catalog_cache()
+
+    async with session_maker() as session:
+        first = await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+    assert first.outcome == OUTCOME_APPLIED
+
+    # The operator never saw the first report: the container died after commit.
+    async with session_maker() as session:
+        after_first = await _row_counts(session)
+        raws_before = {
+            record.id: copy.deepcopy(record.raw)
+            for record in (await session.execute(select(Record).order_by(Record.id))).scalars()
+        }
+
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        second = await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+
+    assert second.outcome == OUTCOME_ALREADY_APPLIED
+    report = second.report()
+    assert report["migrated_record_ids"] == CANONICAL_ORDER
+    assert report["migrated_this_run_record_ids"] == []
+    assert report["already_applied_record_ids"] == CANONICAL_ORDER
+    assert report["mutation_counts"]["records_snapshot_migrated"] == 0
+
+    async with session_maker() as session:
+        assert await _row_counts(session) == after_first
+        raws_after = {
+            record.id: record.raw for record in (await session.execute(select(Record).order_by(Record.id))).scalars()
+        }
+    assert raws_after == raws_before
+
+    # The regenerated report is a valid input for verify.
+    report_path = write_private_json(report, tmp_path / "second-apply.json")
+    reread = read_apply_report(report_path, frozen=frozen)
+    async with session_maker() as session:
+        verified = await verify_snapshot_recovery(
+            session, frozen=frozen, apply_report=reread, client=_wave_reader(), pause_sec=0
+        )
+    assert verified["passed"] is True
+    assert verified["outcome"] == OUTCOME_ALREADY_APPLIED
+
+
+async def _applied_wave(session_maker, tmp_path):
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+        frozen, _path = await _freeze(tmp_path, plan)
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+    clear_multi_service_catalog_cache()
+    return frozen
+
+
+async def test_a_partially_applied_wave_is_never_mistaken_for_idempotency(session_maker, tmp_path) -> None:
+    frozen = await _applied_wave(session_maker, tmp_path)
+
+    # Put one record back to its version 1 projection: a partial state.
+    async with session_maker() as session:
+        async with session.begin():
+            record = await session.get(Record, PRODUCTION_WAVE[0][0])
+            assert record is not None
+            raw = copy.deepcopy(record.raw)
+            raw["easyweek"][MULTI_SERVICE_SNAPSHOT_KEY] = _stored_v1_snapshot(
+                _wave_uuid(0), starts_at=PRODUCTION_WAVE[0][1]
+            ).as_dict()
+            record.raw = raw
+
+    async with session_maker() as session:
+        with pytest.raises(RecoveryError):
+            await apply_snapshot_recovery_plan(session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0)
+
+
+@pytest.mark.parametrize("drift", ["neighbour-raw", "job", "outbox", "live", "new-candidate"])
+async def test_a_reconcile_refuses_any_drift(session_maker, tmp_path, drift: str) -> None:
+    frozen = await _applied_wave(session_maker, tmp_path)
+    reader = _wave_reader()
+
+    async with session_maker() as session:
+        async with session.begin():
+            record = await session.get(Record, PRODUCTION_WAVE[0][0])
+            assert record is not None
+            if drift == "neighbour-raw":
+                record.raw = {**copy.deepcopy(record.raw), "tampered": True}
+            elif drift == "job":
+                session.add(
+                    MessageJob(
+                        provider="easyweek",
+                        company_id=KARLSRUHE_COMPANY_ID,
+                        record_id=record.id,
+                        client_id=record.client_id,
+                        job_type="record_created",
+                        run_at=NOW,
+                        status="queued",
+                        dedupe_key="snapshot-recovery-reconcile-job",
+                        payload={},
+                    )
+                )
+            elif drift == "outbox":
+                session.add(
+                    OutboxMessage(
+                        company_id=KARLSRUHE_COMPANY_ID,
+                        client_id=record.client_id,
+                        record_id=record.id,
+                        phone_e164="+49000000777",
+                        template_code="record_created",
+                        body="fixture",
+                        status="queued",
+                        scheduled_at=NOW,
+                        meta={},
+                    )
+                )
+            elif drift == "new-candidate":
+                await _seed(
+                    session,
+                    record_id=8999,
+                    booking_uuid="78888888-2222-4333-8444-555555555555",
+                    booking_id=BOOKING_ID + 900,
+                    starts_at=NOW + timedelta(days=40),
+                )
+
+    if drift == "live":
+        reader = _wave_reader(canceled=True)
+
+    async with session_maker() as session:
+        with pytest.raises(RecoveryError):
+            await apply_snapshot_recovery_plan(session, frozen=frozen, client=reader, now=NOW, pause_sec=0)

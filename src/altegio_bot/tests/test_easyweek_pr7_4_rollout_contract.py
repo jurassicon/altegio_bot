@@ -481,12 +481,63 @@ def test_the_runbook_documents_the_full_operator_order() -> None:
         assert heading in part, f"missing runbook step: {heading}"
 
 
+def test_every_recovery_command_names_both_production_compose_files() -> None:
+    """A command with only one Compose file would target a different graph."""
+    blocks = _fenced_blocks(_recovery_part())
+    invocations = [line for line in blocks.splitlines() if "docker compose" in line]
+    assert invocations, "the recovery part documents no Compose command"
+    for line in invocations:
+        assert "-f docker-compose.yml" in line, line
+        assert "-f docker-compose.chatwoot-internal.yml" in line, line
+
+
+def test_the_runbook_and_the_cli_agree_on_the_apply_command() -> None:
+    """The CLI must not print a command the runbook contradicts."""
+    printed = snapshot_recovery_cli.apply_command(
+        plan_path="/recovery/snapshot-plan.json",
+        apply_report="/recovery/snapshot-apply.json",
+        plan_digest="0" * 64,
+        max_snapshot_age_sec=600,
+    )
+    flattened = " ".join(printed.replace("\\\n", " ").split())
+    assert "docker compose -p altegio_bot" in flattened
+    assert "-f docker-compose.yml -f docker-compose.chatwoot-internal.yml" in flattened
+    assert "--profile ops run --rm --build" in flattened
+    assert "easyweek-multi-service-snapshot-recovery apply" in flattened
+    # The host trap the review found: a module path and a host /recovery.
+    assert "python -m altegio_bot" not in printed
+
+    blocks = _fenced_blocks(_recovery_part())
+    runbook_apply = " ".join(
+        blocks.split("easyweek-multi-service-snapshot-recovery apply", 1)[1].split("\n\n", 1)[0].split()
+    )
+    for flag in ("--plan", "--apply-report", "--plan-digest", "--confirm", "--max-snapshot-age-sec"):
+        assert flag in runbook_apply, flag
+        assert flag in flattened, flag
+
+
+def test_the_runbook_documents_the_same_plan_retry() -> None:
+    part = _recovery_part()
+    assert "## 27a." in part
+    flattened = " ".join(part.split())
+    for required in (
+        "already_applied",
+        "migrated_this_run_record_ids",
+        "already_applied_record_ids",
+        "partial_apply_detected",
+        "единой мутации БД",
+    ):
+        assert required in flattened, f"missing retry contract: {required}"
+    # Section 33 must not contradict the documented retry.
+    assert "Единственное исключение" in flattened
+
+
 def test_the_recovery_commands_use_the_real_compose_files_and_ops_service() -> None:
     part = _recovery_part()
     blocks = _fenced_blocks(part)
     assert "docker-compose.yml" in blocks
     assert "docker-compose.chatwoot-internal.yml" in blocks
-    assert f"--profile ops run --rm --build \\\n  {SNAPSHOT_RECOVERY_SERVICE} plan" in blocks
+    assert f"{SNAPSHOT_RECOVERY_SERVICE} plan" in blocks
     assert f"{SNAPSHOT_RECOVERY_SERVICE} apply" in blocks
     assert f"{SNAPSHOT_RECOVERY_SERVICE} verify" in blocks
     # The apply command carries the exact digest and confirmation phrase.
