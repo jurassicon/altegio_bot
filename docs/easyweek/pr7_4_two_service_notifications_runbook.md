@@ -765,25 +765,76 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
    `job_state_changed`, `outbox_state_changed`, `scope_drift`) и ничего не
    меняет.
 
-Различать исходы по отчёту:
+Различать исходы по отчёту. Проверка самодостаточна: она читает **текущий**
+frozen plan и привязывает отчёт к нему по `plan_digest` и по точному составу
+migrate IDs. Это существенно: при отказе apply файл отчёта не
+перезаписывается, поэтому на постоянном пути может лежать отчёт от прежнего
+плана, и проверка без такой привязки дала бы ложный успех.
 
 ```bash
 cd /opt/altegio_bot
-jq -e '
+PLAN=outputs/easyweek_multi_service_recovery/snapshot-plan.json
+REPORT=outputs/easyweek_multi_service_recovery/snapshot-apply.json
+EXPECTED_PLAN_DIGEST="$(jq -er '.plan_digest' "$PLAN")"
+EXPECTED_MIGRATE_IDS="$(jq -ec '[.records[] | select(.disposition == "migrate") | .record_id] | sort' "$PLAN")"
+jq -e \
+  --arg expected_plan_digest "$EXPECTED_PLAN_DIGEST" \
+  --argjson expected_migrate_ids "$EXPECTED_MIGRATE_IDS" '
+  def id_array:
+    type == "array"
+    and all(.[]; type == "number" and . == floor)
+    and (length == (unique | length));
   select(
-    (.outcome == "applied" or .outcome == "already_applied")
+    (.version == 2)
+    and (.mode == "apply-report")
+    and (.plan_digest == $expected_plan_digest)
+    and (.halted == false)
+    and (.migrated_record_ids | id_array)
+    and (.migrated_this_run_record_ids | id_array)
+    and (.already_applied_record_ids | id_array)
+    and ((.migrated_record_ids | sort) == $expected_migrate_ids)
+    and (((.migrated_this_run_record_ids + .already_applied_record_ids) | sort) == (.migrated_record_ids | sort))
+    and (((.migrated_this_run_record_ids + .already_applied_record_ids) | unique | length) == (.migrated_record_ids | length))
+    and (
+      (
+        .outcome == "applied"
+        and ((.migrated_this_run_record_ids | sort) == $expected_migrate_ids)
+        and (.already_applied_record_ids == [])
+        and (.mutation_counts.records_snapshot_migrated == ($expected_migrate_ids | length))
+      )
+      or
+      (
+        .outcome == "already_applied"
+        and (.migrated_this_run_record_ids == [])
+        and ((.already_applied_record_ids | sort) == $expected_migrate_ids)
+        and (.mutation_counts.records_snapshot_migrated == 0)
+      )
+    )
     and (.mutation_counts.message_jobs_created == 0)
+    and (.mutation_counts.message_jobs_changed == 0)
     and (.mutation_counts.outbox_messages_created == 0)
-    and ((.migrated_this_run_record_ids + .already_applied_record_ids) | sort) == (.migrated_record_ids | sort)
+    and (.mutation_counts.outbox_messages_changed == 0)
+    and (.mutation_counts.clients_changed == 0)
+    and (.mutation_counts.record_services_changed == 0)
   )
   | {outcome, migrated_record_ids, migrated_this_run_record_ids,
      already_applied_record_ids, mutation_counts}
-' outputs/easyweek_multi_service_recovery/snapshot-apply.json
+' "$REPORT"
 ```
 
+Вывод содержит только технические Record ID и счётчики: booking UUID, имена
+услуг и клиентские данные в него не попадают.
+
+Ненулевой код возвращается при отсутствующем или нечитаемом plan либо report,
+при отчёте от другого плана, при неверном `version`/`mode`/`halted`, при
+нецелых или повторяющихся ID, при несовпадении состава ID с текущим планом,
+при пересечении или неполноте двух списков, при несогласованном `outcome` и
+при любом ненулевом mutation counter. Пустой вывод — это STOP, а не PASS.
+
 Состояние 3 никогда не даёт отчёта: при нём файл не перезаписывается, а
-предыдущий отчёт (если он есть) остаётся прежним. Не «чинить» такое состояние
-повторными запусками — нужен новый `plan` и разбор причины.
+предыдущий отчёт (если он есть) остаётся прежним — и именно поэтому проверка
+выше сверяет `plan_digest`. Не «чинить» такое состояние повторными запусками —
+нужен новый `plan` и разбор причины.
 
 ## 28. Verify
 

@@ -425,15 +425,38 @@ def _contract_state(snapshot: MultiServiceSnapshot) -> dict[str, object]:
     }
 
 
-def _ordered_business_projection(snapshot: MultiServiceSnapshot) -> list[dict[str, object]]:
-    """The canonical business identity of a pair, in business order.
+# The business identity of one line, as §38.6 defines it.  Deliberately NOT
+# `MultiServiceLine.as_dict()`: that also carries `business_signature_digest`,
+# which hashes the whole raw ordered-service row apart from its UUID and so
+# includes technical fields nobody models — a resource uuid, a position, any
+# future column EasyWeek adds.
+_SEMANTIC_LINE_FIELDS: Final = (
+    "display_name",
+    "normalized_name",
+    "category",
+    "currency",
+    "actual_price_minor",
+    "actual_duration_minutes",
+    "original_duration_minutes",
+)
 
-    Everything ``MultiServiceLine`` models is included — display and normalized
-    name, category, currency, actual price, both durations and the business
-    signature digest — because an upgrade may change the projection's VERSION
-    and nothing about which two services it describes.
+
+def _ordered_semantic_projection(snapshot: MultiServiceSnapshot) -> list[dict[str, object]]:
+    """The two services a projection describes, in business order.
+
+    Used ONLY to compare a stored version 1 with the version 2 that would
+    replace it.  Those two were proved from two different live observations of
+    the same booking — one before the resource row existed in the response, one
+    after — so their raw rows legitimately differ in technical fields.  §38.6
+    is explicit that the full raw-row digest is not a criterion of equivalence:
+    unknown technical fields may differ as long as every known business field
+    matches.  Comparing the signature digest here would therefore refuse a
+    perfectly sound upgrade.
+
+    Order is preserved, so a reordered pair is still a mismatch, and each field
+    below is a real business fact whose change must still fail closed.
     """
-    return [line.as_dict() for line in snapshot.lines]
+    return [{field: getattr(line, field) for field in _SEMANTIC_LINE_FIELDS} for line in snapshot.lines]
 
 
 def _source_provenance_error(
@@ -449,7 +472,9 @@ def _source_provenance_error(
     live resolver produced a version 2 — which would let recovery paper over a
     misbound, corrupted or genuinely outdated business snapshot instead of
     refusing it.  The only differences an upgrade may introduce are the
-    version, the top-level digest and the resource-shadow proof.
+    version, the top-level digest, the resource-shadow proof and the per-line
+    raw-row signature digest, which §38.6 excludes from equivalence because it
+    hashes technical fields this contract does not model.
     """
     record_booking = str(record.easyweek_booking_uuid) if record.easyweek_booking_uuid is not None else None
     if (
@@ -461,7 +486,7 @@ def _source_provenance_error(
         return SOURCE_IDENTITY_MISMATCH
     if len(stored.lines) != 2 or len(target.lines) != 2:
         return SOURCE_BUSINESS_MISMATCH
-    if _ordered_business_projection(stored) != _ordered_business_projection(target):
+    if _ordered_semantic_projection(stored) != _ordered_semantic_projection(target):
         return SOURCE_BUSINESS_MISMATCH
     return None
 

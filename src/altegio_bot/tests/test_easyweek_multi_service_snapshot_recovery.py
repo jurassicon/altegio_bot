@@ -48,6 +48,7 @@ from altegio_bot.easyweek_resource_shadow_contract import (
 )
 from altegio_bot.easyweek_service_category import record_raw_with_services_count
 from altegio_bot.easyweek_snapshot_recovery import (
+    _SEMANTIC_LINE_FIELDS,
     BLOCKED,
     CATEGORY_NOW_ALLOWED,
     JOBS_PRESENT,
@@ -60,6 +61,7 @@ from altegio_bot.easyweek_snapshot_recovery import (
     SOURCE_BUSINESS_MISMATCH,
     SOURCE_IDENTITY_MISMATCH,
     RecoveryError,
+    _ordered_semantic_projection,
     apply_snapshot_recovery_plan,
     build_snapshot_recovery_plan,
     check_apply_authorization,
@@ -155,7 +157,14 @@ def _webhook(*, booking_uuid: str = BOOKING_UUID, booking_id: int = BOOKING_ID) 
     return payload
 
 
-def _line(index: int, name: str, *, price: int | None = None, minutes: int = 60) -> dict[str, Any]:
+def _line(
+    index: int,
+    name: str,
+    *,
+    price: int | None = None,
+    minutes: int = 60,
+    technical: str = "0",
+) -> dict[str, Any]:
     return {
         "uuid": f"5000000{index}-0000-4000-8000-000000000001",
         "name": name,
@@ -168,8 +177,10 @@ def _line(index: int, name: str, *, price: int | None = None, minutes: int = 60)
         "original_duration": {"value": minutes, "label": "minutes"},
         # A technical API field the proof does not model; it differs between
         # the pedicure row and its resource copy, which is exactly why the old
-        # full-row signature could not collapse them.
-        "resource": {"uuid": f"5100000{index}-0000-4000-8000-000000000001"},
+        # full-row signature could not collapse them.  ``technical`` also lets
+        # a test give two live observations of the SAME booking different
+        # technical values, which is what §38.6 says must not matter.
+        "resource": {"uuid": f"5100000{index}-{technical}000-4000-8000-000000000001"[:36]},
     }
 
 
@@ -181,10 +192,14 @@ def _api(
     canceled: bool = False,
     completed: bool = False,
     second_price: int | None = None,
+    technical: str = "0",
 ) -> dict[str, Any]:
-    rows = [_line(0, SHELLAC), _line(1, PEDIKUERE_GEL, price=second_price)]
+    rows = [
+        _line(0, SHELLAC, technical=technical),
+        _line(1, PEDIKUERE_GEL, price=second_price, technical=technical),
+    ]
     if resource_shadow:
-        rows.append(_line(2, PEDIKUERE_GEL, price=second_price))
+        rows.append(_line(2, PEDIKUERE_GEL, price=second_price, technical=technical))
     total = rows[0]["price"] + rows[1]["price"]
     status = "canceled" if canceled else "completed" if completed else "active"
     return {
@@ -272,7 +287,12 @@ class FakeReader:
         return None
 
 
-def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID, *, starts_at: datetime = STARTS_AT):
+def _stored_v1_snapshot(
+    booking_uuid: str = BOOKING_UUID,
+    *,
+    starts_at: datetime = STARTS_AT,
+    technical: str = "0",
+):
     """The projection these records really carry: proven, correct, version 1.
 
     Built from the two-row form the booking had when it was first proved, which
@@ -292,7 +312,9 @@ def _stored_v1_snapshot(booking_uuid: str = BOOKING_UUID, *, starts_at: datetime
             company_id=KARLSRUHE_COMPANY_ID,
             service_id=SHELLAC_ID,
         ),
-        booking_payload=_api(booking_uuid=booking_uuid, starts_at=starts_at, resource_shadow=False),
+        booking_payload=_api(
+            booking_uuid=booking_uuid, starts_at=starts_at, resource_shadow=False, technical=technical
+        ),
         catalog_rows=_catalog(),
     )
     assert snapshot.version == MULTI_SERVICE_SNAPSHOT_VERSION
@@ -313,6 +335,7 @@ async def _seed(
     services_count: int = 2,
     with_snapshot: bool = True,
     snapshot_override: Any = None,
+    stored_technical: str = "0",
     extra_raw: dict[str, Any] | None = None,
 ) -> Record:
     client = Client(
@@ -334,7 +357,7 @@ async def _seed(
             raw,
             snapshot_override
             if snapshot_override is not None
-            else _stored_v1_snapshot(booking_uuid, starts_at=starts_at),
+            else _stored_v1_snapshot(booking_uuid, starts_at=starts_at, technical=stored_technical),
         )
     record = Record(
         id=record_id,
@@ -1603,7 +1626,6 @@ def _tampered_v1(**overrides: Any):
         # The canonical parser already forbids duration != original_duration,
         # so this shape never reaches the provenance check.
         ({"original_duration_minutes": 75}, "multi_service_snapshot_digest_mismatch"),
-        ({"business_signature_digest": "0" * 64}, SOURCE_BUSINESS_MISMATCH),
     ],
     ids=[
         "other-booking",
@@ -1615,7 +1637,6 @@ def _tampered_v1(**overrides: Any):
         "other-price",
         "other-duration",
         "other-original-duration",
-        "other-signature",
     ],
 )
 async def test_a_stored_v1_from_a_different_projection_is_never_upgraded(
@@ -1648,7 +1669,7 @@ async def test_a_stored_v1_from_a_different_projection_is_never_upgraded(
         assert (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one() == 0
 
 
-async def test_the_production_shaped_pair_has_one_ordered_business_projection(session_maker) -> None:
+async def test_the_production_shaped_pair_has_one_ordered_semantic_projection(session_maker) -> None:
     """The positive control: only version, digest and proof may differ."""
     async with session_maker() as session:
         async with session.begin():
@@ -1839,3 +1860,341 @@ async def test_a_reconcile_refuses_any_drift(session_maker, tmp_path, drift: str
     async with session_maker() as session:
         with pytest.raises(RecoveryError):
             await apply_snapshot_recovery_plan(session, frozen=frozen, client=reader, now=NOW, pause_sec=0)
+
+
+# ===========================================================================
+# Review finding 1: the raw-row signature digest is not a business field
+#
+# A stored version 1 was proved from a two-row response; the version 2 that
+# would replace it is proved from the same booking after EasyWeek started
+# returning the resource row. §38.6: unknown technical fields may differ as
+# long as every known business field matches. Comparing the whole
+# MultiServiceLine — which carries a digest over the raw row minus its UUID —
+# refused exactly that legitimate upgrade.
+# ===========================================================================
+
+STORED_TECHNICAL = "a"
+LIVE_TECHNICAL = "b"
+
+
+async def test_a_technical_only_difference_between_the_two_observations_still_migrates(
+    session_maker,
+    tmp_path,
+) -> None:
+    stored = _stored_v1_snapshot(technical=STORED_TECHNICAL)
+    live_payload = _api(technical=LIVE_TECHNICAL)
+    target = prove_exactly_two_service_snapshot(
+        webhook=WebhookServicePair(
+            booking_uuid=uuid.UUID(BOOKING_UUID),
+            location_uuid=KARLSRUHE_LOCATION_UUID,
+            service_name=SHELLAC,
+            service_related=PEDIKUERE_GEL,
+            services_description=f"{SHELLAC}, {PEDIKUERE_GEL}",
+            services_count=2,
+            quantity=2,
+            booking_currency="EUR",
+            total_cost=Decimal(TOTAL) / Decimal(100),
+            company_id=KARLSRUHE_COMPANY_ID,
+            service_id=SHELLAC_ID,
+        ),
+        booking_payload=live_payload,
+        catalog_rows=_catalog(),
+    )
+
+    # Both projections come from the shared production resolver, and each is
+    # independently digest-valid.
+    assert stored.version == MULTI_SERVICE_SNAPSHOT_VERSION
+    assert target.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert stored.booking_uuid == target.booking_uuid
+    assert stored.location_uuid == target.location_uuid
+
+    # Every business field agrees...
+    for field in (
+        "display_name",
+        "normalized_name",
+        "category",
+        "currency",
+        "actual_price_minor",
+        "actual_duration_minutes",
+        "original_duration_minutes",
+    ):
+        assert [getattr(line, field) for line in stored.lines] == [getattr(line, field) for line in target.lines]
+
+    # ...and the raw-row signature digests genuinely do NOT, because only a
+    # technical field moved between the two live observations.
+    assert [line.business_signature_digest for line in stored.lines] != [
+        line.business_signature_digest for line in target.lines
+    ]
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, stored_technical=STORED_TECHNICAL)
+        before_counts = await _row_counts(session)
+        record = (await session.execute(select(Record))).scalars().one()
+        raw_before = copy.deepcopy(record.raw)
+
+    reader = FakeReader(bookings={BOOKING_UUID: live_payload})
+    async with session_maker() as session:
+        plan = await _plan(session, reader=reader)
+
+    assert plan.records[0]["disposition"] == MIGRATE
+    assert plan.records[0]["refusal_reason"] is None
+    assert plan.summary["apply_ready"] is True
+
+    frozen, _path = await _freeze(tmp_path, plan)
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        result = await apply_snapshot_recovery_plan(
+            session,
+            frozen=frozen,
+            client=FakeReader(bookings={BOOKING_UUID: live_payload}),
+            now=NOW,
+            pause_sec=0,
+        )
+    assert len(result.migrated) == 1
+
+    report_path = write_private_json(result.report(), tmp_path / "apply.json")
+    reread = read_apply_report(report_path, frozen=frozen)
+
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        verified = await verify_snapshot_recovery(
+            session,
+            frozen=frozen,
+            apply_report=reread,
+            client=FakeReader(bookings={BOOKING_UUID: live_payload}),
+            pause_sec=0,
+        )
+    assert verified["passed"] is True
+    assert verified["still_version_1_record_ids"] == []
+
+    async with session_maker() as session:
+        assert await _row_counts(session) == before_counts
+        record = (await session.execute(select(Record))).scalars().one()
+        stored_after, error = multi_service_snapshot_from_record_raw(record.raw)
+        assert error is None and stored_after is not None
+        assert stored_after.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+        assert stored_after.digest == target.digest
+        # The record is no longer a stale digest for the preflight.
+        assert (await session.execute(select(func.count()).select_from(MessageJob))).scalar_one() == 0
+        assert (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one() == 0
+
+    # Every neighbouring key of Record.raw survived untouched.
+    assert set(record.raw) == set(raw_before)
+    assert set(record.raw["easyweek"]) == set(raw_before["easyweek"])
+    assert record.raw["easyweek"]["services_count"] == raw_before["easyweek"]["services_count"]
+
+    # A second plan no longer sees it as version 1 work.
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        second = await _plan(session, reader=FakeReader(bookings={BOOKING_UUID: live_payload}))
+    assert second.records == ()
+
+
+async def test_the_semantic_projection_excludes_only_the_raw_row_signature() -> None:
+    """The contract of the comparison, stated once and pinned."""
+    assert set(_SEMANTIC_LINE_FIELDS) == {
+        "display_name",
+        "normalized_name",
+        "category",
+        "currency",
+        "actual_price_minor",
+        "actual_duration_minutes",
+        "original_duration_minutes",
+    }
+    # `as_dict()` is untouched and still carries the digest the snapshot needs.
+    line = _stored_v1_snapshot().lines[0]
+    assert "business_signature_digest" in line.as_dict()
+    assert "business_signature_digest" not in _ordered_semantic_projection(_stored_v1_snapshot())[0]
+
+
+# ===========================================================================
+# Review finding 2: the operator's report check must be bound to THIS plan
+#
+# A refused apply does not rewrite the report file, so the permanent path can
+# still hold a report from an earlier plan. A check that only validates the
+# report's internal lists would give that stale file a clean exit code.
+# ===========================================================================
+
+
+def _runbook_report_command() -> str:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = text.split("## 27a.", 1)[1].split("## 28.", 1)[0]
+    blocks = [part for index, part in enumerate(section.split("```")) if index % 2 == 1]
+    assert len(blocks) == 1, "section 27a must document exactly one command block"
+    body = blocks[0]
+    assert body.startswith("bash\n")
+    return body[len("bash\n") :]
+
+
+def _run_runbook_report_check(plan_payload: object, report_payload: object, tmp_path) -> subprocess.CompletedProcess:
+    command = _runbook_report_command().replace("cd /opt/altegio_bot\n", "")
+    plan_file = tmp_path / "rb-plan.json"
+    report_file = tmp_path / "rb-apply.json"
+    for path, payload in ((plan_file, plan_payload), (report_file, report_payload)):
+        if payload is None:
+            path.unlink(missing_ok=True)
+        elif isinstance(payload, str):
+            path.write_text(payload, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    command = command.replace(
+        "PLAN=outputs/easyweek_multi_service_recovery/snapshot-plan.json",
+        f"PLAN={shlex.quote(str(plan_file))}",
+    )
+    command = command.replace(
+        "REPORT=outputs/easyweek_multi_service_recovery/snapshot-apply.json",
+        f"REPORT={shlex.quote(str(report_file))}",
+    )
+    return subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False)
+
+
+async def _plan_and_reports(session_maker, tmp_path):
+    """One real frozen plan plus its genuine applied and reconciled reports."""
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_production_wave(session)
+    async with session_maker() as session:
+        plan = await _plan(session, reader=_wave_reader())
+        frozen, _path = await _freeze(tmp_path, plan)
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        applied = await apply_snapshot_recovery_plan(
+            session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0
+        )
+    clear_multi_service_catalog_cache()
+    async with session_maker() as session:
+        reconciled = await apply_snapshot_recovery_plan(
+            session, frozen=frozen, client=_wave_reader(), now=NOW, pause_sec=0
+        )
+    return plan.snapshot(), applied.report(), reconciled.report()
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+async def test_the_documented_report_check_accepts_both_real_outcomes(session_maker, tmp_path) -> None:
+    plan_payload, applied, reconciled = await _plan_and_reports(session_maker, tmp_path)
+
+    for report, outcome, this_run, already in (
+        (applied, OUTCOME_APPLIED, CANONICAL_ORDER, []),
+        (reconciled, OUTCOME_ALREADY_APPLIED, [], CANONICAL_ORDER),
+    ):
+        result = _run_runbook_report_check(plan_payload, report, tmp_path)
+        assert result.returncode == 0, result.stderr
+        printed = json.loads(result.stdout)
+        assert printed["outcome"] == outcome
+        assert printed["migrated_record_ids"] == CANONICAL_ORDER
+        assert printed["migrated_this_run_record_ids"] == this_run
+        assert printed["already_applied_record_ids"] == already
+        for forbidden in (BOOKING_UUID[:8], SHELLAC, PEDIKUERE_GEL, "+49000000777"):
+            assert forbidden not in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+async def test_a_report_from_an_earlier_plan_is_refused(session_maker, tmp_path) -> None:
+    """The exact production trap: same record ids, different plan."""
+    plan_payload, applied, _reconciled = await _plan_and_reports(session_maker, tmp_path)
+
+    stale = {**applied, "plan_digest": "f" * 64}
+    unsigned = {key: value for key, value in stale.items() if key != "report_digest"}
+    stale["report_digest"] = _digest(unsigned)
+
+    # The stale report is internally perfectly consistent.
+    assert stale["migrated_record_ids"] == applied["migrated_record_ids"]
+    result = _run_runbook_report_check(plan_payload, stale, tmp_path)
+    assert result.returncode != 0, result.stdout
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "version",
+        "mode",
+        "halted",
+        "duplicate-id",
+        "non-integer-id",
+        "missing-id",
+        "extra-id",
+        "overlapping-partition",
+        "applied-with-already",
+        "already-with-this-run",
+        "wrong-migrated-count",
+        "job-created",
+        "outbox-changed",
+        "missing-counts",
+    ],
+)
+async def test_the_documented_report_check_refuses_every_inconsistency(
+    session_maker,
+    tmp_path,
+    damage: str,
+) -> None:
+    plan_payload, applied, reconciled = await _plan_and_reports(session_maker, tmp_path)
+    report = copy.deepcopy(applied)
+    ids = list(report["migrated_record_ids"])
+
+    if damage == "version":
+        report["version"] = 1
+    elif damage == "mode":
+        report["mode"] = "plan"
+    elif damage == "halted":
+        report["halted"] = True
+    elif damage == "duplicate-id":
+        report["migrated_record_ids"] = [ids[0], *ids]
+        report["migrated_this_run_record_ids"] = [ids[0], *ids]
+    elif damage == "non-integer-id":
+        report["migrated_record_ids"] = [f"{ids[0]}", *ids[1:]]
+    elif damage == "missing-id":
+        report["migrated_record_ids"] = ids[:-1]
+        report["migrated_this_run_record_ids"] = ids[:-1]
+    elif damage == "extra-id":
+        report["migrated_record_ids"] = [*ids, 99999]
+        report["migrated_this_run_record_ids"] = [*ids, 99999]
+    elif damage == "overlapping-partition":
+        report["migrated_this_run_record_ids"] = ids
+        report["already_applied_record_ids"] = [ids[0]]
+    elif damage == "applied-with-already":
+        report["migrated_this_run_record_ids"] = ids[:-1]
+        report["already_applied_record_ids"] = ids[-1:]
+    elif damage == "already-with-this-run":
+        report = copy.deepcopy(reconciled)
+        report["migrated_this_run_record_ids"] = list(report["already_applied_record_ids"])
+        report["already_applied_record_ids"] = []
+    elif damage == "wrong-migrated-count":
+        report["mutation_counts"]["records_snapshot_migrated"] = 0
+    elif damage == "job-created":
+        report["mutation_counts"]["message_jobs_created"] = 1
+    elif damage == "outbox-changed":
+        report["mutation_counts"]["outbox_messages_changed"] = 1
+    else:
+        report.pop("mutation_counts")
+
+    unsigned = {key: value for key, value in report.items() if key != "report_digest"}
+    report["report_digest"] = _digest(unsigned)
+
+    result = _run_runbook_report_check(plan_payload, report, tmp_path)
+    assert result.returncode != 0, f"{damage} was accepted: {result.stdout}"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+@pytest.mark.parametrize("missing", ["plan", "report"])
+async def test_the_documented_report_check_refuses_a_missing_or_malformed_file(
+    session_maker,
+    tmp_path,
+    missing: str,
+) -> None:
+    plan_payload, applied, _reconciled = await _plan_and_reports(session_maker, tmp_path)
+
+    absent = _run_runbook_report_check(
+        None if missing == "plan" else plan_payload,
+        None if missing == "report" else applied,
+        tmp_path,
+    )
+    assert absent.returncode != 0, absent.stdout
+
+    malformed = _run_runbook_report_check(
+        "{not json" if missing == "plan" else plan_payload,
+        "{not json" if missing == "report" else applied,
+        tmp_path,
+    )
+    assert malformed.returncode != 0, malformed.stdout
