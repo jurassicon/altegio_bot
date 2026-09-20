@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient
+from altegio_bot.easyweek_multi_service_rollout import RolloutPhase, multi_service_configuration_error
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.easyweek_reminder_guard import (
     BookingReader,
@@ -81,6 +82,13 @@ DEADLINE_EXPIRED_OUTCOME: Final = "deadline_expired"
 class PreflightReport:
     """Counts, reason codes and technical ids — never a value from a booking."""
 
+    # §38.9: the effective configuration this report is a statement about.
+    #
+    # A reminder preflight run with EASYWEEK_REMINDER_API_GUARD_ENABLED=false
+    # is the sharpest case. With the guard off the outbox does not claim
+    # reminders AT ALL, so every job it inspects is one the worker would not
+    # even look at — and calling that "rollout-ready" is exactly backwards.
+    config_error: str | None = None
     candidate_count: int = 0
     checked_count: int = 0
     truncated: bool = False
@@ -100,9 +108,15 @@ class PreflightReport:
             return False
         return self.outcomes.get(GuardOutcome.PROVEN_CURRENT.value, 0) == self.candidate_count
 
+    @property
+    def rollout_ready(self) -> bool:
+        """Green data AND the exact pre-open configuration §38.9 requires."""
+        return self.config_error is None and self.ready
+
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "mode": "read-only",
+            "config_error": self.config_error,
             "candidate_count": self.candidate_count,
             "checked_count": self.checked_count,
             "truncated": self.truncated,
@@ -111,6 +125,7 @@ class PreflightReport:
             "unproven_record_ids": sorted(self.unproven_record_ids)[:MAX_REPORTED_IDS],
             "company_ids": sorted(self.company_ids)[:MAX_REPORTED_IDS],
             "ready": self.ready,
+            "rollout_ready": self.rollout_ready,
         }
 
 
@@ -152,6 +167,10 @@ async def run_preflight(
 
     jobs, truncated = await select_open_reminder_jobs(session, limit=limit)
     report = PreflightReport(candidate_count=len(jobs), truncated=truncated)
+    # Read from the SAME settings object the outbox worker reads, so a report
+    # and a worker cannot disagree about the rollout state. The queue is still
+    # checked in full: an operator fixing a flag needs the picture as well.
+    report.config_error = multi_service_configuration_error(RolloutPhase.PRE_OPEN)
 
     registry = configured_easyweek_locations()
     locations = registry.locations if registry.valid else {}
@@ -249,8 +268,9 @@ async def main(argv: list[str] | None = None) -> int:
         await client.aclose()
 
     print(report.as_safe_dict())
-    # Non-zero on anything short of "every open reminder is provably sendable".
-    return 0 if report.ready else 1
+    # Non-zero on anything short of "every open reminder is provably sendable,
+    # in the configuration this report claims to be about".
+    return 0 if report.rollout_ready else 1
 
 
 if __name__ == "__main__":

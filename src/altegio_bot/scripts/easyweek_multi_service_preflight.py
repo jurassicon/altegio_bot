@@ -47,6 +47,7 @@ from altegio_bot.easyweek_multi_service import (
     record_raw_with_multi_service_snapshot,
     resolve_effective_multi_service_snapshot,
 )
+from altegio_bot.easyweek_multi_service_rollout import RolloutPhase, multi_service_configuration_error
 from altegio_bot.easyweek_normalizer import NormalizationError, normalize_event
 from altegio_bot.easyweek_policy import EASYWEEK_LIFECYCLE_JOB_TYPES, EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.easyweek_service_category import (
@@ -85,6 +86,13 @@ _PROOF_TRIGGER_KEYS: Final = frozenset(
 
 @dataclass
 class MultiServicePreflightReport:
+    # §38.9: the effective configuration this report is a statement about.
+    # "Every held pair job would be delivered correctly" is only true in one
+    # configuration; in any other one the business aggregates below describe a
+    # world the operator is not in.  Kept separate from `ready` on purpose:
+    # `ready` stays the verdict about the DATA, and `rollout_ready` is the one
+    # the runbook and the exit code use.
+    config_error: str | None = None
     active_multi_service: int = 0
     checked: int = 0
     structurally_proven: int = 0
@@ -113,9 +121,15 @@ class MultiServicePreflightReport:
             and self.open_jobs == self.jobs_held_by_send_fence
         )
 
+    @property
+    def rollout_ready(self) -> bool:
+        """Green data AND the exact pre-open configuration §38.9 requires."""
+        return self.config_error is None and self.ready
+
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "mode": "read-only",
+            "config_error": self.config_error,
             "active_multi_service": self.active_multi_service,
             "checked": self.checked,
             "structurally_proven": self.structurally_proven,
@@ -130,6 +144,7 @@ class MultiServicePreflightReport:
             "truncated": self.truncated,
             "reasons": dict(sorted(self.reasons.items())),
             "ready": self.ready,
+            "rollout_ready": self.rollout_ready,
         }
 
 
@@ -306,6 +321,10 @@ async def run_preflight(
     pause = sleep if sleep is not None else asyncio.sleep
     records, truncated = await select_active_multi_service_records(session, limit=limit)
     report = MultiServicePreflightReport(active_multi_service=len(records), truncated=truncated)
+    # Checked from the SAME settings object both workers read, so a report and
+    # a worker cannot disagree about the rollout state.  The queue is still
+    # audited: an operator fixing a flag needs the business picture too.
+    report.config_error = multi_service_configuration_error(RolloutPhase.PRE_OPEN)
     events = await _latest_lifecycle_events(session, records)
     jobs = await _open_jobs_by_record(session, records)
     outboxes = await _non_terminal_outboxes_by_record(session, records)
@@ -453,7 +472,7 @@ async def main(argv: list[str] | None = None) -> int:
     finally:
         await client.aclose()
     print(report.as_safe_dict())
-    return 0 if report.ready else 1
+    return 0 if report.rollout_ready else 1
 
 
 if __name__ == "__main__":

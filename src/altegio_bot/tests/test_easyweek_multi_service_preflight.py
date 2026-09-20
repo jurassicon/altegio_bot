@@ -82,6 +82,13 @@ def _configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
+    # §38.9: the report is a statement about a configuration, so the fixture
+    # deploys the exact pre-open one the runbook requires.
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_canary_job_id", "", raising=False)
     clear_multi_service_catalog_cache()
 
 
@@ -351,6 +358,8 @@ async def test_historical_pair_without_snapshot_is_proven_and_preflight_is_read_
         "truncated": False,
         "reasons": {},
         "ready": True,
+        "config_error": None,
+        "rollout_ready": True,
     }
     assert (reader.booking_calls, reader.catalog_calls) == (1, 1)
 
@@ -989,3 +998,52 @@ async def test_an_unusable_envelope_quantity_still_keeps_the_preflight_red(
     assert report.ambiguous == 1
     assert report.unexplained == 1
     assert report.ready is False
+
+
+# ===========================================================================
+# §38.9: readiness is a statement about a configuration, not only about data
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("easyweek_notifications_enabled", "easyweek_notifications_disabled"),
+        ("easyweek_reminders_enabled", "easyweek_reminders_disabled"),
+        ("easyweek_reminder_api_guard_enabled", "easyweek_reminder_api_guard_disabled"),
+        ("easyweek_multi_service_notifications_enabled", "multi_service_disabled"),
+        ("easyweek_resource_shadow_proof_enabled", "multi_service_resource_shadow_disabled"),
+    ],
+)
+async def test_a_mandatory_flag_that_is_off_makes_the_report_not_rollout_ready(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    expected: str,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session)
+
+    monkeypatch.setattr(settings, flag, False, raising=False)
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_no_sleep)
+
+    assert report.config_error == expected
+    assert report.rollout_ready is False
+
+
+async def test_a_malformed_canary_value_makes_the_report_not_rollout_ready(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_active_pair(session)
+
+    monkeypatch.setattr(settings, "easyweek_multi_service_canary_job_id", "12, 13", raising=False)
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_no_sleep)
+
+    assert report.config_error == "multi_service_canary_job_id_invalid"
+    assert report.rollout_ready is False

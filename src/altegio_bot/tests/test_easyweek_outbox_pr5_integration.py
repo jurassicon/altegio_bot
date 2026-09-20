@@ -9167,3 +9167,200 @@ async def test_an_allowed_pair_sends_both_services_once_with_one_total(
     assert params[5] == "95.00"
     assert len(capture.template_calls) == 1
     assert len(await _outbox_rows(db, job)) == 1
+
+
+# ===========================================================================
+# §38.9: the controlled canary on the pair queue
+# ===========================================================================
+
+
+def _multi_canary(monkeypatch: pytest.MonkeyPatch, value: object) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_canary_job_id", value, raising=False)
+
+
+def _open_pair_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+
+
+async def _seed_second_pair_job(db: AsyncSession, first: MessageJob) -> MessageJob:
+    """A second, equally sendable pair job on the same proven record."""
+    record = await db.get(Record, first.record_id)
+    client = await db.get(Client, first.client_id)
+    assert record is not None and client is not None
+    other = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=first.company_id,
+        job_type="record_updated",
+        record=record,
+        client=client,
+        dedupe_key="eyw-second-pair-job",
+    )
+    other.payload = dict(first.payload)
+    await db.flush()
+    return other
+
+
+async def test_the_pair_canary_lets_exactly_one_due_job_be_claimed(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE canary property: two due pair jobs, one claim, nothing else moves.
+
+    "The queue happens to hold one job" is not a controlled canary — the queue
+    grows between the audit and the fence opening. This proves the restriction
+    is mechanical.
+    """
+    _open_pair_fence(monkeypatch)
+    chosen = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, chosen)
+    other = await _seed_second_pair_job(db, chosen)
+    _multi_canary(monkeypatch, str(chosen.id))
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert [row.id for row in claimed] == [chosen.id]
+    await db.refresh(other)
+    assert other.status == "queued"
+    assert other.attempts == 0
+    assert other.locked_at is None
+
+
+async def test_the_pair_canary_leaves_single_service_and_altegio_jobs_alone(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _open_pair_fence(monkeypatch)
+    pair = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, pair)
+    record = await db.get(Record, pair.record_id)
+    client = await db.get(Client, pair.client_id)
+    assert record is not None and client is not None
+    single = await _seed_job(
+        db,
+        provider=PROVIDER_EASYWEEK,
+        company_id=pair.company_id,
+        job_type="record_updated",
+        record=record,
+        client=client,
+        dedupe_key="single-beside-canary",
+    )
+    altegio = await _seed_job(
+        db,
+        provider=PROVIDER_ALTEGIO,
+        company_id=pair.company_id,
+        job_type="repeat_10d",
+        record=None,
+        client=None,
+        dedupe_key="altegio-beside-canary",
+    )
+    # A job id that exists nowhere: the restriction must hold every pair job
+    # and still leave the other two families untouched.
+    _multi_canary(monkeypatch, str(pair.id + 10_000))
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == {single.id, altegio.id}
+    await db.refresh(pair)
+    assert pair.status == "queued" and pair.attempts == 0 and pair.locked_at is None
+
+
+@pytest.mark.parametrize("bad", ["12, 13", "0", "-1", "true", "1.0", "١٤"])
+async def test_a_malformed_canary_holds_the_whole_pair_queue(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    bad: str,
+) -> None:
+    _open_pair_fence(monkeypatch)
+    pair = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, pair)
+    other = await _seed_second_pair_job(db, pair)
+    _multi_canary(monkeypatch, bad)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+
+    assert claimed == [], "a value nobody can read must never release the queue"
+    for row in (pair, other):
+        await db.refresh(row)
+        assert row.status == "queued" and row.attempts == 0 and row.locked_at is None
+
+
+async def test_a_malformed_canary_also_holds_an_already_claimed_pair_job(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _open_pair_fence(monkeypatch)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+    _multi_canary(monkeypatch, "not-a-number")
+
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.attempts == 0
+    assert job.last_error == "multi_service_canary_job_id_invalid"
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_a_canary_set_after_the_claim_stops_the_send_without_spending_an_attempt(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The race half of the gate: claimed a moment before the operator chose."""
+    _open_pair_fence(monkeypatch)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+
+    claimed = await ow._lock_next_jobs(db, 10)
+    assert [row.id for row in claimed] == [job.id]
+
+    _multi_canary(monkeypatch, str(job.id + 777))
+    await _run_job(db, job)
+
+    assert job.status == "queued"
+    assert job.locked_at is None
+    assert job.attempts == 0
+    assert job.last_error == "multi_service_canary_restricted"
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_the_named_pair_job_still_reaches_the_provider(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _open_pair_fence(monkeypatch)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+    other = await _seed_second_pair_job(db, job)
+    _multi_canary(monkeypatch, str(job.id))
+
+    for row in await ow._lock_next_jobs(db, 10):
+        await _run_job(db, row)
+
+    assert len(capture.template_calls) == 1
+    await db.refresh(job)
+    await db.refresh(other)
+    assert job.status == "done"
+    assert other.status == "queued" and other.attempts == 0
+
+
+async def test_an_empty_canary_releases_the_whole_pair_queue(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing the restriction is a bulk rollout, and the claim says so."""
+    _open_pair_fence(monkeypatch)
+    first = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, first)
+    second = await _seed_second_pair_job(db, first)
+    _multi_canary(monkeypatch, "")
+
+    claimed = {row.id for row in await ow._lock_next_jobs(db, 10)}
+
+    assert claimed == {first.id, second.id}
