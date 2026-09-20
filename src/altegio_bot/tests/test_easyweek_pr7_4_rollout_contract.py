@@ -10,8 +10,10 @@ import yaml
 
 from altegio_bot import easyweek_resource_shadow_contract as resource_shadow_contract
 from altegio_bot.easyweek_multi_service_recovery import build_recovery_plan
+from altegio_bot.easyweek_snapshot_recovery import build_snapshot_recovery_plan
 from altegio_bot.scripts import easyweek_multi_service_preflight as preflight
 from altegio_bot.scripts import easyweek_multi_service_reminder_recovery as recovery_cli
+from altegio_bot.scripts import easyweek_multi_service_snapshot_recovery as snapshot_recovery_cli
 from altegio_bot.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -415,3 +417,194 @@ def test_env_example_exposes_the_third_closed_fence() -> None:
 def test_both_services_that_read_the_new_fence_are_documented_in_compose() -> None:
     text = COMPOSE.read_text(encoding="utf-8")
     assert text.count("EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED") == 2
+
+
+# ===========================================================================
+# PR-7.5 operator-only snapshot recovery (v1 -> v2)
+# ===========================================================================
+
+SNAPSHOT_RECOVERY_SERVICE = "easyweek-multi-service-snapshot-recovery"
+RECOVERY_TITLE = "# PR-7.5 — operator-only recovery старых snapshot version 1"
+
+
+def _recovery_part() -> str:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert RECOVERY_TITLE in text, "the runbook has no snapshot-recovery part"
+    return text.split(RECOVERY_TITLE, 1)[1]
+
+
+@_PLAN_PRESENT
+def test_the_canonical_plan_authorises_the_snapshot_recovery_narrowly() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    section = text.split("### 38.7", 1)[1]
+    for required in (
+        "operator-only",
+        "plan",
+        "apply",
+        "verify",
+        "Record.raw.easyweek.multi_service_snapshot",
+        "karlsruhe_resource_shadow",
+        "multi_service_category_not_allowed",
+        "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false",
+        "13934",
+    ):
+        assert required in section
+    flattened = " ".join(section.split())
+    # The narrow boundaries the owner authorised, restated as refusals.
+    for required in (
+        "автоматический background backfill",
+        "не разрешает отправку",
+        "не меняет business scope",
+        "не попадают ни в код, ни в тесты как селектор",
+    ):
+        assert required in flattened
+
+
+def test_the_runbook_documents_the_full_operator_order() -> None:
+    part = _recovery_part()
+    for heading in (
+        "## 21. Deploy",
+        "## 22. Проверка фактических значений флагов",
+        "## 23. Приватный каталог",
+        "## 24. Read-only plan",
+        "## 25. Проверка ожидаемых technical Record IDs",
+        "## 26. Получение plan digest",
+        "## 27. Apply",
+        "## 28. Verify",
+        "## 29. Повторный multi-service preflight",
+        "## 30. Ожидаемый переход preflight",
+        "## 31. Rollback и fail-closed условия",
+        "## 32. Запрет ручного SQL",
+        "## 33. Запрет повторного использования старого plan",
+        "## 34. Запрет открытия общего send fence",
+    ):
+        assert heading in part, f"missing runbook step: {heading}"
+
+
+def test_every_recovery_command_names_both_production_compose_files() -> None:
+    """A command with only one Compose file would target a different graph."""
+    blocks = _fenced_blocks(_recovery_part())
+    invocations = [line for line in blocks.splitlines() if "docker compose" in line]
+    assert invocations, "the recovery part documents no Compose command"
+    for line in invocations:
+        assert "-f docker-compose.yml" in line, line
+        assert "-f docker-compose.chatwoot-internal.yml" in line, line
+
+
+def test_the_runbook_and_the_cli_agree_on_the_apply_command() -> None:
+    """The CLI must not print a command the runbook contradicts."""
+    printed = snapshot_recovery_cli.apply_command(
+        plan_path="/recovery/snapshot-plan.json",
+        apply_report="/recovery/snapshot-apply.json",
+        plan_digest="0" * 64,
+        max_snapshot_age_sec=600,
+    )
+    flattened = " ".join(printed.replace("\\\n", " ").split())
+    assert "docker compose -p altegio_bot" in flattened
+    assert "-f docker-compose.yml -f docker-compose.chatwoot-internal.yml" in flattened
+    assert "--profile ops run --rm --build" in flattened
+    assert "easyweek-multi-service-snapshot-recovery apply" in flattened
+    # The host trap the review found: a module path and a host /recovery.
+    assert "python -m altegio_bot" not in printed
+
+    blocks = _fenced_blocks(_recovery_part())
+    runbook_apply = " ".join(
+        blocks.split("easyweek-multi-service-snapshot-recovery apply", 1)[1].split("\n\n", 1)[0].split()
+    )
+    for flag in ("--plan", "--apply-report", "--plan-digest", "--confirm", "--max-snapshot-age-sec"):
+        assert flag in runbook_apply, flag
+        assert flag in flattened, flag
+
+
+def test_the_runbook_documents_the_same_plan_retry() -> None:
+    part = _recovery_part()
+    assert "## 27a." in part
+    flattened = " ".join(part.split())
+    for required in (
+        "already_applied",
+        "migrated_this_run_record_ids",
+        "already_applied_record_ids",
+        "partial_apply_detected",
+        "единой мутации БД",
+    ):
+        assert required in flattened, f"missing retry contract: {required}"
+    # Section 33 must not contradict the documented retry.
+    assert "Единственное исключение" in flattened
+
+
+def test_the_recovery_commands_use_the_real_compose_files_and_ops_service() -> None:
+    part = _recovery_part()
+    blocks = _fenced_blocks(part)
+    assert "docker-compose.yml" in blocks
+    assert "docker-compose.chatwoot-internal.yml" in blocks
+    assert f"{SNAPSHOT_RECOVERY_SERVICE} plan" in blocks
+    assert f"{SNAPSHOT_RECOVERY_SERVICE} apply" in blocks
+    assert f"{SNAPSHOT_RECOVERY_SERVICE} verify" in blocks
+    # The apply command carries the exact digest and confirmation phrase.
+    assert '--plan-digest "$PLAN_DIGEST"' in blocks
+    assert '--confirm "migrate easyweek multi-service snapshots $PLAN_DIGEST"' in blocks
+    assert "--max-snapshot-age-sec" in blocks
+
+
+def test_the_recovery_runbook_states_the_expected_transition_and_stop_rules() -> None:
+    part = _recovery_part()
+    flattened = " ".join(part.split())
+    for required in (
+        "candidates=5",
+        "source_version_1=5",
+        "target_version_2=5",
+        "blocked=0",
+        "apply_ready=true",
+        "stale_snapshot_digest: 5 -> 0",
+        "unexplained: 5 -> 0",
+        "passed=true",
+        "не хардкод",
+    ):
+        assert required in flattened, f"missing expected outcome: {required}"
+    # The six deadline-expired reminders stay out of this change.
+    for required in ("13934", "13939", "не отменяет, не восстанавливает и не отправляет"):
+        assert required in flattened
+
+
+def test_the_recovery_runbook_forbids_manual_sql_and_plan_reuse() -> None:
+    flattened = " ".join(_recovery_part().split())
+    assert "Ручные `UPDATE` или `DELETE` по `records.raw` запрещены" in flattened
+    assert "Plan одноразовый" in flattened
+    assert "нужен новый `plan` и новый digest" in flattened
+
+
+def test_the_recovery_never_asks_to_open_the_send_fence_or_the_allowlist() -> None:
+    part = _recovery_part()
+    assert "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true" not in _fenced_blocks(part)
+    for line in part.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("EASYWEEK_ALLOWED_SERVICE_CATEGORIES"):
+            raise AssertionError(f"recovery runbook assigns the allowlist: {stripped}")
+        if stripped == "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true":
+            raise AssertionError("recovery runbook opens the shared send fence")
+
+
+def test_the_snapshot_recovery_is_an_ops_only_one_off_with_a_private_mount() -> None:
+    service = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"][SNAPSHOT_RECOVERY_SERVICE]
+    assert service["profiles"] == ["ops"]
+    assert service["restart"] == "no"
+    assert service["command"] == ["--help"]
+    assert any("easyweek.env" in str(item) for item in service["env_file"])
+    assert any(":/recovery" in item for item in service["volumes"])
+    assert "easyweek_multi_service_snapshot_recovery" in " ".join(service["entrypoint"])
+
+
+def test_the_snapshot_recovery_defaults_to_plan_and_cannot_write_without_authorisation() -> None:
+    args = snapshot_recovery_cli.build_parser().parse_args([])
+    assert args.mode == "plan"
+    apply_args = snapshot_recovery_cli.build_parser().parse_args(["apply"])
+    assert apply_args.plan is None
+    assert apply_args.plan_digest is None
+    assert apply_args.confirm is None
+
+
+def test_the_snapshot_recovery_plan_function_has_no_write_primitive() -> None:
+    source = inspect.getsource(build_snapshot_recovery_plan)
+    for forbidden in (".commit(", "session.add(", ".delete(", "pg_insert(", "MessageJob(", "OutboxMessage("):
+        assert forbidden not in source
+    assert "await session.rollback()" in inspect.getsource(snapshot_recovery_cli)

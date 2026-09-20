@@ -254,6 +254,13 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # restart:no one-off with no EasyWeek mutation method and is not part
         # of the normal service graph.
         "easyweek-multi-service-reminder-recovery",
+        # PR-7.5 snapshot recovery re-proves each booking and its full
+        # catalogue before replacing one durable projection. Admitted
+        # separately because it holds yet another, narrower power: it can
+        # rewrite exactly one JSONB key of Record.raw and can create neither a
+        # customer, a booking, a message job nor an outbox row. Same narrowest
+        # carrier: ops profile, restart:no, one command per container.
+        "easyweek-multi-service-snapshot-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 
