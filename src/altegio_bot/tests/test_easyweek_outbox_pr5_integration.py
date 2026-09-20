@@ -9095,3 +9095,75 @@ async def test_a_v2_reminder_makes_exactly_one_live_proof_not_two(
     # lifecycle verifier must not add a second pass on top of the guard.
     assert reader.booking_calls == [str(KARLSRUHE_BOOKING_UUID)]
     assert reader.catalog_calls == [(KARLSRUHE_LOCATION_UUID, 1)]
+
+
+# ===========================================================================
+# §38.8: the envelope quantity is a proof input, never a send authorisation
+# ===========================================================================
+
+
+async def test_the_send_path_never_consults_the_webhook_envelope_quantity() -> None:
+    """Authorisation comes from the snapshot, its digest, the fences and the
+    live re-proof — never from a number in a webhook envelope."""
+    import inspect
+
+    from altegio_bot import easyweek_reminder_guard
+
+    for module in (ow, easyweek_reminder_guard):
+        source = inspect.getsource(module)
+        assert "envelope_quantity" not in source
+        assert "authoritative_services_count" not in source
+
+
+async def test_a_pair_whose_webhook_lowered_the_quantity_still_needs_its_snapshot(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The record below was proved from a services_count=2 / quantity=1 event.
+
+    Its job is still only sendable while the durable projection and its digest
+    say so: revoking the snapshot cancels it before Meta, Chatwoot or Outbox.
+    """
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    job = await _seed_easyweek_happy_path(db, total_cost="95.00")
+    await _attach_outbox_pair(db, job)
+    record = await db.get(Record, job.record_id)
+    assert record is not None
+    # The stored services_count stays the authoritative 2; only the webhook
+    # envelope had said 1, and nothing downstream remembers that.
+    assert record.raw["easyweek"]["services_count"] == 2
+    record.raw = record_raw_with_multi_service_snapshot(record.raw, None)
+    await db.flush()
+
+    await _run_job(db, job)
+
+    assert job.status == "canceled"
+    assert job.attempts == 0
+    assert capture.template_calls == capture.text_calls == []
+    assert await _outbox_rows(db, job) == []
+
+
+async def test_an_allowed_pair_sends_both_services_once_with_one_total(
+    db: AsyncSession,
+    capture: CaptureProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The positive end state the rollout is waiting for."""
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    job = await _seed_easyweek_happy_path(
+        db,
+        services=((11, "Erste Leistung, Zweite Leistung", "95.00"),),
+        total_cost="95.00",
+    )
+    await _attach_outbox_pair(db, job)
+
+    params = await _run_and_get_params(db, capture, job)
+
+    assert params[4] == "Erste Leistung — 30.00€, Zweite Leistung — 65.00€"
+    assert params[4].count("Erste Leistung") == params[4].count("Zweite Leistung") == 1
+    assert params[5] == "95.00"
+    assert len(capture.template_calls) == 1
+    assert len(await _outbox_rows(db, job)) == 1

@@ -8,13 +8,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+from altegio_bot import easyweek_multi_service
+from altegio_bot import easyweek_multi_service_recovery as recovery_module
 from altegio_bot import easyweek_resource_shadow_contract as resource_shadow_contract
+from altegio_bot import easyweek_snapshot_recovery as snapshot_recovery
 from altegio_bot.easyweek_multi_service_recovery import build_recovery_plan
 from altegio_bot.easyweek_snapshot_recovery import build_snapshot_recovery_plan
 from altegio_bot.scripts import easyweek_multi_service_preflight as preflight
 from altegio_bot.scripts import easyweek_multi_service_reminder_recovery as recovery_cli
 from altegio_bot.scripts import easyweek_multi_service_snapshot_recovery as snapshot_recovery_cli
 from altegio_bot.settings import Settings
+from altegio_bot.workers import easyweek_inbox_worker as inbox_worker
 
 ROOT = Path(__file__).resolve().parents[3]
 PLAN = ROOT / "docs/easyweek/INTEGRATION_PLAN.md"
@@ -430,7 +434,9 @@ RECOVERY_TITLE = "# PR-7.5 — operator-only recovery старых snapshot vers
 def _recovery_part() -> str:
     text = RUNBOOK.read_text(encoding="utf-8")
     assert RECOVERY_TITLE in text, "the runbook has no snapshot-recovery part"
-    return text.split(RECOVERY_TITLE, 1)[1]
+    # Stop at the next top-level part, so a later section cannot be read as
+    # part of the recovery contract.
+    return text.split(RECOVERY_TITLE, 1)[1].split("\n# ", 1)[0]
 
 
 @_PLAN_PRESENT
@@ -608,3 +614,115 @@ def test_the_snapshot_recovery_plan_function_has_no_write_primitive() -> None:
     for forbidden in (".commit(", "session.add(", ".delete(", "pg_insert(", "MessageJob(", "OutboxMessage("):
         assert forbidden not in source
     assert "await session.rollback()" in inspect.getsource(snapshot_recovery_cli)
+
+
+# ===========================================================================
+# §38.8: authoritative services_count
+# ===========================================================================
+
+COUNT_SEMANTICS_TITLE = "# §38.8 — rollout после фикса count semantics"
+
+
+@_PLAN_PRESENT
+def test_the_canonical_plan_records_the_authoritative_count_revision() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    section = text.split("### 38.8", 1)[1]
+    flattened = " ".join(section.split())
+    for required in (
+        "authoritative whole-set count",
+        "ordered_services[].quantity",
+        "точный integer `1` или `2`",
+        "остаётся точным integer `1`",
+        "полный live proof обязателен",
+        "`2→1` по-прежнему отзывает snapshot",
+        "запускает полный re-proof",
+        "не добавляется",
+        "rollout evidence",
+    ):
+        assert required in flattened, f"missing normative statement: {required}"
+
+
+def test_the_three_counts_are_named_apart_in_one_shared_primitive() -> None:
+    """The relaxed envelope rule must be unreachable from an API line."""
+    source = inspect.getsource(easyweek_multi_service)
+    assert source.count("def authoritative_services_count(") == 1
+    assert source.count("def envelope_quantity(") == 1
+    assert source.count("def _order_line_quantity(") == 1
+    assert easyweek_multi_service.ALLOWED_ENVELOPE_QUANTITIES == (1, 2)
+    assert easyweek_multi_service.REQUIRED_ORDER_LINE_QUANTITY == 1
+    assert easyweek_multi_service.EXACTLY_TWO_SERVICES == 2
+
+    # Exactly one caller each, so no consumer can pick the wrong rule.
+    assert source.count("authoritative_services_count(pair.services_count)") == 1
+    assert source.count("envelope_quantity(pair.quantity)") == 1
+    assert source.count('_order_line_quantity(value.get("quantity"))') == 1
+
+    # And the rules really are different.
+    assert easyweek_multi_service.envelope_quantity(1) == 1
+    assert easyweek_multi_service.envelope_quantity(2) == 2
+    for rejected in (None, True, False, 0, 3, -1, "1", 1.0):
+        assert easyweek_multi_service.envelope_quantity(rejected) is None
+        assert easyweek_multi_service.authoritative_services_count(rejected) is None
+    assert easyweek_multi_service.authoritative_services_count(2) == 2
+    assert easyweek_multi_service.authoritative_services_count(1) is None
+
+
+def test_no_consumer_reimplements_the_envelope_quantity_rule() -> None:
+    """One primitive decides the envelope rule; no consumer repeats it.
+
+    The authoritative-count revoke rule (`services_count != 2` clears the
+    snapshot) deliberately stays in the inbox worker — §38.8 keeps it — so the
+    check below targets the ENVELOPE quantity specifically.
+    """
+    for module in (preflight, inbox_worker, snapshot_recovery, recovery_module):
+        source = inspect.getsource(module)
+        for forbidden in ("quantity != 2", "quantity == 2", "quantity != 1", "quantity in (1, 2)"):
+            assert forbidden not in source, f"{module.__name__} re-implements {forbidden}"
+        # They all go through the one shared proof instead.
+        assert "prove_exactly_two_service_snapshot" in source or "fetch_and_prove" in source
+
+    # The authoritative count still revokes, and that rule is still there.
+    assert "booking.services_count != 2" in inspect.getsource(inbox_worker)
+
+
+def test_the_runbook_pins_the_count_semantics_rollout_order() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert COUNT_SEMANTICS_TITLE in text
+    part = text.split(COUNT_SEMANTICS_TITLE, 1)[1]
+    for heading in (
+        "## 35. Deploy при закрытом send fence",
+        "## 36. Проверка фактических значений флагов",
+        "## 37. Свежий multi-service preflight",
+        "## 38. Отдельный общий reminder preflight",
+        "## 39. Owner canary",
+        "## 40. Открытие send fence",
+        "## 41. Проверка после открытия",
+        "## 42. Rollback",
+    ):
+        assert heading in part, f"missing rollout step: {heading}"
+
+    flattened = " ".join(part.split())
+    for required in (
+        "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false",
+        "ready: false -> true",
+        "ambiguous: 1 -> 0",
+        "unexplained: 1 -> 0",
+        "open_jobs == jobs_held_by_send_fence",
+        "Он тоже обязан вернуть `ready=true`",
+        "не является** причиной менять count proof",
+        "14143",
+        "rollout evidence, а не контракт",
+    ):
+        assert required in flattened, f"missing rollout assertion: {required}"
+
+    # Every production command names both Compose files.
+    blocks = _fenced_blocks(part)
+    for line in blocks.splitlines():
+        if "docker compose" in line:
+            assert "-f docker-compose.yml" in line, line
+            assert "-f docker-compose.chatwoot-internal.yml" in line, line
+
+    # The send fence is opened only in its own step, after both preflights.
+    opening = part.split("## 40. Открытие send fence", 1)[1]
+    assert "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true" in opening
+    assert "EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true" not in part.split("## 40.", 1)[0]

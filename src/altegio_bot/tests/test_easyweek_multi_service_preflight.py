@@ -824,3 +824,168 @@ async def test_the_observed_baseline_mixes_one_ordinary_pair_with_resource_shado
     assert report.ambiguous == 0
     assert report.unexplained == 0
     assert report.ready is True
+
+
+# ===========================================================================
+# §38.8: the rescheduled Karlsruhe pair must reach the category, not ambiguity
+#
+# Two events for one booking: booking-created with services_count=2 and a
+# top-level quantity of 2, then the later booking-rescheduled with the same
+# authoritative count and a top-level quantity of 1. The proof used to refuse
+# the second shape outright, so one fully provable forbidden record turned the
+# whole preflight red with ambiguous=1 / unexplained=1.
+# ===========================================================================
+
+
+def _karlsruhe_rescheduled_webhook(*, quantity: int) -> dict[str, Any]:
+    payload = _karlsruhe_webhook()
+    payload["quantity"] = quantity
+    return payload
+
+
+async def _seed_rescheduled_karlsruhe_record(session, *, quantity: int = 1) -> None:
+    """The production shape, with no production identifiers."""
+    client = Client(
+        provider="easyweek",
+        company_id=KARLSRUHE_COMPANY_ID,
+        altegio_client_id=KARLSRUHE_CUSTOMER_ID,
+        display_name="Karlsruhe reschedule fixture",
+        phone_e164="+49000000778",
+        raw={},
+    )
+    session.add(client)
+    await session.flush()
+
+    record = Record(
+        provider="easyweek",
+        company_id=KARLSRUHE_COMPANY_ID,
+        altegio_record_id=KARLSRUHE_BOOKING_ID,
+        easyweek_booking_uuid=uuid.UUID(KARLSRUHE_BOOKING_UUID),
+        client_id=client.id,
+        starts_at=utcnow() + timedelta(days=6),
+        total_cost=Decimal(_KARLSRUHE_TOTAL) / Decimal(100),
+        is_deleted=False,
+        raw=record_raw_with_services_count({}, 2),
+    )
+    session.add(record)
+    await session.flush()
+
+    created = _karlsruhe_rescheduled_webhook(quantity=2)
+    session.add(
+        EasyWeekEvent(
+            status="processed",
+            event_hint="booking-created",
+            auth_via="query",
+            payload_hash="karlsruhe-reschedule-created",
+            payload=created,
+            booking_uuid=canonical_booking_uuid(created),
+            body_truncated=False,
+            received_at=utcnow() - timedelta(hours=2),
+        )
+    )
+    rescheduled = _karlsruhe_rescheduled_webhook(quantity=quantity)
+    session.add(
+        EasyWeekEvent(
+            status="processed",
+            event_hint="booking-rescheduled",
+            auth_via="query",
+            payload_hash="karlsruhe-reschedule-later",
+            payload=rescheduled,
+            booking_uuid=canonical_booking_uuid(rescheduled),
+            body_truncated=False,
+            received_at=utcnow() - timedelta(minutes=5),
+        )
+    )
+    await session.flush()
+
+
+async def test_a_rescheduled_pair_with_a_lower_envelope_quantity_is_structurally_proven(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", _karlsruhe_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_rescheduled_karlsruhe_record(session)
+        before = await _row_counts(session)
+
+    reader = KarlsruheReader()
+    async with session_maker() as session:
+        report = await run_preflight(session, client=reader, sleep=_no_sleep)
+
+    async with session_maker() as session:
+        # Read-only: not one row moved.
+        assert await _row_counts(session) == before
+
+    assert report.active_multi_service == report.checked == 1
+    assert report.structurally_proven == 1
+    assert report.allowed == 0
+    assert report.disallowed_by_category == 1
+    assert report.contract_excluded == 0
+    assert report.ambiguous == 0
+    assert report.unexplained == 0
+    assert report.stale_snapshot_digest == 0
+    assert report.truncated is False
+    assert report.reasons["multi_service_category_not_allowed"] == 1
+    assert report.ready is True
+
+
+async def test_the_later_service_bearing_event_is_the_one_that_is_proved(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status-only later delivery must not hide the proof-bearing one."""
+    monkeypatch.setattr(settings, "easyweek_location_map", _karlsruhe_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_rescheduled_karlsruhe_record(session)
+            status_only = {
+                "uid": KARLSRUHE_BOOKING_UUID,
+                "id": KARLSRUHE_BOOKING_ID,
+                "location_id": KARLSRUHE_COMPANY_ID,
+                "location_uuid": KARLSRUHE_LOCATION_UUID,
+                "booking_status": "Confirmed",
+            }
+            session.add(
+                EasyWeekEvent(
+                    status="processed",
+                    event_hint="booking-updated",
+                    auth_via="query",
+                    payload_hash="karlsruhe-reschedule-status-only",
+                    payload=status_only,
+                    booking_uuid=uuid.UUID(KARLSRUHE_BOOKING_UUID),
+                    body_truncated=False,
+                    received_at=utcnow(),
+                )
+            )
+
+    async with session_maker() as session:
+        report = await run_preflight(session, client=KarlsruheReader(), sleep=_no_sleep)
+
+    assert report.structurally_proven == 1
+    assert report.disallowed_by_category == 1
+    assert report.ambiguous == 0
+    assert report.ready is True
+
+
+@pytest.mark.parametrize("quantity", [0, 3, "1", None])
+async def test_an_unusable_envelope_quantity_still_keeps_the_preflight_red(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    quantity: object,
+) -> None:
+    monkeypatch.setattr(settings, "easyweek_location_map", _karlsruhe_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed_rescheduled_karlsruhe_record(session, quantity=quantity)  # type: ignore[arg-type]
+
+    async with session_maker() as session:
+        report = await run_preflight(session, client=KarlsruheReader(), sleep=_no_sleep)
+
+    assert report.structurally_proven == 0
+    assert report.ambiguous == 1
+    assert report.unexplained == 1
+    assert report.ready is False

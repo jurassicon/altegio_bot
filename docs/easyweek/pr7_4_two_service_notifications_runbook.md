@@ -926,3 +926,128 @@ Bounded max snapshot age существует именно для этого.
 а также отдельного безопасного решения по шести `deadline_expired` reminder
 jobs `13934`–`13939`. Эти шесть jobs не входят в snapshot recovery: данный
 change их не отменяет, не восстанавливает и не отправляет.
+
+---
+
+# §38.8 — rollout после фикса count semantics
+
+Фикс убирает единственное несогласованное правило: multi-service proof больше
+не требует top-level `quantity == 2`. Authoritative whole-set count — это
+`services_count`, а top-level `quantity` допускается как точный `1` или `2` и
+ничего не разрешает сам по себе. Line-level `ordered_services[].quantity`
+остаётся точным `1`. Полный live proof обязателен по-прежнему.
+
+## 35. Deploy при закрытом send fence
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+## 36. Проверка фактических значений флагов в обоих контейнерах
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED'
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED'
+```
+
+Требуется `true`, `true`, `false` в обоих сервисах.
+
+## 37. Свежий multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+Ожидаемый переход — rollout evidence, а не контракт:
+
+```text
+active_multi_service=20
+checked=20
+structurally_proven: 16 -> 17
+allowed=1
+disallowed_by_category: 15 -> 16
+contract_excluded=3
+ambiguous: 1 -> 0
+unexplained: 1 -> 0
+stale_snapshot_digest=0
+open_jobs=3
+jobs_held_by_send_fence=3
+ready: false -> true
+```
+
+Продолжать можно только при `ready=true`, `ambiguous=0`, `unexplained=0`,
+`stale_snapshot_digest=0`, `truncated=false` и
+`open_jobs == jobs_held_by_send_fence`.
+
+## 38. Отдельный общий reminder preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_reminder_preflight \
+  --limit 500 --pause-sec 1.00
+```
+
+Он тоже обязан вернуть `ready=true`. Текущее состояние с `canceled=3` и jobs
+`14143`/`14168`/`14304` при `ready=false` **не является** причиной менять count
+proof и не разрешает открывать send fence. Эти jobs должны либо штатно стать
+terminal после своего `run_at`, либо быть обработаны отдельной заранее
+проверенной операторской процедурой очистки.
+
+## 39. Owner canary
+
+Проверить на активной записи владельца: две snapshot lines, digest совпадает,
+`record_created` и reminder jobs в `queued` и удержаны send fence,
+`attempts=0`, `Outbox=0`, dry render показывает обе услуги и правильный общий
+total.
+
+## 40. Открытие send fence
+
+Только когда **оба** preflight зелёные:
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps altegio-outbox-worker
+```
+
+## 41. Проверка после открытия
+
+Ожидается один `record_created` outcome, ровно один Outbox/provider attempt,
+фактическое WhatsApp-сообщение владельцу с обеими услугами и корректным общим
+total.
+
+## 42. Rollback
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+```
+
+Jobs не удалять и `attempts` вручную не менять: удержанные jobs остаются
+`queued` и повторно доказываются при следующем открытии fence.
