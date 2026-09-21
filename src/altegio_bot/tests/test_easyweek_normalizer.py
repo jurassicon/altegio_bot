@@ -1363,3 +1363,134 @@ def test_every_new_reason_code_is_registered_and_pii_free() -> None:
         assert code == code.lower()
         assert " " not in code
         assert str(NormalizationError(code)) == code
+
+
+# ===========================================================================
+# Production event 360: a literal `service_id: null` on `booking-canceled`
+# ===========================================================================
+#
+# The original contract rejected every non-positive `service_id`, on the stated
+# grounds that no captured payload had ever sent a null. Production event 360
+# is a real, untruncated `booking-canceled` delivery that does, so the null is
+# now proven — for that ONE trigger and nothing else.
+
+
+def _canceled_with_null_service_id() -> dict:
+    payload = booking_canceled()
+    payload["service_id"] = None
+    return payload
+
+
+def test_canceled_with_null_service_id_is_accepted_as_delete() -> None:
+    booking = _normalize(_canceled_with_null_service_id(), event_hint="booking-canceled")
+
+    assert booking is not None
+    assert booking.action == DELETE
+    assert booking.booking_uuid == uuid.UUID(TEST_BOOKING_UUID)
+    assert booking.booking_id == TEST_BOOKING_ID
+
+
+def test_canceled_null_service_id_is_none_and_not_carried() -> None:
+    """Exactly the "delivery said nothing" shape, so a proven identity survives."""
+    booking = _normalize(_canceled_with_null_service_id(), event_hint="booking-canceled")
+
+    assert booking is not None
+    assert booking.service_id is None
+    assert not booking.carries("service_id")
+    assert "service_id" not in booking.present_fields
+
+
+def test_canceled_null_service_id_does_not_weaken_the_other_fields() -> None:
+    """Only the one identity field changes meaning; everything else is untouched."""
+    booking = _normalize(_canceled_with_null_service_id(), event_hint="booking-canceled")
+
+    assert booking is not None
+    assert booking.carries("service_name")
+    assert booking.carries("services_description")
+    assert booking.carries("services_count")
+    assert booking.carries("total_cost")
+    assert booking.carries("starts_at")
+    assert booking.carries("customer_id")
+    assert booking.total_cost == Decimal("35.00")
+    assert booking.starts_at == datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("event_hint", ["booking-created", "booking-updated", "booking-rescheduled"])
+def test_null_service_id_is_still_rejected_for_every_other_trigger(event_hint: str) -> None:
+    payload = {
+        "booking-created": booking_created,
+        "booking-updated": booking_updated,
+        "booking-rescheduled": booking_rescheduled,
+    }[event_hint]()
+    payload["service_id"] = None
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload, event_hint=event_hint)
+    assert excinfo.value.code == NormalizationError.INVALID_PAYLOAD
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        (True, NormalizationError.INVALID_PAYLOAD),
+        (False, NormalizationError.INVALID_PAYLOAD),
+        ("5100003", NormalizationError.INVALID_PAYLOAD),
+        ("", NormalizationError.INVALID_PAYLOAD),
+        (1.5, NormalizationError.INVALID_PAYLOAD),
+        ({}, NormalizationError.INVALID_PAYLOAD),
+        ([], NormalizationError.INVALID_PAYLOAD),
+        (0, NormalizationError.INVALID_NUMERIC_RANGE),
+        (-1, NormalizationError.INVALID_NUMERIC_RANGE),
+        (-5100003, NormalizationError.INVALID_NUMERIC_RANGE),
+    ],
+)
+def test_cancellation_rejects_every_shape_that_is_not_null_or_a_positive_id(value: object, code: str) -> None:
+    """The allowance is for the literal null only, not for "anything falsy"."""
+    payload = booking_canceled()
+    payload["service_id"] = value
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload, event_hint="booking-canceled")
+    assert excinfo.value.code == code
+
+
+def test_cancellation_with_a_positive_service_id_is_unchanged() -> None:
+    booking = _normalize(booking_canceled(), event_hint="booking-canceled")
+
+    assert booking is not None
+    assert booking.action == DELETE
+    assert booking.service_id == 5100003
+    assert booking.carries("service_id")
+
+
+def test_an_absent_service_id_on_a_cancellation_is_still_absent() -> None:
+    """The allowance must not make an omitted key behave differently."""
+    payload = booking_canceled()
+    del payload["service_id"]
+
+    booking = _normalize(payload, event_hint="booking-canceled")
+    assert booking is not None
+    assert booking.service_id is None
+    assert not booking.carries("service_id")
+
+
+def test_the_null_allowance_is_keyed_on_the_exact_trigger_name() -> None:
+    """A near-miss trigger is not a cancellation, so it does not get the null."""
+    payload = _canceled_with_null_service_id()
+
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(payload, event_hint="canceled")
+    assert excinfo.value.code == NormalizationError.INVALID_EVENT_HINT
+
+
+def test_a_null_service_id_never_weakens_truncation_or_location_isolation() -> None:
+    truncated = _canceled_with_null_service_id()
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(truncated, event_hint="booking-canceled", truncated=True)
+    assert excinfo.value.code == NormalizationError.TRUNCATED_PAYLOAD
+
+    foreign = _canceled_with_null_service_id()
+    foreign["location_id"] = FOREIGN_LOCATION_ID
+    with pytest.raises(NormalizationError) as excinfo:
+        _normalize(foreign, event_hint="booking-canceled")
+    assert excinfo.value.code == NormalizationError.FOREIGN_LOCATION

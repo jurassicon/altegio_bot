@@ -247,6 +247,19 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         # ops-profile, restart:no one-off with a private mount; it creates no
         # job and no outbox row and has no EasyWeek mutation method.
         "easyweek-multi-service-snapshot-recovery",
+        # Plan §40 (revision 43). The failed-cancellation recovery proves the
+        # live state of each named booking with a real GET before it writes, so
+        # it needs the same key. Admitted separately because its power is
+        # narrower still: per named event it marks that historical Record
+        # deleted, withdraws that record's queued EasyWeek reminders and
+        # terminalizes that one event, and it can create neither a customer, a
+        # booking, a message job nor an outbox row. The scope is a bounded set
+        # of explicitly named `--event-id` values — required, repeatable and
+        # capped at MAX_EVENT_IDS (10) — never a scan: there is no `--all`.
+        # Same narrowest carrier: ops profile, restart:no, one command per
+        # container, and the apply authorisation is passed per invocation
+        # rather than declared in Compose.
+        "easyweek-failed-cancellation-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 
