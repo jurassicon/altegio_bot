@@ -166,10 +166,18 @@ Run ID Ирины и Алёны (`b4ca41ac1ad54591`, `c52bb4f62fb64a35`,
 Один и тот же фрагмент от `--manifest` до последнего `--run-id` используется без
 изменений во **всех трёх** режимах plan/apply/verify ниже.
 
+`--build` стоит **только** у этого первого plan. `easyweek-migration-prepare-handover`
+живёт в профиле `ops` и обычным деплоем воркеров не пересобирается, поэтому без
+`--build` первая команда волны может уйти на устаревшем образе. Дальнейшие
+apply, verify и повторный apply запускаются **без** `--build` намеренно: они
+обязаны работать тем же образом, которым был сформирован snapshot, а пересборка
+между plan и apply означала бы, что доказательство и запись сделаны разными
+версиями кода.
+
 ```bash
 cd /opt/altegio_bot
 dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
-dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json
+dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json
 ```
 
 Строка, которую восстановил шаг 3, обязана теперь получить disposition

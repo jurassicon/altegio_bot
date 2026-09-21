@@ -1291,6 +1291,17 @@ def _argv_after(line: str, service: str) -> list[str]:
     return tokens[tokens.index(service) + 1 :]
 
 
+def _compose_prefix(line: str, service: str) -> list[str]:
+    """The `docker compose run` half, before the service name.
+
+    Checked as carefully as the CLI argv: a correct argv launched from a stale
+    image is still the wrong command, and `--profile`/`--no-deps` are what keep
+    a one-off container from dragging the normal service graph up with it.
+    """
+    tokens = shlex.split(line)
+    return tokens[: tokens.index(service)]
+
+
 def _handover_scope(argv: list[str]) -> tuple[str, int, tuple[str, ...]]:
     """The contiguous identity of a wave: manifest, company and run IDs."""
     parser = _handover_parser()
@@ -1424,3 +1435,82 @@ async def test_the_documented_order_puts_recovery_before_the_handover() -> None:
     first_handover = min(text.index(line) for line in _service_lines(text, HANDOVER_SERVICE))
     last_recovery = max(text.index(line) for line in _service_lines(text, COMPOSE_SERVICE))
     assert last_recovery < first_handover, "every recovery command must precede the handover"
+
+
+# ---------------------------------------------------------------------------
+# The Compose half of each handover command
+# ---------------------------------------------------------------------------
+#
+# `easyweek-migration-prepare-handover` lives in the `ops` profile, so a normal
+# worker deploy never rebuilds it. Without `--build` the first command of the
+# wave can run last week's image against today's ledger — a correct argv on a
+# stale binary. The plan therefore builds, and the three commands that follow
+# deliberately do not: they must run the SAME image that produced the snapshot,
+# and rebuilding between plan and apply would mean the proof and the write came
+# from different versions of the code.
+
+# Flags every one-off handover container needs, whatever its mode.
+REQUIRED_COMPOSE_FLAGS = ("--profile", "ops", "--rm", "--no-deps", "-T")
+
+
+def _handover_lines_by_mode(section: str) -> dict[str, list[str]]:
+    parser = _handover_parser()
+    by_mode: dict[str, list[str]] = {}
+    for line in _service_lines(section, HANDOVER_SERVICE):
+        mode = parser.parse_args(_argv_after(line, HANDOVER_SERVICE)).mode
+        by_mode.setdefault(mode, []).append(line)
+    return by_mode
+
+
+async def test_every_handover_container_keeps_the_one_off_compose_flags() -> None:
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    lines = _service_lines(section, HANDOVER_SERVICE)
+    assert lines, "the recovery runbook documents no handover commands"
+
+    for line in lines:
+        prefix = _compose_prefix(line, HANDOVER_SERVICE)
+        assert prefix[:2] == ["dc", "--profile"], line
+        for flag in REQUIRED_COMPOSE_FLAGS:
+            assert flag in prefix, f"{flag} is missing from:\n{line}"
+        assert "run" in prefix, line
+        # A one-off must never be left behind or wired into the service graph.
+        assert "-d" not in prefix and "--detach" not in prefix, line
+
+
+async def test_only_the_first_handover_plan_rebuilds_the_ops_image() -> None:
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    by_mode = _handover_lines_by_mode(section)
+
+    plans = by_mode.get("plan", [])
+    assert len(plans) == 1, "the HANNA section must document exactly one plan"
+    assert "--build" in _compose_prefix(plans[0], HANDOVER_SERVICE), (
+        "the first plan must rebuild: the ops profile is not covered by a worker deploy"
+    )
+
+    for mode in ("apply", "verify"):
+        for line in by_mode.get(mode, []):
+            assert "--build" not in _compose_prefix(line, HANDOVER_SERVICE), (
+                f"{mode} must reuse the image that produced the snapshot:\n{line}"
+            )
+
+
+async def test_the_repeat_apply_also_reuses_the_snapshot_image() -> None:
+    """The idempotence run proves the same code is a no-op, not a newer one."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    parser = _handover_parser()
+    repeats = [
+        line
+        for line in _service_lines(section, HANDOVER_SERVICE)
+        if parser.parse_args(_argv_after(line, HANDOVER_SERVICE)).apply_report == HANNA_REPEAT_APPLY_REPORT
+    ]
+    assert len(repeats) == 1, "the HANNA section must document exactly one repeat apply"
+    assert "--build" not in _compose_prefix(repeats[0], HANDOVER_SERVICE), repeats[0]
+
+
+async def test_the_plan_precedes_every_write_and_read_back() -> None:
+    """Build first, then freeze, then write, then prove — in that order."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    by_mode = _handover_lines_by_mode(section)
+
+    plan_at = section.index(by_mode["plan"][0])
+    assert all(plan_at < section.index(line) for mode in ("apply", "verify") for line in by_mode[mode])
