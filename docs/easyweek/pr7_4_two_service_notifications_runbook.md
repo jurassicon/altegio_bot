@@ -926,3 +926,719 @@ Bounded max snapshot age существует именно для этого.
 а также отдельного безопасного решения по шести `deadline_expired` reminder
 jobs `13934`–`13939`. Эти шесть jobs не входят в snapshot recovery: данный
 change их не отменяет, не восстанавливает и не отправляет.
+
+---
+
+# §38.8 — rollout после фикса count semantics
+
+Фикс убирает единственное несогласованное правило: multi-service proof больше
+не требует top-level `quantity == 2`. Authoritative whole-set count — это
+`services_count`, а top-level `quantity` допускается как точный `1` или `2` и
+ничего не разрешает сам по себе. Line-level `ordered_services[].quantity`
+остаётся точным `1`. Полный live proof обязателен по-прежнему.
+
+## 35. Deploy при закрытом send fence
+
+```dotenv
+EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true
+EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true
+EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+```
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+## 36. Проверка фактических значений флагов в обоих контейнерах
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED'
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED'
+```
+
+Требуется `true`, `true`, `false` в обоих сервисах.
+
+## 37. Свежий multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+Ожидаемый переход — rollout evidence, а не контракт:
+
+```text
+active_multi_service=20
+checked=20
+structurally_proven: 16 -> 17
+allowed=1
+disallowed_by_category: 15 -> 16
+contract_excluded=3
+ambiguous: 1 -> 0
+unexplained: 1 -> 0
+stale_snapshot_digest=0
+open_jobs=3
+jobs_held_by_send_fence=3
+ready: false -> true
+```
+
+Продолжать можно только при `ready=true`, `ambiguous=0`, `unexplained=0`,
+`stale_snapshot_digest=0`, `truncated=false` и
+`open_jobs == jobs_held_by_send_fence`.
+
+## 38. Отдельный общий reminder preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_reminder_preflight \
+  --limit 500 --pause-sec 1.00
+```
+
+Он тоже обязан вернуть `ready=true`. Текущее состояние с `canceled=3` и jobs
+`14143`/`14168`/`14304` при `ready=false` **не является** причиной менять count
+proof и не разрешает открывать send fence. Эти jobs должны либо штатно стать
+terminal после своего `run_at`, либо быть обработаны отдельной заранее
+проверенной операторской процедурой очистки.
+
+## 39. Owner canary
+
+Проверить на активной записи владельца: две snapshot lines, digest совпадает,
+`record_created` и reminder jobs в `queued` и удержаны send fence,
+`attempts=0`, `Outbox=0`, dry render показывает обе услуги и правильный общий
+total.
+
+## 40. Открытие send fence
+
+Только когда **оба** preflight зелёные — и только через управляемую
+последовательность §38.9 ниже. Открытие `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true`
+одним шагом на всю очередь здесь больше не описывается: глобальный флаг
+освобождает все due pair jobs, включая jobs удалённых и прошедших записей,
+поэтому первое открытие выполняется с `EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID`
+ровно на одну job. Шаги 43–59.
+
+## 41. Проверка после открытия
+
+Проверка выполняется по шагу 53: ровно выбранная canary job дошла до
+провайдера, ровно одна ожидаемая attempt, остальные pair jobs остались
+`queued` с `attempts=0`, фактическое WhatsApp-сообщение владельцу содержит обе
+услуги и один корректный общий total.
+
+## 42. Rollback
+
+Rollback выполняется по шагу 54 (плановый возврат) или по шагу 59
+(аварийный). Единственный аварийный стоп — `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false`;
+изменение или очистка canary ID его не заменяет.
+
+Jobs не удалять и `attempts` вручную не менять: удержанные jobs остаются
+`queued` и повторно доказываются при следующем открытии fence.
+
+# §38.9 — управляемое открытие общего send fence (шаги 43–59)
+
+`EASYWEEK_MULTI_SERVICE_SEND_ENABLED` — глобальный флаг. Его открытие
+освобождает **все** due EasyWeek lifecycle/reminder jobs с каноническим
+`multi_service_snapshot_digest`, включая jobs записей, которые с тех пор были
+удалены или уже начались. Structural preflight смотрит только на активные
+будущие записи и поэтому описывает меньшее множество. Отсюда весь порядок
+ниже: сначала полный аудит очереди, затем ровно одна job через
+`EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID`, и только потом отдельное решение о
+bulk.
+
+Dotenv-блоки в разделах 1, 13, 15, 21 и 35 — это описание целевого состояния
+файла, а не команда. Пересоздание контейнера перечитывает
+`/opt/altegio_bot/easyweek.env` с диска: если файл не изменён, worker
+поднимается со старым значением. Изменение флага выполняется только
+командами ниже.
+
+Наборы команд: **(A)** deploy/preflight, **(B)** controlled canary, **(C)**
+возврат после canary, **(D)** bulk, **(E)** аварийный rollback.
+
+Плейсхолдеры в командах записаны без угловых скобок (`CANARY_JOB_ID`,
+`RELEASE_DIGEST`, `DUE_IDS`, `OPENED_AT`) намеренно: `<...>` в shell — это
+перенаправление ввода, и незаменённый или пустой плейсхолдер выполнил бы
+команду не так, как выглядит. Каждый плейсхолдер заменяется целиком.
+
+Фактический результат отправки доказывается на шаге 58 отдельным
+post-open verifier по точным утверждённым job ID: release audit отвечает на
+вопрос «что уйдёт», а не «что ушло».
+
+Утверждённый inventory связывается с открытием bulk двумя независимыми
+механизмами, а не сравнением двух распечаток глазами: producer (EasyWeek
+inbox worker) физически останавливается на шаге 56a, и финальный audit на
+шаге 56b сверяет `release_set_digest` с тем, по которому оператор принимал
+решение. Любое расхождение — STOP.
+
+Helper `easyweek_env_set.py` использует только стандартную библиотеку, имеет
+allowlist редактируемых ключей, требует ровно одного assignment на ключ,
+отказывается до любой записи, делает timestamped backup с правами `0600`,
+заменяет файл атомарно с сохранением прав и печатает только изменённые
+`key=value`. Он ничего не перезапускает.
+
+Backup — это полная копия файла секретов рядом с оригиналом. Он игнорируется
+git по отдельному паттерну, но его нельзя копировать, пересылать и оставлять
+в общедоступных каталогах.
+
+Категорийный allowlist `EASYWEEK_ALLOWED_SERVICE_CATEGORIES` на протяжении
+всей последовательности 43–59 не меняется: release audit считает
+provider candidates по действующему allowlist, и его изменение между аудитом
+и открытием делает утверждённый inventory недействительным. Helper этот ключ
+редактировать не умеет намеренно.
+
+## 43. (A) Deploy при закрытом send fence и пустом canary
+
+Production `easyweek.env` создан до появления
+`EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID`, поэтому этого ключа в файле нет, а
+обычный `--set` требует ровно одного существующего assignment и откажет.
+Первый шаг — узкий явный bootstrap только этого ключа и только пустым
+значением. Отсутствующий и пустой ключ парсятся одинаково, поэтому создание
+строки ничего не включает.
+
+```bash
+cd /opt/altegio_bot
+python3 --version
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --bootstrap-canary-key
+```
+
+Ожидаемый вывод — ровно одна строка `EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=`
+в stdout при первом запуске, либо `already present; nothing written` в stderr
+при повторном. Повторный запуск дубликата не создаёт. Отказ
+`N assignments found, expected zero or one` означает, что ключ в файле уже
+дважды: STOP, файл не изменён, дубликат убирается вручную и шаг повторяется.
+
+Затем проверить, что helper согласен с файлом по остальным ключам.
+`--dry-run` ничего не пишет и не создаёт backup.
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env --dry-run \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=
+```
+
+Если `python3` отсутствует или helper отказал — STOP. Править `easyweek.env`
+вручную под давлением времени запрещено: именно ручная правка даёт второй
+assignment ключа, при котором выигрывает последняя строка. Единственное
+исключение — устранение уже существующего дубликата, обнаруженного выше.
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --set EASYWEEK_NOTIFICATIONS_ENABLED=true \
+  --set EASYWEEK_REMINDERS_ENABLED=true \
+  --set EASYWEEK_REMINDER_API_GUARD_ENABLED=true \
+  --set EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED=true \
+  --set EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED=true \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --build --force-recreate \
+  altegio-easyweek-inbox-worker altegio-outbox-worker
+```
+
+Helper печатает только те ключи, которые реально изменил. Если он отказал
+(`refused: ...`), файл не изменён ни на байт: исправить `easyweek.env` руками
+так, чтобы у каждого ключа был ровно один assignment, и повторить. Любой
+`docker compose` до успешного helper — бессмысленная пересборка со старым
+значением. Обязательная проверка effective значений после пересоздания —
+шаг 44; без неё шаг 43 не считается выполненным.
+
+## 44. Аудит фактической конфигурации обоих workers
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-easyweek-inbox-worker sh -lc \
+  'printenv EASYWEEK_NOTIFICATIONS_ENABLED EASYWEEK_REMINDERS_ENABLED EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED'
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_NOTIFICATIONS_ENABLED EASYWEEK_RESOURCE_SHADOW_PROOF_ENABLED EASYWEEK_REMINDER_API_GUARD_ENABLED EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID'
+```
+
+Требуется для inbox worker: `true`, `true`, `true`, `true`. Для outbox
+worker: `true`, `true`, `true`, `false` и пустая строка для canary. Любое
+расхождение — STOP: дальше идти нельзя, потому что все последующие отчёты
+описывали бы другую конфигурацию.
+
+## 45. Structural multi-service preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_preflight \
+  --limit 500 --pause-sec 1.10
+```
+
+Требуется `rollout_ready=true` и `config_error=null`. Отдельно проверить
+`ambiguous=0`, `unexplained=0`, `stale_snapshot_digest=0`, `truncated=false`,
+`open_jobs == jobs_held_by_send_fence`.
+
+## 46. Общий reminder preflight
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_reminder_preflight \
+  --limit 500 --pause-sec 1.00
+```
+
+Требуется `rollout_ready=true` и `config_error=null`. `rollout_ready=false`
+при `config_error=easyweek_reminder_api_guard_disabled` означает, что runtime
+API guard выключен: тогда outbox вообще не claim'ит reminder jobs и отчёт не
+является утверждением о том, что произойдёт при открытии fence.
+
+## 47. Полный release audit всей очереди
+
+Этот шаг не заменяется двумя предыдущими: он выбирает все открытые pair jobs
+без единого record-side фильтра, то есть включая jobs удалённых и уже
+начавшихся записей.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_audit \
+  --phase pre_open --limit 500
+```
+
+Требуется `audit_sound=true`, `truncated=false`, `inventory_complete=true`,
+`config_error=null` и нули в `unsafe_or_unproven`, `processing_or_locked`,
+`nonterminal_outbox_present`. Ненулевой `local_cancel_or_noop` — нормальное
+состояние: это jobs, которые worker терминализует локально без attempt и без
+внешнего вызова (прошедшая запись, устаревший reminder, истёкший deadline,
+удалённая запись для типа не про удаление, запрещённая категория).
+
+Списки `provider_candidate_job_ids` и `future_provider_candidate_job_ids` —
+это полный перечень того, что уйдёт наружу при снятом ограничении. Его нужно
+сохранить в тикет вместе с полем `release_set_digest`: шаги 55–58
+сравниваются именно с ним, а шаг 56b сверяет digest машинно.
+
+## 48. Выбор ровно одной canary job
+
+Выбрать один `message_jobs.id` из `provider_candidate_job_ids` шага 47.
+Только оттуда: job из `future_provider_candidate_job_ids` ещё не due и при
+открытии fence не отправится, а любой другой ID не является тем, что fence
+освобождает. Записать выбранный ID в тикет вместе с типом job.
+
+## 49. Dry-run проверка canary readiness
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_audit \
+  --phase pre_open --limit 500 --canary-job-id CANARY_JOB_ID
+```
+
+Требуется `canary_ready=true` и `canary_error=null`. Этот шаг ничего не
+меняет: send fence остаётся закрытым, canary в `easyweek.env` остаётся
+пустым.
+
+STOP-условия по `canary_error`:
+
+- `multi_service_canary_job_not_found` — ID не входит в release set: возврат
+  к шагу 47;
+- `multi_service_canary_job_not_due` — ID входит в release set, но его
+  `run_at` ещё не наступил. При открытии fence он не отправится, и пустая
+  очередь будет ошибочно прочитана как успешный canary. Выбрать другой ID из
+  `provider_candidate_job_ids`;
+- `multi_service_canary_job_mismatch` — в `easyweek.env` уже задан другой
+  canary: сначала привести файл в соответствие шагу 54.
+
+## 50. (B) Установка send=true и точного canary ID
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+```
+
+Helper обязан напечатать обе строки `EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID`
+и `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true`. Если напечатана только одна —
+второй ключ уже имел это значение; проверить это явно на шаге 52, а не
+предполагать.
+
+## 51. Пересоздание только outbox worker
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps altegio-outbox-worker
+```
+
+Пересоздаётся только outbox worker: inbox worker planning не меняется, и
+трогать его на этом шаге незачем.
+
+## 52. Проверка effective значений внутри пересозданного контейнера
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID'
+```
+
+Требуется ровно `true` и выбранный `CANARY_JOB_ID`. Любое расхождение — немедленный
+переход к набору (E): контейнер работает не с той конфигурацией, которую
+утвердил оператор, и ни один последующий вывод не является доказательством.
+
+## 53. Проверка исхода canary
+
+Ожидается: до провайдера дошла ровно выбранная job, у неё ровно одна
+ожидаемая attempt, все остальные pair jobs остались `queued` с `attempts=0` и
+неизменным `run_at`, у остальных не появилось новых `OutboxMessage`.
+Фактическое WhatsApp-сообщение владельцу содержит **обе** услуги и **один**
+корректный общий total.
+
+Если ушло больше одного сообщения — это отказ canary, а не успех: перейти к
+набору (E) и не продолжать.
+
+## 54. (C) Немедленный возврат send=false и подтверждение rollback
+
+Выполняется сразу после шага 53, независимо от результата.
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID'
+```
+
+Требуется `false` и пустая строка. Пока эта проверка не показала `false`,
+fence считается открытым — и именно `false`, а не очистка canary, является
+здесь возвратом. Canary очищается вместе с ним только для того, чтобы шаг 55
+снова аудировал всю очередь целиком, а не одну job.
+
+## 55. Повторный полный release audit
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_audit \
+  --phase pre_open --limit 500
+```
+
+Требуется `audit_sound=true`, `config_error=null` и `bulk_ready=true`. Отчёт
+сравнивается с сохранённым на шаге 47: отправленная canary job должна
+исчезнуть из release set, остальные ID — совпасть. Новые ID означают, что
+очередь выросла между аудитами, и их нужно разобрать отдельно.
+
+## 56. Явное решение по каждому оставшемуся provider candidate
+
+По каждому ID из `provider_candidate_job_ids` и
+`future_provider_candidate_job_ids` оператор принимает отдельное явное
+решение и фиксирует его в тикете. Отдельно рассматриваются jobs удалённых
+записей: `record_created` такой записи локально отменяется deleted-record
+guard, а `record_canceled` — легитимный provider candidate и уйдёт клиенту.
+
+Автоматической очистки, отмены или переписывания старых jobs здесь нет и не
+предусмотрено: ни `attempts`, ни `run_at`, ни payload вручную не меняются.
+
+## 56a. Приостановка producer: EasyWeek inbox worker
+
+Между утверждением inventory на шаге 56 и открытием bulk fence на шаге 57
+inbox worker продолжает планировать новые pair jobs. Такая job не была
+утверждена, но bulk fence выпустит её наравне с утверждёнными. Поэтому перед
+открытием producer останавливается, и утверждённый backlog становится
+физически неизменяемым.
+
+Остановка inbox worker **не теряет доставки**. Capture-эндпоинт живёт в
+сервисе `altegio-api`: он сам открывает сессию, сам пишет строку
+`easyweek_events` со статусом `captured` и сам её коммитит, и только после
+успешного коммита отвечает EasyWeek `200`. Inbox worker — независимый
+потребитель, который позже забирает строки `captured` в порядке `received_at`
+с causal-order по booking UUID. Пока он остановлен, доставки продолжают
+приниматься и накапливаться; при запуске он продолжит ровно с того места, где
+остановился. `docker compose stop` посылает SIGTERM: worker перестаёт брать
+следующее событие и не прерывает уже идущую транзакцию, а прерванная
+транзакция откатывается и оставляет строку `captured`.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml stop altegio-easyweek-inbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps -a altegio-easyweek-inbox-worker altegio-outbox-worker altegio-api
+```
+
+Ожидается: `altegio-easyweek-inbox-worker` в состоянии `exited`,
+`altegio-outbox-worker` и `altegio-api` — `running`. Если `altegio-api` не
+`running`, capture не работает и остановка producer теряет доставки: немедленно
+вернуть inbox worker шагом 58a и разбираться с API отдельно.
+
+Необязательная информационная проверка, что capture продолжается:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml logs --since 30m altegio-api | grep -c "easyweek capture stored"
+```
+
+Ноль здесь означает только, что за 30 минут не было доставок, и сам по себе
+STOP-условием не является.
+
+## 56b. Финальный release audit при остановленном producer
+
+`RELEASE_DIGEST` — значение `release_set_digest` из шага 55, то есть ровно того
+отчёта, по которому оператор принимал решения на шаге 56.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_audit \
+  --phase pre_open --limit 500 --expect-release-digest RELEASE_DIGEST
+```
+
+Требуется нулевой код возврата, `release_digest_error=null`,
+`audit_sound=true`, `bulk_ready=true` и `config_error=null`. Последнее
+одновременно доказывает, что send fence всё ещё `false`, а canary пуст: в
+фазе `pre_open` любое другое состояние даёт `config_error`.
+
+`release_digest_error=multi_service_release_set_changed` — STOP: между шагом
+55 и остановкой producer очередь изменилась. Вернуться к шагу 55, получить
+новый отчёт и заново пройти шаг 56 по новому inventory; открывать bulk по
+старому решению нельзя. Producer при этом можно оставить остановленным.
+
+С этого момента и до шага 58a утверждённый release set неизменяем: новых
+pair jobs никто не создаёт, а уже существующие меняют только собственный
+статус при обработке.
+
+## 57. (D) Bulk открытие после утверждённого inventory
+
+Только после шагов 55, 56, 56a и 56b.
+
+Сначала зафиксировать технический маркер времени — он понадобится на шаге 58
+как граница окна. Записать вывод в тикет **до** изменения флага:
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+```
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID= \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID'
+```
+
+Требуется `true` и пустая строка. После снятия ограничения обещание «ровно
+одна provider attempt» **недействительно**: уйдёт столько сообщений, сколько
+позиций было в утверждённом inventory, плюс те
+`future_provider_candidate_job_ids`, которые станут due по расписанию.
+
+## 58. Post-open verification фактических исходов
+
+Пустой open release set **не является** доказательством отправки. Release
+audit выбирает только открытые jobs, поэтому завершённая job уходит из его
+результата одинаково при успешной отправке, permanent Meta failure,
+исчерпанных retries, локальной отмене и при `done` без единой подтверждённой
+Outbox-строки. Фактический исход проверяется отдельным verifier по точным
+утверждённым ID.
+
+`DUE_IDS` и `FUTURE_IDS` — списки из отчёта шага 55, утверждённые на шаге 56
+(через запятую, только положительные целые). `OPENED_AT` — момент UTC,
+записанный **до** шага 57; он ограничивает окно поиска отправок вне
+утверждённого набора.
+
+Вариант зависит от того, что осталось в утверждённом inventory. Флаг для
+пустого списка не передаётся вообще: пустой аргумент — это не пустой список,
+а невалидный ввод.
+
+**Вариант A — в inventory есть due jobs.**
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_verify \
+  --due-job-ids DUE_IDS \
+  --opened-at OPENED_AT \
+  --settle-sec 180 --poll-sec 10 --limit 500
+```
+
+`--future-job-ids FUTURE_IDS` добавляется в ту же команду только если
+future-набор непуст. `--allow-empty-due` в варианте A не используется.
+
+**Вариант B — due jobs нет, есть только future jobs.**
+
+Это штатный исход после успешного canary: единственная due job уже
+отправлена на шаге 53 и стала терминальной, поэтому в inventory остались
+только reminders, которые сработают по своему расписанию.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_verify \
+  --future-job-ids FUTURE_IDS \
+  --opened-at OPENED_AT \
+  --allow-empty-due \
+  --settle-sec 180 --poll-sec 10 --limit 500
+```
+
+Зелёный вариант B доказывает не факт новой отправки, а то, что bulk fence
+действительно открыт в правильной конфигурации и что все утверждённые future
+jobs остались ровно в том состоянии, в котором их утвердили. Без due job сам
+по себе «нет новых сообщений» не доказывает ничего: закрытый fence выглядит
+точно так же. Поэтому в варианте B `config_error=null` — основная часть
+доказательства, и `empty_due_allowed=true` в отчёте показывает, что нулевой
+due-набор допустил оператор, а не логика.
+
+**Если и due, и future списки пусты — STOP.** Post-open verification в этом
+случае бессодержательна, и запускать её нельзя: пустой inventory даёт
+`config_error=approved_inventory_empty` и никогда не становится зелёным.
+Пустой inventory не является доказательством успешного rollout. Операторское
+решение здесь: вернуться к шагу 55, получить свежий release audit и заново
+пройти шаг 56 — либо, если очередь действительно пуста и открывать нечего,
+закрыть fence по набору (E) и зафиксировать в тикете, что bulk-открытие не
+выполнялось.
+
+Verifier строго read-only: он ничего не отправляет, не меняет флаги, не
+выполняет rollback и не трогает jobs.
+
+Зелёный результат требует одновременно:
+
+- `verified=true`, `settled=true` и `config_error=null`;
+- `inventory_proven=true` — утверждённый inventory непуст и полностью учтён;
+- `due_outcomes.succeeded == approved_due`, то есть каждая утверждённая due
+  job имеет `status=done` **и** подтверждённую Outbox-строку в
+  `sent`/`delivered`/`read`;
+- `unapproved_sent_job_ids=[]` — ни одна pair job вне утверждённого набора не
+  дошла до провайдера в окне;
+- `future_problem_job_ids=[]` и `future_maturing_job_ids=[]` — утверждённые
+  future jobs остались `queued`, непретендованными и без попыток отправки до
+  своего `run_at`, либо доказуемо ушли уже после него.
+
+Первый прогон сразу после открытия почти всегда показывает
+`in_progress`: outbox worker одним batch переводит несколько jobs в
+`processing` и только потом обрабатывает их последовательно. Это **не**
+rollout failure. Verifier сам ждёт в пределах `--settle-sec` и завершает
+ожидание, как только все утверждённые due jobs стали терминальными.
+
+STOP-условия и что они означают:
+
+- `settled=false` и непустой `pending_job_ids` — окно ожидания истекло, работа
+  ещё идёт. Это не отказ: у оператора ровно два варианта — повторить команду
+  с тем же `--opened-at` (наблюдать дальше) либо закрыть fence по набору (E);
+- `due_outcomes.failed > 0`, включая причину `done_without_proven_outbox_send`;
+- `due_outcomes.canceled_without_provider_send > 0`;
+- `due_outcomes.unknown_or_indeterminate > 0` — Meta-исход недоказуем; такую
+  job не ретраить автоматически и не считать успешной;
+- `due_outcomes.missing > 0` или `identity_mismatch > 0`;
+- непустой `unapproved_sent_job_ids` — отправка вне утверждённого набора при
+  остановленном producer;
+- `future_outcomes.future_sent_early > 0` — future job ушла раньше своего
+  `run_at`;
+- `future_outcomes.future_unexpected_state > 0` — future job не просто «ещё
+  не ушла», а `failed`, `canceled`, `done` без подтверждённой Outbox-строки,
+  претендована воркером до `run_at` либо в нераспознанном статусе;
+- `future_outcomes.future_indeterminate > 0` — Outbox `unknown`, недоказуемое
+  время отправки или противоречие job и Outbox;
+- `future_outcomes.missing > 0` или `future_outcomes.identity_mismatch > 0`;
+- `config_error` любого вида, включая `multi_service_send_disabled`,
+  `multi_service_canary_configured` и отключённые prerequisite flags: отчёт
+  описывает не ту конфигурацию, о которой заявляет;
+- `scan_truncated=true`.
+
+Отдельно про `future_outcomes.future_matured_pending`: у такой job `run_at`
+наступил уже во время проверки. Это не отказ и не успех — verifier ждёт её в
+пределах `--settle-sec` наравне с due jobs. Если она так и не завершилась,
+отчёт остаётся `settled=false`, и действует то же операторское решение, что и
+при таймауте.
+
+Любое из них — набор (E). Дополнительно можно посмотреть остаток очереди:
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_audit \
+  --phase bulk --limit 500
+```
+
+Это вспомогательная проверка остатка, а не доказательство отправки. В фазе
+`bulk` поле `in_flight` — нормальное состояние активной обработки и само по
+себе блокером не является.
+
+Переход к шагу 58a выполняется только после `verified=true`.
+
+## 58a. Возврат EasyWeek inbox worker в работу
+
+Выполняется только после `verified=true` на шаге 58 — и обязательно
+выполняется в любом случае, включая аварийный выход по набору (E). Оставлять producer
+остановленным нельзя: доставки продолжают накапливаться `captured`, но
+Client/Record перестают обновляться, а reminders перестают планироваться.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml start altegio-easyweek-inbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps -a altegio-easyweek-inbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml logs --tail 50 altegio-easyweek-inbox-worker
+```
+
+Ожидается состояние `running` и отсутствие повторяющихся ошибок в логе.
+События, накопленные за паузу, обрабатываются обычным путём: тот же полный
+proof, тот же causal order, те же fences. Никакого догоняющего режима и
+никакой массовой досылки не существует.
+
+Восстановление после частично выполненного шага: если `start` не поднял
+контейнер, повторить `up -d --no-deps altegio-easyweek-inbox-worker` и
+проверить `ps -a` ещё раз. Пока состояние не `running`, инцидент не закрыт.
+
+## 59. (E) Аварийный rollback
+
+Единственный аварийный стоп — `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false`.
+Порядок при отказе или таймауте шага 58 строгий: сначала закрыть send fence,
+затем убедиться по `printenv` внутри контейнера, что effective значение
+`false`, и только потом вернуть inbox worker по шагу 58a. Jobs не удалять,
+`attempts`, `run_at` и payload не править.
+Canary ID аварийным стопом не является и его не заменяет: при открытом fence
+и пустом canary ограничения нет вообще, а при открытом fence и заданном
+canary одна job всё ещё может уйти.
+
+```bash
+cd /opt/altegio_bot
+python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
+  --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --force-recreate altegio-outbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-outbox-worker sh -lc \
+  'printenv EASYWEEK_MULTI_SERVICE_SEND_ENABLED'
+```
+
+Проверка `printenv` обязательна: пока она не вернула `false`, rollback не
+выполнен.
+
+Затем — обязательно, даже если инцидент ещё разбирается, — вернуть producer
+в предсказуемое состояние по шагу 58a. Приостановленный inbox worker не
+является частью rollback и не должен пережить инцидент.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml start altegio-easyweek-inbox-worker
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps -a altegio-easyweek-inbox-worker altegio-outbox-worker altegio-api
+```
+
+Ожидается `running` у всех трёх сервисов.
+
+Jobs при этом не удалять, `attempts`, `run_at` и payload не править —
+удержанные jobs остаются `queued` и заново доказываются при следующем
+открытии fence.

@@ -8,6 +8,7 @@ the guarantee that none of it disturbs the Altegio path.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import uuid
@@ -6184,3 +6185,229 @@ async def test_the_durlach_incident_pair_keeps_working_on_the_version_one_path(
     assert snapshot.resource_shadow_proof is None
     jobs = await _easyweek_jobs(bound_session_local)
     assert {job.job_type for job in jobs} == {"record_created", "reminder_24h", "reminder_2h"}
+
+
+# ===========================================================================
+# §38.8: a reschedule may lower the envelope quantity without losing the pair
+#
+# Production sent booking-created with services_count=2 / quantity=2, then
+# booking-rescheduled with services_count=2 / quantity=1 for the same two
+# services. The authoritative whole-set count never changed, so the pair must
+# be re-proved against the live booking rather than silently dropped.
+# ===========================================================================
+
+
+def _rescheduled(payload: dict[str, Any], *, quantity: int) -> dict[str, Any]:
+    """The same booking, later, with a different top-level envelope quantity."""
+    rescheduled = _in(copy.deepcopy(payload), days=5)
+    rescheduled["quantity"] = quantity
+    return rescheduled
+
+
+async def test_an_allowed_pair_survives_a_reschedule_that_lowers_the_envelope_quantity(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="count-semantics-created",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    created_snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and created_snapshot is not None
+    created_jobs = {job.dedupe_key for job in await _easyweek_jobs(bound_session_local)}
+    assert created_jobs
+
+    await _capture_and_process(
+        bound_session_local,
+        _rescheduled(_multi_webhook(), quantity=1),
+        event_hint="booking-rescheduled",
+        payload_hash="count-semantics-rescheduled",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        event = (await session.execute(select(EasyWeekEvent).order_by(EasyWeekEvent.id.desc()))).scalars().first()
+    # The snapshot is still there and still digest-valid: a lower envelope
+    # quantity re-proves the pair, it does not revoke it.
+    after, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and after is not None
+    assert [line.display_name for line in after.lines] == [line.display_name for line in created_snapshot.lines]
+    assert record.raw[EASYWEEK_RAW_NAMESPACE][MULTI_SERVICE_SNAPSHOT_KEY]["digest"] == after.digest
+    # The captured webhook keeps the value EasyWeek actually sent.
+    assert event is not None and event.payload["quantity"] == 1
+
+    jobs = await _easyweek_jobs(bound_session_local)
+    assert {job.payload.get(MULTI_SERVICE_JOB_DIGEST_KEY) for job in jobs} == {after.digest}
+    # Reminder dedupe keys are stable across the re-proof; no duplicates.
+    assert len({job.dedupe_key for job in jobs}) == len(jobs)
+
+
+async def test_a_forbidden_pair_is_re_proved_and_still_suppressed_after_the_reschedule(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_karlsruhe_planning(monkeypatch, resource_shadow_enabled=True)
+
+    await _capture_and_process(
+        bound_session_local,
+        _in(_karlsruhe_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="count-semantics-nail-created",
+    )
+    await _capture_and_process(
+        bound_session_local,
+        _rescheduled(_karlsruhe_webhook(), quantity=1),
+        event_hint="booking-rescheduled",
+        payload_hash="count-semantics-nail-rescheduled",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+
+    snapshot, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and snapshot is not None
+    assert snapshot.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert [line.display_name for line in snapshot.lines] == [KARLSRUHE_SHELLAC, KARLSRUHE_PEDIKUERE_GEL]
+    # Structurally proven, and still suppressed by the category allowlist.
+    assert await _easyweek_jobs(bound_session_local) == []
+
+
+async def test_a_first_event_with_the_lower_envelope_quantity_still_needs_the_full_proof(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No prior event to lean on: only the live proof may create the snapshot."""
+    drifted = _multi_booking()
+    services = drifted["ordered_services"]
+    assert isinstance(services, list)
+    services[1]["price"] = 4600
+    services[1]["original_price"] = 4600
+    _enable_multi_planning(monkeypatch, booking=drifted)
+
+    payload = _in(_multi_webhook(), days=3)
+    payload["quantity"] = 1
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint="booking-created",
+        payload_hash="count-semantics-first-q1-mismatch",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+    assert await _easyweek_jobs(bound_session_local) == []
+
+    # The same first-event shape with a consistent live booking does prove.
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint="booking-updated",
+        payload_hash="count-semantics-first-q1-proven",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    proven, error = multi_service_snapshot_from_record_raw(record.raw)
+    assert error is None and proven is not None
+
+
+async def test_the_authoritative_count_dropping_to_one_still_revokes_the_snapshot(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="count-semantics-revoke-created",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is not None
+
+    single = _rescheduled(_multi_webhook(), quantity=1)
+    single["services_count"] = 1
+    await _capture_and_process(
+        bound_session_local,
+        single,
+        event_hint="booking-rescheduled",
+        payload_hash="count-semantics-revoke-single",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+
+
+async def test_a_lower_envelope_quantity_with_live_drift_revokes_the_pair(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    await _capture_and_process(
+        bound_session_local,
+        _in(_multi_webhook(), days=3),
+        event_hint="booking-created",
+        payload_hash="count-semantics-drift-created",
+    )
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is not None
+
+    drifted = _multi_booking(second="Andere Leistung")
+    _enable_multi_planning(monkeypatch, booking=drifted)
+    await _capture_and_process(
+        bound_session_local,
+        _rescheduled(_multi_webhook(), quantity=1),
+        event_hint="booking-rescheduled",
+        payload_hash="count-semantics-drift-rescheduled",
+    )
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert multi_service_snapshot_from_record_raw(record.raw)[0] is None
+
+
+async def test_replaying_the_same_lower_quantity_event_is_idempotent(
+    bound_session_local,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_multi_planning(monkeypatch)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    payload = _rescheduled(_multi_webhook(), quantity=1)
+
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint="booking-created",
+        payload_hash="count-semantics-replay-1",
+    )
+    first = await _easyweek_jobs(bound_session_local)
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    first_digest = multi_service_snapshot_from_record_raw(record.raw)[0]
+
+    await _capture_and_process(
+        bound_session_local,
+        payload,
+        event_hint="booking-updated",
+        payload_hash="count-semantics-replay-2",
+    )
+    second = await _easyweek_jobs(bound_session_local)
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    second_digest = multi_service_snapshot_from_record_raw(record.raw)[0]
+
+    assert first_digest is not None and second_digest is not None
+    assert first_digest.digest == second_digest.digest
+    assert {job.dedupe_key for job in second} >= {job.dedupe_key for job in first}
+    assert len({job.dedupe_key for job in second}) == len(second)

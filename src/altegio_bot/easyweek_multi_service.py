@@ -304,10 +304,66 @@ def webhook_pair_is_touched(present_fields: object) -> bool:
     )
 
 
+# §38.8.  Three different numbers live in one booking, and each answers a
+# different question.  Naming them apart is the point: the relaxed envelope
+# rule below must never be reachable from an API order line.
+EXACTLY_TWO_SERVICES: Final = 2
+ALLOWED_ENVELOPE_QUANTITIES: Final = (1, 2)
+REQUIRED_ORDER_LINE_QUANTITY: Final = 1
+
+
+def _exact_int(value: object) -> int | None:
+    """An exact ``int``, or ``None``.
+
+    ``bool`` is an ``int`` subclass, so ``type(...) is int`` is deliberate:
+    ``True`` must never be read as the quantity 1.
+    """
+    return value if type(value) is int else None
+
+
+def authoritative_services_count(value: object) -> int | None:
+    """The whole-set count, the one number that says how many services exist.
+
+    The shared domain snapshot already treats ``services_count`` this way —
+    ``RecordService.amount`` reads it first and only falls back to the envelope
+    quantity — so the pair proof has to agree with it.
+    """
+    count = _exact_int(value)
+    return count if count == EXACTLY_TWO_SERVICES else None
+
+
+def envelope_quantity(value: object) -> int | None:
+    """The TOP-LEVEL webhook quantity, which is a weaker signal than the count.
+
+    Production reschedules an exactly-two booking and sends ``services_count=2``
+    with ``quantity=1``; the two services, their ids, the description, the
+    currency and the booking identity all stay consistent, and the live booking
+    still proves two real services.  §38.8 therefore lets this envelope field
+    be an exact 1 or 2 and nothing else.  It is never permission on its own:
+    every identity, price, duration, currency, total and category proof below
+    still has to pass.
+
+    This is NOT the order-line quantity — see :func:`_order_line_quantity`.
+    """
+    quantity = _exact_int(value)
+    return quantity if quantity in ALLOWED_ENVELOPE_QUANTITIES else None
+
+
+def _order_line_quantity(value: object) -> int | None:
+    """One ``ordered_services`` row's quantity, which stays an exact 1.
+
+    Deliberately separate from :func:`envelope_quantity`: a row that claims to
+    be two of something is a shape this contract has never proved, and the
+    §38.8 relaxation must not reach it.
+    """
+    quantity = _exact_int(value)
+    return quantity if quantity == REQUIRED_ORDER_LINE_QUANTITY else None
+
+
 def _validate_webhook(pair: WebhookServicePair) -> tuple[str, str]:
-    if type(pair.services_count) is not int or pair.services_count != 2:
+    if authoritative_services_count(pair.services_count) is None:
         raise MultiServiceProofError(MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN)
-    if type(pair.quantity) is not int or pair.quantity != 2:
+    if envelope_quantity(pair.quantity) is None:
         raise MultiServiceProofError(MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN)
 
     first = _normalized_name(pair.service_name)
@@ -374,8 +430,8 @@ def _read_ordered_line(value: object) -> _OrderedLine:
     if name is None or normalized is None:
         raise MultiServiceProofError(MULTI_SERVICE_ORDERED_SERVICES_MALFORMED)
 
-    quantity = value.get("quantity")
-    if type(quantity) is not int or quantity != 1:
+    quantity = _order_line_quantity(value.get("quantity"))
+    if quantity is None:
         raise MultiServiceProofError(MULTI_SERVICE_QUANTITY_UNSUPPORTED)
     discount = value.get("discount")
     if type(discount) is not int or discount != 0:

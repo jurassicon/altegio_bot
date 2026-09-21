@@ -622,6 +622,28 @@ class Settings(BaseSettings):
     easyweek_multi_service_notifications_enabled: bool = False
     easyweek_multi_service_send_enabled: bool = False
 
+    # §38.9: the controlled-canary restriction for the pair queue. One internal
+    # `message_jobs.id`, and the ONLY EasyWeek pair job the outbox worker may
+    # claim or send while it is set.
+    #
+    # It exists because `easyweek_multi_service_send_enabled` is global: opening
+    # it releases EVERY due lifecycle/reminder job carrying the canonical pair
+    # digest — including jobs of records that were since deleted or have already
+    # started — which is strictly more than the structural preflight audits.
+    #
+    # A string rather than an int, for the same reason the PR-12 retention
+    # canary is one: typing it as `int | None` would make a typo raise inside
+    # `Settings()`, and every worker and the API would fail to start over a
+    # rollout variable. Parsing at the point of use instead lets a malformed
+    # value fail CLOSED in exactly one place — no pair job is claimed at all,
+    # and both preflights report it as a configuration error.
+    #
+    # Empty means no restriction (bulk behaviour, only after the full release
+    # audit). The restriction is scoped to EasyWeek lifecycle/reminder jobs
+    # carrying the pair digest: single-service EasyWeek jobs, every Altegio job
+    # and every review/retention/campaign/voucher job ignore it entirely.
+    easyweek_multi_service_canary_job_id: str = ""
+
     # --- PR-7.5: Karlsruhe resource-shadow proof -------------------------
     # A third, independent default-false kill switch. It widens NOTHING on its
     # own: it only lets the shared proof recognise the one owner-approved
