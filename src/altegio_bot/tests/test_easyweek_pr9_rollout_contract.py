@@ -264,11 +264,15 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # Plan §40 (revision 43). The failed-cancellation recovery proves the
         # live state of each named booking with a real GET before it writes, so
         # it needs the same key. Admitted separately because its power is
-        # narrower still: it can mark ONE historical Record deleted, withdraw
-        # that record's queued EasyWeek reminders and terminalize one named
-        # event, and it can create neither a customer, a booking, a message job
-        # nor an outbox row. Same narrowest carrier: ops profile, restart:no,
-        # one command per container, `--event-id` required, no `--all`.
+        # narrower still: per named event it marks that historical Record
+        # deleted, withdraws that record's queued EasyWeek reminders and
+        # terminalizes that one event, and it can create neither a customer, a
+        # booking, a message job nor an outbox row. The scope is a bounded set
+        # of explicitly named `--event-id` values — required, repeatable and
+        # capped at MAX_EVENT_IDS (10) — never a scan: there is no `--all`.
+        # Same narrowest carrier: ops profile, restart:no, one command per
+        # container, and the apply authorisation is passed per invocation
+        # rather than declared in Compose.
         "easyweek-failed-cancellation-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 

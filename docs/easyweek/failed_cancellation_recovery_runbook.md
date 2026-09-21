@@ -140,33 +140,169 @@ dc --profile ops run --rm --build --no-deps -T easyweek-failed-cancellation-reco
 reminders у неё нет; ни одного нового `MessageJob` или `OutboxMessage`; другие
 события, записи и задания не изменены.
 
-### Шаг 5 — повторный reminder handover plan для тех же 13 ledger rows
+### Шаг 5 — HANNA reminder handover plan
 
-Тот же `HANDOVER_SCOPE`, что и раньше: тот же manifest и те же `--run-id`.
-Полный контракт и все предупреждения — `migration_preparation_runbook.md`.
+Восстановленная строка принадлежит волне **HANNA**, а не CORE. Это разные
+manifest, разные ledger `run_id` и разные snapshot/report. Смешивать их в одном
+snapshot запрещено: `migration_wave_changed` — STOP, а применённый не к той
+волне snapshot затрагивает чужие записи.
+
+Точный и единственный scope этого раздела:
+
+| Параметр | Значение |
+|---|---|
+| manifest | `/migration/input/manifest.handover.hanna.json` |
+| company-id | `758285` |
+| run-id | `55be3c0a62164e06` |
+| run-id | `f61323dc49384c62` |
+
+Ровно два run ID. Пять CORE run ID
+(`27d8b9b5c59a446c`, `887cfbbe881149ad`, `90b183e121294f49`, `9f895ed02dc64073`,
+`f6897b60b99b4860`), CORE manifest `manifest.karlsruhe.api-contract.20260831.json`
+и общий snapshot `reminder_handover.v5.json` в этом разделе **не используются**.
+Run ID Ирины и Алёны (`b4ca41ac1ad54591`, `c52bb4f62fb64a35`,
+`02d514703aec466f`, `de193299b9974859`) тоже не входят.
+
+Один и тот же фрагмент от `--manifest` до последнего `--run-id` используется без
+изменений во **всех трёх** режимах plan/apply/verify ниже.
 
 ```bash
-dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.karlsruhe.api-contract.20260831.json --company-id 758285 --run-id 27d8b9b5c59a446c --run-id 887cfbbe881149ad --run-id 90b183e121294f49 --run-id 9f895ed02dc64073 --run-id f6897b60b99b4860 --snapshot /migration/state/reminder_handover.v5.json
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover plan --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json
 ```
 
 Строка, которую восстановил шаг 3, обязана теперь получить disposition
 `handover_terminal_canceled` вместо `local_target_mismatch`.
 
-### Шаг 6 — handover apply только при `cutover_ready=true`
+Полный контракт отчёта, значения `guard_ready` / `coverage_ready` /
+`cutover_ready` и все предупреждения — §6b.2 `migration_preparation_runbook.md`.
 
-Продолжать **только если** отчёт шага 5 показывает `cutover_ready = true`, и в
-нём нет ни одного `unproven` и ни одного `local_target_mismatch`. Иначе —
-стоп, разбор причины, новый plan.
+### Шаг 6 — проверка отчёта перед apply
 
-Команда apply, короткая остановка `altegio-outbox-worker` с обязательным
-`trap` и проверка, что воркер поднялся, описаны в
-`migration_preparation_runbook.md`; они этой ревизией не изменены.
+Продолжать **только если** отчёт шага 5 показывает одновременно:
 
-### Шаг 7 — handover verify
+- `cutover_ready = true`;
+- ни одного `unproven`;
+- ни одного `local_target_mismatch`;
+- `rows_with_processing_source_jobs` пуст.
 
-Существующий verify handover, затем существующий
-`easyweek_reminder_preflight`, затем read-only SQL-сверка — как описано в
-`migration_preparation_runbook.md`.
+Иначе — STOP, разбор причины, новый plan. Запишите `plan_digest` отчёта: он
+нужен шагу 7 дважды — в `--plan-digest` и внутри `--confirm`.
+
+### Шаг 7 — HANNA handover apply с короткой остановкой outbox
+
+Outbox останавливается только на время одной транзакции, и `trap` возвращает
+воркер при любом выходе, включая ошибку и Ctrl-C. Inbox и capture не
+останавливаются, notification-флаги не трогаются.
+
+```bash
+(
+set -euo pipefail
+cd /opt/altegio_bot
+
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+
+restore_outbox() {
+  original_rc=$?
+  trap - EXIT INT TERM HUP
+  set +e
+  dc up -d altegio-outbox-worker
+  restart_rc=$?
+  dc ps altegio-outbox-worker
+  running="$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')"
+  if [ "$running" -ne 1 ]; then
+    restart_rc=1
+    echo 'STOP: altegio-outbox-worker не вернулся в running' >&2
+  fi
+  if [ "$original_rc" -ne 0 ]; then
+    exit "$original_rc"
+  fi
+  exit "$restart_rc"
+}
+
+trap restore_outbox EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+dc stop altegio-outbox-worker
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json --apply-report /migration/state/reminder_handover.hanna.after-failed-cancellation.apply-report.v3.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_5 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_5'
+)
+```
+
+### Шаг 8 — проверка, что outbox вернулся
+
+Trap проверяет это сам; после выхода команды это доказывается независимо.
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc ps altegio-outbox-worker
+test "$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')" -eq 1
+```
+
+### Шаг 9 — HANNA handover verify
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc --profile ops run --rm --no-deps -T easyweek-migration-prepare-handover verify --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json --apply-report /migration/state/reminder_handover.hanna.after-failed-cancellation.apply-report.v3.json
+```
+
+Требования к PASS — §6b.4 `migration_preparation_runbook.md`:
+`wave_closures_expected == wave_closures_verified`,
+`wave_closures_missing == []`, `wave_closures_with_foreign_digest == []`.
+
+Проверка идемпотентности — повторный apply того же snapshot в **отдельный**
+report, чтобы не уничтожить evidence шага 7. Результат обязан показать
+`mutations: 0`.
+
+```bash
+(
+set -euo pipefail
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+restore_outbox() {
+  original_rc=$?
+  trap - EXIT INT TERM HUP
+  set +e
+  dc up -d altegio-outbox-worker
+  restart_rc=$?
+  dc ps altegio-outbox-worker
+  running="$(dc ps --status running -q altegio-outbox-worker | wc -l | tr -d ' ')"
+  if [ "$running" -ne 1 ]; then restart_rc=1; fi
+  if [ "$original_rc" -ne 0 ]; then exit "$original_rc"; fi
+  exit "$restart_rc"
+}
+trap restore_outbox EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+dc stop altegio-outbox-worker
+dc --profile ops run --rm --no-deps -T -e EASYWEEK_REMINDER_HANDOVER_ALLOW_APPLY=true easyweek-migration-prepare-handover apply --manifest /migration/input/manifest.handover.hanna.json --company-id 758285 --run-id 55be3c0a62164e06 --run-id f61323dc49384c62 --snapshot /migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json --apply-report /migration/state/reminder_handover.hanna.after-failed-cancellation.repeat-apply-report.v3.json --apply --plan-digest PLAN_DIGEST_ИЗ_ШАГА_5 --confirm 'apply reminder handover PLAN_DIGEST_ИЗ_ШАГА_5'
+)
+```
+
+### Шаг 10 — reminder preflight и read-only сверка
+
+Существующий API preflight читает актуальные EasyWeek booking и прогоняет
+production reminder guard для всей открытой очереди. Он не подменяет verify.
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc run --rm --no-deps -T --entrypoint /app/.venv/bin/python altegio-outbox-worker -m altegio_bot.scripts.easyweek_reminder_preflight --limit 200 --pause-sec 1.05
+```
+
+```bash
+cd /opt/altegio_bot
+dc() { docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"; }
+dc exec -T postgres psql -X -v ON_ERROR_STOP=1 -U altegio -d altegio_bot -c "BEGIN TRANSACTION READ ONLY; SELECT provider, job_type, status, count(*) FROM message_jobs WHERE job_type IN ('reminder_24h','reminder_2h') GROUP BY 1,2,3 ORDER BY 1,2,3; COMMIT;"
+```
+
+Полная marker-сверка обоих видов отметок — §6b.4
+`migration_preparation_runbook.md`; она этой ревизией не изменена.
 
 ---
 
@@ -180,7 +316,10 @@ dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handov
   изменилось**, нужен новый plan;
 - verify вернул `passed = false`;
 - handover plan после recovery всё ещё показывает `local_target_mismatch` или
-  любой `unproven`.
+  любой `unproven`;
+- handover-команда содержит CORE manifest, любой из пяти CORE run ID или общий
+  snapshot `reminder_handover.v5.json` — это чужая волна, выполнять нельзя;
+- `altegio-outbox-worker` не вернулся в `running` после шага 7.
 
 Во всех этих случаях никаких ручных правок в PostgreSQL не делается. Причина
 разбирается, при необходимости запрашивается отдельное решение владельца.
@@ -198,3 +337,15 @@ dc --profile ops run --rm --build --no-deps -T easyweek-migration-prepare-handov
 `${EASYWEEK_FAILED_CANCELLATION_RECOVERY_STATE_DIR:-./outputs/easyweek_failed_cancellation_recovery}`
 и имеет права `0700`. Ни один артефакт не содержит имён, телефонов, email и
 webhook payload.
+
+Артефакты HANNA handover — отдельные от CORE и друг от друга, чтобы evidence
+одного запуска не затирало другое:
+
+| Файл | Шаг |
+|---|---|
+| `/migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json` | snapshot шага 5, читается шагами 7 и 9 |
+| `/migration/state/reminder_handover.hanna.after-failed-cancellation.apply-report.v3.json` | apply report шага 7, читается шагом 9 |
+| `/migration/state/reminder_handover.hanna.after-failed-cancellation.repeat-apply-report.v3.json` | отдельный report проверки идемпотентности |
+
+CORE-файл `/migration/state/reminder_handover.v5.json` в этой процедуре не
+используется и не перезаписывается.

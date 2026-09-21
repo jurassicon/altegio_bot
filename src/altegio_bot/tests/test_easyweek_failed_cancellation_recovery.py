@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import shlex
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1225,3 +1227,200 @@ async def test_unrelated_traffic_elsewhere_does_not_veto_a_correct_apply(session
     async with session_maker() as session:
         report = await verify_recovery(session, frozen=frozen, apply_report=apply_report)
     assert report["passed"] is True, "unrelated rows must not make a correct recovery look broken"
+
+
+# ===========================================================================
+# The handover section of the runbook must carry the HANNA scope, not CORE
+# ===========================================================================
+#
+# The first draft of steps 5-7 told the operator to "repeat the handover for
+# the same thirteen rows" and then pasted the CORE command underneath: the
+# Karlsruhe API-contract manifest, five CORE run IDs and the shared
+# `reminder_handover.v5.json`. Prose said HANNA, the copyable line said CORE.
+# Running it would have frozen the wrong wave into a snapshot and reached
+# bookings this recovery has nothing to do with.
+#
+# So these tests read the EXECUTABLE bash blocks, not the prose. The warning
+# paragraph deliberately names the CORE identifiers so an operator recognises
+# them; what must never contain them is a line one can paste into a shell.
+
+HANDOVER_SERVICE = "easyweek-migration-prepare-handover"
+
+HANNA_MANIFEST = "/migration/input/manifest.handover.hanna.json"
+HANNA_COMPANY_ID = 758285
+HANNA_RUN_IDS = ("55be3c0a62164e06", "f61323dc49384c62")
+HANNA_SNAPSHOT = "/migration/state/reminder_handover.hanna.after-failed-cancellation.v5.json"
+HANNA_APPLY_REPORT = "/migration/state/reminder_handover.hanna.after-failed-cancellation.apply-report.v3.json"
+HANNA_REPEAT_APPLY_REPORT = (
+    "/migration/state/reminder_handover.hanna.after-failed-cancellation.repeat-apply-report.v3.json"
+)
+
+# Everything that belongs to the OTHER wave. None of it may appear in a line
+# an operator can execute from this runbook.
+CORE_TOKENS = (
+    "manifest.karlsruhe.api-contract.20260831.json",
+    "27d8b9b5c59a446c",
+    "887cfbbe881149ad",
+    "90b183e121294f49",
+    "9f895ed02dc64073",
+    "f6897b60b99b4860",
+    "/migration/state/reminder_handover.v5.json",
+    "/migration/state/reminder_handover.apply-report.v3.json",
+)
+# Irina and Alena are a later wave and are out of scope for this procedure too.
+FOREIGN_RUN_IDS = ("b4ca41ac1ad54591", "c52bb4f62fb64a35", "02d514703aec466f", "de193299b9974859")
+
+
+def _bash_blocks(text: str) -> list[str]:
+    return [block.strip() for block in re.findall(r"```bash\n(.*?)```", text, flags=re.S)]
+
+
+def _handover_section(text: str) -> str:
+    """Steps 5-10: everything from the handover plan to the read-only audit."""
+    start = text.index("### Шаг 5 —")
+    end = text.index("## 4. Стоп-условия")
+    return text[start:end]
+
+
+def _service_lines(text: str, service: str) -> list[str]:
+    return [line.strip() for block in _bash_blocks(text) for line in block.splitlines() if service in line]
+
+
+def _argv_after(line: str, service: str) -> list[str]:
+    tokens = shlex.split(line)
+    return tokens[tokens.index(service) + 1 :]
+
+
+def _handover_scope(argv: list[str]) -> tuple[str, int, tuple[str, ...]]:
+    """The contiguous identity of a wave: manifest, company and run IDs."""
+    parser = _handover_parser()
+    args = parser.parse_args(argv)
+    return args.manifest, tuple(args.company_id)[0], tuple(sorted(args.run_id))
+
+
+def _handover_parser():
+    from altegio_bot.scripts import easyweek_reminder_handover as tool
+
+    return tool.build_parser()
+
+
+async def test_the_handover_commands_parse_with_the_real_parser() -> None:
+    """A runbook whose flags do not exist fails where somebody is mid-procedure."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    lines = _service_lines(section, HANDOVER_SERVICE)
+    assert lines, "the recovery runbook documents no handover commands"
+
+    parser = _handover_parser()
+    for line in lines:
+        args = parser.parse_args(_argv_after(line, HANDOVER_SERVICE))
+        assert args.company_id == [HANNA_COMPANY_ID], line
+        assert args.manifest == HANNA_MANIFEST, line
+        assert sorted(args.run_id) == sorted(HANNA_RUN_IDS), line
+
+
+async def test_all_three_handover_modes_use_one_identical_hanna_scope() -> None:
+    """plan, apply and verify must freeze, write and prove the SAME wave."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    parser = _handover_parser()
+    by_mode: dict[str, list[list[str]]] = {}
+    for line in _service_lines(section, HANDOVER_SERVICE):
+        argv = _argv_after(line, HANDOVER_SERVICE)
+        by_mode.setdefault(parser.parse_args(argv).mode, []).append(argv)
+
+    assert set(by_mode) == {"plan", "apply", "verify"}, by_mode.keys()
+
+    scopes = {_handover_scope(argv) for argvs in by_mode.values() for argv in argvs}
+    assert scopes == {(HANNA_MANIFEST, HANNA_COMPANY_ID, tuple(sorted(HANNA_RUN_IDS)))}, scopes
+
+
+async def test_the_handover_commands_use_hanna_specific_snapshot_and_reports() -> None:
+    """Separate files, so CORE evidence and HANNA evidence cannot overwrite each other."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    parser = _handover_parser()
+    snapshots: set[str] = set()
+    apply_reports: set[str] = set()
+    for line in _service_lines(section, HANDOVER_SERVICE):
+        args = parser.parse_args(_argv_after(line, HANDOVER_SERVICE))
+        snapshots.add(args.snapshot)
+        if args.mode in ("apply", "verify"):
+            apply_reports.add(args.apply_report)
+
+    assert snapshots == {HANNA_SNAPSHOT}, snapshots
+    # The idempotence re-apply writes its own report so the first apply's
+    # evidence survives; verify reads the first one.
+    assert apply_reports == {HANNA_APPLY_REPORT, HANNA_REPEAT_APPLY_REPORT}, apply_reports
+
+
+async def test_no_core_identifier_reaches_an_executable_line() -> None:
+    """The prose may name the other wave; a copyable command may not."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = _handover_section(text)
+
+    for block in _bash_blocks(section):
+        for token in (*CORE_TOKENS, *FOREIGN_RUN_IDS):
+            assert token not in block, f"{token} reached an executable line:\n{block}"
+
+    # And nowhere else in the runbook either — the recovery steps have their
+    # own service and must not grow a stray handover line.
+    for block in _bash_blocks(text):
+        for token in (*CORE_TOKENS, *FOREIGN_RUN_IDS):
+            assert token not in block, f"{token} reached an executable line:\n{block}"
+
+
+async def test_the_warning_still_names_the_core_scope_in_prose() -> None:
+    """Recognising the wrong wave is the point; the warning must stay readable."""
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    prose = re.sub(r"```bash\n.*?```", "", section, flags=re.S)
+    for token in ("manifest.karlsruhe.api-contract.20260831.json", "27d8b9b5c59a446c", "f6897b60b99b4860"):
+        assert token in prose, token
+    assert "HANNA" in prose
+
+
+async def test_only_the_apply_handover_command_can_write() -> None:
+    from altegio_bot.scripts import easyweek_reminder_handover as tool
+
+    section = _handover_section(RUNBOOK.read_text(encoding="utf-8"))
+    parser = tool.build_parser()
+    for line in _service_lines(section, HANDOVER_SERVICE):
+        args = parser.parse_args(_argv_after(line, HANDOVER_SERVICE))
+        if args.mode == "apply":
+            assert args.apply is True, line
+            assert args.plan_digest, line
+            assert args.confirm, line
+            assert args.confirm == tool.confirmation_phrase(args.plan_digest), line
+            assert tool.APPLY_ENV_FLAG in line, line
+        else:
+            assert args.apply is False, line
+            assert tool.APPLY_ENV_FLAG not in line, line
+
+
+async def test_the_recovery_steps_still_name_only_event_360() -> None:
+    """The recovery half must not widen while the handover half is corrected."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    parser = cli.build_parser()
+    lines = _service_lines(text, COMPOSE_SERVICE)
+    assert lines, "the runbook documents no recovery commands"
+
+    modes = set()
+    for line in lines:
+        args = parser.parse_args(_argv_after(line, COMPOSE_SERVICE))
+        assert args.event_id == [360], line
+        modes.add(args.mode)
+        if args.mode == "apply":
+            assert args.apply is True, line
+            assert cli.APPLY_ENV_FLAG in line, line
+        else:
+            assert args.apply is False, line
+            assert cli.APPLY_ENV_FLAG not in line, line
+    assert modes == {"plan", "apply", "verify"}, modes
+
+
+async def test_the_documented_order_puts_recovery_before_the_handover() -> None:
+    """Recovery first: the handover cannot classify a row that is still active."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    steps = [text.index(f"### Шаг {number} —") for number in range(1, 11)]
+    assert steps == sorted(steps), "the runbook steps are out of order"
+
+    first_handover = min(text.index(line) for line in _service_lines(text, HANDOVER_SERVICE))
+    last_recovery = max(text.index(line) for line in _service_lines(text, COMPOSE_SERVICE))
+    assert last_recovery < first_handover, "every recovery command must precede the handover"
