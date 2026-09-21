@@ -60,6 +60,26 @@ BOOL_KEYS = (
 JOB_ID_KEYS = ("EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID",)
 ALLOWED_KEYS = BOOL_KEYS + JOB_ID_KEYS
 
+# The ONE key `--bootstrap-canary-key` may create, and the ONLY value it may
+# create it with.
+#
+# The production `easyweek.env` predates §38.9, so it has no canary line at
+# all — and `--set` is strict on purpose: "no assignment found" is how an
+# operator learns they are editing a file that does not control the flag. That
+# strictness would make the very first command of step 43 refuse forever.
+#
+# The bootstrap is therefore explicit, single-key and single-valued rather
+# than a general "append if missing" mode. A generic append would quietly
+# recreate any key an operator mistyped out of the file, which is the failure
+# `--set` exists to catch. Creating the restriction in its CLOSED, unrestricted
+# form changes no behaviour: an absent key and an empty key parse identically.
+BOOTSTRAP_KEY = "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID"
+BOOTSTRAP_VALUE = ""
+
+# What a bootstrap call did, reported to the operator as a stable word.
+BOOTSTRAP_CREATED = "created"
+BOOTSTRAP_ALREADY_PRESENT = "already_present"
+
 _BACKUP_MODE = 0o600
 PROG = "easyweek_env_set"
 
@@ -176,6 +196,51 @@ def edit_env_file(path: Path, assignments: dict[str, str], *, dry_run: bool = Fa
     return changed
 
 
+def count_assignments(lines: list[str], key: str) -> int:
+    """Active assignments of *key*. A commented-out line is not one."""
+    pattern = _assignment_pattern(key)
+    return sum(1 for line in lines if pattern.match(line))
+
+
+def bootstrap_canary_key(path: Path, *, dry_run: bool = False) -> str:
+    """Create ``EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=`` if it does not exist.
+
+    Idempotent and fail-closed, in that order of importance:
+
+    * exactly zero active assignments -> the line is appended, with the same
+      backup, atomic replace and preserved mode every other write gets;
+    * exactly one -> nothing is written and the caller is told so, because the
+      key already controls the flag and rewriting it could change its value;
+    * two or more -> refused without touching the file, for the same reason
+      ``--set`` refuses: the last line silently wins, and an operator must see
+      that before a rollout depends on it.
+    """
+    if not path.is_file():
+        raise EnvEditError(f"{path} is not a file")
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+
+    found = count_assignments(lines, BOOTSTRAP_KEY)
+    if found == 1:
+        return BOOTSTRAP_ALREADY_PRESENT
+    if found > 1:
+        raise EnvEditError(f"{BOOTSTRAP_KEY}: {found} assignments found, expected zero or one")
+
+    if dry_run:
+        return BOOTSTRAP_CREATED
+
+    # Appended, never inserted: rewriting the middle of a secrets file to make
+    # it tidier is a diff nobody asked for and a chance to corrupt a line.
+    updated = original
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    updated += f"{BOOTSTRAP_KEY}={BOOTSTRAP_VALUE}\n"
+
+    _backup(path, original)
+    _atomic_write(path, updated, stat.S_IMODE(path.stat().st_mode))
+    return BOOTSTRAP_CREATED
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -185,11 +250,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE)
     parser.add_argument("--set", dest="assignments", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--dry-run", action="store_true", help="Validate and report; write nothing.")
+    parser.add_argument(
+        "--bootstrap-canary-key",
+        action="store_true",
+        help=(
+            f"Create {BOOTSTRAP_KEY}= if the file has no assignment of it. "
+            "Only that key, only empty, and never together with --set."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.bootstrap_canary_key:
+        # Deliberately not combinable with --set: one invocation does one
+        # thing, so a refusal is never ambiguous about what did happen.
+        if args.assignments:
+            print(f"{PROG}: refused: --bootstrap-canary-key cannot be combined with --set", file=sys.stderr)
+            return 1
+        try:
+            outcome = bootstrap_canary_key(Path(args.env_file), dry_run=bool(args.dry_run))
+        except EnvEditError as exc:
+            print(f"{PROG}: refused: {exc}", file=sys.stderr)
+            return 1
+        if outcome == BOOTSTRAP_ALREADY_PRESENT:
+            print(f"{PROG}: {BOOTSTRAP_KEY} already present; nothing written", file=sys.stderr)
+            return 0
+        print(f"{BOOTSTRAP_KEY}={BOOTSTRAP_VALUE}")
+        if args.dry_run:
+            print(f"{PROG}: dry run; nothing written", file=sys.stderr)
+        return 0
+
     try:
         assignments = parse_assignments(list(args.assignments))
         changed = edit_env_file(Path(args.env_file), assignments, dry_run=bool(args.dry_run))

@@ -310,3 +310,123 @@ def test_the_env_helper_cannot_touch_a_secret() -> None:
     source = inspect.getsource(easyweek_env_set)
     assert "os.replace(" in source, "the write must be atomic"
     assert "S_IMODE" in source, "the original file mode must survive"
+
+
+# ===========================================================================
+# §38.9 follow-up: bootstrap, due-only canary, and the producer boundary
+# ===========================================================================
+
+BOUNDARY_STEPS = (
+    "## 56a. Приостановка producer: EasyWeek inbox worker",
+    "## 56b. Финальный release audit при остановленном producer",
+    "## 57. (D) Bulk открытие после утверждённого inventory",
+    "## 58. Post-open аудит фактических исходов",
+    "## 58a. Возврат EasyWeek inbox worker в работу",
+    "## 59. (E) Аварийный rollback",
+)
+
+
+def test_step_43_bootstraps_the_canary_key_before_it_sets_anything() -> None:
+    """The production file predates the key, so --set alone would always refuse."""
+    block = _section().split("## 43.", 1)[1].split("\n## ", 1)[0]
+    assert "--bootstrap-canary-key" in block
+    assert block.index("--bootstrap-canary-key") < block.index("--dry-run")
+    assert block.index("--dry-run") < block.index("--set EASYWEEK_NOTIFICATIONS_ENABLED=true")
+    assert "already present" in block
+    assert "expected zero or one" in block
+    # The verification half of the step is still mandatory.
+    assert "шаг 44" in block
+
+
+def test_step_49_names_the_not_due_stop_condition() -> None:
+    block = _section().split("## 49.", 1)[1].split("\n## ", 1)[0]
+    for code in (
+        "multi_service_canary_job_not_found",
+        "multi_service_canary_job_not_due",
+        "multi_service_canary_job_mismatch",
+    ):
+        assert code in block, code
+
+
+def test_the_producer_is_paused_and_restarted_in_order() -> None:
+    section = _section()
+    positions = [section.index(step) for step in BOUNDARY_STEPS]
+    assert positions == sorted(positions), "the producer boundary steps are out of order"
+
+    pause = section.split("## 56a.", 1)[1].split("\n## ", 1)[0]
+    assert "stop altegio-easyweek-inbox-worker" in pause
+    assert "ps -a altegio-easyweek-inbox-worker altegio-outbox-worker altegio-api" in pause
+
+    resume = section.split("## 58a.", 1)[1].split("\n## ", 1)[0]
+    assert "start altegio-easyweek-inbox-worker" in resume
+
+
+def test_the_final_audit_is_bound_to_the_approved_digest() -> None:
+    section = _section()
+    assert "release_set_digest" in section.split("## 47.", 1)[1].split("\n## ", 1)[0]
+    final = section.split("## 56b.", 1)[1].split("\n## ", 1)[0]
+    assert "--expect-release-digest <DIGEST>" in final
+    assert "multi_service_release_set_changed" in final
+    # It runs BEFORE the bulk opening, and after the producer is paused.
+    assert section.index("## 56a.") < section.index("## 56b.") < section.index("## 57.")
+
+
+def test_the_rollback_always_returns_the_producer_to_a_running_state() -> None:
+    """A paused inbox worker must not outlive the incident."""
+    rollback = _section().split("## 59.", 1)[1]
+    assert "start altegio-easyweek-inbox-worker" in rollback
+    assert "ps -a altegio-easyweek-inbox-worker altegio-outbox-worker altegio-api" in rollback
+    resume = _section().split("## 58a.", 1)[1].split("\n## ", 1)[0]
+    assert "включая аварийный выход" in resume
+
+
+def test_the_runbook_states_why_pausing_the_producer_loses_no_delivery() -> None:
+    pause = " ".join(_section().split("## 56a.", 1)[1].split("\n## ", 1)[0].split())
+    assert "altegio-api" in pause
+    assert "captured" in pause
+    assert "SIGTERM" in pause
+    assert "не теряет доставки" in pause
+
+
+def test_the_runbook_still_forbids_touching_jobs_by_hand() -> None:
+    section = _section()
+    flattened = " ".join(section.split())
+    assert "Jobs при этом не удалять" in flattened
+    assert "`attempts`, `run_at` и payload не править" in flattened
+
+
+def test_the_bootstrap_is_one_key_one_value_and_never_a_generic_append() -> None:
+    assert easyweek_env_set.BOOTSTRAP_KEY == "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID"
+    assert easyweek_env_set.BOOTSTRAP_VALUE == ""
+    assert easyweek_env_set.BOOTSTRAP_KEY in easyweek_env_set.ALLOWED_KEYS
+    signature = inspect.signature(easyweek_env_set.bootstrap_canary_key)
+    assert list(signature.parameters) == ["path", "dry_run"]
+    source = inspect.getsource(easyweek_env_set.bootstrap_canary_key)
+    assert "_backup(" in source and "_atomic_write(" in source and "S_IMODE" in source
+
+
+def test_the_due_only_canary_rule_lives_in_the_audit() -> None:
+    source = inspect.getsource(audit._canary_error)
+    assert "future_provider_candidate_job_ids" in source
+    assert "MULTI_SERVICE_CANARY_JOB_NOT_DUE" in source
+    assert source.index("MULTI_SERVICE_CANARY_JOB_NOT_DUE") < source.index("MULTI_SERVICE_CANARY_JOB_NOT_FOUND")
+
+
+def test_the_release_digest_covers_the_job_ids_and_nothing_else() -> None:
+    source = inspect.getsource(audit.ReleaseAuditReport.release_set_digest.fget)
+    assert "sha256" in source
+    assert "provider_candidate_job_ids" in source and "future_provider_candidate_job_ids" in source
+    # Classification and due/future split must NOT enter the digest: both move
+    # on their own and would make an unchanged set look changed.
+    assert "classifications" not in source
+    assert "phase" not in source
+
+
+def test_the_capture_endpoint_is_independent_of_the_inbox_worker() -> None:
+    """What makes pausing the producer a safe boundary rather than data loss."""
+    from altegio_bot.webhooks import easyweek as capture
+
+    source = inspect.getsource(capture)
+    assert "easyweek_inbox_worker" not in source
+    assert "session.commit()" in source
+    assert "status_code=503" in source

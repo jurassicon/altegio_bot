@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -55,7 +57,9 @@ from altegio_bot.easyweek_multi_service import (
 )
 from altegio_bot.easyweek_multi_service_rollout import (
     MULTI_SERVICE_CANARY_JOB_MISMATCH,
+    MULTI_SERVICE_CANARY_JOB_NOT_DUE,
     MULTI_SERVICE_CANARY_JOB_NOT_FOUND,
+    MULTI_SERVICE_RELEASE_SET_CHANGED,
     RolloutPhase,
     multi_service_canary,
     multi_service_configuration_error,
@@ -153,6 +157,10 @@ class ReleaseAuditReport:
     canary_job_id: int | None = None
     intended_canary_job_id: int | None = None
     canary_error: str | None = None
+    # Set when the operator passed the digest they approved and this run found
+    # a different release set.
+    release_digest_error: str | None = None
+    expected_release_digest: str | None = None
     classifications: Counter[str] = field(default_factory=Counter)
     reasons: Counter[str] = field(default_factory=Counter)
     provider_candidate_job_ids: list[int] = field(default_factory=list)
@@ -162,6 +170,21 @@ class ReleaseAuditReport:
     def release_set_size(self) -> int:
         """Every job that reaches the provider once the bulk fence is open."""
         return len(self.provider_candidate_job_ids) + len(self.future_provider_candidate_job_ids)
+
+    @property
+    def release_set_digest(self) -> str:
+        """A stable fingerprint of WHICH jobs will go out, and nothing else.
+
+        Over the sorted internal job ids alone, deliberately. Neither the
+        classification nor the due/future split belongs in it: both move on
+        their own as the clock passes and as the operator turns the fence,
+        while the set itself changes only when the producer adds or a worker
+        terminalises a job. That is exactly the difference an operator needs to
+        detect between approving an inventory and opening the fence for it.
+        """
+        ids = sorted(set(self.provider_candidate_job_ids) | set(self.future_provider_candidate_job_ids))
+        canonical = json.dumps(ids, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @property
     def inventory_complete(self) -> bool:
@@ -201,8 +224,8 @@ class ReleaseAuditReport:
 
     @property
     def bulk_ready(self) -> bool:
-        """The complete release set is known, and no restriction is in force."""
-        if not self.audit_sound:
+        """The complete release set is known, approved, and unrestricted."""
+        if not self.audit_sound or self.release_digest_error is not None:
             return False
         if self.canary_job_id is not None:
             return False
@@ -227,6 +250,9 @@ class ReleaseAuditReport:
             "canary_job_id": self.canary_job_id,
             "intended_canary_job_id": self.intended_canary_job_id,
             "canary_error": self.canary_error,
+            "release_set_digest": self.release_set_digest,
+            "expected_release_digest": self.expected_release_digest,
+            "release_digest_error": self.release_digest_error,
             "classifications": {name: self.classifications.get(name, 0) for name in CLASSIFICATIONS},
             "reasons": dict(sorted(self.reasons.items())),
             "release_set_size": self.release_set_size,
@@ -381,9 +407,11 @@ async def run_release_audit(
     limit: int = DEFAULT_LIMIT,
     phase: RolloutPhase = RolloutPhase.PRE_OPEN,
     intended_canary_job_id: int | None = None,
+    expected_release_digest: str | None = None,
 ) -> ReleaseAuditReport:
     """Audit the whole pair release set without mutating or sending anything."""
     report = ReleaseAuditReport(phase=phase.value)
+    report.expected_release_digest = expected_release_digest
     report.config_error = multi_service_configuration_error(phase)
 
     canary = multi_service_canary()
@@ -417,20 +445,36 @@ async def run_release_audit(
     report.canary_error = _canary_error(report, intended_canary_job_id=intended_canary_job_id)
     if report.canary_error is None and intended_canary_job_id is not None:
         report.intended_canary_job_id = intended_canary_job_id
+
+    # The TOCTOU check. Comparing two printed lists by eye is not a control:
+    # between the approval and the opening the inbox worker can plan another
+    # pair job, and nothing about the second list would look wrong.
+    if expected_release_digest is not None and expected_release_digest != report.release_set_digest:
+        report.release_digest_error = MULTI_SERVICE_RELEASE_SET_CHANGED
+        report.reasons[MULTI_SERVICE_RELEASE_SET_CHANGED] += 1
     return report
 
 
 def _canary_error(report: ReleaseAuditReport, *, intended_canary_job_id: int | None) -> str | None:
-    """Is the named job one this audit actually found in the release set?
+    """Is the named job one this audit would actually release, right now?
 
     Answered here rather than left to the operator's eyes: "release exactly
     job N" is worth nothing if N is not a job the fence would release, and the
     place to learn that is before the fence opens, not from a silent send.
+
+    A job from ``future_provider_candidate_job_ids`` is rejected by its own
+    code rather than folded into "not found". It IS in the release set and it
+    WILL go out with the bulk opening — it simply is not due yet, so naming it
+    as the canary produces no message at all. That is the worst possible
+    outcome of a canary: an operator watching an empty queue and concluding
+    the pair path is safe. Runbook step 48 says the canary comes from
+    ``provider_candidate_job_ids``; this makes saying it a machine check.
     """
     if intended_canary_job_id is None:
         return None
-    known = set(report.provider_candidate_job_ids) | set(report.future_provider_candidate_job_ids)
-    if intended_canary_job_id not in known:
+    if intended_canary_job_id in set(report.future_provider_candidate_job_ids):
+        return MULTI_SERVICE_CANARY_JOB_NOT_DUE
+    if intended_canary_job_id not in set(report.provider_candidate_job_ids):
         return MULTI_SERVICE_CANARY_JOB_NOT_FOUND
     if report.canary_job_id is not None and report.canary_job_id != intended_canary_job_id:
         return MULTI_SERVICE_CANARY_JOB_MISMATCH
@@ -453,13 +497,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--canary-job-id",
         type=int,
         default=None,
-        help="The one job the operator intends to release. Checked against the audited release set.",
+        help="The one DUE job the operator intends to release. Checked against the audited release set.",
+    )
+    parser.add_argument(
+        "--expect-release-digest",
+        default=None,
+        help="The release_set_digest the operator approved. A different set fails closed.",
     )
     args = parser.parse_args(argv)
     if args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.canary_job_id is not None and args.canary_job_id < 1:
         parser.error("--canary-job-id must be a positive message_jobs.id")
+    if args.expect_release_digest is not None:
+        digest = args.expect_release_digest.strip().lower()
+        if len(digest) != 64 or not all(char in "0123456789abcdef" for char in digest):
+            parser.error("--expect-release-digest must be a 64-character sha256 hex digest")
+        args.expect_release_digest = digest
     return args
 
 
@@ -472,6 +526,7 @@ async def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             phase=phase,
             intended_canary_job_id=args.canary_job_id,
+            expected_release_digest=args.expect_release_digest,
         )
         # Defence in depth: even an accidental dirty ORM object cannot become a
         # write when the context exits.
@@ -479,6 +534,10 @@ async def main(argv: list[str] | None = None) -> int:
     print(report.as_safe_dict())
     if args.canary_job_id is not None:
         return 0 if report.canary_ready else 1
+    if args.expect_release_digest is not None:
+        # The operator asked "is this still the set I approved?". Only an exact
+        # match, over a sound audit, is an answer they may act on.
+        return 0 if report.audit_sound and report.release_digest_error is None else 1
     # Every other run exits on whether the AUDIT is trustworthy, not on
     # whether it recommends an opening. `bulk_ready` is reported and read by
     # the operator: a post-open audit legitimately finds an empty release set,

@@ -33,12 +33,15 @@ from altegio_bot.easyweek_multi_service import (
 )
 from altegio_bot.easyweek_multi_service_rollout import (
     EASYWEEK_REMINDER_API_GUARD_DISABLED,
+    MULTI_SERVICE_CANARY_JOB_MISMATCH,
+    MULTI_SERVICE_CANARY_JOB_NOT_DUE,
     MULTI_SERVICE_CANARY_JOB_NOT_FOUND,
     MULTI_SERVICE_SEND_FENCE_OPEN,
     RolloutPhase,
 )
 from altegio_bot.easyweek_service_category import record_raw_with_services_count
 from altegio_bot.models.models import PROVIDER_ALTEGIO, PROVIDER_EASYWEEK, Client, MessageJob, OutboxMessage, Record
+from altegio_bot.scripts import easyweek_multi_service_release_audit as audit_cli
 from altegio_bot.scripts.easyweek_multi_service_release_audit import (
     BULK_PROVIDER_CANDIDATE,
     FUTURE_NOT_DUE,
@@ -739,3 +742,173 @@ async def test_the_report_carries_no_booking_uuid_name_phone_or_price(session_ma
     assert report.as_safe_dict()["read_only"] is True
     assert report.as_safe_dict()["send_authorized"] is False
     assert report.as_safe_dict()["config_changed"] is False
+
+
+# ===========================================================================
+# §38.9: the canary must be DUE, not merely in the release set
+# ===========================================================================
+
+
+async def test_a_future_release_set_job_can_never_be_the_canary(session_maker) -> None:
+    """Runbook step 48, as a machine check.
+
+    A future job IS in the release set and WILL go out with the bulk opening.
+    Naming it as the canary produces no message at all — and an operator
+    watching a silent queue would read that as a successful canary.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session, starts_in=timedelta(days=3))
+            future = await _seed_pair_job(
+                session,
+                client,
+                record,
+                snapshot,
+                job_type="reminder_24h",
+                run_at=timedelta(days=2),
+            )
+        future_id = future.id
+
+    async with session_maker() as session:
+        report = await run_release_audit(session, intended_canary_job_id=future_id)
+
+    assert report.canary_error == MULTI_SERVICE_CANARY_JOB_NOT_DUE
+    assert report.canary_ready is False
+    assert report.intended_canary_job_id is None
+    # It stays part of the bulk inventory; it is only unusable as a canary.
+    assert report.future_provider_candidate_job_ids == [future_id]
+
+
+async def test_a_due_candidate_beside_a_future_one_is_still_a_valid_canary(session_maker) -> None:
+    """Positive control: the new rule must not reject a correct choice."""
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            due = await _seed_pair_job(session, client, record, snapshot)
+            await _seed_pair_job(
+                session,
+                client,
+                record,
+                snapshot,
+                job_type="reminder_24h",
+                run_at=timedelta(days=2),
+                dedupe_key="future-beside-due",
+            )
+        due_id = due.id
+
+    async with session_maker() as session:
+        report = await run_release_audit(session, intended_canary_job_id=due_id)
+
+    assert report.canary_error is None
+    assert report.canary_ready is True
+    assert report.intended_canary_job_id == due_id
+
+
+async def test_an_unknown_id_is_still_reported_as_not_found(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            job = await _seed_pair_job(session, client, record, snapshot)
+        stranger = job.id + 10_000
+
+    async with session_maker() as session:
+        report = await run_release_audit(session, intended_canary_job_id=stranger)
+
+    assert report.canary_error == MULTI_SERVICE_CANARY_JOB_NOT_FOUND
+
+
+async def test_a_mismatch_with_the_configured_canary_stays_fail_closed(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            first = await _seed_pair_job(session, client, record, snapshot)
+            second = await _seed_pair_job(
+                session,
+                client,
+                record,
+                snapshot,
+                job_type="record_updated",
+                dedupe_key="mismatch-second",
+            )
+        first_id, second_id = first.id, second.id
+
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_canary_job_id", str(second_id), raising=False)
+
+    async with session_maker() as session:
+        report = await run_release_audit(session, phase=RolloutPhase.CANARY, intended_canary_job_id=first_id)
+
+    assert report.canary_error == MULTI_SERVICE_CANARY_JOB_MISMATCH
+    assert report.canary_ready is False
+
+
+async def test_the_not_due_reason_is_stable_and_free_of_customer_data(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            future = await _seed_pair_job(
+                session,
+                client,
+                record,
+                snapshot,
+                job_type="reminder_24h",
+                run_at=timedelta(days=2),
+            )
+        future_id = future.id
+
+    async with session_maker() as session:
+        report = await run_release_audit(session, intended_canary_job_id=future_id)
+
+    text = str(report.as_safe_dict())
+    for forbidden in (TEST_BOOKING_UUID, TEST_LOCATION_UUID, "Release audit fixture", "+49000000000"):
+        assert forbidden not in text, forbidden
+    assert report.canary_error == "multi_service_canary_job_not_due"
+
+
+async def test_the_cli_exits_non_zero_for_a_future_canary(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            future = await _seed_pair_job(
+                session,
+                client,
+                record,
+                snapshot,
+                job_type="reminder_24h",
+                run_at=timedelta(days=2),
+            )
+            due = await _seed_pair_job(session, client, record, snapshot, dedupe_key="cli-due")
+        future_id, due_id = future.id, due.id
+
+    monkeypatch.setattr(audit_cli, "SessionLocal", session_maker, raising=False)
+
+    assert await audit_cli.main(["--canary-job-id", str(future_id)]) == 1
+    assert await audit_cli.main(["--canary-job-id", str(due_id)]) == 0
+
+
+async def test_the_cli_exits_non_zero_when_the_release_set_changed(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            await _seed_pair_job(session, client, record, snapshot)
+
+    async with session_maker() as session:
+        approved = await run_release_audit(session)
+
+    monkeypatch.setattr(audit_cli, "SessionLocal", session_maker, raising=False)
+    assert await audit_cli.main(["--expect-release-digest", approved.release_set_digest]) == 0
+    assert await audit_cli.main(["--expect-release-digest", "0" * 64]) == 1
+
+
+async def test_the_digest_argument_must_be_a_sha256_hex_string() -> None:
+    for bad in ("", "nope", "0" * 63, "g" * 64):
+        with pytest.raises(SystemExit):
+            audit_cli._parse_args(["--expect-release-digest", bad])
+    parsed = audit_cli._parse_args(["--expect-release-digest", "A" * 64])
+    assert parsed.expect_release_digest == "a" * 64

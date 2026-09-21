@@ -67,6 +67,14 @@ MULTI_SERVICE_CANARY_NOT_CONFIGURED: Final = "multi_service_canary_not_configure
 MULTI_SERVICE_CANARY_JOB_MISMATCH: Final = "multi_service_canary_job_mismatch"
 # The canary names a job that is not in the audited release set at all.
 MULTI_SERVICE_CANARY_JOB_NOT_FOUND: Final = "multi_service_canary_job_not_found"
+# The canary names a real release-set job whose `run_at` has not arrived. It
+# is part of the bulk inventory, but opening the fence for it sends nothing —
+# so the "one named message" the canary phase is supposed to produce would
+# never appear, and an operator would read that silence as success.
+MULTI_SERVICE_CANARY_JOB_NOT_DUE: Final = "multi_service_canary_job_not_due"
+# The audited release set is not the one the operator approved: a job was
+# added or removed between the approval and this run.
+MULTI_SERVICE_RELEASE_SET_CHANGED: Final = "multi_service_release_set_changed"
 
 
 @dataclass(frozen=True)
@@ -212,9 +220,11 @@ __all__ = [
     "MULTI_SERVICE_CANARY_CONFIGURED",
     "MULTI_SERVICE_CANARY_INVALID",
     "MULTI_SERVICE_CANARY_JOB_MISMATCH",
+    "MULTI_SERVICE_CANARY_JOB_NOT_DUE",
     "MULTI_SERVICE_CANARY_JOB_NOT_FOUND",
     "MULTI_SERVICE_CANARY_NOT_CONFIGURED",
     "MULTI_SERVICE_CANARY_RESTRICTED",
+    "MULTI_SERVICE_RELEASE_SET_CHANGED",
     "MULTI_SERVICE_SEND_FENCE_OPEN",
     "MultiServiceCanary",
     "RolloutPhase",
