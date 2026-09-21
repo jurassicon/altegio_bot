@@ -209,7 +209,35 @@ jobs:
             --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
             --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py \
             --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py \
-            --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+            --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py \
+            --durations=100 \
+            --durations-min=0.25 \
+            --junitxml=pytest-results.xml
+
+      # TEMPORARY, DIAGNOSTICS ONLY — chore/pytest-timing-profile.
+      #
+      # This branch exists to read per-test duration off a real GitHub runner,
+      # so the decision about splitting the suite rests on runner numbers rather
+      # than on a contended laptop. It is not meant to be merged: once three
+      # profiles for one SHA have been collected and analysed, the PR is closed
+      # and the branch deleted.
+      #
+      # `always()` on purpose — a failing suite is exactly the run whose timings
+      # are worth keeping, and the job still goes red because this step neither
+      # changes the pytest exit code nor carries continue-on-error.
+      #
+      # Only the JUnit XML is uploaded. pytest's `junit_logging` stays off, so
+      # the file holds test ids, outcomes and durations and no captured log
+      # output — webhook secrets travel in query strings through these tests,
+      # and an uploaded artifact is a distribution channel.
+      - name: Upload pytest timing profile
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-profile-${{ github.sha }}-${{ github.run_attempt }}
+          path: pytest-results.xml
+          retention-days: 7
+          if-no-files-found: error
 
   deploy:
     name: Deploy to Server
