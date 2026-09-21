@@ -76,6 +76,14 @@ def _registry(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
         raising=False,
     )
+    # §38.9: the pre-open configuration this report claims to be about.
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminders_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_notifications_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_resource_shadow_proof_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_multi_service_canary_job_id", "", raising=False)
 
 
 def _api(**overrides: Any) -> dict[str, Any]:
@@ -583,3 +591,89 @@ def test_the_default_seed_stays_in_the_future_whatever_today_is() -> None:
     assert run_at > now
     # Not clinging to the edge either: a slow suite must not drift into failure.
     assert run_at - now > timedelta(days=7)
+
+
+# ===========================================================================
+# §38.9: a green queue in the wrong configuration is not rollout-ready
+# ===========================================================================
+
+
+async def test_a_fully_proven_queue_is_rollout_ready_in_the_pre_open_configuration(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, suffix="71")
+
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_noop_sleep)
+
+    assert report.ready is True
+    assert report.config_error is None
+    assert report.rollout_ready is True
+
+
+async def test_the_runtime_api_guard_being_off_can_never_be_rollout_ready(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the guard off the outbox does not claim reminders at all.
+
+    Every job this report inspected is therefore one the worker would not even
+    look at, so "every reminder is provably sendable" says nothing about what
+    opening the fence would do.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, suffix="72")
+
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", False, raising=False)
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_noop_sleep)
+
+    assert report.ready is True, "the data itself is fine; that is the point"
+    assert report.config_error == "easyweek_reminder_api_guard_disabled"
+    assert report.rollout_ready is False
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("easyweek_notifications_enabled", "easyweek_notifications_disabled"),
+        ("easyweek_reminders_enabled", "easyweek_reminders_disabled"),
+        ("easyweek_multi_service_notifications_enabled", "multi_service_disabled"),
+        ("easyweek_resource_shadow_proof_enabled", "multi_service_resource_shadow_disabled"),
+    ],
+)
+async def test_each_other_mandatory_flag_blocks_rollout_readiness(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    expected: str,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, suffix="73")
+
+    monkeypatch.setattr(settings, flag, False, raising=False)
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_noop_sleep)
+
+    assert report.config_error == expected
+    assert report.rollout_ready is False
+
+
+async def test_the_configuration_reason_is_stable_and_carries_no_customer_data(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            await _seed(session, suffix="74")
+
+    monkeypatch.setattr(settings, "easyweek_reminder_api_guard_enabled", False, raising=False)
+    async with session_maker() as session:
+        report = await run_preflight(session, client=FakeReader(), sleep=_noop_sleep)
+
+    text = str(report.as_safe_dict())
+    assert str(BOOKING) not in text
+    assert LOCATION_UUID not in text
+    assert report.as_safe_dict()["rollout_ready"] is False

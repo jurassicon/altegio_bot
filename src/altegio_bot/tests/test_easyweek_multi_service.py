@@ -38,6 +38,7 @@ from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_SNAPSHOT_VERSION,
     MULTI_SERVICE_SNAPSHOT_VERSION_UNSUPPORTED,
     MULTI_SERVICE_TOTAL_MISMATCH,
+    MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN,
     MultiServiceProofError,
     ServiceEligibilityPurpose,
     WebhookServicePair,
@@ -239,8 +240,14 @@ def test_missing_order_line_quantity_fails() -> None:
     assert _reason(booking=booking) == MULTI_SERVICE_QUANTITY_UNSUPPORTED
 
 
-@pytest.mark.parametrize("value", [None, "2", True, False, 0, 1, 3])
-def test_webhook_quantity_must_be_the_exact_integer_two(value: object) -> None:
+@pytest.mark.parametrize("value", [None, "2", True, False, 0, 3])
+def test_the_envelope_quantity_must_be_an_exact_one_or_two(value: object) -> None:
+    """§38.8 widened this from `== 2` to `in (1, 2)`, and nothing further.
+
+    The authoritative whole-set count is ``services_count``; a rescheduled
+    booking legitimately reports ``services_count=2`` with ``quantity=1``.
+    Every other shape stays fail-closed.
+    """
     assert _reason(pair=_pair(quantity=value)) == "multi_service_webhook_shape_unproven"
 
 
@@ -1454,3 +1461,80 @@ def test_every_contract_name_still_pairs_with_every_resource_name(
     assert [line.display_name for line in secondary.lines] == [partner, resource_name]
     assert [line.display_name for line in primary.lines] == [resource_name, partner]
     assert secondary.version == primary.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+
+
+# ---------------------------------------------------------------------------
+# §38.8: three different counts, three different rules
+#
+# A production booking of two real services was rescheduled, and the later
+# webhook carried services_count=2 with a top-level quantity of 1.  The shared
+# domain code already treats services_count as the authoritative whole-set
+# count — RecordService.amount reads it first and only falls back to quantity —
+# but this proof additionally demanded quantity == 2 and refused the pair
+# before it ever reached the live booking, the catalogue or the category.
+# ---------------------------------------------------------------------------
+
+
+def test_the_authoritative_whole_set_count_is_services_count(karlsruhe_fence_open: None) -> None:
+    """A top-level quantity of 1 does not deny that the set holds two."""
+    ordinary = _prove(pair=_pair(quantity=1))
+    assert [line.display_name for line in ordinary.lines] == ["Erste Leistung", "Zweite Leistung"]
+    # The digest is the ordinary one: nothing about the envelope leaks into it.
+    assert ordinary.digest == _prove(pair=_pair(quantity=2)).digest
+
+    names = [MANIKUERE_SHELLAC, PEDIKUERE_GEL, PEDIKUERE_GEL]
+    shadow = _prove_karlsruhe(names, quantity=1)
+    assert [line.display_name for line in shadow.lines] == [MANIKUERE_SHELLAC, PEDIKUERE_GEL]
+    assert shadow.version == MULTI_SERVICE_SNAPSHOT_RESOURCE_SHADOW_VERSION
+    assert shadow.digest == _prove_karlsruhe(names, quantity=2).digest
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [None, "1", "2", True, False, 0, 3, -1, 1.0],
+    ids=["none", "str-1", "str-2", "true", "false", "zero", "three", "negative", "float"],
+)
+def test_only_an_exact_envelope_quantity_of_one_or_two_is_accepted(quantity: object) -> None:
+    assert _reason(pair=_pair(quantity=quantity)) == MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN
+
+
+@pytest.mark.parametrize(
+    "services_count",
+    [None, "2", True, 0, 1, 3, 2.0],
+    ids=["none", "str", "true", "zero", "one", "three", "float"],
+)
+def test_the_whole_set_count_must_still_be_an_exact_two(services_count: object) -> None:
+    assert _reason(pair=_pair(services_count=services_count)) == MULTI_SERVICE_WEBHOOK_SHAPE_UNPROVEN
+
+
+@pytest.mark.parametrize(
+    "line_quantity",
+    [2, 0, None, "1", True],
+    ids=["two", "zero", "none", "str", "true"],
+)
+def test_the_api_order_line_quantity_is_never_relaxed(line_quantity: object) -> None:
+    """The envelope rule must not leak into an ordered_services row."""
+    booking = _booking()
+    rows = booking["ordered_services"]
+    assert isinstance(rows, list)
+    rows[1]["quantity"] = line_quantity
+    assert _reason(pair=_pair(quantity=1), booking=booking) == MULTI_SERVICE_QUANTITY_UNSUPPORTED
+
+
+def test_an_envelope_quantity_of_one_still_needs_the_whole_live_proof() -> None:
+    """quantity=1 grants nothing on its own."""
+    mismatched_total = _booking()
+    order = mismatched_total["order"]
+    assert isinstance(order, dict)
+    order["total"] = 9900
+    assert _reason(pair=_pair(quantity=1), booking=mismatched_total) == MULTI_SERVICE_TOTAL_MISMATCH
+
+    three_lines = _booking()
+    rows = three_lines["ordered_services"]
+    assert isinstance(rows, list)
+    rows.append(_line("Dritte Leistung", 0, 10, "10000000-0000-4000-8000-000000000009"))
+    assert _reason(pair=_pair(quantity=1), booking=three_lines) == MULTI_SERVICE_DUPLICATE_AMBIGUOUS
+
+    wrong_catalog = _catalog(first_category="Wimpernverlängerung")
+    wrong_catalog[1]["name"] = "Andere Leistung"
+    assert _reason(pair=_pair(quantity=1), catalog=wrong_catalog) == MULTI_SERVICE_CATALOG_MATCH_MISSING

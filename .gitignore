@@ -16,6 +16,11 @@ env/
 # Секреты EasyWeek живут отдельным файлом. Паттерны выше его НЕ покрывают:
 # `easyweek.env` не начинается с `.env`. Трекается только .example-шаблон.
 easyweek.env
+# §38.9: timestamped backup и атомарный temp, которые создаёт
+# scripts/easyweek_env_set.py рядом с файлом на production-хосте. Это ПОЛНЫЕ
+# копии файла секретов, а точный паттерн `easyweek.env` выше их не покрывает.
+easyweek.env.bak.*
+.easyweek.env.*
 
 # ===== Build / packaging =====
 build/

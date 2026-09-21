@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select, text, update
@@ -69,6 +69,10 @@ from altegio_bot.easyweek_multi_service import (
     resolve_effective_multi_service_snapshot,
     snapshot_requires_live_proof,
     verify_live_multi_service_snapshot,
+)
+from altegio_bot.easyweek_multi_service_rollout import (
+    MULTI_SERVICE_CANARY_RESTRICTED,
+    multi_service_canary,
 )
 from altegio_bot.easyweek_normalizer import extract_manage_link, normalize_booking_hash_id
 from altegio_bot.easyweek_policy import (
@@ -221,6 +225,16 @@ PRE_APPOINTMENT_JOB_TYPES = (
     "reminder_24h",
     "reminder_2h",
 )
+
+# The only job types that may still be sent for a DELETED record, for either
+# provider: both are ABOUT the deletion. Every other job type is cancelled
+# locally, without an attempt and without an external call.
+#
+# Named here rather than inline at the guard so the §38.9 read-only release
+# audit can project the same outcome from the same list. An audit that decided
+# separately which jobs a deleted record still sends would either hide a
+# provider candidate or invent one.
+DELETED_RECORD_ALLOWED_JOB_TYPES: Final[frozenset[str]] = frozenset({"record_canceled", "comeback_3d"})
 
 # Recurring marketing campaign job types subject to the stricter 90-day
 # suppression (any prior 131026/131049 failure or suppressed_* row blocks the
@@ -667,11 +681,34 @@ def easyweek_retention_job_blocked(job: MessageJob) -> str | None:
 
 
 def _easyweek_multi_service_fence_reason() -> str | None:
-    """Current pair-delivery fence outcome, shared by claim and race guard."""
+    """Current pair-delivery fence outcome for the QUEUE as a whole.
+
+    Shared by claim and race guard. A malformed canary value belongs here
+    rather than in the per-job half below: an unreadable restriction is not a
+    statement about one job, so the fail-closed answer is to hold every pair
+    job until an operator fixes the value.
+    """
     if not bool(settings.easyweek_multi_service_notifications_enabled):
         return MULTI_SERVICE_DISABLED
     if not bool(settings.easyweek_multi_service_send_enabled):
         return MULTI_SERVICE_SEND_DISABLED
+    return multi_service_canary().unavailable_reason
+
+
+def _easyweek_multi_service_job_blocked(job: MessageJob) -> str | None:
+    """The configuration reason THIS pair job may not send now, or ``None``.
+
+    The per-job half of the gate above: everything that applies to the pair
+    queue as a whole, plus the §38.9 canary restriction, which names one
+    internal job id and holds every other pair job untouched — `queued`, its
+    original `run_at`, zero attempts, no Meta and no Chatwoot.
+    """
+    blocked = _easyweek_multi_service_fence_reason()
+    if blocked is not None:
+        return blocked
+    canary = multi_service_canary()
+    if canary.restricted and getattr(job, "id", None) != canary.job_id:
+        return MULTI_SERVICE_CANARY_RESTRICTED
     return None
 
 
@@ -731,13 +768,24 @@ async def _lock_next_jobs(
     # PR-7.4 send fence.  It is deliberately narrower than either lifecycle or
     # reminder fences: only jobs carrying the immutable pair digest are held.
     # Single-service jobs with the same provider/job_type remain claimable.
+    #
+    # §38.9 adds the controlled canary in the same predicate and for the same
+    # reason the PR-12 one is expressed as an EQUALITY on the claim: a
+    # claimed-then-requeued row would spin the worker on every due pair job in
+    # the queue, which is the opposite of a controlled canary. Opening the
+    # global fence releases every due pair job — of active, past and DELETED
+    # records alike — so the first opening names exactly one of them.
+    _multi_rows = (
+        (MessageJob.provider == PROVIDER_EASYWEEK)
+        & (MessageJob.job_type.in_(EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES))
+        & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_DIGEST_KEY)
+    )
     if _easyweek_multi_service_fence_reason() is not None:
-        multi_rows = (
-            (MessageJob.provider == PROVIDER_EASYWEEK)
-            & (MessageJob.job_type.in_(EASYWEEK_LIFECYCLE_JOB_TYPES | EASYWEEK_REMINDER_JOB_TYPES))
-            & MessageJob.payload.op("?")(MULTI_SERVICE_JOB_DIGEST_KEY)
-        )
-        stmt = stmt.where(~multi_rows)
+        stmt = stmt.where(~_multi_rows)
+    else:
+        _multi_canary = multi_service_canary()
+        if _multi_canary.restricted:
+            stmt = stmt.where(~_multi_rows | (MessageJob.id == _multi_canary.job_id))
 
     # PR-7.5 send fence, narrower still: only jobs whose immutable payload names
     # the version 2 resource-aware projection. Version 1 pair jobs, single
@@ -3373,7 +3421,7 @@ async def _run_job_logic(
     payload = job.payload if isinstance(job.payload, dict) else {}
     claims_multi_service = MULTI_SERVICE_JOB_DIGEST_KEY in payload
     effective_multi_service_snapshot: MultiServiceSnapshot | None = None
-    multi_service_fence_reason = _easyweek_multi_service_fence_reason() or (
+    multi_service_fence_reason = _easyweek_multi_service_job_blocked(job) or (
         _easyweek_resource_shadow_fence_reason() if _claims_resource_shadow_pair(payload) else None
     )
     if (
@@ -4228,7 +4276,7 @@ async def _run_job_logic(
         # `comeback_3d` is the one message that is ABOUT a deleted record, for
         # either provider. The EasyWeek guard above has already proven the
         # deletion is the cancellation this job was planned from.
-        allow_deleted = job.job_type in ("record_canceled", "comeback_3d")
+        allow_deleted = job.job_type in DELETED_RECORD_ALLOWED_JOB_TYPES
         if not allow_deleted:
             job.status = "canceled"
             job.locked_at = None
