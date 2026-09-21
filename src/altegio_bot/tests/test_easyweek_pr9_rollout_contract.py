@@ -261,6 +261,15 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # customer, a booking, a message job nor an outbox row. Same narrowest
         # carrier: ops profile, restart:no, one command per container.
         "easyweek-multi-service-snapshot-recovery",
+        # Plan §40 (revision 43). The failed-cancellation recovery proves the
+        # live state of each named booking with a real GET before it writes, so
+        # it needs the same key. Admitted separately because its power is
+        # narrower still: it can mark ONE historical Record deleted, withdraw
+        # that record's queued EasyWeek reminders and terminalize one named
+        # event, and it can create neither a customer, a booking, a message job
+        # nor an outbox row. Same narrowest carrier: ops profile, restart:no,
+        # one command per container, `--event-id` required, no `--all`.
+        "easyweek-failed-cancellation-recovery",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 
