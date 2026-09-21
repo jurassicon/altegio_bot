@@ -21,6 +21,9 @@ import pytest
 
 from altegio_bot.campaigns.altegio_crm import CrmUnavailableError, get_client_crm_records
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 
 def _make_http_client() -> httpx.AsyncClient:
     """Фиктивный AsyncClient для unit-тестов (не делает реальных запросов)."""

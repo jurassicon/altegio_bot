@@ -29,6 +29,9 @@ from altegio_bot.campaigns.segment import (
 from altegio_bot.models.models import Client, Record
 from altegio_bot.service_filter import ServiceLookupError
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 PERIOD_START = datetime(2026, 3, 1, tzinfo=timezone.utc)
 PERIOD_END = datetime(2026, 4, 1, tzinfo=timezone.utc)
 COMPANY = 758285

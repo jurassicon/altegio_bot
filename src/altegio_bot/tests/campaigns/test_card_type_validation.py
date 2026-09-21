@@ -30,6 +30,9 @@ from altegio_bot.main import app
 from altegio_bot.models.models import CampaignRun, MessageJob
 from altegio_bot.ops.auth import require_ops_auth
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 COMPANY_ID = 758285
 LOCATION_ID = 758285
 PERIOD_START = "2026-03-01T00:00:00Z"

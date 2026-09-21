@@ -8,7 +8,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from altegio_bot.service_filter import _CACHE_MAX_SIZE, _LRU_CACHE, _cache_get, _cache_put
+
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
 
 
 def _clear_cache() -> None:

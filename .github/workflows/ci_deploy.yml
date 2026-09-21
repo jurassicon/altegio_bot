@@ -193,9 +193,18 @@ jobs:
 
       # Both Docker-dependent suites above already ran under their own mandatory
       # gates; re-running them here would only duplicate container work.
+      #
+      # `-m "not legacy_altegio"` withdraws ONLY the explicitly marked Wave 1
+      # modules of Altegio-only functionality. Everything unmarked — EasyWeek,
+      # migration/handover, provider isolation, security, shared runtime and any
+      # new test — stays in this required gate, and the dedicated gates above
+      # are never marker-filtered. The quarantined modules are not deleted: the
+      # Legacy Altegio Tests workflow runs them nightly and on demand. Rules and
+      # the procedure for the next wave: docs/ops/test_suite_tiers.md.
       - name: Run tests
         run: |
           uv run pytest -q \
+            -m "not legacy_altegio" \
             --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py \
             --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
             --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py \

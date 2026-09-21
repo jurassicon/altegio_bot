@@ -13,6 +13,9 @@ from altegio_bot.scripts.run_newsletter_new_clients_monthly import (
     _prev_month_range,
 )
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 PERIOD_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 PERIOD_END = datetime(2026, 2, 1, tzinfo=timezone.utc)
 
