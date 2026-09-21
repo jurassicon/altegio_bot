@@ -49,7 +49,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_multi_service import MULTI_SERVICE_JOB_DIGEST_KEY
-from altegio_bot.easyweek_multi_service_rollout import JobIdListError, parse_job_id_list
+from altegio_bot.easyweek_multi_service_rollout import (
+    JobIdListError,
+    RolloutPhase,
+    multi_service_configuration_error,
+    parse_job_id_list,
+)
 from altegio_bot.easyweek_policy import EASYWEEK_LIFECYCLE_JOB_TYPES, EASYWEEK_REMINDER_JOB_TYPES
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageJob, OutboxMessage
 from altegio_bot.utils import utcnow
@@ -101,18 +106,40 @@ DUE_OUTCOMES: Final = (
 PENDING_OUTCOMES: Final = (IN_PROGRESS, RETRY_SCHEDULED)
 
 # --- outcomes for an approved FUTURE job -----------------------------------
+#
+# "It has not gone out" is the expected result for a future job, but it is not
+# the ONLY thing that can be true of one. A job can also be cancelled, fail,
+# reach `done` with nothing behind it, or be claimed long before its `run_at`,
+# and none of those is the state the inventory was approved in.
+
+# Still queued, still scheduled, nothing attempted: exactly as approved.
 FUTURE_PENDING: Final = "future_pending"
+# Its `run_at` arrived and it went out afterwards, provably.
 FUTURE_RELEASED_ON_SCHEDULE: Final = "future_released_on_schedule"
+# Its `run_at` arrived DURING this verification and a worker has it now. Not
+# accepted and not a failure: the settle window exists for exactly this.
+FUTURE_MATURED_PENDING: Final = "future_matured_pending"
+# A proven send that precedes the job's own `run_at`.
 FUTURE_SENT_EARLY: Final = "future_sent_early"
+# An indeterminate Meta outcome, or a send whose timing cannot be proven.
+FUTURE_INDETERMINATE: Final = "future_indeterminate"
+# Terminal or in-flight where the approval said "scheduled": failed, canceled,
+# `done` with no proven Outbox row, claimed before `run_at`, or a status this
+# code does not recognise.
+FUTURE_UNEXPECTED_STATE: Final = "future_unexpected_state"
 
 FUTURE_OUTCOMES: Final = (
     FUTURE_PENDING,
     FUTURE_RELEASED_ON_SCHEDULE,
+    FUTURE_MATURED_PENDING,
     FUTURE_SENT_EARLY,
+    FUTURE_INDETERMINATE,
+    FUTURE_UNEXPECTED_STATE,
     MISSING,
     IDENTITY_MISMATCH,
 )
 FUTURE_ACCEPTED: Final = (FUTURE_PENDING, FUTURE_RELEASED_ON_SCHEDULE)
+FUTURE_PENDING_OUTCOMES: Final = (FUTURE_MATURED_PENDING,)
 
 # --- stable reason codes ----------------------------------------------------
 REASON_JOB_ROW_MISSING: Final = "job_row_missing"
@@ -131,7 +158,15 @@ REASON_SETTLE_TIMEOUT: Final = "settle_window_expired"
 # that says otherwise.
 REASON_UNAPPROVED_SEND: Final = "unapproved_pair_provider_send"
 REASON_EMPTY_DUE_SET: Final = "approved_due_set_empty"
+REASON_EMPTY_INVENTORY: Final = "approved_inventory_empty"
 REASON_SCAN_TRUNCATED: Final = "unapproved_scan_truncated"
+# Future-specific codes. Kept apart from the due vocabulary on purpose: an
+# operator reading "failed" must be able to tell a message that should have
+# gone out from one that should not have gone out yet.
+REASON_FUTURE_SEND_BEFORE_RUN_AT: Final = "future_send_before_run_at"
+REASON_FUTURE_SEND_TIME_UNPROVABLE: Final = "future_send_time_unprovable"
+REASON_FUTURE_CLAIMED_BEFORE_RUN_AT: Final = "future_claimed_before_run_at"
+REASON_FUTURE_RUN_AT_MISSING: Final = "future_run_at_missing"
 
 
 @dataclass
@@ -147,6 +182,9 @@ class ReleaseVerifyReport:
 
     approved_due: int = 0
     approved_future: int = 0
+    # Set when the operator passed --allow-empty-due, so a zero due count in
+    # this report is never something they have to guess the reason for.
+    empty_due_allowed: bool = False
     due_outcomes: Counter[str] = field(default_factory=Counter)
     future_outcomes: Counter[str] = field(default_factory=Counter)
     reasons: Counter[str] = field(default_factory=Counter)
@@ -155,25 +193,61 @@ class ReleaseVerifyReport:
     pending_job_ids: list[int] = field(default_factory=list)
     unsuccessful_job_ids: list[int] = field(default_factory=list)
     future_problem_job_ids: list[int] = field(default_factory=list)
+    # Approved future jobs whose `run_at` arrived during this verification.
+    # Tracked separately from the due queue so a future job's own timing can
+    # never be read as a due job's outcome.
+    future_maturing_job_ids: list[int] = field(default_factory=list)
     unapproved_sent_job_ids: list[int] = field(default_factory=list)
     scan_truncated: bool = False
 
     @property
     def due_all_succeeded(self) -> bool:
-        return self.approved_due > 0 and self.due_outcomes.get(SUCCEEDED, 0) == self.approved_due
+        """Every approved due job provably reached the provider.
+
+        Vacuously true for an empty due set — an empty set is admitted by
+        ``inventory_proven`` below, under its own explicit conditions, not by
+        quietly satisfying this one.
+        """
+        return self.due_outcomes.get(SUCCEEDED, 0) == self.approved_due
+
+    @property
+    def future_all_accepted(self) -> bool:
+        return not self.future_problem_job_ids
+
+    @property
+    def inventory_proven(self) -> bool:
+        """The approved inventory, whatever shape it has, is accounted for.
+
+        After a successful canary the remaining inventory can legitimately be
+        all-future: the one due job the canary released is terminal and gone,
+        and what is left are reminders that fire on their own schedule. That
+        rollout still has to be closable, so an empty due set is allowed —
+        but only when the operator said so, and only when there is a non-empty
+        future set to actually verify.
+
+        An inventory with nothing in it at all is never proven. There would be
+        no evidence in it, and "no evidence" is the one thing this command
+        exists to stop being read as success.
+        """
+        if self.approved_due == 0 and self.approved_future == 0:
+            return False
+        if self.approved_due == 0 and not self.empty_due_allowed:
+            return False
+        return self.due_all_succeeded and self.future_all_accepted
 
     @property
     def pending(self) -> bool:
         """Something may still change by itself, so no verdict is final yet."""
-        return bool(self.pending_job_ids)
+        return bool(self.pending_job_ids) or bool(self.future_maturing_job_ids)
 
     @property
     def verified(self) -> bool:
         """Green, and only for the narrow case that actually proves delivery.
 
-        Every approved due job provably reached the provider, every approved
-        future job is still where it belongs, and nothing outside the approved
-        list was sent in the window.
+        The effective bulk configuration is part of it, and it carries most of
+        the weight in the all-future case: with no due job to send, the
+        absence of an immediate message proves nothing on its own — the fence
+        could simply still be shut. ``config_error`` is what rules that out.
         """
         if self.config_error is not None:
             return False
@@ -181,9 +255,7 @@ class ReleaseVerifyReport:
             return False
         if self.scan_truncated or self.unapproved_sent_job_ids:
             return False
-        if self.future_problem_job_ids:
-            return False
-        return self.due_all_succeeded
+        return self.inventory_proven
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -202,6 +274,8 @@ class ReleaseVerifyReport:
             "config_error": self.config_error,
             "approved_due": self.approved_due,
             "approved_future": self.approved_future,
+            "empty_due_allowed": self.empty_due_allowed,
+            "inventory_proven": self.inventory_proven,
             "due_outcomes": {name: self.due_outcomes.get(name, 0) for name in DUE_OUTCOMES},
             "future_outcomes": {name: self.future_outcomes.get(name, 0) for name in FUTURE_OUTCOMES},
             "reasons": dict(sorted(self.reasons.items())),
@@ -209,6 +283,7 @@ class ReleaseVerifyReport:
             "pending_job_ids": sorted(self.pending_job_ids)[:MAX_REPORTED_IDS],
             "unsuccessful_job_ids": sorted(self.unsuccessful_job_ids)[:MAX_REPORTED_IDS],
             "future_problem_job_ids": sorted(self.future_problem_job_ids)[:MAX_REPORTED_IDS],
+            "future_maturing_job_ids": sorted(self.future_maturing_job_ids)[:MAX_REPORTED_IDS],
             "unapproved_sent_job_ids": sorted(self.unapproved_sent_job_ids)[:MAX_REPORTED_IDS],
             "scan_truncated": self.scan_truncated,
             "verified": self.verified,
@@ -282,12 +357,22 @@ def classify_future_job(
     *,
     now: datetime,
 ) -> tuple[str, str | None]:
-    """An approved future job is expected to be exactly where it was left.
+    """An approved future job must be exactly where the approval left it.
 
-    Not having gone out is the CORRECT result here and is never a failure. The
-    one thing that is: a success whose ``sent_at`` precedes the job's own
-    ``run_at``, which would mean the release ignored the schedule the
-    inventory was approved against.
+    "It has not gone out" is the expected result, but absence of a send is not
+    the same as being in the approved state. A future job can equally be
+    cancelled, fail, reach ``done`` with nothing behind it, carry an
+    indeterminate Meta outcome, or be sitting claimed by a worker hours before
+    its ``run_at`` — and a check that only looked for a success row would have
+    called every one of those "pending" and gone green.
+
+    So the expected state is stated positively: identity proven, still
+    ``queued``, unclaimed, nothing attempted, and its scheduled instant still
+    ahead. Everything else is named.
+
+    The one genuinely open case is a job whose ``run_at`` arrives DURING the
+    verification. It is neither wrong nor finished, so it gets its own pending
+    outcome and the settle window decides.
     """
     if job is None:
         return MISSING, REASON_JOB_ROW_MISSING
@@ -295,18 +380,53 @@ def classify_future_job(
     if identity is not None:
         return IDENTITY_MISMATCH, identity
 
+    run_at = getattr(job, "run_at", None)
+    if run_at is None:
+        # Without its scheduled instant nothing below can be judged: "early"
+        # and "on schedule" both stop meaning anything.
+        return FUTURE_INDETERMINATE, REASON_FUTURE_RUN_AT_MISSING
+    matured = run_at <= now
+
+    statuses = {getattr(row, "status", None) for row in outbox}
+    if INDETERMINATE_OUTBOX_STATUS in statuses:
+        return FUTURE_INDETERMINATE, REASON_OUTBOX_UNKNOWN
+
     successes = [row for row in outbox if getattr(row, "status", None) in SUCCESS_OUTBOX_STATUSES]
+    job_status = getattr(job, "status", None)
     if successes:
-        run_at = getattr(job, "run_at", None)
         earliest = min((row.sent_at for row in successes if row.sent_at is not None), default=None)
-        if run_at is not None and earliest is not None and earliest < run_at:
-            return FUTURE_SENT_EARLY, REASON_UNAPPROVED_SEND
-        if run_at is not None and run_at > now:
-            # Sent while still scheduled for the future, with no usable
-            # `sent_at` to compare: unprovable rather than acceptable.
-            return FUTURE_SENT_EARLY, REASON_UNAPPROVED_SEND
+        if earliest is None:
+            # A success with no `sent_at` cannot be placed relative to
+            # `run_at`, so it can be neither cleared nor convicted here.
+            return FUTURE_INDETERMINATE, REASON_FUTURE_SEND_TIME_UNPROVABLE
+        if earliest < run_at:
+            return FUTURE_SENT_EARLY, REASON_FUTURE_SEND_BEFORE_RUN_AT
+        if job_status != "done":
+            return FUTURE_INDETERMINATE, REASON_SEND_CONTRADICTS_JOB
         return FUTURE_RELEASED_ON_SCHEDULE, None
-    return FUTURE_PENDING, None
+
+    # No proven send. From here only the job row and the clock decide.
+    in_flight = bool(statuses & set(IN_FLIGHT_OUTBOX_STATUSES))
+    claimed = job_status == "processing" or getattr(job, "locked_at", None) is not None
+
+    if job_status == "queued":
+        if matured:
+            return FUTURE_MATURED_PENDING, None
+        if claimed or in_flight:
+            # Held for later, yet something is already working on it.
+            return FUTURE_UNEXPECTED_STATE, REASON_FUTURE_CLAIMED_BEFORE_RUN_AT
+        return FUTURE_PENDING, None
+    if job_status == "processing":
+        if matured:
+            return FUTURE_MATURED_PENDING, None
+        return FUTURE_UNEXPECTED_STATE, REASON_FUTURE_CLAIMED_BEFORE_RUN_AT
+    if job_status == "done":
+        return FUTURE_UNEXPECTED_STATE, REASON_DONE_WITHOUT_PROVEN_SEND
+    if job_status == "failed":
+        return FUTURE_UNEXPECTED_STATE, REASON_JOB_FAILED
+    if job_status == "canceled":
+        return FUTURE_UNEXPECTED_STATE, REASON_JOB_CANCELED
+    return FUTURE_UNEXPECTED_STATE, REASON_UNRECOGNISED_JOB_STATUS
 
 
 async def _jobs_by_id(session: AsyncSession, job_ids: list[int]) -> dict[int, MessageJob]:
@@ -395,7 +515,9 @@ async def _collect_once(
         report.future_outcomes[outcome] += 1
         if reason:
             report.reasons[reason] += 1
-        if outcome not in FUTURE_ACCEPTED:
+        if outcome in FUTURE_PENDING_OUTCOMES:
+            report.future_maturing_job_ids.append(job_id)
+        elif outcome not in FUTURE_ACCEPTED:
             report.future_problem_job_ids.append(job_id)
 
     approved = set(all_ids)
@@ -441,8 +563,20 @@ async def verify_release(
     pause = sleep if sleep is not None else asyncio.sleep
     clock = now if now is not None else utcnow
 
+    # The effective bulk configuration, from the SAME shared resolver both
+    # preflights and the audit use — send fence open, canary unset, every
+    # mandatory prerequisite on. It is checked BEFORE the wait, and a wrong
+    # configuration ends the wait immediately: there is nothing to settle if
+    # the fence the report is about is not the fence that is open.
+    #
+    # It matters most in the all-future case. With no due job to release, an
+    # absent message is not evidence of anything — a shut fence looks exactly
+    # the same — so this check is what the green verdict actually rests on.
+    bulk_config_error = multi_service_configuration_error(RolloutPhase.BULK)
+    effective_settle = 0 if bulk_config_error is not None else settle_sec
+
     started = clock()
-    max_polls = max(1, int(settle_sec // max(poll_sec, MIN_POLL_SEC)) + 1)
+    max_polls = max(1, int(effective_settle // max(poll_sec, MIN_POLL_SEC)) + 1)
     report: ReleaseVerifyReport | None = None
 
     for attempt in range(max_polls):
@@ -462,7 +596,7 @@ async def verify_release(
         if not report.pending:
             report.settled = True
             break
-        if report.waited_sec >= settle_sec:
+        if report.waited_sec >= effective_settle:
             break
         await pause(poll_sec)
     else:  # pragma: no cover - the loop always assigns `report` on its first pass
@@ -470,12 +604,22 @@ async def verify_release(
 
     assert report is not None
     report.settle_sec = settle_sec
+    report.empty_due_allowed = allow_empty_due
     if report.pending and not report.settled:
         # The wait ended with work still moving. That is not a failure yet, and
         # the report must not call it one: it is an operator decision between
         # watching longer and closing the fence.
         report.reasons[REASON_SETTLE_TIMEOUT] += 1
-    if not due_job_ids and not allow_empty_due:
+
+    # Configuration first: a shut fence or a leftover canary explains every
+    # other number in the report, so it is the reason worth naming.
+    if bulk_config_error is not None:
+        report.config_error = bulk_config_error
+    elif not due_job_ids and not future_ids:
+        # Nothing was approved, so nothing can be proven. `--allow-empty-due`
+        # widens the shape of an inventory, never its emptiness.
+        report.config_error = REASON_EMPTY_INVENTORY
+    elif not due_job_ids and not allow_empty_due:
         report.config_error = REASON_EMPTY_DUE_SET
     return report
 

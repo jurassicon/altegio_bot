@@ -1063,6 +1063,11 @@ Dotenv-блоки в разделах 1, 13, 15, 21 и 35 — это описа�
 Наборы команд: **(A)** deploy/preflight, **(B)** controlled canary, **(C)**
 возврат после canary, **(D)** bulk, **(E)** аварийный rollback.
 
+Плейсхолдеры в командах записаны без угловых скобок (`CANARY_JOB_ID`,
+`RELEASE_DIGEST`, `DUE_IDS`, `OPENED_AT`) намеренно: `<...>` в shell — это
+перенаправление ввода, и незаменённый или пустой плейсхолдер выполнил бы
+команду не так, как выглядит. Каждый плейсхолдер заменяется целиком.
+
 Фактический результат отправки доказывается на шаге 58 отдельным
 post-open verifier по точным утверждённым job ID: release audit отвечает на
 вопрос «что уйдёт», а не «что ушло».
@@ -1232,7 +1237,7 @@ cd /opt/altegio_bot
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
   --entrypoint /app/.venv/bin/python altegio-outbox-worker \
   -m altegio_bot.scripts.easyweek_multi_service_release_audit \
-  --phase pre_open --limit 500 --canary-job-id <ID>
+  --phase pre_open --limit 500 --canary-job-id CANARY_JOB_ID
 ```
 
 Требуется `canary_ready=true` и `canary_error=null`. Этот шаг ничего не
@@ -1255,12 +1260,12 @@ STOP-условия по `canary_error`:
 ```bash
 cd /opt/altegio_bot
 python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
-  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=<ID> \
+  --set EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID \
   --set EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml config --quiet
 ```
 
-Helper обязан напечатать обе строки `EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=<ID>`
+Helper обязан напечатать обе строки `EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID`
 и `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true`. Если напечатана только одна —
 второй ключ уже имел это значение; проверить это явно на шаге 52, а не
 предполагать.
@@ -1284,7 +1289,7 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
   'printenv EASYWEEK_MULTI_SERVICE_SEND_ENABLED EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID'
 ```
 
-Требуется ровно `true` и выбранный `<ID>`. Любое расхождение — немедленный
+Требуется ровно `true` и выбранный `CANARY_JOB_ID`. Любое расхождение — немедленный
 переход к набору (E): контейнер работает не с той конфигурацией, которую
 утвердил оператор, и ни один последующий вывод не является доказательством.
 
@@ -1387,7 +1392,7 @@ STOP-условием не является.
 
 ## 56b. Финальный release audit при остановленном producer
 
-`<DIGEST>` — значение `release_set_digest` из шага 55, то есть ровно того
+`RELEASE_DIGEST` — значение `release_set_digest` из шага 55, то есть ровно того
 отчёта, по которому оператор принимал решения на шаге 56.
 
 ```bash
@@ -1395,7 +1400,7 @@ cd /opt/altegio_bot
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
   --entrypoint /app/.venv/bin/python altegio-outbox-worker \
   -m altegio_bot.scripts.easyweek_multi_service_release_audit \
-  --phase pre_open --limit 500 --expect-release-digest <DIGEST>
+  --phase pre_open --limit 500 --expect-release-digest RELEASE_DIGEST
 ```
 
 Требуется нулевой код возврата, `release_digest_error=null`,
@@ -1448,35 +1453,79 @@ audit выбирает только открытые jobs, поэтому зав
 Outbox-строки. Фактический исход проверяется отдельным verifier по точным
 утверждённым ID.
 
-`<DUE_IDS>` и `<FUTURE_IDS>` — списки из отчёта шага 55, утверждённые на шаге
-56 (через запятую, только положительные целые). `<OPENED_AT>` — момент UTC,
+`DUE_IDS` и `FUTURE_IDS` — списки из отчёта шага 55, утверждённые на шаге 56
+(через запятую, только положительные целые). `OPENED_AT` — момент UTC,
 записанный **до** шага 57; он ограничивает окно поиска отправок вне
 утверждённого набора.
+
+Вариант зависит от того, что осталось в утверждённом inventory. Флаг для
+пустого списка не передаётся вообще: пустой аргумент — это не пустой список,
+а невалидный ввод.
+
+**Вариант A — в inventory есть due jobs.**
 
 ```bash
 cd /opt/altegio_bot
 docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
   --entrypoint /app/.venv/bin/python altegio-outbox-worker \
   -m altegio_bot.scripts.easyweek_multi_service_release_verify \
-  --due-job-ids <DUE_IDS> \
-  --future-job-ids <FUTURE_IDS> \
-  --opened-at <OPENED_AT> \
+  --due-job-ids DUE_IDS \
+  --opened-at OPENED_AT \
   --settle-sec 180 --poll-sec 10 --limit 500
 ```
+
+`--future-job-ids FUTURE_IDS` добавляется в ту же команду только если
+future-набор непуст. `--allow-empty-due` в варианте A не используется.
+
+**Вариант B — due jobs нет, есть только future jobs.**
+
+Это штатный исход после успешного canary: единственная due job уже
+отправлена на шаге 53 и стала терминальной, поэтому в inventory остались
+только reminders, которые сработают по своему расписанию.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_verify \
+  --future-job-ids FUTURE_IDS \
+  --opened-at OPENED_AT \
+  --allow-empty-due \
+  --settle-sec 180 --poll-sec 10 --limit 500
+```
+
+Зелёный вариант B доказывает не факт новой отправки, а то, что bulk fence
+действительно открыт в правильной конфигурации и что все утверждённые future
+jobs остались ровно в том состоянии, в котором их утвердили. Без due job сам
+по себе «нет новых сообщений» не доказывает ничего: закрытый fence выглядит
+точно так же. Поэтому в варианте B `config_error=null` — основная часть
+доказательства, и `empty_due_allowed=true` в отчёте показывает, что нулевой
+due-набор допустил оператор, а не логика.
+
+**Если и due, и future списки пусты — STOP.** Post-open verification в этом
+случае бессодержательна, и запускать её нельзя: пустой inventory даёт
+`config_error=approved_inventory_empty` и никогда не становится зелёным.
+Пустой inventory не является доказательством успешного rollout. Операторское
+решение здесь: вернуться к шагу 55, получить свежий release audit и заново
+пройти шаг 56 — либо, если очередь действительно пуста и открывать нечего,
+закрыть fence по набору (E) и зафиксировать в тикете, что bulk-открытие не
+выполнялось.
 
 Verifier строго read-only: он ничего не отправляет, не меняет флаги, не
 выполняет rollback и не трогает jobs.
 
 Зелёный результат требует одновременно:
 
-- `verified=true` и `settled=true`;
+- `verified=true`, `settled=true` и `config_error=null`;
+- `inventory_proven=true` — утверждённый inventory непуст и полностью учтён;
 - `due_outcomes.succeeded == approved_due`, то есть каждая утверждённая due
   job имеет `status=done` **и** подтверждённую Outbox-строку в
   `sent`/`delivered`/`read`;
 - `unapproved_sent_job_ids=[]` — ни одна pair job вне утверждённого набора не
   дошла до провайдера в окне;
-- `future_problem_job_ids=[]` — утверждённые future jobs остались `queued` до
-  своего `run_at` либо ушли уже после него.
+- `future_problem_job_ids=[]` и `future_maturing_job_ids=[]` — утверждённые
+  future jobs остались `queued`, непретендованными и без попыток отправки до
+  своего `run_at`, либо доказуемо ушли уже после него.
 
 Первый прогон сразу после открытия почти всегда показывает
 `in_progress`: outbox worker одним batch переводит несколько jobs в
@@ -1496,8 +1545,24 @@ STOP-условия и что они означают:
 - `due_outcomes.missing > 0` или `identity_mismatch > 0`;
 - непустой `unapproved_sent_job_ids` — отправка вне утверждённого набора при
   остановленном producer;
-- `future_outcomes.future_sent_early > 0`;
+- `future_outcomes.future_sent_early > 0` — future job ушла раньше своего
+  `run_at`;
+- `future_outcomes.future_unexpected_state > 0` — future job не просто «ещё
+  не ушла», а `failed`, `canceled`, `done` без подтверждённой Outbox-строки,
+  претендована воркером до `run_at` либо в нераспознанном статусе;
+- `future_outcomes.future_indeterminate > 0` — Outbox `unknown`, недоказуемое
+  время отправки или противоречие job и Outbox;
+- `future_outcomes.missing > 0` или `future_outcomes.identity_mismatch > 0`;
+- `config_error` любого вида, включая `multi_service_send_disabled`,
+  `multi_service_canary_configured` и отключённые prerequisite flags: отчёт
+  описывает не ту конфигурацию, о которой заявляет;
 - `scan_truncated=true`.
+
+Отдельно про `future_outcomes.future_matured_pending`: у такой job `run_at`
+наступил уже во время проверки. Это не отказ и не успех — verifier ждёт её в
+пределах `--settle-sec` наравне с due jobs. Если она так и не завершилась,
+отчёт остаётся `settled=false`, и действует то же операторское решение, что и
+при таймауте.
 
 Любое из них — набор (E). Дополнительно можно посмотреть остаток очереди:
 

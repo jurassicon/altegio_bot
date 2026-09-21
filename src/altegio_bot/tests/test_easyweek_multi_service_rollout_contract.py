@@ -148,10 +148,10 @@ def test_the_canary_phase_comes_before_the_bulk_phase() -> None:
     section = _section()
     assert section.index("## 50.") < section.index("## 57.")
     canary_block = section.split("## 50.", 1)[1].split("\n## ", 1)[0]
-    assert "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=<ID>" in canary_block
+    assert "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID" in canary_block
     bulk_block = section.split("## 57.", 1)[1].split("\n## ", 1)[0]
     assert "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=" in bulk_block
-    assert "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=<ID>" not in bulk_block
+    assert "EASYWEEK_MULTI_SERVICE_CANARY_JOB_ID=CANARY_JOB_ID" not in bulk_block
 
 
 def test_a_full_release_audit_precedes_both_openings() -> None:
@@ -366,7 +366,7 @@ def test_the_final_audit_is_bound_to_the_approved_digest() -> None:
     section = _section()
     assert "release_set_digest" in section.split("## 47.", 1)[1].split("\n## ", 1)[0]
     final = section.split("## 56b.", 1)[1].split("\n## ", 1)[0]
-    assert "--expect-release-digest <DIGEST>" in final
+    assert "--expect-release-digest RELEASE_DIGEST" in final
     assert "multi_service_release_set_changed" in final
     # It runs BEFORE the bulk opening, and after the producer is paused.
     assert section.index("## 56a.") < section.index("## 56b.") < section.index("## 57.")
@@ -441,9 +441,9 @@ def test_the_capture_endpoint_is_independent_of_the_inbox_worker() -> None:
 def test_step_58_runs_the_verifier_and_not_the_pre_open_audit_as_proof() -> None:
     block = _section().split("## 58. ", 1)[1].split("\n## ", 1)[0]
     assert "easyweek_multi_service_release_verify" in block
-    assert "--due-job-ids <DUE_IDS>" in block
-    assert "--future-job-ids <FUTURE_IDS>" in block
-    assert "--opened-at <OPENED_AT>" in block
+    assert "--due-job-ids DUE_IDS" in block
+    assert "--future-job-ids FUTURE_IDS" in block
+    assert "--opened-at OPENED_AT" in block
     assert "--settle-sec" in block
 
     flattened = " ".join(block.split())
@@ -540,3 +540,108 @@ def test_the_bulk_audit_tolerates_in_flight_rows_and_nothing_else() -> None:
     assert "RolloutPhase.BULK.value" in source
     assert "in_flight" in source
     assert "UNSAFE_OR_UNPROVEN" in source, "an unprovable job still blocks every phase"
+
+
+# ===========================================================================
+# §38.9 step 58: the all-future inventory and the future lifecycle
+# ===========================================================================
+
+
+def _step_58() -> str:
+    return _section().split("## 58. ", 1)[1].split("\n## ", 1)[0]
+
+
+def test_step_58_offers_a_variant_for_an_inventory_with_no_due_jobs() -> None:
+    """After a successful canary the remaining inventory is legitimately all-future."""
+    block = _step_58()
+    assert "**Вариант A — в inventory есть due jobs.**" in block
+    assert "**Вариант B — due jobs нет, есть только future jobs.**" in block
+    assert block.index("Вариант A") < block.index("Вариант B")
+
+    variant_a = block.split("Вариант A", 1)[1].split("Вариант B", 1)[0]
+    command_a = variant_a.split("```", 2)[1]
+    assert "--due-job-ids DUE_IDS" in command_a
+    assert "--allow-empty-due" not in command_a
+    # And the prose says so explicitly, so it is not left to inference.
+    assert "`--allow-empty-due` в варианте A не используется" in " ".join(variant_a.split())
+
+    variant_b = block.split("Вариант B", 1)[1]
+    command_b = variant_b.split("```", 2)[1]
+    assert "--future-job-ids FUTURE_IDS" in command_b
+    assert "--allow-empty-due" in command_b
+    assert "--due-job-ids" not in command_b, "an empty placeholder is never passed"
+    assert "config_error=null" in variant_b
+    assert "empty_due_allowed=true" in variant_b
+
+
+def test_step_58_stops_when_both_approved_lists_are_empty() -> None:
+    flattened = " ".join(_step_58().split())
+    assert "Если и due, и future списки пусты — STOP" in flattened
+    assert "approved_inventory_empty" in flattened
+    assert "Пустой inventory не является доказательством успешного rollout" in flattened
+
+
+def test_the_runbook_uses_no_angle_bracket_placeholder_in_a_shell_block() -> None:
+    """`<FOO>` in a shell block is a redirection, not a placeholder."""
+    for block in _fenced(_section()):
+        for line in block.splitlines():
+            assert "<" not in line and ">" not in line, line
+
+
+def test_step_58_names_every_red_future_outcome() -> None:
+    flattened = " ".join(_step_58().split())
+    for outcome in (
+        "future_sent_early",
+        "future_unexpected_state",
+        "future_indeterminate",
+        "future_matured_pending",
+        "future_maturing_job_ids",
+        "inventory_proven",
+    ):
+        assert outcome in flattened, outcome
+
+
+def test_the_verifier_checks_the_effective_bulk_configuration_through_the_shared_resolver() -> None:
+    source = inspect.getsource(verify.verify_release)
+    assert "multi_service_configuration_error(RolloutPhase.BULK)" in source
+    # Not a second copy of the flag rules.
+    for forbidden in (
+        "easyweek_multi_service_send_enabled",
+        "easyweek_notifications_enabled",
+        "easyweek_reminder_api_guard_enabled",
+    ):
+        assert forbidden not in inspect.getsource(verify), forbidden
+
+
+def test_an_empty_inventory_can_never_be_proven() -> None:
+    source = inspect.getsource(verify.ReleaseVerifyReport.inventory_proven.fget)
+    assert "approved_due == 0 and self.approved_future == 0" in source
+    assert "empty_due_allowed" in source
+    assert "due_all_succeeded" in source and "future_all_accepted" in source
+
+
+def test_the_future_classification_states_the_approved_state_positively() -> None:
+    """A check that only looked for a success row called everything pending."""
+    source = inspect.getsource(verify.classify_future_job)
+    for expected in (
+        "FUTURE_UNEXPECTED_STATE",
+        "FUTURE_INDETERMINATE",
+        "FUTURE_MATURED_PENDING",
+        "REASON_FUTURE_CLAIMED_BEFORE_RUN_AT",
+        "REASON_JOB_FAILED",
+        "REASON_JOB_CANCELED",
+        "REASON_DONE_WITHOUT_PROVEN_SEND",
+        "REASON_UNRECOGNISED_JOB_STATUS",
+    ):
+        assert expected in source, expected
+    assert verify.FUTURE_ACCEPTED == (verify.FUTURE_PENDING, verify.FUTURE_RELEASED_ON_SCHEDULE)
+
+
+def test_future_and_due_outcomes_keep_separate_vocabularies_and_lists() -> None:
+    fields = verify.ReleaseVerifyReport.__dataclass_fields__
+    for name in ("due_outcomes", "future_outcomes", "pending_job_ids", "future_maturing_job_ids"):
+        assert name in fields, name
+    # The future vocabulary never borrows a due outcome name beyond the two
+    # identity-level ones that mean the same thing on both sides.
+    shared = set(verify.DUE_OUTCOMES) & set(verify.FUTURE_OUTCOMES)
+    assert shared == {verify.MISSING, verify.IDENTITY_MISMATCH}
