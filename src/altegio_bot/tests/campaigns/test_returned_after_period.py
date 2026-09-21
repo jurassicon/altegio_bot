@@ -37,6 +37,9 @@ from altegio_bot.campaigns.altegio_crm import CrmClientRef, CrmRecord, classify_
 from altegio_bot.campaigns.segment import compute_excluded_reason, find_candidates
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 PERIOD_START = datetime(2026, 3, 1, tzinfo=timezone.utc)
 PERIOD_END = datetime(2026, 4, 1, tzinfo=timezone.utc)
 COMPANY = 758285

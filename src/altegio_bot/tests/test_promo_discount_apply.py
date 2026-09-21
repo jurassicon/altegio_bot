@@ -50,6 +50,9 @@ from altegio_bot.promo_discount_apply import (
 )
 from altegio_bot.settings import settings
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 _UTC = timezone.utc
 _NOW = datetime(2026, 5, 8, 12, 0, 0, tzinfo=_UTC)
 _FUTURE = datetime(2099, 1, 1, tzinfo=_UTC)

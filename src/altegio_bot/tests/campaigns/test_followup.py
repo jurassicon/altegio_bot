@@ -13,11 +13,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from altegio_bot.campaigns.followup import (
     _is_eligible_for_followup,
     classify_followup_candidate,
 )
 from altegio_bot.models.models import CampaignRecipient
+
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
 
 _NOW = datetime(2026, 1, 15, tzinfo=timezone.utc)
 

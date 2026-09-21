@@ -26,6 +26,9 @@ from altegio_bot.main import app
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 from altegio_bot.ops.auth import require_ops_auth
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 COMPANY = 758285
 LOCATION = 1
 CARD_TYPE = "type-1"

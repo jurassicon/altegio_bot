@@ -44,6 +44,9 @@ from altegio_bot.scripts.repair_schedule_campaign_followups import (
     schedule_followups,
 )
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 COMPANY = 758285
 PHONE = "+49999000111"
 NOW = datetime(2026, 5, 6, 12, 0, 0, tzinfo=timezone.utc)
