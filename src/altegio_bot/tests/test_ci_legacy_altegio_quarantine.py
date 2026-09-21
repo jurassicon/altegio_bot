@@ -1,6 +1,6 @@
 """The legacy-Altegio quarantine must stay a quarantine, not a hole in CI.
 
-Wave 1 withdrew 25 explicitly marked Altegio-only modules from the required
+Wave 1 withdrew 24 explicitly marked Altegio-only modules from the required
 pull-request gate. That is only safe while four properties hold together, and
 each of them is one careless edit away from silently disappearing:
 
@@ -18,13 +18,16 @@ structurally — parsed TOML, parsed YAML and tokenized shell commands — rathe
 than grepping for substrings that a comment or an ``echo`` could fake.
 
 Deliberately absent: any assertion pinning the exact number of quarantined
-tests or naming the Wave 1 files. Later owner-approved waves must be able to
-grow the marked set without editing this file; what they must not do is break
-the four properties above.
+tests, and any allowlist of the Wave 1 files. Later owner-approved waves must
+be able to grow the marked set without editing this file; what they must not do
+is break the four properties above. The one module named below is named
+negatively — it must *not* carry the marker — which constrains nothing about
+what a future wave may add.
 """
 
 from __future__ import annotations
 
+import ast
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 PYPROJECT_FILE = _REPO_ROOT / "pyproject.toml"
 REQUIRED_WORKFLOW_FILE = _REPO_ROOT / ".github" / "workflows" / "ci_deploy.yml"
 LEGACY_WORKFLOW_FILE = _REPO_ROOT / ".github" / "workflows" / "legacy_altegio_tests.yml"
+
+# Wave 1 marked this module and review took it back out: its tests cover
+# `_update_run_exclusion_counters`, which `run_preview` calls unconditionally
+# after BOTH provider branches, EasyWeek included. Named here as a single
+# negative guard, not as the first entry of an allowlist.
+PROVIDER_NEUTRAL_MODULE = _REPO_ROOT / "src" / "altegio_bot" / "tests" / "campaigns" / "test_runner_counters.py"
 
 MARKER = "legacy_altegio"
 NEGATIVE_FILTER = f"not {MARKER}"
@@ -107,6 +116,24 @@ def _ignored_suites(invocation: list[str]) -> set[str]:
         elif argument == "--ignore" and index + 1 < len(arguments):
             ignored.add(arguments[index + 1])
     return ignored
+
+
+def _declares_legacy_marker(module_path: Path) -> bool:
+    """True when the module assigns a `pytestmark` carrying the legacy marker.
+
+    Parsed, not grepped: a mention of the marker in a docstring, a comment or a
+    string literal must not read as a classification, and `pytestmark = [a, b]`
+    must read as one.
+    """
+    for node in ast.parse(module_path.read_text()).body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in node.targets):
+            continue
+        attributes = {child.attr for child in ast.walk(node.value) if isinstance(child, ast.Attribute)}
+        if MARKER in attributes:
+            return True
+    return False
 
 
 def _legacy_workflow() -> dict[str, Any]:
@@ -178,11 +205,26 @@ def test_global_addopts_does_not_exclude_legacy_tests() -> None:
 
 
 def test_marker_is_applied_per_module_not_by_a_central_hook() -> None:
-    """No conftest may infer the marker from a path, filename or import."""
+    """Classification is per module — and one module must stay unclassified.
+
+    Two halves of the same property: nothing may attach the marker centrally,
+    and a module whose helper is on the EasyWeek path may not carry it at all.
+    """
     for conftest in _REPO_ROOT.joinpath("src").rglob("conftest.py"):
         source = conftest.read_text()
         assert "pytest_collection_modifyitems" not in source, f"{conftest} adds markers behind the author's back"
         assert MARKER not in source, f"{conftest} must not classify tests centrally"
+
+    # A keyword scan called this module Altegio-only: it never says "easyweek"
+    # and its fixtures name no provider. Tracing the call site says otherwise —
+    # `run_preview` calls `_update_run_exclusion_counters` after the EasyWeek
+    # branch and the Altegio branch alike, so these tests guard EasyWeek
+    # preview too and belong in the required tier.
+    assert PROVIDER_NEUTRAL_MODULE.is_file(), f"missing {PROVIDER_NEUTRAL_MODULE}"
+    assert not _declares_legacy_marker(PROVIDER_NEUTRAL_MODULE), (
+        f"{PROVIDER_NEUTRAL_MODULE.name} covers a provider-neutral helper reached by EasyWeek run_preview; "
+        "it must stay in the required tier"
+    )
 
 
 # ===========================================================================
