@@ -26,6 +26,13 @@ all. Because it makes no live call, a ``*_provider_candidate`` is an UPPER
 BOUND: a version 2 job additionally faces a live re-proof at send time, which
 can still refuse it. The audit therefore never under-states what may go out.
 
+It is a pre-open instrument, and it stays one. It selects OPEN jobs, so a job
+that finished leaves its result set entirely — which makes an empty release
+set here evidence of nothing at all: a provider send, a permanent refusal, an
+exhausted retry chain and a local cancel are indistinguishable once the row is
+terminal. What the bulk opening actually sent is proven job by job against the
+approved ids by ``easyweek_multi_service_release_verify``.
+
 Output is counts, stable reason codes and internal ``message_jobs.id`` values.
 No booking uuid, no customer name, phone, e-mail, service text, price, URL or
 API body ever reaches stdout: this output is read in a terminal and pasted into
@@ -195,17 +202,39 @@ class ReleaseAuditReport:
         )
 
     @property
+    def in_flight(self) -> int:
+        """Rows a worker is actively moving right now.
+
+        Before the fence opens this is an anomaly: nothing should be claimed
+        while the queue is held. After it opens it is what ordinary delivery
+        looks like — ``_lock_next_jobs`` commits a whole batch as
+        ``processing`` and only then works through it one job at a time, so a
+        healthy bulk rollout shows several ``processing`` rows and a couple of
+        ``sending`` Outbox rows at once.
+        """
+        return self.classifications.get(PROCESSING_OR_LOCKED, 0) + self.classifications.get(
+            NONTERMINAL_OUTBOX_PRESENT, 0
+        )
+
+    @property
     def audit_sound(self) -> bool:
-        """The audit itself is trustworthy, whatever it then concludes."""
+        """The audit itself is trustworthy, whatever it then concludes.
+
+        ``in_flight`` blocks it in every phase EXCEPT ``bulk``. That exception
+        is the whole point: reading this report a minute after the opening,
+        the operator would otherwise see normal delivery as a blocker and
+        start an emergency rollback in the middle of it. In the bulk phase the
+        report is a picture of the remaining queue, and what actually went out
+        is proven by the post-open verifier against the approved ids — this
+        report never claims to answer that.
+        """
         if self.config_error is not None:
             return False
         if self.truncated or not self.inventory_complete:
             return False
         if self.classifications.get(UNSAFE_OR_UNPROVEN, 0):
             return False
-        if self.classifications.get(PROCESSING_OR_LOCKED, 0):
-            return False
-        if self.classifications.get(NONTERMINAL_OUTBOX_PRESENT, 0):
+        if self.phase != RolloutPhase.BULK.value and self.in_flight:
             return False
         return True
 
@@ -247,6 +276,7 @@ class ReleaseAuditReport:
             "truncated": self.truncated,
             "inventory_complete": self.inventory_complete,
             "nonterminal_outbox_rows": self.nonterminal_outbox_rows,
+            "in_flight": self.in_flight,
             "canary_job_id": self.canary_job_id,
             "intended_canary_job_id": self.intended_canary_job_id,
             "canary_error": self.canary_error,

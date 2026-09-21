@@ -912,3 +912,103 @@ async def test_the_digest_argument_must_be_a_sha256_hex_string() -> None:
             audit_cli._parse_args(["--expect-release-digest", bad])
     parsed = audit_cli._parse_args(["--expect-release-digest", "A" * 64])
     assert parsed.expect_release_digest == "a" * 64
+
+
+# ===========================================================================
+# §38.9 step 58: ordinary delivery is not a blocker
+# ===========================================================================
+
+
+async def test_a_processing_batch_blocks_the_pre_open_audit_but_not_the_bulk_one(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The false red that used to start rollbacks mid-delivery.
+
+    `_lock_next_jobs` commits a whole batch as `processing` and only then
+    works through it one job at a time, so a healthy opening looks exactly
+    like this. Before the fence opens the same picture is an anomaly — nothing
+    should be claimed while the queue is held — so only the bulk phase
+    tolerates it.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            for index in range(3):
+                await _seed_pair_job(
+                    session,
+                    client,
+                    record,
+                    snapshot,
+                    status="processing",
+                    locked=True,
+                    dedupe_key=f"inflight-batch-{index}",
+                )
+
+    async with session_maker() as session:
+        pre_open = await run_release_audit(session)
+    assert pre_open.classifications[PROCESSING_OR_LOCKED] == 3
+    assert pre_open.in_flight == 3
+    assert pre_open.audit_sound is False
+
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    async with session_maker() as session:
+        bulk = await run_release_audit(session, phase=RolloutPhase.BULK)
+
+    assert bulk.classifications[PROCESSING_OR_LOCKED] == 3
+    assert bulk.in_flight == 3
+    assert bulk.audit_sound is True, "normal delivery must not read as a rollout blocker"
+
+
+async def test_an_in_flight_outbox_row_is_tolerated_in_the_bulk_phase_only(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            job = await _seed_pair_job(session, client, record, snapshot)
+            session.add(
+                OutboxMessage(
+                    company_id=TEST_LOCATION_ID,
+                    client_id=client.id,
+                    record_id=record.id,
+                    job_id=job.id,
+                    phone_e164="+49000000000",
+                    template_code="record_created",
+                    body="fixture",
+                    status="sending",
+                    scheduled_at=utcnow(),
+                    meta={},
+                )
+            )
+
+    async with session_maker() as session:
+        pre_open = await run_release_audit(session)
+    assert pre_open.audit_sound is False
+
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    async with session_maker() as session:
+        bulk = await run_release_audit(session, phase=RolloutPhase.BULK)
+    assert bulk.classifications[NONTERMINAL_OUTBOX_PRESENT] == 1
+    assert bulk.audit_sound is True
+
+
+async def test_an_unprovable_job_still_blocks_the_bulk_audit(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bulk exception covers in-flight rows, and nothing else."""
+    async with session_maker() as session:
+        async with session.begin():
+            client, record, snapshot = await _seed_record(session)
+            payload = multi_service_job_payload(snapshot)
+            payload[MULTI_SERVICE_JOB_DIGEST_KEY] = "0" * 64
+            await _seed_pair_job(session, client, record, snapshot, payload=payload)
+
+    monkeypatch.setattr(settings, "easyweek_multi_service_send_enabled", True, raising=False)
+    async with session_maker() as session:
+        bulk = await run_release_audit(session, phase=RolloutPhase.BULK)
+
+    assert bulk.classifications[UNSAFE_OR_UNPROVEN] == 1
+    assert bulk.audit_sound is False

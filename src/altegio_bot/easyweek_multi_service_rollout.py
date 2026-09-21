@@ -28,6 +28,7 @@ preflights and the release audit share one definition without a cycle.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
@@ -146,6 +147,48 @@ def multi_service_canary() -> MultiServiceCanary:
     return parse_multi_service_canary_job_id(getattr(settings, "easyweek_multi_service_canary_job_id", ""))
 
 
+class JobIdListError(ValueError):
+    """A refusal to read an operator-supplied id list. Never echoes a value."""
+
+
+def parse_job_id_list(values: Iterable[str]) -> list[int]:
+    """Parse approved ``message_jobs.id`` lists exactly as strictly as the canary.
+
+    Accepts repeated arguments and comma-separated groups, in any mix. Each id
+    must be one positive ASCII decimal integer — no sign, no fraction, no
+    bool-like word, no other script's digits — and no id may repeat.
+
+    Strict for the same reason ``parse_multi_service_canary_job_id`` is: this
+    list is what a post-open verifier calls "approved". A silently dropped or
+    misread entry turns an unverified send into a green report, which is the
+    one outcome the verification exists to prevent.
+
+    The raised message names the offending TEXT, never a payload or a booking:
+    an operator has to see what they mistyped, and a job id is technical.
+    """
+    ids: list[int] = []
+    seen: set[int] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            raise JobIdListError("job id list must be given as text")
+        for chunk in raw.split(","):
+            text = chunk.strip()
+            if not text:
+                # A trailing comma is a typo in a list that decides what counts
+                # as verified, not a harmless formatting quirk.
+                raise JobIdListError("empty job id in the list")
+            if not text.isascii() or not text.isdecimal():
+                raise JobIdListError(f"not a positive decimal job id: {text!r}")
+            value = int(text)
+            if value <= 0:
+                raise JobIdListError(f"not a positive decimal job id: {text!r}")
+            if value in seen:
+                raise JobIdListError(f"duplicate job id: {value}")
+            seen.add(value)
+            ids.append(value)
+    return ids
+
+
 class RolloutPhase(Enum):
     """The three configurations §38.9 recognises, and nothing in between."""
 
@@ -226,9 +269,11 @@ __all__ = [
     "MULTI_SERVICE_CANARY_RESTRICTED",
     "MULTI_SERVICE_RELEASE_SET_CHANGED",
     "MULTI_SERVICE_SEND_FENCE_OPEN",
+    "JobIdListError",
     "MultiServiceCanary",
     "RolloutPhase",
     "multi_service_canary",
     "multi_service_configuration_error",
+    "parse_job_id_list",
     "parse_multi_service_canary_job_id",
 ]

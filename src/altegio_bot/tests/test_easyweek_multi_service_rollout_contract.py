@@ -16,6 +16,7 @@ import pytest
 from altegio_bot.easyweek_multi_service_rollout import parse_multi_service_canary_job_id
 from altegio_bot.scripts import easyweek_env_set
 from altegio_bot.scripts import easyweek_multi_service_release_audit as audit
+from altegio_bot.scripts import easyweek_multi_service_release_verify as verify
 from altegio_bot.settings import Settings
 from altegio_bot.workers import outbox_worker as ow
 
@@ -44,7 +45,7 @@ STEPS = (
     "## 55. Повторный полный release audit",
     "## 56. Явное решение по каждому оставшемуся provider candidate",
     "## 57. (D) Bulk открытие после утверждённого inventory",
-    "## 58. Post-open аудит фактических исходов",
+    "## 58. Post-open verification фактических исходов",
     "## 59. (E) Аварийный rollback",
 )
 
@@ -320,7 +321,7 @@ BOUNDARY_STEPS = (
     "## 56a. Приостановка producer: EasyWeek inbox worker",
     "## 56b. Финальный release audit при остановленном producer",
     "## 57. (D) Bulk открытие после утверждённого inventory",
-    "## 58. Post-open аудит фактических исходов",
+    "## 58. Post-open verification фактических исходов",
     "## 58a. Возврат EasyWeek inbox worker в работу",
     "## 59. (E) Аварийный rollback",
 )
@@ -430,3 +431,112 @@ def test_the_capture_endpoint_is_independent_of_the_inbox_worker() -> None:
     assert "easyweek_inbox_worker" not in source
     assert "session.commit()" in source
     assert "status_code=503" in source
+
+
+# ===========================================================================
+# §38.9 step 58: post-open verification of what actually went out
+# ===========================================================================
+
+
+def test_step_58_runs_the_verifier_and_not_the_pre_open_audit_as_proof() -> None:
+    block = _section().split("## 58. ", 1)[1].split("\n## ", 1)[0]
+    assert "easyweek_multi_service_release_verify" in block
+    assert "--due-job-ids <DUE_IDS>" in block
+    assert "--future-job-ids <FUTURE_IDS>" in block
+    assert "--opened-at <OPENED_AT>" in block
+    assert "--settle-sec" in block
+
+    flattened = " ".join(block.split())
+    assert "Пустой open release set **не является** доказательством отправки" in flattened
+    # The audit may still be run, but only as a look at what is left.
+    assert "вспомогательная проверка остатка, а не доказательство отправки" in flattened
+
+
+def test_step_58_requires_a_proven_outbox_row_for_every_approved_due_job() -> None:
+    flattened = " ".join(_section().split("## 58. ", 1)[1].split("\n## ", 1)[0].split())
+    assert "due_outcomes.succeeded == approved_due" in flattened
+    assert "sent`/`delivered`/`read`" in flattened
+    assert "unapproved_sent_job_ids=[]" in flattened
+    assert "future_problem_job_ids=[]" in flattened
+
+
+def test_step_58_treats_a_first_in_flight_look_as_normal() -> None:
+    """The false red that used to start rollbacks mid-delivery."""
+    flattened = " ".join(_section().split("## 58. ", 1)[1].split("\n## ", 1)[0].split())
+    assert "in_progress" in flattened
+    assert "Это **не** rollout failure" in flattened
+    assert "batch" in flattened
+    # The timeout is a decision, not a verdict.
+    assert "наблюдать дальше" in flattened and "закрыть fence" in flattened
+
+
+def test_step_58_lists_every_unsuccessful_outcome_as_a_stop_condition() -> None:
+    flattened = " ".join(_section().split("## 58. ", 1)[1].split("\n## ", 1)[0].split())
+    for outcome in (
+        "done_without_proven_outbox_send",
+        "canceled_without_provider_send",
+        "unknown_or_indeterminate",
+        "missing",
+        "identity_mismatch",
+        "future_sent_early",
+        "scan_truncated",
+    ):
+        assert outcome in flattened, outcome
+
+
+def test_the_opening_records_its_time_marker_before_the_flag_changes() -> None:
+    block = _section().split("## 57. ", 1)[1].split("\n## ", 1)[0]
+    assert "date -u +%Y-%m-%dT%H:%M:%SZ" in block
+    assert block.index("date -u") < block.index("EASYWEEK_MULTI_SERVICE_SEND_ENABLED=true")
+
+
+def test_the_producer_returns_only_after_a_verified_release() -> None:
+    resume = _section().split("## 58a.", 1)[1].split("\n## ", 1)[0]
+    assert "verified=true" in resume
+
+
+def test_the_rollback_closes_the_fence_before_it_resumes_the_producer() -> None:
+    rollback = " ".join(_section().split("## 59.", 1)[1].split())
+    assert "сначала закрыть send fence" in rollback
+    assert rollback.index("закрыть send fence") < rollback.index("вернуть inbox worker")
+
+
+def test_the_verifier_is_read_only_and_cannot_send_or_roll_back() -> None:
+    source = inspect.getsource(verify)
+    assert "select(" in source
+    for forbidden in (
+        ".commit(",
+        ".add(",
+        ".delete(",
+        "insert(",
+        "safe_send",
+        "ChatwootClient(",
+        "easyweek_env_set",
+        "get_booking",
+    ):
+        assert forbidden not in source, forbidden
+    assert "await session.rollback()" in source
+
+
+def test_the_verifier_reuses_the_project_success_statuses() -> None:
+    """A second opinion about what "sent" means is how a rollout lies."""
+    from altegio_bot.workers.outbox_worker import SUCCESS_OUTBOX_STATUSES
+
+    assert verify.SUCCESS_OUTBOX_STATUSES is SUCCESS_OUTBOX_STATUSES
+    assert set(SUCCESS_OUTBOX_STATUSES) == {"sent", "delivered", "read"}
+    source = inspect.getsource(verify)
+    assert '("sent", "delivered", "read")' not in source, "restated instead of imported"
+
+
+def test_the_verifier_settle_loop_is_bounded() -> None:
+    source = inspect.getsource(verify.verify_release)
+    assert "while True" not in source
+    assert "max_polls" in source
+    assert verify.MAX_SETTLE_SEC <= 1800
+
+
+def test_the_bulk_audit_tolerates_in_flight_rows_and_nothing_else() -> None:
+    source = inspect.getsource(audit.ReleaseAuditReport.audit_sound.fget)
+    assert "RolloutPhase.BULK.value" in source
+    assert "in_flight" in source
+    assert "UNSAFE_OR_UNPROVEN" in source, "an unprovable job still blocks every phase"

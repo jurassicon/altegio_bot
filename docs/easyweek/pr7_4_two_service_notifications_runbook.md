@@ -1063,6 +1063,10 @@ Dotenv-блоки в разделах 1, 13, 15, 21 и 35 — это описа�
 Наборы команд: **(A)** deploy/preflight, **(B)** controlled canary, **(C)**
 возврат после canary, **(D)** bulk, **(E)** аварийный rollback.
 
+Фактический результат отправки доказывается на шаге 58 отдельным
+post-open verifier по точным утверждённым job ID: release audit отвечает на
+вопрос «что уйдёт», а не «что ушло».
+
 Утверждённый inventory связывается с открытием bulk двумя независимыми
 механизмами, а не сравнением двух распечаток глазами: producer (EasyWeek
 inbox worker) физически останавливается на шаге 56a, и финальный audit на
@@ -1412,6 +1416,13 @@ pair jobs никто не создаёт, а уже существующие м�
 
 Только после шагов 55, 56, 56a и 56b.
 
+Сначала зафиксировать технический маркер времени — он понадобится на шаге 58
+как граница окна. Записать вывод в тикет **до** изменения флага:
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+```
+
 ```bash
 cd /opt/altegio_bot
 python3 src/altegio_bot/scripts/easyweek_env_set.py --env-file /opt/altegio_bot/easyweek.env \
@@ -1428,7 +1439,67 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
 позиций было в утверждённом inventory, плюс те
 `future_provider_candidate_job_ids`, которые станут due по расписанию.
 
-## 58. Post-open аудит фактических исходов
+## 58. Post-open verification фактических исходов
+
+Пустой open release set **не является** доказательством отправки. Release
+audit выбирает только открытые jobs, поэтому завершённая job уходит из его
+результата одинаково при успешной отправке, permanent Meta failure,
+исчерпанных retries, локальной отмене и при `done` без единой подтверждённой
+Outbox-строки. Фактический исход проверяется отдельным verifier по точным
+утверждённым ID.
+
+`<DUE_IDS>` и `<FUTURE_IDS>` — списки из отчёта шага 55, утверждённые на шаге
+56 (через запятую, только положительные целые). `<OPENED_AT>` — момент UTC,
+записанный **до** шага 57; он ограничивает окно поиска отправок вне
+утверждённого набора.
+
+```bash
+cd /opt/altegio_bot
+docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps \
+  --entrypoint /app/.venv/bin/python altegio-outbox-worker \
+  -m altegio_bot.scripts.easyweek_multi_service_release_verify \
+  --due-job-ids <DUE_IDS> \
+  --future-job-ids <FUTURE_IDS> \
+  --opened-at <OPENED_AT> \
+  --settle-sec 180 --poll-sec 10 --limit 500
+```
+
+Verifier строго read-only: он ничего не отправляет, не меняет флаги, не
+выполняет rollback и не трогает jobs.
+
+Зелёный результат требует одновременно:
+
+- `verified=true` и `settled=true`;
+- `due_outcomes.succeeded == approved_due`, то есть каждая утверждённая due
+  job имеет `status=done` **и** подтверждённую Outbox-строку в
+  `sent`/`delivered`/`read`;
+- `unapproved_sent_job_ids=[]` — ни одна pair job вне утверждённого набора не
+  дошла до провайдера в окне;
+- `future_problem_job_ids=[]` — утверждённые future jobs остались `queued` до
+  своего `run_at` либо ушли уже после него.
+
+Первый прогон сразу после открытия почти всегда показывает
+`in_progress`: outbox worker одним batch переводит несколько jobs в
+`processing` и только потом обрабатывает их последовательно. Это **не**
+rollout failure. Verifier сам ждёт в пределах `--settle-sec` и завершает
+ожидание, как только все утверждённые due jobs стали терминальными.
+
+STOP-условия и что они означают:
+
+- `settled=false` и непустой `pending_job_ids` — окно ожидания истекло, работа
+  ещё идёт. Это не отказ: у оператора ровно два варианта — повторить команду
+  с тем же `--opened-at` (наблюдать дальше) либо закрыть fence по набору (E);
+- `due_outcomes.failed > 0`, включая причину `done_without_proven_outbox_send`;
+- `due_outcomes.canceled_without_provider_send > 0`;
+- `due_outcomes.unknown_or_indeterminate > 0` — Meta-исход недоказуем; такую
+  job не ретраить автоматически и не считать успешной;
+- `due_outcomes.missing > 0` или `identity_mismatch > 0`;
+- непустой `unapproved_sent_job_ids` — отправка вне утверждённого набора при
+  остановленном producer;
+- `future_outcomes.future_sent_early > 0`;
+- `scan_truncated=true`.
+
+Любое из них — набор (E). Дополнительно можно посмотреть остаток очереди:
 
 ```bash
 cd /opt/altegio_bot
@@ -1438,16 +1509,16 @@ docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-i
   --phase bulk --limit 500
 ```
 
-Требуется `audit_sound=true`. Пустой release set здесь — нормальный успешный
-итог, а не ошибка. Фактические исходы сравниваются с inventory, утверждённым
-на шаге 56: каждое ушедшее сообщение обязано соответствовать позиции из
-списка. Любой исход вне
-списка — повод для набора (E), а не для задним числом расширенного inventory.
+Это вспомогательная проверка остатка, а не доказательство отправки. В фазе
+`bulk` поле `in_flight` — нормальное состояние активной обработки и само по
+себе блокером не является.
+
+Переход к шагу 58a выполняется только после `verified=true`.
 
 ## 58a. Возврат EasyWeek inbox worker в работу
 
-Выполняется только после успешного шага 58 — и обязательно выполняется в
-любом случае, включая аварийный выход по набору (E). Оставлять producer
+Выполняется только после `verified=true` на шаге 58 — и обязательно
+выполняется в любом случае, включая аварийный выход по набору (E). Оставлять producer
 остановленным нельзя: доставки продолжают накапливаться `captured`, но
 Client/Record перестают обновляться, а reminders перестают планироваться.
 
@@ -1470,6 +1541,10 @@ proof, тот же causal order, те же fences. Никакого догоня
 ## 59. (E) Аварийный rollback
 
 Единственный аварийный стоп — `EASYWEEK_MULTI_SERVICE_SEND_ENABLED=false`.
+Порядок при отказе или таймауте шага 58 строгий: сначала закрыть send fence,
+затем убедиться по `printenv` внутри контейнера, что effective значение
+`false`, и только потом вернуть inbox worker по шагу 58a. Jobs не удалять,
+`attempts`, `run_at` и payload не править.
 Canary ID аварийным стопом не является и его не заменяет: при открытом fence
 и пустом canary ограничения нет вообще, а при открытом fence и заданном
 canary одна job всё ещё может уйти.
