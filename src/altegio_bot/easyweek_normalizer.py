@@ -18,6 +18,13 @@ deliberately stricter than the payload:
   one.
 * **No prose parsing.** The event type comes from the ``event_hint`` recorded in
   our own URL, never from the localized ``booking_status``.
+* **One trigger-scoped null.** An earlier revision of this module stated that no
+  captured payload had ever carried ``service_id: null``. Production event 360 —
+  a real, untruncated ``booking-canceled`` delivery — disproved that. A literal
+  null in ``service_id`` is therefore accepted for that ONE trigger and read as
+  "the identity field was not transmitted"; for every other trigger, and for
+  every other malformed shape, it stays a deterministic ``invalid_payload``.
+  See :func:`normalize_event`.
 
 The payload shape is taken from real captured deliveries: every field lives at
 the ROOT of the object, and some root keys literally contain dots
@@ -52,6 +59,12 @@ UPDATE: Final = "update"
 DELETE: Final = "delete"
 IGNORE: Final = "ignore"
 
+# The exact cancellation trigger. Named as its own constant because one narrow
+# payload allowance is keyed on this TRIGGER rather than on the DELETE action it
+# maps to: the production evidence for that allowance is a `booking-canceled`
+# delivery, and a future trigger routed to DELETE would not be covered by it.
+CANCEL_EVENT_HINT: Final = "booking-canceled"
+
 # The five real trigger names, confirmed by live capture. Short aliases
 # ("created", "updated", "canceled") and our own internal verbs ("create",
 # "update", "delete") are NOT accepted: early capture rows contain synthetic
@@ -61,7 +74,7 @@ _EVENT_HINT_MAP: Final[dict[str, str]] = {
     "booking-created": CREATE,
     "booking-updated": UPDATE,
     "booking-rescheduled": UPDATE,
-    "booking-canceled": DELETE,
+    CANCEL_EVENT_HINT: DELETE,
     # Captured for phase 2 (visits_total / review guard). Reaches a terminal
     # status with no Client, Record or MessageJob side effect.
     "booking-succeeded": IGNORE,
@@ -941,18 +954,41 @@ def normalize_event(
     #
     # Absent  -> the known service identity is kept (the delivery said nothing).
     # Present as a valid positive id -> the normal service change.
-    # Present as null/false/"12"/0/negative -> DETERMINISTIC REJECTION.
+    # Present as null on an exact `booking-canceled` -> the identity field was
+    #   NOT CARRIED by this delivery (see below).
+    # Present as null on any other trigger, or as false/"12"/0/negative/
+    #   fractional on ANY trigger -> DETERMINISTIC REJECTION.
     #
-    # The last case is fail-closed on purpose. No captured payload has ever sent
-    # `service_id: null`, so its meaning is unproven: it could mean "the service
-    # was removed" or it could be an upstream serialisation artefact. Guessing
-    # either way is unsafe — silently keeping the old identity (the previous
-    # behaviour) would attach a NEW title, amount and price to the OLD
-    # service_id, and deleting the snapshot would destroy a proven one. Rejecting
-    # leaves every domain row untouched and makes the payload visible to an
-    # operator instead.
-    if "service_id" not in payload:
+    # The rejection is fail-closed on purpose: a value whose meaning is unproven
+    # must not silently attach a NEW title, amount and price to the OLD
+    # service_id, and must not delete a proven snapshot either.
+    #
+    # The cancellation allowance is NOT a relaxation of that rule; it is the one
+    # shape production has now proven. The original comment here asserted that
+    # no captured payload had ever sent `service_id: null`. Production event 360
+    # — a real `booking-canceled` delivery, `body_truncated=false` — disproved
+    # that: EasyWeek does send a literal JSON null in this field when it cancels
+    # a booking. A cancellation carries no new service selection to attach
+    # anything to, so for THIS trigger the null is read as "the identity field
+    # was not transmitted": `service_id` becomes None and is deliberately kept
+    # OUT of `present_fields`, which is exactly the "delivery said nothing"
+    # case, so the already-proven RecordService identity survives untouched.
+    #
+    # The proof is bounded to this trigger. For `booking-created`,
+    # `booking-updated` and `booking-rescheduled` a null still means an unproven
+    # service change and still produces `invalid_payload`, and every other
+    # malformed shape stays rejected for cancellations too.
+    #
+    # Both halves are asserted: the DELETE action AND the exact trigger that
+    # produced it. `map_event_hint` above already guarantees the two agree
+    # today, and stating both keeps them agreeing if the map ever grows.
+    is_cancellation = action == DELETE and isinstance(event_hint, str) and event_hint.strip() == CANCEL_EVENT_HINT
+    carries_service_id = "service_id" in payload
+    if not carries_service_id:
         service_id = None
+    elif is_cancellation and payload.get("service_id") is None:
+        service_id = None
+        carries_service_id = False
     else:
         service_id = _require_positive_id(
             payload.get("service_id"),
@@ -989,7 +1025,6 @@ def normalize_event(
                 ("duration_sec", "booking_duration"),
                 ("staff_name", "users_description"),
                 ("comment", "booking_attributes.booking_comment"),
-                ("service_id", "service_id"),
                 ("service_name", "service_name"),
                 ("service_related", "service_related"),
                 ("service_quantity", "quantity"),
@@ -1005,6 +1040,15 @@ def normalize_event(
                 ("customer_id", "customer_id"),
             )
             if key in payload
+        )
+        | (
+            # Kept out of the key-presence loop above because presence alone is
+            # not the answer for this one field: a literal null on the proven
+            # `booking-canceled` shape means the identity was NOT carried, so it
+            # must read exactly like an absent key and leave the known
+            # RecordService identity in place. Every other shape either set this
+            # flag from the key or was already rejected.
+            frozenset({"service_id"}) if carries_service_id else frozenset()
         )
         | (
             # display_name is derived from several possible keys.

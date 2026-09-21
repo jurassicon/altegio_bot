@@ -17,6 +17,7 @@ from __future__ import annotations
 import uuid as uuid_module
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +27,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot import easyweek_failed_cancellation_recovery as recovery
 from altegio_bot.easyweek_migration import ledger as ledger_module
 from altegio_bot.easyweek_migration.manifest import KARLSRUHE_COMPANY_ID, parse_manifest
 from altegio_bot.easyweek_migration.reminder_handover import (
@@ -46,6 +48,7 @@ from altegio_bot.easyweek_migration.reminder_handover_db import (
     build_plan,
     verify_handover,
 )
+from altegio_bot.easyweek_normalizer import canonical_booking_uuid
 from altegio_bot.easyweek_policy import EASYWEEK_REMINDER_JOB_TYPES, REMINDER_2H, REMINDER_24H
 from altegio_bot.easyweek_reminders import (
     REMINDER_OFFSETS,
@@ -63,6 +66,7 @@ from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
     PROVIDER_EASYWEEK,
     Client,
+    EasyWeekEvent,
     EasyWeekMigrationLedger,
     MessageJob,
     OutboxMessage,
@@ -76,6 +80,7 @@ from altegio_bot.reminder_ownership import (
     reminder_owner,
 )
 from altegio_bot.settings import settings
+from altegio_bot.tests.easyweek_fixtures import booking_canceled
 from altegio_bot.tests.easyweek_migration_harness import (
     KA_LOCATION_ID,
     apply_production_flags,
@@ -2678,3 +2683,187 @@ async def test_a_corrupt_marker_is_refused_rather_than_crashing(session_maker, s
     assert client.calls == [], "a corrupt row is refused before any API call"
     assert {job.id: job.status for job in await jobs(session_maker)} == jobs_before
     assert await ledger_marker(session_maker) == (None, None), "the real row is untouched"
+
+
+# ---------------------------------------------------------------------------
+# Composition with the failed-cancellation recovery
+# ---------------------------------------------------------------------------
+#
+# Production event 360 is the whole reason these two tools have to compose: a
+# `booking-canceled` delivery carrying `service_id: null` failed as
+# `invalid_payload`, so its EasyWeek booking is cancelled live while the local
+# target Record is still active. §30 rightly calls that `local_target_mismatch`
+# and refuses — and one refusal blocks the entire atomic wave, including the
+# other twelve ledger-confirmed rows that are perfectly fine.
+
+
+def null_service_cancellation_payload(*, starts_at: datetime, booking_id: int) -> dict[str, Any]:
+    payload = booking_canceled()
+    payload["uid"] = str(BOOKING)
+    payload["id"] = booking_id
+    payload["location_id"] = LOCATION_ID
+    payload["location_uuid"] = KA_LOCATION_UUID
+    payload["service_id"] = None
+    payload["booking_date_start"] = starts_at.strftime("%Y-%m-%dT%H:%M:%S+0000")
+    payload["booking_date_end"] = (starts_at + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    return payload
+
+
+async def seed_failed_null_service_cancellation(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    starts_at: datetime,
+    booking_id: int,
+) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            payload = null_service_cancellation_payload(starts_at=starts_at, booking_id=booking_id)
+            event = EasyWeekEvent(
+                status="failed",
+                event_hint="booking-canceled",
+                auth_via="query",
+                payload_hash="c" * 64,
+                payload=payload,
+                body_truncated=False,
+                booking_uuid=canonical_booking_uuid(payload),
+                received_at=datetime.now(timezone.utc) - timedelta(days=1),
+                processed_at=datetime.now(timezone.utc) - timedelta(days=1),
+                error_code="invalid_payload",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+async def run_recovery(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    event_id: int,
+    live: dict[str, Any],
+    tmp_path: Path,
+):
+    reader = FakeBookings(live)
+    async with session_maker() as session:
+        plan = await recovery.build_recovery_plan(
+            session,
+            event_ids=[event_id],
+            client=reader,
+            sleep=_no_sleep,
+        )
+    frozen = recovery.read_plan(recovery.write_plan(plan, tmp_path / "recovery-plan.json"))
+    async with session_maker() as session:
+        result = await recovery.apply_recovery_plan(session, frozen=frozen, client=reader, sleep=_no_sleep)
+    return plan, result
+
+
+@pytest.mark.asyncio
+async def test_an_uncancelled_local_target_blocks_the_whole_wave(session_maker, seeded) -> None:
+    """The production symptom, reproduced: one row stops thirteen."""
+    other_source, _other_target = await add_migrated_pair(
+        session_maker,
+        source_record_id=SOURCE_RECORD_ID + 1,
+        booking_uuid=BOOKING_TWO,
+        starts_at=seeded["starts"],
+    )
+    await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=other_source,
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key=make_dedupe_key(
+            job_type=REMINDER_24H,
+            company_id=COMPANY,
+            record_id=other_source,
+            run_at=seeded["starts"] - timedelta(hours=24),
+        ),
+    )
+
+    client = FakeBookingMap(
+        {
+            str(BOOKING): booking_body(seeded["starts"], canceled=True, status_type="canceled"),
+            str(BOOKING_TWO): booking_body(seeded["starts"], booking_uuid=BOOKING_TWO),
+        }
+    )
+    async with session_maker() as session:
+        plan = await build_plan(
+            session,
+            manifest=wave_manifest(),
+            company_ids=(COMPANY,),
+            run_ids=("run-1", "run-2"),
+            client=client,
+            sleep=_no_sleep,
+        )
+
+    assert plan.refused == {"local_target_mismatch": 1}
+    assert plan.cutover_ready is False, "one unproven row blocks the whole atomic wave"
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_cancellation_becomes_terminal_canceled_and_the_wave_can_cut_over(
+    session_maker, seeded, tmp_path: Path
+) -> None:
+    starts = seeded["starts"]
+    live = booking_body(starts, canceled=True, status_type="canceled")
+
+    async with session_maker() as session:
+        target = await session.get(Record, seeded["target_pk"])
+        booking_id = target.altegio_record_id
+    event_id = await seed_failed_null_service_cancellation(session_maker, starts_at=starts, booking_id=booking_id)
+
+    # A queued Altegio reminder the handover — and ONLY the handover — may
+    # withdraw, plus the marker only the handover may set.
+    stale = await add_job(
+        session_maker,
+        provider=PROVIDER_ALTEGIO,
+        record_pk=seeded["source_pk"],
+        job_type=REMINDER_24H,
+        status="queued",
+        dedupe_key=make_dedupe_key(
+            job_type=REMINDER_24H,
+            company_id=COMPANY,
+            record_id=seeded["source_pk"],
+            run_at=starts - timedelta(hours=24),
+        ),
+    )
+
+    # --- before the recovery: the row is unproven and blocks the wave --------
+    before = await plan_for(session_maker, answer=live)
+    assert before.scoped == ()
+    assert before.refused == {"local_target_mismatch": 1}
+    assert before.cutover_ready is False
+
+    # --- the recovery -------------------------------------------------------
+    recovery_plan, recovery_result = await run_recovery(session_maker, event_id=event_id, live=live, tmp_path=tmp_path)
+    assert recovery_plan.apply_ready is True
+    assert recovery_result.outcome == recovery.OUTCOME_APPLIED
+
+    # It fixed the local cancellation state and nothing about the handover's
+    # own half: the Altegio reminder is still queued and still Altegio's.
+    async with session_maker() as session:
+        target = await session.get(Record, seeded["target_pk"])
+        altegio_job = await session.get(MessageJob, stale)
+    assert target.is_deleted is True
+    assert altegio_job.status == "queued"
+    assert altegio_job.provider == PROVIDER_ALTEGIO
+    assert await ledger_marker(session_maker) == (None, None), "recovery must not bypass the handover"
+
+    # --- after the recovery: §30 can classify and cut over ------------------
+    after = await plan_for(session_maker, answer=live)
+    assert len(after.scoped) == 1
+    assert after.scoped[0].disposition == DISPOSITION_TERMINAL_CANCELED
+    assert after.to_create == 0, "a cancelled booking owes no EasyWeek reminder"
+    assert after.cutover_ready is True
+
+    result = await run_apply(session_maker, after)
+    assert result.halted is None
+    assert result.created_job_ids == ()
+    assert result.canceled_job_ids == (stale,)
+
+    async with session_maker() as session:
+        altegio_job = await session.get(MessageJob, altegio_job.id)
+    assert altegio_job.status == "canceled"
+    assert altegio_job.last_error == CANCEL_REASON
+    marked_at, marked_digest = await ledger_marker(session_maker)
+    assert marked_at is not None and marked_digest is not None
+    assert [job.provider for job in await jobs(session_maker)] == [PROVIDER_ALTEGIO]

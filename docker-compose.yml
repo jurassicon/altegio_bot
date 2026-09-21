@@ -494,6 +494,41 @@ services:
     profiles:
       - ops
 
+  # Operator-only recovery of explicitly named EasyWeek `booking-canceled`
+  # events that failed with `invalid_payload` because the delivery carried
+  # `service_id: null`. Normalizing that shape fixes future deliveries; the
+  # rows that already reached a terminal `failed` are never claimed again, and
+  # this is the only supported way to finish them.
+  #
+  # plan and verify are read-only. apply needs `--apply`, the plan digest, the
+  # confirmation phrase AND
+  # EASYWEEK_FAILED_CANCELLATION_RECOVERY_ALLOW_APPLY=true, which is passed per
+  # invocation and is deliberately NOT part of this definition. It can create
+  # no MessageJob and no OutboxMessage, and it calls no EasyWeek mutation
+  # endpoint, Meta or Chatwoot. `--event-id` is required: there is no `--all`.
+  easyweek-failed-cancellation-recovery:
+    build: .
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${EASYWEEK_FAILED_CANCELLATION_RECOVERY_STATE_DIR:-./outputs/easyweek_failed_cancellation_recovery}:/recovery
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "-m",
+        "altegio_bot.scripts.easyweek_failed_cancellation_recovery",
+      ]
+    command: ["--help"]
+    working_dir: /app
+    restart: "no"
+    profiles:
+      - ops
+
 volumes:
   postgres_data:
   redis_data:

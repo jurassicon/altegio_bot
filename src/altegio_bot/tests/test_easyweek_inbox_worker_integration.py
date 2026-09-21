@@ -6411,3 +6411,163 @@ async def test_replaying_the_same_lower_quantity_event_is_idempotent(
     assert first_digest.digest == second_digest.digest
     assert {job.dedupe_key for job in second} >= {job.dedupe_key for job in first}
     assert len({job.dedupe_key for job in second}) == len(second)
+
+
+# ===========================================================================
+# Production event 360: `booking-canceled` carrying `service_id: null`
+# ===========================================================================
+#
+# Before the normalizer contract was widened, such a delivery reached
+# `failed`/`invalid_payload` and changed nothing at all. These tests are about
+# the FUTURE deliveries: an ordinary, timely cancellation whose `service_id` is
+# a literal null must run the ordinary cancellation path and nothing more.
+
+
+def _null_service_cancel(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = payload if payload is not None else booking_canceled()
+    body["service_id"] = None
+    return body
+
+
+async def test_null_service_id_cancellation_deletes_the_record(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _null_service_cancel(), event_hint="booking-canceled", payload_hash="h2")
+    assert await _run_until_idle() == 1
+
+    async with bound_session_local() as session:
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+        assert record.is_deleted is True
+        assert record.easyweek_booking_uuid == uuid.UUID(TEST_BOOKING_UUID)
+        statuses = list((await session.execute(select(EasyWeekEvent.status).order_by(EasyWeekEvent.id))).scalars())
+        assert statuses == ["processed", "processed"]
+        codes = list((await session.execute(select(EasyWeekEvent.error_code))).scalars())
+        assert codes == [None, None]
+
+
+async def test_null_service_id_cancellation_keeps_the_proven_service_identity(bound_session_local) -> None:
+    """The cancellation carries no new selection, so it must not move the snapshot."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        before = list((await session.execute(select(RecordService).order_by(RecordService.service_id))).scalars())
+        assert [row.service_id for row in before] == [5100003]
+        before_cost = before[0].cost_to_pay
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _null_service_cancel(), event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        after = list((await session.execute(select(RecordService).order_by(RecordService.service_id))).scalars())
+    assert [row.service_id for row in after] == [5100003], "the proven service row must survive the cancellation"
+    assert after[0].cost_to_pay == before_cost
+
+
+async def test_null_service_id_cancellation_withdraws_only_queued_easyweek_reminders(
+    bound_session_local, _reminders_on
+) -> None:
+    start = _future(days=3)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _at(booking_created(), start), payload_hash="h1")
+    await _run_until_idle()
+    assert [(row[0], row[1]) for row in await _reminder_rows(bound_session_local)] == [
+        ("reminder_24h", "queued"),
+        ("reminder_2h", "queued"),
+    ]
+
+    # A reminder that already went out is history, not an obligation: it must
+    # stay `done` rather than be swept up by the withdrawal.
+    async with bound_session_local() as session:
+        async with session.begin():
+            await session.execute(update(MessageJob).where(MessageJob.job_type == "reminder_24h").values(status="done"))
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(
+                session,
+                _null_service_cancel(_at(booking_canceled(), start)),
+                event_hint="booking-canceled",
+                payload_hash="h2",
+            )
+    await _run_until_idle()
+
+    rows = await _reminder_rows(bound_session_local)
+    assert sorted((row[0], row[1]) for row in rows) == [("reminder_24h", "done"), ("reminder_2h", "canceled")]
+
+    async with bound_session_local() as session:
+        providers = set((await session.execute(select(MessageJob.provider))).scalars().all())
+    assert providers == {"easyweek"}, "the withdrawal must stay inside the EasyWeek provider"
+
+
+async def test_null_service_id_cancellation_keeps_the_canonical_realtime_lifecycle(
+    bound_session_local, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timely webhook is still a timely webhook: the hotfix is not a send fence."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    monkeypatch.setattr(settings, "easyweek_notifications_enabled", True, raising=False)
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, _null_service_cancel(), event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    jobs = await _easyweek_jobs(bound_session_local)
+    assert [job.job_type for job in jobs] == ["record_canceled"]
+    assert jobs[0].status == "queued"
+
+
+async def test_a_duplicate_null_service_id_cancellation_is_idempotent(bound_session_local) -> None:
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+            await _capture(session, _null_service_cancel(), event_hint="booking-canceled", payload_hash="h2")
+            await _capture(session, _null_service_cancel(), event_hint="booking-canceled", payload_hash="h2")
+    assert await _run_until_idle() == 3
+
+    async with bound_session_local() as session:
+        statuses = list((await session.execute(select(EasyWeekEvent.status).order_by(EasyWeekEvent.id))).scalars())
+        assert statuses == ["processed"] * 3
+        records, clients, jobs = await _counts(session)
+    assert (records, clients, jobs) == (1, 1, 0)
+
+
+async def test_a_null_service_id_cancellation_with_a_conflicting_identity_stays_fail_closed(
+    bound_session_local,
+) -> None:
+    """The widened field must not widen identity: a stolen numeric id still conflicts."""
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, booking_created(), payload_hash="h1")
+    await _run_until_idle()
+
+    impostor = _null_service_cancel()
+    impostor["uid"] = "99999999-2222-4333-8444-555555555555"
+
+    async with bound_session_local() as session:
+        async with session.begin():
+            await _capture(session, impostor, event_hint="booking-canceled", payload_hash="h2")
+    await _run_until_idle()
+
+    async with bound_session_local() as session:
+        rows = list(
+            (
+                await session.execute(select(EasyWeekEvent.status, EasyWeekEvent.error_code).order_by(EasyWeekEvent.id))
+            ).all()
+        )
+        record = (await session.execute(select(Record).where(Record.provider == "easyweek"))).scalars().one()
+    assert rows[1] == ("failed", NormalizationError.IDENTITY_CONFLICT)
+    assert record.is_deleted is False, "a conflicting delivery must change nothing"
