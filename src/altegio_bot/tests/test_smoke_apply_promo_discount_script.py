@@ -18,6 +18,9 @@ from altegio_bot.promo_discount_apply import PromoDiscountApplyError, PromoDisco
 from altegio_bot.scripts.smoke_apply_promo_discount import _build_parser, _run
 from altegio_bot.settings import settings
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 _ARGS = ["--location-id", "123", "--card-id", "456", "--program-id", "789", "--record-id", "111"]
 _PATCH = "altegio_bot.scripts.smoke_apply_promo_discount.apply_promo_discount_to_visit"
 

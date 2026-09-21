@@ -32,6 +32,9 @@ from altegio_bot.models.models import Client, PromoLead, Record, RecordService
 from altegio_bot.scripts.find_promo_discount_smoke_candidate import _build_parser, _run
 from altegio_bot.settings import settings
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 _UTC = timezone.utc
 _FUTURE = datetime(2099, 1, 1, tzinfo=_UTC)
 _PAST = datetime(2020, 1, 1, tzinfo=_UTC)

@@ -21,6 +21,9 @@ from altegio_bot.workers.inbox_worker import (
     upsert_record,
 )
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 
 class TestParseDt:
     """Tests for parse_dt DST handling."""

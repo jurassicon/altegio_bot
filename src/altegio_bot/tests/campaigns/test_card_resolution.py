@@ -52,6 +52,9 @@ from altegio_bot.campaigns.runner import RunParams, run_send_real
 from altegio_bot.campaigns.segment import ClientCandidate, ClientSnapshot
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 COMPANY = 758285
 LOCATION = 1
 CARD_TYPE = "type-res"

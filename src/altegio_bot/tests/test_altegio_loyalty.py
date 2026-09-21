@@ -8,6 +8,9 @@ import respx
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 BASE = "https://api.alteg.io/api/v1"
 
 

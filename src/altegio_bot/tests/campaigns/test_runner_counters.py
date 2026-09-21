@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from altegio_bot.campaigns.runner import _update_run_exclusion_counters
 from altegio_bot.campaigns.segment import ClientCandidate
+
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
 
 
 def _make_run() -> SimpleNamespace:

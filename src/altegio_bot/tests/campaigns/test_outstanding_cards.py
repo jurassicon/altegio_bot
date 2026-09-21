@@ -34,6 +34,9 @@ from altegio_bot.campaigns.loyalty_cleanup import (
 )
 from altegio_bot.models.models import CampaignRecipient, CampaignRun
 
+# Altegio-only: quarantined from the required PR gate (docs/ops/test_suite_tiers.md).
+pytestmark = pytest.mark.legacy_altegio
+
 CAMPAIGN_CODE = "new_clients_monthly"
 COMPANY_ID = 758285
 LOCATION_ID = 758285

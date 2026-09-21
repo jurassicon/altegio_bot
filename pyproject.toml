@@ -37,8 +37,19 @@ where = ['src']
 
 [tool.pytest.ini_options]
 asyncio_mode = 'auto'
-addopts = '-q'
+# `--strict-markers` turns a typo such as `legacy_altegia` into a collection
+# error instead of a silently unmarked test that stays in the required suite
+# while its author believes it was quarantined.
+#
+# `addopts` deliberately does NOT carry `-m "not legacy_altegio"`. A plain
+# `uv run pytest` must stay the full project suite, and a new test must land in
+# the required tier unless somebody marks it by hand. The negative filter lives
+# only in the required CI invocation; see docs/ops/test_suite_tiers.md.
+addopts = '-q --strict-markers'
 testpaths = ['src/altegio_bot/tests']
+markers = [
+  'legacy_altegio: only tests of Altegio-only functionality withdrawn from the required PR gate. Never for EasyWeek, migration/handover, provider isolation, security or shared-runtime behaviour, which stay required. Applied per module as `pytestmark`, never by path or filename heuristics. Runs nightly and on demand via the Legacy Altegio Tests workflow.',
+]
 
 [tool.ruff]
 
