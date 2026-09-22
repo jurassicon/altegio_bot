@@ -99,6 +99,11 @@ _CANONICAL_PROVIDER_TABLES = (
     # campaign row, and a row that did not say which provider it belongs to
     # could be joined to the wrong one.
     "easyweek_manual_voucher_delivery_ledger",
+    # §41's batch header and its slots, for the same reason again. Both name a
+    # campaign row through a COMPOSITE foreign key that includes the provider,
+    # which is only possible because they carry the column themselves.
+    "easyweek_voucher_snapshot_batches",
+    "easyweek_voucher_snapshot_batch_items",
 )
 
 # (table, pre-PR-3 constraint, provider-scoped replacement)

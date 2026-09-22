@@ -1709,6 +1709,32 @@ async def _apply_manual_voucher_status(session: AsyncSession, provider_message_i
     return result.reason != manual_voucher_ledger.RECORD_MISSING_ROW
 
 
+async def _apply_voucher_batch_status(session: AsyncSession, provider_message_id: str, kind: str) -> bool:
+    """Record a delivered/read callback for the §41 voucher snapshot batch.
+
+    The same contract as its two siblings and for the same reason: a batch slot
+    has no ``OutboxMessage`` either, so a callback naming its message id would
+    otherwise fall through to a lookup that finds nothing and be dropped.
+
+    Returns whether this callback belonged to that batch. It runs inside the
+    caller's session and transaction; a callback for any other message returns
+    ``False`` immediately and falls through to the ordinary path.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_batch import ledger as voucher_batch_ledger
+
+    result = await voucher_batch_ledger.apply_webhook_transition(
+        session,
+        provider_message_id=provider_message_id,
+        status=kind,
+    )
+    if result.applied:
+        logger.info("status_webhook: voucher snapshot batch advanced to %s", kind)
+        return True
+    # A refused write is either "not ours" — fall through — or "ours, and
+    # already at or past this status", which is handled and done.
+    return result.reason != voucher_batch_ledger.RECORD_MISSING_ROW
+
+
 async def _handle_delivery_statuses(
     session: AsyncSession,
     event: WhatsAppEvent | None,
@@ -1733,6 +1759,12 @@ async def _handle_delivery_statuses(
         # way. Asked second and only when the first said "not mine": the two
         # ledgers are separate tables and one message id belongs to at most one.
         if kind in {"delivered", "read"} and await _apply_manual_voucher_status(session, provider_message_id, kind):
+            continue
+
+        # And the §41 snapshot batch, whose slots own their message ids the same
+        # way. Asked third, on the same terms: the three ledgers are separate
+        # tables and one message id belongs to at most one of them.
+        if kind in {"delivered", "read"} and await _apply_voucher_batch_status(session, provider_message_id, kind):
             continue
 
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
