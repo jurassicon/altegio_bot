@@ -59,12 +59,14 @@ import sys
 from datetime import datetime
 from typing import Any, Final
 
+from altegio_bot.campaigns.easyweek_voucher_batch import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_batch import runner as runner_module
 from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     ACCOUNT_UNCONFIGURED,
     BATCH_DISABLED,
     BATCH_STAGES,
     DATABASE_UNAVAILABLE,
+    MUTATION_UNKNOWN,
     RUNTIME_IDENTITY_UNUSABLE,
     STAFFER_UNCONFIGURED,
     STAGE_CREATE,
@@ -285,14 +287,23 @@ async def _run_stage(request: BatchRequest, args: argparse.Namespace) -> tuple[d
 
 
 async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    # The fence is checked before anything opens a socket or a session — the
-    # read-only plan included. A closed fence means this command does nothing at
-    # all, not "nothing that writes".
-    if not settings.easyweek_voucher_snapshot_batch_enabled:
-        return _refusal_report(args.command, [BATCH_DISABLED]), EXIT_CONTRACT_MISMATCH
-
+    # `status` is answered BEFORE the fence, and only `status`.
+    #
+    # It reads the durable ledger and nothing else: no HTTP, no approval, no
+    # mutation, no transport constructed. Putting it behind the fence would
+    # make the state unreadable at exactly the moment an operator needs it
+    # most — after an emergency `false`, when the question is what a halted
+    # batch left behind and whether a draft is still open in the POS. Refusing
+    # to answer that would not be safety; it would be an operator running SQL
+    # by hand instead.
     if args.command == COMMAND_STATUS:
         return await _run_status()
+
+    # Everything else is behind the fence, before anything opens a socket or a
+    # session — the read-only plan included. A closed fence means the command
+    # does nothing at all, not "nothing that writes".
+    if not settings.easyweek_voucher_snapshot_batch_enabled:
+        return _refusal_report(args.command, [BATCH_DISABLED]), EXIT_CONTRACT_MISMATCH
 
     request, refusal = _build_request(args)
     if refusal is not None or request is None:
@@ -305,20 +316,107 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     return await _run_stage(request, args)
 
 
+# The commands that can reach EasyWeek or Meta. A failure inside one of these
+# cannot be reported as "nothing happened", because by the time anything can go
+# wrong the durable claim is already committed and the request may already have
+# left. Everything else — `status`, `plan`, `reconcile` and `freeze` — either
+# reads or writes locally; none of them constructs a mutation transport at all,
+# so their failure provably started no external effect.
+_EFFECTFUL_COMMANDS: Final = frozenset({STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND})
+
+
+def _durable_batch() -> dict[str, Any] | None:
+    """The batch as the database currently reads it, or ``None`` if unreadable.
+
+    Used only on the failure path, to answer an operator's real question — what
+    does the ledger say NOW — rather than repeating what the crashed command
+    believed a moment ago. Fails silently to ``None``: a second exception here
+    must not replace the first report with a worse one.
+    """
+    try:
+        report = asyncio.run(runner_module.run_status(SessionLocal))
+    except Exception:  # noqa: BLE001 - an unreadable database is itself the answer
+        return None
+    return report.as_safe_dict().get("batch")
+
+
+def _has_unresolved_slot(batch: dict[str, Any] | None) -> bool:
+    """Does the ledger hold a slot whose request may have left this process?
+
+    The claim is committed before the request goes out, so an unresolved slot is
+    the durable trace of a possible external effect — and the absence of one,
+    on a ledger that still answers, is the only thing that makes "nothing
+    started" a fact rather than a hope.
+    """
+    if batch is None:
+        return False
+    return any(str(item.get("status")) in ledger_module.UNRESOLVED_ITEM_STATUSES for item in (batch.get("items") or []))
+
+
+def _unexpected_failure(command: str) -> tuple[dict[str, Any], int]:
+    """What to print when a mutating stage died somewhere nobody planned for.
+
+    The old behaviour was the dangerous one: a blanket handler that answered
+    `refused`, `external_effect_attempted=false` and exit 4 for ANY exception —
+    including one raised after a voucher had been created, after €15 had been
+    charged, or after Meta had accepted a message. Exit 4 is a promise that
+    nothing started. That promise may only be made when it is provable.
+
+    What makes "nothing started" PROVABLE is the invariant the whole phase is
+    built on: a request only ever leaves after its claim is committed. So a
+    ledger that still answers, and that holds no slot in an unresolved state,
+    is proof that no CREATE, PAY, REFUND or Meta POST was made by the command
+    that just died — and only then is exit 4 honest. A ledger that cannot be
+    read proves nothing at all, and neither does one holding a claim.
+
+    Nothing here prints a traceback, an exception message, SQL, a URL, a
+    customer UUID, a phone number or a voucher code.
+    """
+    batch = _durable_batch()
+    claimed = _has_unresolved_slot(batch)
+
+    if command not in _EFFECTFUL_COMMANDS or (batch is not None and not claimed):
+        payload = _refusal_report(command, [DATABASE_UNAVAILABLE])
+        if batch is not None:
+            # Still worth showing: a freeze that committed and then failed to
+            # print must not read as though no batch exists.
+            payload["batch"] = batch
+        return payload, EXIT_CONTRACT_MISMATCH
+
+    reasons = [MUTATION_UNKNOWN] if batch is not None else [MUTATION_UNKNOWN, DATABASE_UNAVAILABLE]
+    report = runner_module.StageReport(
+        stage=command,
+        outcome="unknown",
+        reasons=reasons,
+        # Not proven to have happened — and, crucially, not proven not to.
+        external_effect_attempted=True,
+        external_send_attempted=command == STAGE_DELIVER,
+        reconciliation_required=True,
+        # The claim halts the batch in its own transaction, so a readable
+        # ledger says so itself. When it is unreadable, the conservative
+        # reading is the only safe one, and `DATABASE_UNAVAILABLE` above says
+        # which case this is.
+        halted=bool(batch.get("halted")) if batch is not None else True,
+        batch=batch or {},
+    )
+    return report.as_safe_dict(), EXIT_UNKNOWN
+
+
 def main(argv: list[str] | None = None) -> int:
     redact_easyweek_url_logging()
     args = _build_parser().parse_args(argv)
     try:
         payload, code = asyncio.run(_dispatch(args))
     except EasyWeekConfigError:
-        # A deployment fault, not a verdict about the batch. Named, without the
+        # A deployment fault, and one raised while building the transport —
+        # before any claim and before any request. Named, without the
         # configuration it is complaining about.
         payload, code = _refusal_report(args.command, [RUNTIME_IDENTITY_UNUSABLE]), EXIT_CONTRACT_MISMATCH
     except Exception:  # noqa: BLE001 - a stable, PII-free surface for operators
         # Deliberately no traceback, no exception text and no SQL: an operator
         # report is pasted into tickets, and an exception string here could
         # carry a URL with a customer UUID in it.
-        payload, code = _refusal_report(args.command, [DATABASE_UNAVAILABLE]), EXIT_CONTRACT_MISMATCH
+        payload, code = _unexpected_failure(args.command)
     _print_json(payload)
     return code
 

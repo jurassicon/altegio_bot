@@ -68,6 +68,7 @@ from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     DELIVERY_ALREADY_ATTEMPTED,
     FROZEN_DIGEST_MISMATCH,
     HALTED_BY_PREDECESSOR,
+    IDENTITY_BINDING_MISMATCH,
     KARLSRUHE_COMPANY_ID,
     LEDGER_STATE_UNEXPECTED,
     MARKER_SEARCH_AMBIGUOUS,
@@ -149,6 +150,36 @@ from altegio_bot.utils import utcnow
 # How long after a claim a created order may have been opened. Bounded locally,
 # because §35 proved the server-side date filters answer 422 for this shape.
 CREATE_WINDOW = timedelta(minutes=30)
+
+# What a crash can leave behind, per stage, and what a reconcile may look at.
+#
+# ``*_claimed`` is a process that died between the commit and the answer;
+# ``*_unknown`` is a process that lived long enough to say so. They mean exactly
+# the same thing about the world — the request may have gone out — so the
+# GET-only reconcile treats them identically. Neither appears in any
+# ``*_CLAIMABLE_FROM`` set, so widening reconcile here can never widen what may
+# be claimed again.
+CREATE_RECOVERABLE_FROM: frozenset[str] = frozenset(
+    {VOUCHER_BATCH_ITEM_CREATE_CLAIMED, VOUCHER_BATCH_ITEM_CREATE_UNKNOWN}
+)
+PAY_RECOVERABLE_FROM: frozenset[str] = frozenset({VOUCHER_BATCH_ITEM_PAY_CLAIMED, VOUCHER_BATCH_ITEM_PAY_UNKNOWN})
+REFUND_RECOVERABLE_FROM: frozenset[str] = frozenset(
+    {VOUCHER_BATCH_ITEM_REFUND_CLAIMED, VOUCHER_BATCH_ITEM_REFUND_UNKNOWN}
+)
+# A send is different from the three above and always will be: whether Meta
+# delivered a message is not a fact a POS order can answer, and a slot that was
+# claimed but never recorded a provider message id has no identifier to ask
+# about. It stays fail-closed for a human.
+SEND_UNRESOLVED: frozenset[str] = frozenset({VOUCHER_BATCH_ITEM_SEND_CLAIMED, VOUCHER_BATCH_ITEM_SEND_UNKNOWN})
+
+# Where an unresolved claim is parked once a reconcile has looked and still
+# cannot prove what happened. Same meaning, one fact added: somebody looked.
+_RECONCILED_UNKNOWN: dict[str, str] = {
+    VOUCHER_BATCH_ITEM_CREATE_CLAIMED: VOUCHER_BATCH_ITEM_CREATE_UNKNOWN,
+    VOUCHER_BATCH_ITEM_PAY_CLAIMED: VOUCHER_BATCH_ITEM_PAY_UNKNOWN,
+    VOUCHER_BATCH_ITEM_REFUND_CLAIMED: VOUCHER_BATCH_ITEM_REFUND_UNKNOWN,
+    VOUCHER_BATCH_ITEM_SEND_CLAIMED: VOUCHER_BATCH_ITEM_SEND_UNKNOWN,
+}
 
 # Which item states each stage may act on. A slot in any other state is simply
 # not part of this stage's work; a stage with no work at all is refused.
@@ -399,6 +430,29 @@ def _identity_from_snapshot(
     )
 
 
+def _runtime_identity_matches(request: BatchRequest, snapshot: ledger_module.BatchSnapshot) -> bool:
+    """Is the environment this process runs in the one the batch was frozen with?
+
+    Four UUIDs decide where a real €15 goes: which branch, which staffer sells,
+    which POS account is charged and which product is sold. All four arrive from
+    the environment at start-up, and nothing stops an operator restarting the
+    container with a different value between the freeze and the payment.
+
+    The ledger already stores what was approved, so the comparison is cheap and
+    the consequence is not: a batch frozen against one payment account must
+    never be paid from another. Answered as a boolean — the UUIDs themselves
+    stay out of every report, exactly as the redaction policy requires.
+    """
+    if not snapshot.exists:
+        return True
+    return (
+        snapshot.location_uuid == request.location_uuid
+        and snapshot.staffer_uuid == request.staffer_uuid
+        and snapshot.payment_account_uuid == request.payment_account_uuid
+        and snapshot.voucher_template_uuid == request.voucher_template_uuid
+    )
+
+
 def _refusal(
     stage: str,
     reasons: tuple[str, ...] | list[str],
@@ -570,6 +624,16 @@ async def build_stage_plan(
     if snapshot.exists and run_id != request.preview_run_id:
         reasons.append(COMPOSITION_DRIFTED)
 
+    # The four UUIDs that decide where a real €15 goes — branch, staffer,
+    # payment account, product — arrive from the environment, and a container
+    # restarted with different values between the freeze and the payment would
+    # otherwise charge an account nobody approved. Checked for every stage that
+    # comes after a freeze, the refund included, and the drift costs zero
+    # external calls because the plan simply is not ready.
+    runtime_identity_bound = _runtime_identity_matches(request, snapshot)
+    if not runtime_identity_bound:
+        reasons.append(IDENTITY_BINDING_MISMATCH)
+
     # The live guard over every member, before every stage that can reach a
     # person — and deliberately NOT before a refund.
     #
@@ -708,6 +772,11 @@ async def build_stage_plan(
         # Stated rather than implied: a refund's report must not read as though
         # a live guard passed when none was run.
         "live_guard_applied": stage != STAGE_REFUND,
+        # A boolean, deliberately. The staffer and the payment account are
+        # operational identities that no report prints, so what the digest
+        # binds is the VERDICT about them: an approval taken while the
+        # environment matched cannot be replayed once it no longer does.
+        "runtime_identity_matches_frozen": runtime_identity_bound,
         "baseline": baseline.as_safe_dict(),
         "batch": snapshot.as_safe_dict(),
     }
@@ -923,11 +992,16 @@ async def run_create(
         # EasyWeek, and nothing in this process may assume otherwise.
         calls += 1
         try:
+            # Every identity on the wire comes from the FROZEN batch, not from
+            # the environment this process happens to have been started with.
+            # The plan already refuses a mismatch; using the frozen values here
+            # means even a plan that somehow got through cannot sell a
+            # different product from a different branch.
             response = await mutator.create_voucher_order(
-                location_uuid=request.location_uuid,
+                location_uuid=identity.location_uuid,
                 customer_uuid=customer,
-                staffer_uuid=request.staffer_uuid,
-                voucher_template_uuid=request.voucher_template_uuid,
+                staffer_uuid=identity.staffer_uuid,
+                voucher_template_uuid=identity.voucher_template_uuid,
                 price_minor=UNIT_PRICE_MINOR,
                 marker=item.reconciliation_marker,
             )
@@ -993,7 +1067,7 @@ async def run_create(
             customer_uuid=customer,
             order_reader=order_reader,
             response=response,
-            voucher_template_uuid=request.voucher_template_uuid,
+            voucher_template_uuid=identity.voucher_template_uuid,
         )
         results.append(result)
         if result.outcome != "created":
@@ -1265,9 +1339,11 @@ async def run_pay(
 
         calls += 1
         try:
+            # The account the batch was frozen with, never the one this
+            # process was started with.
             await mutator.pay_voucher_order(
                 order_uuid=item.target_order_uuid,
-                account_uuid=request.payment_account_uuid,
+                account_uuid=identity.payment_account_uuid,
             )
         except EasyWeekVoucherMutationUnknown:
             await ledger_module.record_item_outcome(
@@ -1303,7 +1379,7 @@ async def run_pay(
                 slot=slot,
                 item=item,
                 order_reader=order_reader,
-                voucher_template_uuid=request.voucher_template_uuid,
+                voucher_template_uuid=identity.voucher_template_uuid,
             )
         )
         if results[-1].outcome != "paid":
@@ -1779,10 +1855,13 @@ async def _recover_unknown_create(
     voucher_template_uuid: str,
     order_reader: Any,
 ) -> tuple[list[str], str | None, list[dict[str, Any]]]:
-    """The GET-only proof path out of one slot's ``create_unknown``.
+    """The GET-only proof path out of one slot's crashed or unknown CREATE.
 
     Never a second CREATE. Either the order is found and proves out — in which
     case the slot becomes ``created`` — or it stays unknown and a human decides.
+    Serves ``create_claimed`` and ``create_unknown`` alike: a process that died
+    between the commit and the answer left exactly the same question behind as
+    one that lived to report a timeout.
 
     Zero matches is NOT "it was not created": the walk may simply not have seen
     it, and a create we cannot see is not a create we can deny. Several matches,
@@ -1882,7 +1961,10 @@ async def _recover_unknown_create(
         session_maker,
         slot=item.slot,
         status=VOUCHER_BATCH_ITEM_CREATED,
-        expected_statuses=frozenset({VOUCHER_BATCH_ITEM_CREATE_UNKNOWN}),
+        # Both crash shapes, because both mean the same thing about the world:
+        # a process that died holding the claim and one that recorded an
+        # unknown answer are recovered by the same exact readback.
+        expected_statuses=CREATE_RECOVERABLE_FROM,
         target_order_uuid=candidate,
         voucher_code_hmac=None if keep_existing else digest,
         hmac_key_id=None if keep_existing else key_id,
@@ -1892,6 +1974,38 @@ async def _recover_unknown_create(
         evidence={"create_recovery_readback": observation.as_safe_dict()},
     )
     return [], state, observations
+
+
+async def _park_unresolved(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    item: ledger_module.ItemSnapshot,
+    reason: str,
+) -> None:
+    """Record that a reconcile looked at a crashed claim and still cannot say.
+
+    Moves ``*_claimed`` to the matching ``*_unknown`` and does nothing else. The
+    destination is deliberately another unresolved state: it is not in any
+    ``*_CLAIMABLE_FROM`` set, so this can never turn "we could not prove it"
+    into permission to send the request again. What it adds is the one fact the
+    row was missing — that a human-driven reconcile has already been here, and
+    with which reason.
+    """
+    parked = _RECONCILED_UNKNOWN.get(item.status)
+    if parked is None:
+        return
+    await ledger_module.record_item_outcome(
+        session_maker,
+        slot=item.slot,
+        status=parked,
+        expected_statuses=frozenset({item.status}),
+        reason_code=reason,
+        reconciliation_required=True,
+        # A create whose answer was lost may still have left an open draft, and
+        # a reconcile that found nothing has not proved otherwise.
+        manual_cleanup_required=True if item.status == VOUCHER_BATCH_ITEM_CREATE_CLAIMED else None,
+        attempt_outcome="unknown" if item.status == VOUCHER_BATCH_ITEM_SEND_CLAIMED else None,
+    )
 
 
 async def run_reconcile(
@@ -1926,7 +2040,10 @@ async def run_reconcile(
         slot_reasons: list[str] = []
         state: str | None = None
 
-        if item.status == VOUCHER_BATCH_ITEM_CREATE_UNKNOWN:
+        if item.status in CREATE_RECOVERABLE_FROM:
+            # `create_claimed` is the crash case and `create_unknown` the
+            # reported one; the world looks identical from here, so one proof
+            # path serves both.
             slot_reasons, state, slot_observations = await _recover_unknown_create(
                 session_maker,
                 item=item,
@@ -1935,6 +2052,11 @@ async def run_reconcile(
                 order_reader=order_reader,
             )
             observations.extend(slot_observations)
+            if slot_reasons:
+                # Nothing was proven. Absence is NOT proof the POST never left:
+                # the walk may simply not have seen the order, so the slot stays
+                # unresolved and nobody gets to send a second CREATE.
+                await _park_unresolved(session_maker, item=item, reason=slot_reasons[0])
         elif item.target_order_uuid is not None:
             payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
             if order_reason is not None:
@@ -1976,33 +2098,39 @@ async def run_reconcile(
                     slot_reasons.append(ARTIFACT_UNPROVEN)
 
                 # Only the transitions a readback PROVES, and only forwards.
-                if state == ORDER_PAID and item.status == VOUCHER_BATCH_ITEM_PAY_UNKNOWN and proven:
+                if state == ORDER_PAID and item.status in PAY_RECOVERABLE_FROM and proven:
+                    # The exact order reads paid and still proves out as ours.
+                    # That is the only thing that resolves a payment whose
+                    # answer was lost — including one whose process died with
+                    # the claim committed and nothing else written.
                     await ledger_module.record_item_outcome(
                         session_maker,
                         slot=item.slot,
                         status=VOUCHER_BATCH_ITEM_PAID,
-                        expected_statuses=frozenset({VOUCHER_BATCH_ITEM_PAY_UNKNOWN}),
+                        expected_statuses=PAY_RECOVERABLE_FROM,
                         verified_field="pay_verified_at",
                         reconciliation_required=False,
                         manual_cleanup_required=False,
                         evidence={"reconcile_readback": observation.as_safe_dict()},
                     )
-                elif state == ORDER_REFUNDED and item.status in (
-                    VOUCHER_BATCH_ITEM_REFUND_UNKNOWN,
-                    VOUCHER_BATCH_ITEM_PAY_UNKNOWN,
-                ):
+                elif state == ORDER_REFUNDED and item.status in (PAY_RECOVERABLE_FROM | REFUND_RECOVERABLE_FROM):
                     # A refunded order needs no artifact proof: the money is
                     # back, which is the outcome.
                     await ledger_module.record_item_outcome(
                         session_maker,
                         slot=item.slot,
                         status=VOUCHER_BATCH_ITEM_REFUNDED,
-                        expected_statuses=frozenset(
-                            {VOUCHER_BATCH_ITEM_REFUND_UNKNOWN, VOUCHER_BATCH_ITEM_PAY_UNKNOWN}
-                        ),
+                        expected_statuses=PAY_RECOVERABLE_FROM | REFUND_RECOVERABLE_FROM,
                         verified_field="refund_verified_at",
                         reconciliation_required=False,
                         manual_cleanup_required=False,
+                    )
+                elif item.status in (PAY_RECOVERABLE_FROM | REFUND_RECOVERABLE_FROM):
+                    # Read, and not proven. The order not reading paid or
+                    # refunded does not prove the POST never left, so the slot
+                    # is parked unresolved rather than reopened.
+                    await _park_unresolved(
+                        session_maker, item=item, reason=slot_reasons[0] if slot_reasons else ORDER_UNPROVEN
                     )
                 elif state in (ORDER_CANCELLED, ORDER_REFUNDED) and item.status == VOUCHER_BATCH_ITEM_CREATED:
                     # The operator closed the draft by hand in the dashboard.
@@ -2021,8 +2149,15 @@ async def run_reconcile(
 
         # A send whose outcome is unknown is NOT reconciled by reading an order:
         # whether Meta delivered the message is not a fact the POS system holds.
-        if item.status == VOUCHER_BATCH_ITEM_SEND_UNKNOWN:
+        #
+        # `send_claimed` is the same situation arrived at by a crash, and it is
+        # worse: the claim was committed, the attempt counter is already at one,
+        # and no provider message id was ever written — so there is not even an
+        # identifier to ask Meta about. It may not be retried, it may not be
+        # declared unsent, and it may not be refunded. It waits for a human.
+        if item.status in SEND_UNRESOLVED:
             slot_reasons.append(MUTATION_UNKNOWN)
+            await _park_unresolved(session_maker, item=item, reason=MUTATION_UNKNOWN)
 
         reasons.extend(slot_reasons)
         results.append(

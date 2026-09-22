@@ -222,11 +222,39 @@ class BatchComposition:
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
+    @property
+    def period_label(self) -> str | None:
+        """The wave an operator is approving, in one glance: ``2026-08-01..2026-08-31``.
+
+        Dates only, because that is the question being asked — WHICH monthly
+        wave is this — and a timestamp with a timezone offset invites a reader
+        to skim past it. The exact bounds stay beside it in full ISO, and the
+        digest signs those, not this label.
+        """
+        if self.campaign_period_start is None or self.campaign_period_end is None:
+            return None
+        return f"{self.campaign_period_start.date().isoformat()}..{self.campaign_period_end.date().isoformat()}"
+
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "composition_proven": self.proven,
             "reasons": list(self.reasons),
             "preview_run_id": self.preview_run_id,
+            # WHICH wave these people are entitled to, shown before the freeze
+            # and not only after it.
+            #
+            # It is the entitlement key, not a send date: a transitional August
+            # audience mailed in October is still an AUGUST entitlement, and an
+            # operator approving the wrong period would be approving a second
+            # €15 for people the August batch already served. Never inferred
+            # from today; always read from the run being frozen.
+            "campaign_period": self.period_label,
+            "campaign_period_start": self.campaign_period_start.isoformat()
+            if self.campaign_period_start is not None
+            else None,
+            "campaign_period_end": self.campaign_period_end.isoformat()
+            if self.campaign_period_end is not None
+            else None,
             "recipient_basis": RECIPIENT_BASIS_MANUAL,
             "first_visit_proof": FIRST_VISIT_NOT_APPLICABLE,
             "observed_active_recipients": self.observed_active,

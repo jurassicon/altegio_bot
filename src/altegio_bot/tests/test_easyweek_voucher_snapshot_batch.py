@@ -21,10 +21,11 @@ secrecy tests hunt for by name.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import uuid as uuid_module
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select, text
@@ -51,6 +52,7 @@ from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     ENTITLEMENT_ALREADY_EXISTS,
     FROZEN_DIGEST_MISMATCH,
     HALTED_BY_PREDECESSOR,
+    IDENTITY_BINDING_MISMATCH,
     LEDGER_STATE_UNEXPECTED,
     MAX_EXPOSURE_MINOR,
     MAX_RECIPIENTS,
@@ -76,7 +78,7 @@ from altegio_bot.campaigns.provider import (
     require_campaign_execution_provider,
 )
 from altegio_bot.easyweek_client import EasyWeekPermanentError
-from altegio_bot.easyweek_voucher_identity import EASYWEEK_VOUCHER_TEMPLATE_UUID
+from altegio_bot.easyweek_voucher_identity import EASYWEEK_VOUCHER_TEMPLATE_UUID, KARLSRUHE_LOCATION_UUID
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
@@ -85,7 +87,6 @@ from altegio_bot.models.models import (
     VOUCHER_BATCH_COMPLETED,
     VOUCHER_BATCH_HALTED,
     VOUCHER_BATCH_IN_PROGRESS,
-    VOUCHER_BATCH_ITEM_CREATE_CLAIMED,
     VOUCHER_BATCH_ITEM_CREATE_UNKNOWN,
     VOUCHER_BATCH_ITEM_CREATED,
     VOUCHER_BATCH_ITEM_DELIVERED,
@@ -94,6 +95,7 @@ from altegio_bot.models.models import (
     VOUCHER_BATCH_ITEM_PROVIDER_ACCEPTED,
     VOUCHER_BATCH_ITEM_READ,
     CampaignRecipient,
+    CampaignRun,
     EasyWeekManualVoucherDeliveryLedger,
     EasyWeekVoucherSnapshotBatch,
     EasyWeekVoucherSnapshotBatchAttempt,
@@ -101,6 +103,7 @@ from altegio_bot.models.models import (
     MessageJob,
     OutboxMessage,
 )
+from altegio_bot.settings import Settings, settings
 from altegio_bot.tests.easyweek_voucher_batch_fixtures import (  # noqa: F401 - fixtures
     ACCOUNT_UUID,
     BOOKING_LINK,
@@ -125,6 +128,7 @@ from altegio_bot.tests.easyweek_voucher_batch_fixtures import (  # noqa: F401 - 
     location_map,
     marker_orders,
     markers_for,
+    orders_page,
     rejected_outcome,
     seed_batch_preview,
     seed_template_and_sender,
@@ -959,45 +963,184 @@ async def test_a_proven_rejection_does_not_stop_the_rest_of_the_batch(
     assert snapshot.item(2).manual_cleanup_required is False
 
 
-async def test_a_crash_after_the_claim_reads_as_it_may_have_gone_out(
-    session_maker, batch_configuration, binding_key
+async def _advance_to(session_maker, reader, request, *, stage, count):
+    """Bring the batch to the state *stage* is claimed from, honestly.
+
+    Through the real commands, not by writing rows: a crash test that set up
+    its own ledger would be proving something about its own fixture.
+    """
+    await _full_create(session_maker, reader, request, count=count)
+    if stage in (STAGE_PAY,):
+        return
+    await _full_pay(session_maker, reader, request, count=count)
+
+
+async def _claim_for(session_maker, identity, *, stage, slot):
+    """Take the durable claim *stage* takes, and then stop — as a crash would."""
+    now = utcnow()
+    if stage == STAGE_CREATE:
+        return await ledger_module.claim_create(
+            session_maker,
+            identity=identity,
+            slot=slot,
+            plan_digest="d" * 64,
+            create_window_start=now - timedelta(minutes=30),
+            create_window_end=now + timedelta(minutes=30),
+        )
+    if stage == STAGE_PAY:
+        return await ledger_module.claim_pay(session_maker, identity=identity, slot=slot, plan_digest="d" * 64)
+    if stage == STAGE_REFUND:
+        return await ledger_module.claim_refund(session_maker, identity=identity, slot=slot, plan_digest="d" * 64)
+    snapshot = await ledger_module.load(session_maker)
+    item = snapshot.item(slot)
+    assert item is not None and item.pay_verified_at is not None
+    return await ledger_module.claim_send(
+        session_maker,
+        identity=identity,
+        slot=slot,
+        plan_digest="d" * 64,
+        # The CHECK requires a guard taken after the payment; a crash test must
+        # not be the thing that relaxes it.
+        live_guard_reproven_at=datetime.fromisoformat(item.pay_verified_at) + timedelta(seconds=1),
+        template_code="new_client_voucher",
+        meta_template_name="kitilash_ka_new_client_voucher_v1",
+        template_language="de",
+        sender_id=None,
+    )
+
+
+@pytest.mark.parametrize("stage", [STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND])
+async def test_a_crash_after_any_claim_halts_the_batch_and_shuts_the_suffix(
+    session_maker, batch_configuration, binding_key, stage
 ) -> None:
-    """The claim is committed before the request leaves, and that is visible."""
-    run_id, _ = await _frozen_batch(session_maker, count=2)
+    """A process that died after the claim must read as "it may have gone out".
+
+    The claim is committed before the request leaves, so what a later reader
+    sees is a slot that may or may not have reached EasyWeek or Meta. The part
+    this guards is what that does to the SLOTS BEHIND IT: until somebody proves
+    what happened, nothing else may be claimed. Testing only that the same slot
+    refuses would miss the whole failure — a second command claiming slot 2
+    while slot 1's request is still in flight.
+    """
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    if stage != STAGE_CREATE:
+        await _advance_to(session_maker, reader, request, stage=stage, count=count)
+    else:
+        await _freeze(session_maker, reader, request)
+        reader.orders = await marker_orders(session_maker, count=count)
+
     snapshot = await ledger_module.load(session_maker)
     identity = runner_module._identity_from_snapshot(snapshot)
     assert identity is not None
 
-    now = utcnow()
-    claim = await ledger_module.claim_create(
-        session_maker,
-        identity=identity,
-        slot=1,
-        plan_digest="d" * 64,
-        create_window_start=now - timedelta(minutes=30),
-        create_window_end=now + timedelta(minutes=30),
-    )
+    claim = await _claim_for(session_maker, identity, stage=stage, slot=1)
     assert claim.granted
 
-    # Nothing further ran. What a later process sees is exactly "claimed,
-    # outcome unknown" — and a claimed slot is an unresolved one, so the batch
-    # is halted and the suffix cannot be claimed.
+    # 1. The header itself is halted, in the very transaction that claimed.
     after = await ledger_module.load(session_maker)
-    assert after.item(1).status == VOUCHER_BATCH_ITEM_CREATE_CLAIMED
-    assert after.item(1).manual_cleanup_required is True
+    assert after.status == VOUCHER_BATCH_HALTED
+    assert after.halted_reason_code is not None
     assert after.item(1).reconciliation_required is True
-    assert after.status == VOUCHER_BATCH_IN_PROGRESS
 
-    second = await ledger_module.claim_create(
-        session_maker,
-        identity=identity,
-        slot=1,
-        plan_digest="e" * 64,
-        create_window_start=now,
-        create_window_end=now,
-    )
-    assert not second.granted
-    assert second.reason == ledger_module.CLAIM_REFUSED_STATE
+    # 2. The same slot cannot be claimed again.
+    again = await _claim_for(session_maker, identity, stage=stage, slot=1)
+    assert not again.granted
+    assert again.reason in (ledger_module.CLAIM_REFUSED_STATE, ledger_module.CLAIM_REFUSED_HALTED)
+
+    # 3. And neither can the NEXT one — the point of the whole exercise.
+    #
+    # The refund is the deliberate exception and stays reachable: it returns
+    # money rather than spending it, and a halt is exactly when an untouched
+    # paid slot most needs it. Every stage that could SPEND or SEND is shut.
+    successor = await _claim_for(session_maker, identity, stage=stage, slot=2)
+    if stage == STAGE_REFUND:
+        assert successor.granted
+    else:
+        assert not successor.granted
+        assert successor.reason == ledger_module.CLAIM_REFUSED_HALTED
+
+    # 4. A fresh plan for any spending or sending stage refuses, so no operator
+    # and no wrapper can walk past it.
+    for blocked in (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER):
+        plan = await _plan(session_maker, reader, stage=blocked, request=request)
+        assert not plan.ready, blocked
+        assert BATCH_HALTED in plan.reasons, blocked
+
+
+@pytest.mark.parametrize("stage", [STAGE_CREATE, STAGE_PAY, STAGE_DELIVER])
+async def test_a_command_run_after_a_crashed_claim_makes_no_external_call(
+    session_maker, batch_configuration, binding_key, stage
+) -> None:
+    """The refusal is worth nothing if the suffix still went out."""
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    if stage == STAGE_CREATE:
+        await _freeze(session_maker, reader, request)
+        reader.orders = await marker_orders(session_maker, count=count)
+    else:
+        await _advance_to(session_maker, reader, request, stage=stage, count=count)
+
+    snapshot = await ledger_module.load(session_maker)
+    identity = runner_module._identity_from_snapshot(snapshot)
+    assert identity is not None
+    assert (await _claim_for(session_maker, identity, stage=stage, slot=1)).granted
+
+    plan = await _plan(session_maker, reader, stage=stage, request=request)
+    assert not plan.ready
+    mutator = FakeMutator(create=_ok_response(0), pay=_ok_response(0))
+    sender = FakeSender()
+    common = {
+        "request": request,
+        "reader": reader,
+        "order_reader": reader,
+        "apply": True,
+        "supplied_digest": plan.digest,
+        "supplied_issued_at": plan.issued_at,
+        "supplied_phrase": plan.confirmation_phrase,
+    }
+    async with session_maker() as session:
+        if stage == STAGE_CREATE:
+            report = await runner_module.run_create(session, session_maker, mutator=mutator, **common)
+        elif stage == STAGE_PAY:
+            report = await runner_module.run_pay(session, session_maker, mutator=mutator, **common)
+        else:
+            report = await runner_module.run_deliver(session, session_maker, sender=sender, **common)
+
+    assert report.outcome == "refused"
+    assert mutator.calls == []
+    assert sender.calls == 0
+    assert report.external_calls == {"create": 0, "pay": 0, "refund": 0, "meta": 0}
+
+
+async def test_a_proven_outcome_lifts_the_halt_the_claim_raised(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """Halting at claim time must not strand a batch that then worked.
+
+    The halt is derived, not latched: recording a proven result re-derives the
+    header, and with nothing unresolved left the next slot becomes claimable
+    again. That is what lets a whole three-slot stage run to the end.
+    """
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+
+    report, mutator = await _full_create(session_maker, reader, request, count=count)
+
+    assert report.outcome == "applied"
+    assert len(mutator.create_calls) == count
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_BATCH_IN_PROGRESS
+    assert {entry.status for entry in snapshot.items} == {VOUCHER_BATCH_ITEM_CREATED}
 
 
 # ===========================================================================
@@ -1513,6 +1656,177 @@ async def test_reconcile_recovers_a_known_order_and_lifts_the_halt(
     assert snapshot.status == VOUCHER_BATCH_IN_PROGRESS
 
 
+@pytest.mark.parametrize("stage", [STAGE_CREATE, STAGE_PAY, STAGE_REFUND])
+async def test_reconcile_resolves_a_crashed_claim_whose_effect_did_happen(
+    session_maker, batch_configuration, binding_key, stage
+) -> None:
+    """The process died after the claim; the request had in fact gone out.
+
+    The order exists and proves out, so a GET-only reconcile is allowed to say
+    so and move the slot forward — which is what lifts the halt and lets the
+    rest of the batch continue.
+    """
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+
+    if stage == STAGE_CREATE:
+        await _freeze(session_maker, reader, request)
+    else:
+        await _full_create(session_maker, reader, request, count=count)
+    if stage == STAGE_REFUND:
+        await _full_pay(session_maker, reader, request, count=count)
+
+    snapshot = await ledger_module.load(session_maker)
+    identity = runner_module._identity_from_snapshot(snapshot)
+    assert identity is not None
+    assert (await _claim_for(session_maker, identity, stage=stage, slot=1)).granted
+    assert (await ledger_module.load(session_maker)).status == VOUCHER_BATCH_HALTED
+
+    # The world as it really is: the request DID leave, and the order shows it.
+    if stage == STAGE_CREATE:
+        reader.orders = await marker_orders(session_maker, count=count)
+        reader.order_pages = [
+            {
+                "data": [reader.orders[ORDER_UUIDS[0]]],
+                "meta": {"current_page": 1, "last_page": 1, "per_page": 100},
+            }
+        ]
+        expected = VOUCHER_BATCH_ITEM_CREATED
+    elif stage == STAGE_PAY:
+        reader.orders = await marker_orders(session_maker, count=count, status="paid")
+        expected = VOUCHER_BATCH_ITEM_PAID
+    else:
+        reader.orders = await marker_orders(session_maker, count=count, status="refunded")
+        expected = "refunded"
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    # A reconcile never sends anything, whatever it proves.
+    assert report.external_effect_attempted is False
+    assert report.external_calls == {"create": 0, "pay": 0, "refund": 0, "meta": 0}
+    after = await ledger_module.load(session_maker)
+    assert after.item(1).status == expected
+    assert after.status != VOUCHER_BATCH_HALTED
+    assert after.item(1).reconciliation_required is False
+
+
+@pytest.mark.parametrize("stage", [STAGE_CREATE, STAGE_PAY, STAGE_DELIVER])
+async def test_reconcile_leaves_the_halt_when_it_cannot_prove_the_outcome(
+    session_maker, batch_configuration, binding_key, stage
+) -> None:
+    """Looked, found nothing, changed nothing that could be re-sent.
+
+    Absence is not proof the request never left. The slot stays unresolved, the
+    batch stays halted, the suffix stays shut, and no second POST is possible —
+    the whole point being that "we could not find it" must never become
+    permission to try again.
+    """
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    if stage == STAGE_CREATE:
+        await _freeze(session_maker, reader, request)
+    else:
+        await _full_create(session_maker, reader, request, count=count)
+    if stage == STAGE_DELIVER:
+        await _full_pay(session_maker, reader, request, count=count)
+
+    snapshot = await ledger_module.load(session_maker)
+    identity = runner_module._identity_from_snapshot(snapshot)
+    assert identity is not None
+    assert (await _claim_for(session_maker, identity, stage=stage, slot=1)).granted
+
+    # The search finds nothing: an empty listing for CREATE, an order that is
+    # still open for PAY, and for DELIVER nothing a POS order could ever say.
+    if stage == STAGE_CREATE:
+        reader.orders = {}
+        reader.order_pages = [orders_page()]
+
+    report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+
+    assert report.outcome == "unknown"
+    assert report.halted is True
+    after = await ledger_module.load(session_maker)
+    assert after.status == VOUCHER_BATCH_HALTED
+    # Parked as "looked, still unknown" — never back to a claimable state.
+    assert after.item(1).status in (
+        VOUCHER_BATCH_ITEM_CREATE_UNKNOWN,
+        "pay_unknown",
+        "send_unknown",
+    )
+    assert after.item(1).status not in (VOUCHER_BATCH_ITEM_PLANNED, VOUCHER_BATCH_ITEM_CREATED)
+
+    # The suffix is still shut, and re-running the stage sends nothing.
+    plan = await _plan(session_maker, reader, stage=stage, request=request)
+    assert not plan.ready
+    assert BATCH_HALTED in plan.reasons
+    mutator = FakeMutator(create=_ok_response(0), pay=_ok_response(0))
+    sender = FakeSender()
+    common = {
+        "request": request,
+        "reader": reader,
+        "order_reader": reader,
+        "apply": True,
+        "supplied_digest": plan.digest,
+        "supplied_issued_at": plan.issued_at,
+        "supplied_phrase": plan.confirmation_phrase,
+    }
+    async with session_maker() as session:
+        if stage == STAGE_CREATE:
+            await runner_module.run_create(session, session_maker, mutator=mutator, **common)
+        elif stage == STAGE_PAY:
+            await runner_module.run_pay(session, session_maker, mutator=mutator, **common)
+        else:
+            await runner_module.run_deliver(session, session_maker, sender=sender, **common)
+    assert mutator.calls == []
+    assert sender.calls == 0
+
+
+async def test_a_crashed_send_is_never_declared_unsent_by_a_reconcile(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """No provider message id means nothing to ask Meta about.
+
+    A send claim that never recorded an identifier cannot be proven, cannot be
+    retried — the attempt counter is already spent — and cannot be refunded.
+    The one honest answer is that a human has to look.
+    """
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+    await _full_pay(session_maker, reader, request, count=count)
+
+    snapshot = await ledger_module.load(session_maker)
+    identity = runner_module._identity_from_snapshot(snapshot)
+    assert identity is not None
+    assert (await _claim_for(session_maker, identity, stage=STAGE_DELIVER, slot=1)).granted
+
+    await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+    after = await ledger_module.load(session_maker)
+
+    assert after.item(1).status == "send_unknown"
+    assert after.item(1).send_attempt_count == 1
+    assert after.item(1).provider_message_id_recorded is False
+    assert after.status == VOUCHER_BATCH_HALTED
+
+    # A refund is forbidden: the customer may be holding the code already.
+    refund_plan = await _plan(session_maker, reader, stage=STAGE_REFUND, request=request, slot=1)
+    assert not refund_plan.ready
+    assert REFUND_FORBIDDEN_AFTER_SEND in refund_plan.reasons
+    # And a second reconcile still resolves nothing and sends nothing.
+    again = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
+    assert again.outcome == "unknown"
+    assert again.external_effect_attempted is False
+
+
 async def test_reconcile_never_sends_a_second_create_and_stays_unknown(
     session_maker, batch_configuration, binding_key
 ) -> None:
@@ -1843,3 +2157,753 @@ def test_the_cli_has_no_command_that_runs_two_external_stages() -> None:
     with pytest.raises(SystemExit) as excinfo:
         parser.parse_args(["--help"])
     assert excinfo.value.code == cli.EXIT_ARGUMENTS
+
+
+# ===========================================================================
+# The runtime identity a batch was frozen with
+# ===========================================================================
+
+
+async def test_a_changed_runtime_identity_refuses_before_any_post(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """Four UUIDs decide where a real €15 goes, and all four come from the env.
+
+    Nothing stops an operator restarting the container with a different payment
+    account between the freeze and the payment. The batch already stores what
+    was approved, so the comparison is cheap — and the consequence of skipping
+    it is a voucher sold from the wrong branch or charged to the wrong account.
+    """
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    frozen = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, frozen)
+    reader.orders = await marker_orders(session_maker, count=count)
+
+    # The same process, restarted against a different POS account.
+    drifted = dataclasses.replace(frozen, payment_account_uuid=str(uuid_module.uuid4()))
+
+    plan = await _plan(session_maker, reader, stage=STAGE_CREATE, request=drifted)
+    assert not plan.ready
+    assert IDENTITY_BINDING_MISMATCH in plan.reasons
+    assert plan.snapshot["runtime_identity_matches_frozen"] is False
+
+    mutator = FakeMutator(create=_ok_response(0))
+    async with session_maker() as session:
+        report = await runner_module.run_create(
+            session,
+            session_maker,
+            request=drifted,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    assert report.outcome == "refused"
+    assert mutator.calls == []
+
+    # The unchanged identity still works, and what goes on the wire is the
+    # frozen identity rather than whatever the environment currently holds.
+    created = FakeMutator(create_sequence=[_ok_response(index) for index in range(count)])
+    good = await _apply(session_maker, reader, stage=STAGE_CREATE, request=frozen, mutator=created)
+    assert good.outcome == "applied"
+    assert {call["staffer_uuid"] for call in created.create_calls} == {STAFFER_UUID}
+    assert {call["location_uuid"] for call in created.create_calls} == {KARLSRUHE_LOCATION_UUID}
+
+
+async def test_a_changed_payment_account_refuses_before_the_charge(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """The one that costs money: PAY must never charge an unapproved account."""
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    frozen = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, frozen, count=count)
+
+    drifted = dataclasses.replace(frozen, payment_account_uuid=str(uuid_module.uuid4()))
+    reader.orders = await marker_orders(session_maker, count=count)
+
+    plan = await _plan(session_maker, reader, stage=STAGE_PAY, request=drifted)
+    assert not plan.ready
+    assert IDENTITY_BINDING_MISMATCH in plan.reasons
+
+    mutator = FakeMutator(pay=_ok_response(0))
+    async with session_maker() as session:
+        report = await runner_module.run_pay(
+            session,
+            session_maker,
+            request=drifted,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+    assert report.outcome == "refused"
+    assert mutator.calls == []
+
+    # And the account actually charged on the good path is the frozen one.
+    _, paid = await _full_pay(session_maker, reader, frozen, count=count)
+    assert {call["account_uuid"] for call in paid.pay_calls} == {ACCOUNT_UUID}
+
+
+def test_no_report_prints_the_operational_identities() -> None:
+    """The staffer and the account are operational identities, not report fields."""
+    safe = ledger_module.BatchSnapshot(
+        exists=True,
+        campaign_period_start="2026-08-01T00:00:00+00:00",
+        campaign_period_end="2026-08-31T23:59:59+00:00",
+        staffer_uuid=STAFFER_UUID,
+        payment_account_uuid=ACCOUNT_UUID,
+    ).as_safe_dict()
+    printed = json.dumps(safe)
+    assert STAFFER_UUID not in printed
+    assert ACCOUNT_UUID not in printed
+
+
+# ===========================================================================
+# The campaign period an operator is approving
+# ===========================================================================
+
+
+async def test_the_campaign_period_is_visible_before_the_freeze(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """Which wave, in one glance, while the approval can still be withheld.
+
+    The period is the entitlement key, not a send date: a transitional August
+    audience mailed in October is still an August entitlement. An operator who
+    cannot see which month they are approving cannot notice that they are about
+    to hand a second €15 to people the August batch already served.
+    """
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+
+    plan = await _plan(session_maker, reader, stage=STAGE_FREEZE, request=request)
+
+    composition = plan.snapshot["composition"]
+    assert composition["campaign_period"] == "2026-08-01..2026-08-31"
+    assert composition["campaign_period_start"] == PERIOD_START.isoformat()
+    assert composition["campaign_period_end"] == PERIOD_END.isoformat()
+
+    # And it keeps saying so after the freeze, in the status and on the page.
+    await _freeze(session_maker, reader, request)
+    status = (await runner_module.run_status(session_maker)).as_safe_dict()
+    assert status["batch"]["campaign_period"] == "2026-08-01..2026-08-31"
+
+    from altegio_bot.ops import router as ops_router
+
+    html = await ops_router.ops_voucher_snapshot_batch_page()
+    assert "2026-08-01..2026-08-31" in html
+    assert "Период кампании" in html
+
+
+async def test_a_different_period_is_a_different_approval(session_maker, batch_configuration, binding_key) -> None:
+    """Change the wave and the digest changes, so the old approval dies with it."""
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+
+    before = await _plan(session_maker, reader, stage=STAGE_FREEZE, request=request)
+    assert before.ready
+
+    # The same preview, the same people, a different entitlement period.
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                text("UPDATE campaign_runs SET period_start = :start, period_end = :end WHERE id = :run"),
+                {
+                    "start": PERIOD_START.replace(month=10),
+                    "end": PERIOD_END.replace(month=10),
+                    "run": run_id,
+                },
+            )
+
+    after = await _plan(session_maker, reader, stage=STAGE_FREEZE, request=request)
+    assert after.snapshot["composition"]["campaign_period"] == "2026-10-01..2026-10-31"
+    assert after.digest_for(before.issued_at) != before.digest
+
+    # The approval taken for August authorises nothing in October.
+    async with session_maker() as session:
+        report = await runner_module.run_freeze(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            apply=True,
+            supplied_digest=before.digest,
+            supplied_issued_at=before.issued_at,
+            supplied_phrase=before.confirmation_phrase,
+        )
+    assert report.outcome == "refused"
+    assert PLAN_DIGEST_MISMATCH in report.reasons
+    assert not (await ledger_module.load(session_maker)).exists
+
+
+# ===========================================================================
+# One lock order, on the real database
+# ===========================================================================
+
+
+async def _delivered_batch(session_maker, *, count):
+    """A batch whose slots all carry a provider message id."""
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+    await _full_pay(session_maker, reader, request, count=count)
+    await _apply(session_maker, reader, stage=STAGE_DELIVER, request=request, sender=FakeSender())
+    return run_id, reader, request
+
+
+async def test_a_blocked_webhook_holds_no_item_lock(session_maker, batch_configuration, binding_key) -> None:
+    """The webhook takes the header FIRST, exactly like every stage writer.
+
+    This is the deadlock in one assertion. A webhook that locked its item and
+    then waited for the header, while a stage held the header and waited for
+    that item, is a textbook cycle — and both orders are individually
+    reasonable, which is why having two of them is the bug.
+
+    So: hold the header elsewhere, let a webhook block on it, and then ask
+    whether item 1 is still lockable by somebody else. Under one shared order
+    it is, because the blocked webhook is waiting at the header and owns
+    nothing. Under the old order the answer would be no.
+    """
+    count = 2
+    await _delivered_batch(session_maker, count=count)
+
+    barrier = asyncio.Event()
+    released = asyncio.Event()
+
+    async def hold_the_header() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await session.execute(text("SELECT id FROM easyweek_voucher_snapshot_batches FOR UPDATE"))
+                barrier.set()
+                await released.wait()
+
+    holder = asyncio.create_task(hold_the_header())
+    await asyncio.wait_for(barrier.wait(), timeout=15)
+
+    webhook = asyncio.create_task(
+        ledger_module.record_webhook_transition(
+            session_maker,
+            provider_message_id=PROVIDER_MESSAGE_IDS[0],
+            status=VOUCHER_BATCH_ITEM_DELIVERED,
+        )
+    )
+    # Give it long enough to have taken whatever locks it is going to take
+    # before the header stops it.
+    await asyncio.sleep(0.5)
+    assert not webhook.done()
+
+    async with session_maker() as probe:
+        async with probe.begin():
+            # NOWAIT: this either gets the lock immediately or raises. A
+            # webhook that already held item 1 would make this fail.
+            rows = (
+                (
+                    await probe.execute(
+                        select(EasyWeekVoucherSnapshotBatchItem)
+                        .where(EasyWeekVoucherSnapshotBatchItem.slot == 1)
+                        .with_for_update(nowait=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(rows) == 1
+
+    released.set()
+    await asyncio.wait_for(holder, timeout=15)
+    result = await asyncio.wait_for(webhook, timeout=15)
+    assert result.applied
+    assert (await ledger_module.load(session_maker)).item(1).status == VOUCHER_BATCH_ITEM_DELIVERED
+
+
+async def test_a_webhook_and_a_stage_write_do_not_deadlock(session_maker, batch_configuration, binding_key) -> None:
+    """Slot 1's callback beside slot 2's recorded Meta outcome, repeatedly.
+
+    Two independent sessions, bounded by a timeout so a deadlock or a lock wait
+    fails the test instead of hanging it, and an assertion that the accepted
+    provider message id is still there afterwards — a lost one would mean a
+    delivered message nobody can ever observe.
+    """
+    count = 2
+    await _delivered_batch(session_maker, count=count)
+
+    for _ in range(6):
+        webhook = ledger_module.record_webhook_transition(
+            session_maker,
+            provider_message_id=PROVIDER_MESSAGE_IDS[0],
+            status=VOUCHER_BATCH_ITEM_READ,
+        )
+        stage = ledger_module.record_item_outcome(
+            session_maker,
+            slot=2,
+            status=VOUCHER_BATCH_ITEM_PROVIDER_ACCEPTED,
+            expected_statuses=frozenset({VOUCHER_BATCH_ITEM_PROVIDER_ACCEPTED}),
+            provider_message_id=PROVIDER_MESSAGE_IDS[1],
+            reconciliation_required=False,
+        )
+        await asyncio.wait_for(asyncio.gather(webhook, stage), timeout=30)
+
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.item(1).status == VOUCHER_BATCH_ITEM_READ
+    assert snapshot.item(1).provider_message_id_recorded is True
+    assert snapshot.item(2).provider_message_id_recorded is True
+    # Neither path relaxed what it guards.
+    assert snapshot.item(1).send_attempt_count == 1
+    assert snapshot.item(2).send_attempt_count == 1
+
+
+# ===========================================================================
+# Freeze against discard and delete
+# ===========================================================================
+
+
+async def test_a_frozen_batch_refuses_discard_and_delete(session_maker, batch_configuration, binding_key) -> None:
+    from altegio_bot.campaigns.runner import delete_preview_run, discard_preview_run
+
+    run_id, _ = await _frozen_batch(session_maker, count=2)
+
+    with pytest.raises(ValueError):
+        await discard_preview_run(run_id)
+    with pytest.raises(ValueError):
+        await delete_preview_run(run_id)
+
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        assert run.status == "completed"
+    assert (await ledger_module.load(session_maker)).exists
+
+
+async def test_a_discarded_preview_cannot_be_frozen(session_maker, batch_configuration, binding_key) -> None:
+    from altegio_bot.campaigns.runner import discard_preview_run
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    await discard_preview_run(run_id)
+
+    plan = await _plan(session_maker, FakeReader(count=count), stage=STAGE_FREEZE, request=batch_request(run_id=run_id))
+
+    assert not plan.ready
+    assert RUN_UNPROVEN in plan.reasons
+    assert not (await ledger_module.load(session_maker)).exists
+
+
+@pytest.mark.parametrize("operation", ["discard", "delete"])
+async def test_a_concurrent_freeze_and_discard_leave_no_impossible_state(
+    session_maker, batch_configuration, binding_key, operation
+) -> None:
+    """Whoever wins, the pair stays consistent.
+
+    The state this forbids is a batch bound to a preview that has since been
+    discarded or deleted: the voucher would be real and the snapshot proving
+    whose it is would be gone. Both paths take the same ``CampaignRun`` lock
+    first and re-check their guards after the wait, so one of them always loses
+    cleanly.
+    """
+    from altegio_bot.campaigns.runner import delete_preview_run, discard_preview_run
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    plan = await _plan(session_maker, reader, stage=STAGE_FREEZE, request=request)
+    assert plan.ready
+
+    async def freeze() -> str:
+        async with session_maker() as session:
+            report = await runner_module.run_freeze(
+                session,
+                session_maker,
+                request=request,
+                reader=reader,
+                order_reader=reader,
+                apply=True,
+                supplied_digest=plan.digest,
+                supplied_issued_at=plan.issued_at,
+                supplied_phrase=plan.confirmation_phrase,
+            )
+        return report.outcome
+
+    async def edit() -> str:
+        try:
+            if operation == "discard":
+                await discard_preview_run(run_id)
+            else:
+                await delete_preview_run(run_id)
+        except ValueError:
+            return "refused"
+        return "applied"
+
+    outcomes = await asyncio.wait_for(asyncio.gather(freeze(), edit()), timeout=30)
+    frozen_outcome, edit_outcome = outcomes
+
+    batch = await ledger_module.load(session_maker)
+    async with session_maker() as session:
+        run = await session.get(CampaignRun, run_id)
+        status = run.status
+
+    if batch.exists:
+        # The freeze won: the preview must still be the snapshot it points at.
+        assert frozen_outcome == "frozen"
+        assert edit_outcome == "refused"
+        assert status == "completed"
+    else:
+        # The edit won: nothing was frozen onto a snapshot that is now gone.
+        assert edit_outcome == "applied"
+        assert frozen_outcome == "refused"
+        assert status in ("discarded", "deleted")
+
+
+# ===========================================================================
+# The operator CLI: what it says when something unplanned happens
+# ===========================================================================
+
+
+class _AsyncCM:
+    """An ``async with`` wrapper around an already-built fake transport."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+def _forbidden_transport(*args, **kwargs):  # pragma: no cover - only called on failure
+    raise AssertionError("no transport may be constructed for this command")
+
+
+async def _run_cli(argv: list[str]) -> tuple[dict, int]:
+    """Drive the real entry point in a worker thread, and read what it printed.
+
+    A thread because ``main`` owns its event loop, and the point of these tests
+    is the entry point an operator actually types — including its exit code.
+
+    The command gets its own ``NullPool`` engine on the same database. Without
+    it the CLI would borrow the module-global pooled engine, leave a connection
+    bound to the thread's event loop, and poison later tests the moment that
+    loop closed — the failure mode ``conftest`` documents at length. NullPool
+    opens and closes a connection per checkout, so nothing outlives a loop.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    engine = create_async_engine(Settings().database_url, poolclass=NullPool)
+    original = cli.SessionLocal
+    cli.SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+    def run() -> tuple[str, int]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli.main(argv)
+        return buffer.getvalue(), code
+
+    try:
+        printed, code = await asyncio.to_thread(run)
+    finally:
+        cli.SessionLocal = original
+        await engine.dispose()
+    return json.loads(printed), code
+
+
+async def test_status_answers_with_the_fence_closed(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """A closed fence must not make the durable state unreadable.
+
+    `status` reads the ledger and nothing else — no HTTP, no approval, no
+    mutation. After an emergency `false` the operator's question is exactly
+    what the halted batch left behind and whether a draft is still open in the
+    POS, and refusing to answer that would not be safety: it would be somebody
+    running SQL by hand instead.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 3
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+    reader.orders = await marker_orders(session_maker, count=count)
+    mutator = FakeMutator(create_sequence=[EasyWeekVoucherMutationUnknown("timeout")])
+    await _apply(session_maker, reader, stage=STAGE_CREATE, request=request, mutator=mutator)
+
+    # The fence goes down, as it would after an incident.
+    monkeypatch.setattr(settings, "easyweek_voucher_snapshot_batch_enabled", False, raising=False)
+    # And nothing may open a socket.
+    monkeypatch.setattr(cli, "EasyWeekClient", _forbidden_transport)
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", _forbidden_transport)
+    monkeypatch.setattr(cli, "VoucherDeliveryClient", _forbidden_transport)
+
+    payload, code = await _run_cli(["status"])
+
+    assert code == cli.EXIT_OK
+    assert payload["stage"] == "status"
+    # The REAL state, not a refusal.
+    batch = payload["batch"]
+    assert batch["exists"] is True
+    assert batch["halted"] is True
+    assert batch["recipient_count"] == count
+    assert payload["reconciliation_required"] is True
+    assert payload["manual_cleanup_required"] is True
+    assert BATCH_DISABLED not in payload["reasons"]
+
+    # Every other command stays behind the fence.
+    for argv in (
+        ["plan", "--stage", "create", "--preview-run-id", str(run_id)],
+        ["create", "--preview-run-id", str(run_id), "--apply"],
+        ["reconcile", "--preview-run-id", str(run_id)],
+    ):
+        refused, refused_code = await _run_cli(argv)
+        assert refused_code == cli.EXIT_CONTRACT_MISMATCH, argv
+        assert BATCH_DISABLED in refused["reasons"], argv
+
+
+async def test_an_exception_before_any_claim_is_still_a_safe_refusal(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """Exit 4 is a promise that nothing started, and here it is provable.
+
+    The claim is committed before any request leaves, so a ledger that still
+    answers and holds no unresolved slot IS the proof. Only then may the CLI
+    say "refused".
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(FakeMutator()))
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure before anything was claimed")
+
+    monkeypatch.setattr(runner_module, "build_stage_plan", explode)
+
+    payload, code = await _run_cli(
+        ["create", "--preview-run-id", str(run_id), "--apply", "--plan-digest", "x", "--confirm", "y"]
+    )
+
+    assert code == cli.EXIT_CONTRACT_MISMATCH
+    assert payload["outcome"] == "refused"
+    assert payload["external_effect_attempted"] is False
+    # And the ledger agrees: nothing was claimed.
+    snapshot = await ledger_module.load(session_maker)
+    assert {entry.status for entry in snapshot.items} == {VOUCHER_BATCH_ITEM_PLANNED}
+    assert snapshot.status != VOUCHER_BATCH_HALTED
+
+
+@pytest.mark.parametrize("stage", [STAGE_PAY, STAGE_DELIVER])
+async def test_a_failure_after_the_effect_never_reports_that_nothing_happened(
+    session_maker, batch_configuration, binding_key, monkeypatch, stage
+) -> None:
+    """The money moved, or Meta took the message, and then the write failed.
+
+    The old blanket handler answered `refused`, `external_effect_attempted=false`
+    and exit 4 for any exception — including this one. That is a promise that
+    nothing started, made over a €15 charge that already happened or a message
+    a customer may already be reading.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+
+    if stage == STAGE_PAY:
+        paid = await marker_orders(session_maker, count=count, status="paid")
+        mutator = FakeMutator(pay_sequence=[_ok_response(index) for index in range(count)], reader=reader, settles=paid)
+        sender = FakeSender()
+    else:
+        await _full_pay(session_maker, reader, request, count=count)
+        mutator = FakeMutator()
+        sender = FakeSender()
+
+    plan = await _plan(session_maker, reader, stage=stage, request=request)
+    assert plan.ready, plan.reasons
+
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+    monkeypatch.setattr(cli, "VoucherDeliveryClient", lambda *a, **k: _AsyncCM(sender))
+
+    # The external effect happens; writing down what it was does not.
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure while recording a proven outcome")
+
+    monkeypatch.setattr(ledger_module, "record_item_outcome", explode)
+
+    payload, code = await _run_cli(
+        [
+            stage,
+            "--preview-run-id",
+            str(run_id),
+            "--apply",
+            "--plan-digest",
+            plan.digest,
+            "--plan-issued-at",
+            plan.issued_at.isoformat(),
+            "--confirm",
+            plan.confirmation_phrase,
+        ]
+    )
+
+    # The effect really did happen.
+    if stage == STAGE_PAY:
+        assert len(mutator.pay_calls) == 1
+    else:
+        assert sender.calls == 1
+
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "unknown"
+    assert payload["external_effect_attempted"] is True
+    assert payload["reconciliation_required"] is True
+    assert payload["halted"] is True
+    if stage == STAGE_DELIVER:
+        assert payload["external_send_attempted"] is True
+
+    # Nothing personal, and no traceback, reached the operator's report.
+    printed = json.dumps(payload)
+    for secret in [*VOUCHER_CODE_SENTINELS[:count], *PHONES[:count], *CUSTOMER_NAMES[:count], *ORDER_UUIDS[:count]]:
+        assert secret not in printed, secret
+    assert "Traceback" not in printed
+    assert "synthetic failure" not in printed
+
+    # And the durable record is the claim, which is what reconcile will resolve.
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.status == VOUCHER_BATCH_HALTED
+    assert snapshot.item(1).status in ("pay_claimed", "send_claimed")
+
+
+# ===========================================================================
+# The runbook, as a contract
+# ===========================================================================
+
+
+def _runbook() -> str:
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "docs" / "easyweek" / "VOUCHER_SNAPSHOT_BATCH_RUNBOOK.md"
+    assert path.exists(), path
+    return path.read_text(encoding="utf-8")
+
+
+def _command_blocks(text: str) -> list[str]:
+    """Every ```bash block, as one command string each."""
+    blocks: list[str] = []
+    inside = False
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.strip().startswith("```bash"):
+            inside, current = True, []
+            continue
+        if inside and line.strip().startswith("```"):
+            blocks.append(" ".join(current).strip())
+            inside = False
+            continue
+        if inside:
+            current.append(line.strip())
+    return blocks
+
+
+def test_the_runbook_recreates_the_api_service_instead_of_restarting_it() -> None:
+    """A `restart` keeps the environment the container was created with.
+
+    Which means the fence would still read `true` inside the container while
+    the file on disk says `false` — the operator believes the batch is shut and
+    it is not. The instruction has to recreate the service, and it has to end
+    with a check of the value INSIDE the container. Pinned here so it cannot
+    quietly go back to a restart.
+    """
+    text = _runbook()
+    blocks = _command_blocks(text)
+
+    recreate = [
+        block for block in blocks if "up -d" in block and "--force-recreate" in block and "altegio-api" in block
+    ]
+    assert recreate, "the runbook must recreate the API service, not restart it"
+    # Both compose files, or the command runs against a different topology.
+    for block in recreate:
+        assert "-f docker-compose.yml" in block
+        assert "-f docker-compose.chatwoot-internal.yml" in block
+        assert "--no-deps" in block
+
+    # No command block may tell an operator to restart the service instead.
+    for block in blocks:
+        assert not (block.startswith("docker compose") and " restart" in f" {block} "), block
+
+    # And the fence-off section must end by reading the value back from inside
+    # the container, with `false` named as the expected output.
+    afterwards = text.split("## 12.")[1].split("## 13.")[0]
+    verify = [
+        block
+        for block in _command_blocks(afterwards)
+        if "EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED" in block and "exec altegio-api" in block
+    ]
+    assert verify, "the runbook must verify the fence value inside the container"
+    assert "printenv" in " ".join(verify)
+    assert "\n```\nfalse\n```" in afterwards
+
+
+def test_the_runbook_makes_the_operator_check_the_campaign_period() -> None:
+    """The period is the entitlement key, and it is checkable before the freeze.
+
+    An operator who cannot see which wave they are approving cannot notice that
+    a transitional August audience is about to be frozen against October.
+    """
+    text = _runbook()
+
+    assert "campaign_period" in text
+    assert "Check the campaign period" in text
+    # The worked example, by name, so the trap is stated rather than implied.
+    assert "August" in text and "October" in text
+    assert "2026-08-01..2026-08-31" in text
+    assert "send date never replaces the entitlement period" in text
+
+
+def test_the_runbook_still_states_the_limits_it_is_built_on() -> None:
+    text = _runbook()
+
+    assert "€75" in text
+    assert "at most five" in text.lower() or "Maximum vouchers | 5" in text
+    # No command that would run two external stages in one go.
+    for block in _command_blocks(text):
+        assert block.count("easyweek_voucher_snapshot_batch ") <= 1, block

@@ -121,6 +121,20 @@ Read `ready`, `reasons`, `snapshot.composition` and `snapshot.baseline` before
 deciding anything. Check `snapshot.composition.recipient_count` and
 `snapshot.composition.total_exposure_minor` against what you intend to spend.
 
+**Check the campaign period.** `snapshot.composition.campaign_period` reads as
+`YYYY-MM-DD..YYYY-MM-DD`. It must be the period the vouchers are *earned for*,
+which is not the period you are sending in:
+
+> A transitional **August** audience mailed in **October** is an **August**
+> entitlement. The plan must read `2026-08-01..2026-08-31`. If it reads
+> `2026-10-01..2026-10-31`, the preview was built for the wrong wave — stop and
+> rebuild it. The send date never replaces the entitlement period, and a batch
+> frozen against the wrong one can hand a second €15 to people an earlier batch
+> already served.
+
+The period is part of the frozen composition and part of the digest, so
+changing it invalidates any approval taken before the change.
+
 Keep three values from the output for the next command:
 
 - `plan_digest`
@@ -148,8 +162,13 @@ Only after the owner approved this exact digest:
 docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_snapshot_batch freeze --preview-run-id RUN --apply --plan-digest DIGEST --plan-issued-at ISSUED_AT --confirm PHRASE
 ```
 
+Before typing this, confirm one last time that `snapshot.composition` names the
+period you mean (step 4) and the number of people you mean. After the freeze
+neither can be changed.
+
 Check the printed `batch.items`: the slots, the recipient row ids and the
-markers are what every later stage will act on.
+markers are what every later stage will act on, and `batch.campaign_period` is
+the wave they are entitled to.
 
 ---
 
@@ -252,16 +271,49 @@ that as an observation.
 
 ---
 
-## 12. Afterwards
+## 12. Afterwards — turning the fence off
 
-Turn the fence off:
+Set `EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED=false` in the environment file
+first.
+
+Then recreate the API service. **A plain `docker compose restart` is not
+enough and must not be used here:** `restart` stops and starts the existing
+container, which keeps the environment it was created with, so the fence would
+still read `true` inside it while the file on disk says `false`. The
+environment is only re-read when the container is created again.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api env | grep EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED
+cd /opt/altegio_bot
 ```
 
-Set `EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED=false` in the environment file and
-restart the API service.
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --no-deps --force-recreate altegio-api
+```
+
+`--no-deps` keeps this to the one service; `--force-recreate` is what makes the
+new environment take effect.
+
+Then verify the value **inside the container**, not in the file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api printenv EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED
+```
+
+Expected output, exactly:
+
+```
+false
+```
+
+Anything else — `true`, or no output at all — means the fence is still open or
+the variable is not set as intended. Do not stop here; fix it and verify again.
+
+`status` keeps working with the fence closed, so the batch state stays readable
+afterwards:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_snapshot_batch status
+```
 
 ---
 

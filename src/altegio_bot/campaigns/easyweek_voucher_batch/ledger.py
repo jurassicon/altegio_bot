@@ -309,6 +309,13 @@ class BatchSnapshot:
     items: tuple[ItemSnapshot, ...] = ()
     evidence: dict[str, Any] | None = None
 
+    @property
+    def period_label(self) -> str | None:
+        """``2026-08-01..2026-08-31``, or ``None`` before the freeze."""
+        if not self.campaign_period_start or not self.campaign_period_end:
+            return None
+        return f"{self.campaign_period_start[:10]}..{self.campaign_period_end[:10]}"
+
     def item(self, slot: int) -> ItemSnapshot | None:
         for entry in self.items:
             if entry.slot == slot:
@@ -333,6 +340,10 @@ class BatchSnapshot:
             "recipient_basis": RECIPIENT_BASIS_MANUAL if self.exists else None,
             # A manual selection has no first visit to prove, and says so.
             "first_visit_proof": "not_applicable" if self.exists else None,
+            # The wave this batch is bound to, in one glance and in full. It is
+            # the entitlement key, so it belongs in every report an operator
+            # reads, not only in the digest that signs it.
+            "campaign_period": self.period_label,
             "campaign_period_start": self.campaign_period_start,
             "campaign_period_end": self.campaign_period_end,
             "frozen_digest": self.frozen_digest,
@@ -723,6 +734,20 @@ async def _claim(
     ``allow_halted`` exists for exactly one caller: the refund. A halt is
     precisely when an untouched paid slot most needs its money back, so the
     cleanup path must not be shut by the condition that makes it necessary.
+
+    The header is halted BY THIS TRANSACTION
+    ----------------------------------------
+    The claimed slot is an unresolved one the instant it is written, so the
+    header is re-derived here, in the same transaction, before the commit. It
+    matters because of what a crash looks like: if the header were left reading
+    ``in_progress`` until some later write settled it, a second command — or a
+    fresh plan a minute later — would see a batch that looks healthy and would
+    happily claim the slots BEHIND a request that may already be in flight.
+    Halting at claim time is what makes "the first unknown stops the suffix"
+    true for a process that died rather than only for one that ran to the end.
+
+    Locks are taken header first, then every item in slot order. The same order
+    as the webhook path, deliberately: two orders is how two sessions deadlock.
     """
     now = utcnow()
     async with session_maker() as session:
@@ -736,14 +761,8 @@ async def _claim(
             if header.status == VOUCHER_BATCH_HALTED and not allow_halted:
                 return ClaimOutcome(False, CLAIM_REFUSED_HALTED, header.status)
 
-            row = (
-                await session.execute(
-                    select(EasyWeekVoucherSnapshotBatchItem)
-                    .where(EasyWeekVoucherSnapshotBatchItem.batch_id == header.id)
-                    .where(EasyWeekVoucherSnapshotBatchItem.slot == slot)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            rows = await _items(session, batch_id=header.id, for_update=True)
+            row = next((entry for entry in rows if entry.slot == slot), None)
             if row is None:
                 return ClaimOutcome(False, CLAIM_REFUSED_MISSING_ROW, None)
             if row.status not in claimable_from:
@@ -763,9 +782,10 @@ async def _claim(
                 setattr(row, name, value)
             row.updated_at = now
 
-            if header.status == VOUCHER_BATCH_FROZEN:
-                header.status = VOUCHER_BATCH_IN_PROGRESS
-            header.reconciliation_required = True
+            # Derived, not asserted. The slot this transaction just claimed is
+            # unresolved, so the header it belongs to is halted before anybody
+            # else can read it.
+            _settle_header(header, rows)
             header.updated_at = now
             await session.flush()
             return ClaimOutcome(True, CLAIM_GRANTED, next_status)
@@ -887,14 +907,8 @@ async def claim_send(
             if header.status == VOUCHER_BATCH_HALTED:
                 return ClaimOutcome(False, CLAIM_REFUSED_HALTED, header.status)
 
-            row = (
-                await session.execute(
-                    select(EasyWeekVoucherSnapshotBatchItem)
-                    .where(EasyWeekVoucherSnapshotBatchItem.batch_id == header.id)
-                    .where(EasyWeekVoucherSnapshotBatchItem.slot == slot)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            rows = await _items(session, batch_id=header.id, for_update=True)
+            row = next((entry for entry in rows if entry.slot == slot), None)
             if row is None:
                 return ClaimOutcome(False, CLAIM_REFUSED_MISSING_ROW, None)
             if row.status not in SEND_CLAIMABLE_FROM or int(row.send_attempt_count or 0) != 0:
@@ -924,9 +938,9 @@ async def claim_send(
                     claimed_at=now,
                 )
             )
-            if header.status == VOUCHER_BATCH_FROZEN:
-                header.status = VOUCHER_BATCH_IN_PROGRESS
-            header.reconciliation_required = True
+            # As in `_claim`: the claimed slot is unresolved, so the header is
+            # halted by this transaction rather than by some later write.
+            _settle_header(header, rows)
             header.updated_at = now
             await session.flush()
             return ClaimOutcome(True, CLAIM_GRANTED, VOUCHER_BATCH_ITEM_SEND_CLAIMED, str(intent))
@@ -1108,35 +1122,58 @@ async def binding_matches(
         )
 
 
-async def _row_by_message(session: AsyncSession, provider_message_id: str) -> EasyWeekVoucherSnapshotBatchItem | None:
-    """The one slot Meta's identifier names, locked. Matched on nothing else."""
+async def _batch_of_message(session: AsyncSession, provider_message_id: str) -> int | None:
+    """Which batch Meta's identifier belongs to, read WITHOUT a lock.
+
+    Unlocked on purpose. Its only job is to learn which header to lock, and
+    taking the item's row lock here would be taking an item BEFORE a header —
+    the reverse of the order every stage writer uses, and the reason a webhook
+    and a stage could deadlock against each other. Nothing this returns is
+    trusted: the row is found again, on the exact identifier, under the locks.
+    """
     if not provider_message_id:
         return None
-    return (
-        await session.execute(
-            select(EasyWeekVoucherSnapshotBatchItem)
-            .where(EasyWeekVoucherSnapshotBatchItem.provider_message_id == provider_message_id)
-            .with_for_update()
+    found = await session.scalar(
+        select(EasyWeekVoucherSnapshotBatchItem.batch_id).where(
+            EasyWeekVoucherSnapshotBatchItem.provider_message_id == provider_message_id
         )
-    ).scalar_one_or_none()
+    )
+    return int(found) if found is not None else None
 
 
-async def _apply_webhook_row(
+async def _apply_webhook_locked(
     session: AsyncSession,
-    row: EasyWeekVoucherSnapshotBatchItem | None,
     *,
+    batch_id: int,
     provider_message_id: str,
     status: str,
     now: datetime,
 ) -> RecordOutcome:
-    if row is None or not row.provider_message_id:
+    """Header first, then every item in slot order, then the transition.
+
+    One lock order for the whole phase. A webhook that locked its item and then
+    waited for the header, while a stage held the header and waited for that
+    item, is a textbook deadlock — and both orders are individually reasonable,
+    which is exactly why having two of them is the bug rather than either one.
+
+    Nothing about the transition itself is relaxed by this: the row is matched
+    on the exact provider message id and nothing else, the rank comparison
+    still refuses a callback that would walk the slot backwards, and the header
+    is re-derived from the rows this transaction holds.
+    """
+    header = await session.get(EasyWeekVoucherSnapshotBatch, batch_id, with_for_update=True)
+    if header is None:
         return RecordOutcome(False, RECORD_MISSING_ROW, BatchSnapshot(exists=False))
-    if row.provider_message_id != provider_message_id:
-        return RecordOutcome(False, RECORD_STALE_STATE, BatchSnapshot(exists=False))
+    rows = await _items(session, batch_id=header.id, for_update=True)
+    row = next((entry for entry in rows if entry.provider_message_id == provider_message_id), None)
+    if row is None:
+        # The unlocked lookup saw something this transaction does not. Not ours
+        # as far as this unit of work is concerned, and nothing is written.
+        return RecordOutcome(False, RECORD_MISSING_ROW, BatchSnapshot(exists=False))
     if ITEM_RANK[status] < ITEM_RANK[row.status]:
         # A duplicate, or a callback that arrived out of order. Acceptance is
         # what Meta said and a later webhook cannot unsay it.
-        return RecordOutcome(False, RECORD_WOULD_REGRESS, BatchSnapshot(exists=False))
+        return RecordOutcome(False, RECORD_WOULD_REGRESS, await _snapshot(session, header))
     if row.provider_accepted_at is None:
         # A callback can land beside the commit that recorded acceptance. The
         # identifier only exists because Meta answered with it, so the callback
@@ -1156,14 +1193,10 @@ async def _apply_webhook_row(
     row.manual_cleanup_required = False
     row.updated_at = now
 
-    header = await session.get(EasyWeekVoucherSnapshotBatch, row.batch_id, with_for_update=True)
-    if header is not None:
-        rows = await _items(session, batch_id=header.id, for_update=True)
-        _settle_header(header, rows)
-        header.updated_at = now
+    _settle_header(header, rows)
+    header.updated_at = now
     await session.flush()
-    snapshot = await _snapshot(session, header) if header is not None else BatchSnapshot(exists=False)
-    return RecordOutcome(True, RECORD_APPLIED, snapshot)
+    return RecordOutcome(True, RECORD_APPLIED, await _snapshot(session, header))
 
 
 async def apply_webhook_transition(
@@ -1187,12 +1220,18 @@ async def apply_webhook_transition(
     # somebody else's transaction, and an ordinary query would flush whatever
     # they have pending at a moment they did not choose.
     with session.no_autoflush:
-        row = await _row_by_message(session, provider_message_id)
-        if row is None:
-            # Not ours, and nothing to write. Leave the caller's unit of work
-            # exactly as it was found.
+        batch_id = await _batch_of_message(session, provider_message_id)
+        if batch_id is None:
+            # Not ours, and nothing to write — and, just as important, no lock
+            # taken. Leave the caller's unit of work exactly as it was found.
             return RecordOutcome(False, RECORD_MISSING_ROW, BatchSnapshot(exists=False))
-    return await _apply_webhook_row(session, row, provider_message_id=provider_message_id, status=status, now=now)
+    return await _apply_webhook_locked(
+        session,
+        batch_id=batch_id,
+        provider_message_id=provider_message_id,
+        status=status,
+        now=now,
+    )
 
 
 async def record_webhook_transition(
@@ -1212,9 +1251,15 @@ async def record_webhook_transition(
     now = utcnow()
     async with session_maker() as session:
         async with session.begin():
-            row = await _row_by_message(session, provider_message_id)
-            return await _apply_webhook_row(
-                session, row, provider_message_id=provider_message_id, status=status, now=now
+            batch_id = await _batch_of_message(session, provider_message_id)
+            if batch_id is None:
+                return RecordOutcome(False, RECORD_MISSING_ROW, BatchSnapshot(exists=False))
+            return await _apply_webhook_locked(
+                session,
+                batch_id=batch_id,
+                provider_message_id=provider_message_id,
+                status=status,
+                now=now,
             )
 
 

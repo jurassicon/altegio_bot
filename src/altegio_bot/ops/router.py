@@ -3505,6 +3505,11 @@ async def ops_voucher_snapshot_batch_page() -> str:
         ("Basis", state.get("recipient_basis") or "—"),
         ("First-visit proof", state.get("first_visit_proof") or "—"),
         ("Preview run", str(batch.get("campaign_run_id") or "—")),
+        # The entitlement period, not the send date. A transitional August
+        # audience mailed in October is still an August entitlement, and an
+        # operator reading this page has to be able to see which wave the batch
+        # is bound to without opening the CLI.
+        ("Период кампании", batch.get("campaign_period") or "—"),
         ("Получателей", f"{batch.get('recipient_count', 0)} из максимум {state.get('max_recipients')}"),
         (
             "Экспозиция",

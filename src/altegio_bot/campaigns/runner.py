@@ -1569,7 +1569,16 @@ async def discard_preview_run(run_id: int) -> None:
     """
     async with SessionLocal() as session:
         async with session.begin():
-            run = await session.get(CampaignRun, run_id)
+            # FOR UPDATE, and first, because this is the same row the
+            # snapshot editor and the §41 batch freeze take before they do
+            # anything. Reading it unlocked would mean this transaction and a
+            # freeze could each check a world the other was already changing,
+            # and the state that falls out of that — a batch bound to a preview
+            # that has since been discarded — is one no later command can
+            # unwind: the voucher is real, and the snapshot proving who it
+            # belongs to would be gone. Every guard below runs AFTER the lock,
+            # so each of them sees the world as it is once the wait is over.
+            run = await session.get(CampaignRun, run_id, with_for_update=True)
             if run is None:
                 raise ValueError(f"CampaignRun {run_id} not found")
 
@@ -2575,7 +2584,16 @@ async def delete_preview_run(run_id: int) -> None:
     """
     async with SessionLocal() as session:
         async with session.begin():
-            run = await session.get(CampaignRun, run_id)
+            # FOR UPDATE, and first, because this is the same row the
+            # snapshot editor and the §41 batch freeze take before they do
+            # anything. Reading it unlocked would mean this transaction and a
+            # freeze could each check a world the other was already changing,
+            # and the state that falls out of that — a batch bound to a preview
+            # that has since been discarded — is one no later command can
+            # unwind: the voucher is real, and the snapshot proving who it
+            # belongs to would be gone. Every guard below runs AFTER the lock,
+            # so each of them sees the world as it is once the wait is over.
+            run = await session.get(CampaignRun, run_id, with_for_update=True)
             if run is None:
                 raise ValueError(f"CampaignRun {run_id} not found")
 
