@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import DBAPIError
 
@@ -334,13 +335,36 @@ def test_wave_authority_is_in_digest(field, tmp_path):
 
 
 def test_ci_cannot_skip_required_handover_proofs():
+    """The handover gate must stay mandatory, whichever job owns it.
+
+    Parsed rather than sliced out of the file by hand. The previous version cut
+    the text between this step's name and the next ``- name:``, which silently
+    depended on another step following it in the same job; once the gate moved
+    to its own job and became the last step, the slice ran on into the next job
+    and picked up that job's ``if:``. Reading the step mapping asserts the same
+    things about the step itself and cannot be confused by its neighbours.
+    """
     workflow = Path(__file__).resolve().parents[3] / ".github/workflows/ci_deploy.yml"
-    body = workflow.read_text()
-    step = body.split("- name: Run required reminder handover tests\n", 1)[1].split("      - name:", 1)[0]
-    assert 'REQUIRE_PG_CONCURRENCY: "1"' in step
+    parsed = yaml.safe_load(workflow.read_text())
+
+    steps = [
+        step
+        for job in parsed["jobs"].values()
+        if isinstance(job, dict)
+        for step in job.get("steps", [])
+        if isinstance(step, dict) and step.get("name") == "Run required reminder handover tests"
+    ]
+    assert len(steps) == 1, f"the handover gate must exist exactly once, found {len(steps)}"
+    step = steps[0]
+
+    assert (step.get("env") or {}).get("REQUIRE_PG_CONCURRENCY") == "1"
+    command = " ".join(str(step.get("run", "")).replace("\\\n", " ").split())
     for suffix in ("", "_db", "_safety"):
-        assert f"src/altegio_bot/tests/test_easyweek_reminder_handover{suffix}.py" in step
-    assert all(fragment not in step for fragment in ("continue-on-error", "if:", " -k ", " -m ", "|| true"))
+        assert f"src/altegio_bot/tests/test_easyweek_reminder_handover{suffix}.py" in command
+
+    assert "continue-on-error" not in step, "the handover gate must not be advisory"
+    assert "if" not in step, "a conditional guard would let the handover gate be skipped"
+    assert all(fragment not in command for fragment in (" -k ", " -m ", "|| true"))
 
 
 @pytest.mark.parametrize("gate", ["flag", "environment", "digest", "confirmation", "manifest", "run"])

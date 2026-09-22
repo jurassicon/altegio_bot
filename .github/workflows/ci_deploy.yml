@@ -98,8 +98,214 @@ jobs:
       # MockConnection and causes an error in offline mode. This will be fixed in a
       # separate PR targeting that migration.
 
-  tests:
-    name: Run Tests
+  # The general required suite runs on TWO runners in parallel, and the three
+  # mandatory gates on a third. Each has its own PostgreSQL service, so no two
+  # pytest processes ever share a database — which is also why pytest-xdist is
+  # deliberately not used here: two workers against one Postgres would race on
+  # migrations and on the shared, truncated tables.
+  #
+  # The split is by MODULE, never by test count, and the heavy list below is
+  # written out in full. It is not derived from a glob, from the word EasyWeek,
+  # or from timings measured during the run itself. The invariant that makes
+  # this safe is asymmetric on purpose:
+  #
+  #   heavy  = exactly the 16 listed modules
+  #   rest   = the whole test root MINUS the dedicated suites MINUS heavy
+  #
+  # so anything nobody thought about — including every new test file — lands in
+  # `rest` and stays required by default. There is no allowlist of light
+  # modules to forget to update.
+  #
+  # Contract: src/altegio_bot/tests/test_ci_required_test_shards.py
+  required-tests-heavy:
+    name: Required Tests (heavy shard)
+    if: github.event_name == 'pull_request' && needs.lint.result == 'success'
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: altegio_bot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d altegio_bot_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/altegio_bot_test
+      ALTEGIO_WEBHOOK_SECRET: test-secret
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv and deps
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync --frozen
+
+      - name: Wait for Postgres
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          def to_asyncpg_dsn(sqlalchemy_dsn: str) -> str:
+              dsn = sqlalchemy_dsn.strip().strip('"').strip("'")
+              if dsn.startswith('postgresql+asyncpg://'):
+                  return 'postgresql://' + dsn.split('://', 1)[1]
+              return dsn
+
+          async def main() -> None:
+              raw = os.environ['DATABASE_URL']
+              dsn = to_asyncpg_dsn(raw)
+              for _ in range(120):
+                  try:
+                      conn = await asyncpg.connect(dsn, timeout=3)
+                      await conn.close()
+                      print('Postgres is ready')
+                      return
+                  except:
+                      await asyncio.sleep(1)
+              raise SystemExit('Postgres did not become ready')
+          asyncio.run(main())
+          PY
+
+      # The 16 slowest general modules by median duration over three profiling
+      # runs on this runner class. Listed explicitly so the split is reviewable
+      # in the diff. `-m "not legacy_altegio"` is a safety net: none of these is
+      # marked, and if one ever were, this job must not resurrect it.
+      - name: Run heavy general shard
+        run: |
+          uv run pytest -q \
+            -m "not legacy_altegio" \
+            src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py \
+            src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py \
+            src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py \
+            src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py \
+            src/altegio_bot/tests/test_easyweek_migration_live_proof.py \
+            src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py \
+            src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py \
+            src/altegio_bot/tests/test_easyweek_pr4_migration.py \
+            src/altegio_bot/tests/test_easyweek_migration_apply.py \
+            src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py \
+            src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py \
+            src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py \
+            src/altegio_bot/tests/test_easyweek_manual_recipient.py \
+            src/altegio_bot/tests/test_easyweek_visit_counter.py \
+            src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py \
+            src/altegio_bot/tests/test_easyweek_post_booking_handover.py
+
+  required-tests-rest:
+    name: Required Tests (rest shard)
+    if: github.event_name == 'pull_request' && needs.lint.result == 'success'
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: altegio_bot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d altegio_bot_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/altegio_bot_test
+      ALTEGIO_WEBHOOK_SECRET: test-secret
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv and deps
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync --frozen
+
+      - name: Wait for Postgres
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          def to_asyncpg_dsn(sqlalchemy_dsn: str) -> str:
+              dsn = sqlalchemy_dsn.strip().strip('"').strip("'")
+              if dsn.startswith('postgresql+asyncpg://'):
+                  return 'postgresql://' + dsn.split('://', 1)[1]
+              return dsn
+
+          async def main() -> None:
+              raw = os.environ['DATABASE_URL']
+              dsn = to_asyncpg_dsn(raw)
+              for _ in range(120):
+                  try:
+                      conn = await asyncpg.connect(dsn, timeout=3)
+                      await conn.close()
+                      print('Postgres is ready')
+                      return
+                  except:
+                      await asyncio.sleep(1)
+              raise SystemExit('Postgres did not become ready')
+          asyncio.run(main())
+          PY
+
+      # Everything else in the required tier. No positional target: the test
+      # root is collected whole and narrowed only by --ignore, so a new module
+      # is picked up here without anybody editing this file.
+      #
+      # The five dedicated suites are ignored because they run under their own
+      # mandatory env flags in required-tests-dedicated; the 16 heavy modules
+      # because they run in required-tests-heavy. Every ignored path is
+      # therefore executed exactly once somewhere else.
+      - name: Run remaining general tests
+        run: |
+          uv run pytest -q \
+            -m "not legacy_altegio" \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py \
+            --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_live_proof.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py \
+            --ignore=src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_pr4_migration.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_apply.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py \
+            --ignore=src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_manual_recipient.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_visit_counter.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_post_booking_handover.py
+
+  required-tests-dedicated:
+    name: Required Tests (dedicated gates)
     if: github.event_name == 'pull_request' && needs.lint.result == 'success'
     runs-on: ubuntu-latest
     needs: lint
@@ -191,25 +397,55 @@ jobs:
             src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
             src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py
 
-      # Both Docker-dependent suites above already ran under their own mandatory
-      # gates; re-running them here would only duplicate container work.
-      #
-      # `-m "not legacy_altegio"` withdraws ONLY the explicitly marked Wave 1
-      # modules of Altegio-only functionality. Everything unmarked — EasyWeek,
-      # migration/handover, provider isolation, security, shared runtime and any
-      # new test — stays in this required gate, and the dedicated gates above
-      # are never marker-filtered. The quarantined modules are not deleted: the
-      # Legacy Altegio Tests workflow runs them nightly and on demand. Rules and
-      # the procedure for the next wave: docs/ops/test_suite_tiers.md.
-      - name: Run tests
+  # The branch-protection context. Splitting execution across three runners must
+  # not cost the repository its required check, so the job key `tests` and the
+  # name `Run Tests` stay exactly as they were and this job now aggregates.
+  #
+  # `always()` is what makes it fail CLOSED: without it a failed or cancelled
+  # dependency would SKIP this job, and a skipped required check is reported as
+  # neutral rather than red. So it always runs and then refuses anything that is
+  # not `success` — failure, cancelled and skipped alike.
+  #
+  # No services, no checkout, no dependencies, no pytest, no secrets: there is
+  # nothing here to go wrong independently of the jobs it reports on.
+  tests:
+    name: Run Tests
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - required-tests-heavy
+      - required-tests-rest
+      - required-tests-dedicated
+    steps:
+      - name: Verify every required test job succeeded
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          HEAVY_RESULT: ${{ needs['required-tests-heavy'].result }}
+          REST_RESULT: ${{ needs['required-tests-rest'].result }}
+          DEDICATED_RESULT: ${{ needs['required-tests-dedicated'].result }}
         run: |
-          uv run pytest -q \
-            -m "not legacy_altegio" \
-            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py \
-            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py \
-            --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py \
-            --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py \
-            --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+          set -euo pipefail
+          status=0
+          for entry in \
+            "lint=$LINT_RESULT" \
+            "required-tests-heavy=$HEAVY_RESULT" \
+            "required-tests-rest=$REST_RESULT" \
+            "required-tests-dedicated=$DEDICATED_RESULT"
+          do
+            job="${entry%%=*}"
+            result="${entry#*=}"
+            echo "${job}: ${result}"
+            if [ "$result" != "success" ]; then
+              echo "::error::${job} did not succeed (result=${result})"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "Required test jobs did not all succeed."
+            exit 1
+          fi
+          echo "All required test jobs succeeded."
 
   deploy:
     name: Deploy to Server

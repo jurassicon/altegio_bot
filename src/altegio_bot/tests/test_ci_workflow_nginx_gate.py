@@ -42,6 +42,17 @@ MIGRATION_GATE_ENV = "ALTEGIO_REQUIRE_MIGTEST"
 NGINX_SUITE = "src/altegio_bot/tests/test_nginx_webhook_logging_integration.py"
 MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_migration_integration.py"
 
+# The required gate runs on three runners in parallel and is reported by a
+# fourth, step-only job that keeps the branch-protection name. `tests` is
+# therefore no longer where pytest lives, so everything that used to ask
+# "which step in `tests`?" now asks "which step in any execution job?".
+# That widens where a gate may be found; it never widens what counts as one.
+HEAVY_JOB = "required-tests-heavy"
+REST_JOB = "required-tests-rest"
+DEDICATED_JOB = "required-tests-dedicated"
+EXECUTION_JOBS = (HEAVY_JOB, REST_JOB, DEDICATED_JOB)
+AGGREGATOR_JOB = "tests"
+
 
 @dataclass(frozen=True)
 class _DeployPolicy:
@@ -112,6 +123,11 @@ def _jobs() -> dict[str, Any]:
 
 def _steps(job_name: str) -> list[dict[str, Any]]:
     return [step for step in _jobs()[job_name].get("steps", []) if isinstance(step, dict)]
+
+
+def _execution_steps() -> list[dict[str, Any]]:
+    """Every step of every job that actually executes required tests."""
+    return [step for job_name in EXECUTION_JOBS for step in _steps(job_name)]
 
 
 def _normalized_run(step: dict[str, Any]) -> str:
@@ -213,21 +229,26 @@ def _ignores_suite(step: dict[str, Any], suite: str) -> bool:
     return any(suite in _ignored_suites(invocation) for invocation in _pytest_invocations(step))
 
 
-def _suite_executions(job_name: str, suite: str) -> list[tuple[dict[str, Any], list[str]]]:
+def _suite_executions(suite: str) -> list[tuple[dict[str, Any], list[str]]]:
+    """Every execution of *suite* anywhere in the required gate.
+
+    Scoped to all execution jobs rather than one, so "runs exactly once" keeps
+    meaning once in the whole gate now that the gate spans three runners.
+    """
     return [
         (step, invocation)
-        for step in _steps(job_name)
+        for step in _execution_steps()
         for invocation in _pytest_invocations(step)
         if _invocation_runs_suite(invocation, suite)
     ]
 
 
 def _nginx_gate_steps() -> list[dict[str, Any]]:
-    return [step for step in _steps("tests") if NGINX_GATE_ENV in (step.get("env") or {})]
+    return [step for step in _execution_steps() if NGINX_GATE_ENV in (step.get("env") or {})]
 
 
 def _migration_gate_steps() -> list[dict[str, Any]]:
-    return [step for step in _steps("tests") if MIGRATION_GATE_ENV in (step.get("env") or {})]
+    return [step for step in _execution_steps() if MIGRATION_GATE_ENV in (step.get("env") or {})]
 
 
 def _condition_source(condition: Any) -> str | None:
@@ -327,7 +348,9 @@ def test_workflow_file_exists() -> None:
 def test_workflow_is_valid_yaml_with_a_tests_job() -> None:
     workflow = _workflow()
     assert isinstance(workflow, dict), "the workflow must parse into a mapping"
-    assert "tests" in workflow["jobs"], "the required test job is gone"
+    assert AGGREGATOR_JOB in workflow["jobs"], "the required test job is gone"
+    for job_name in EXECUTION_JOBS:
+        assert job_name in workflow["jobs"], f"the execution job {job_name} is gone"
 
 
 def test_workflow_triggers_pull_requests_main_pushes_and_manual_runs() -> None:
@@ -367,7 +390,7 @@ def test_trigger_helper_handles_pyyaml_boolean_on_key() -> None:
 # ===========================================================================
 
 
-@pytest.mark.parametrize("job_name", ["lint", "tests", "alembic"])
+@pytest.mark.parametrize("job_name", ["lint", "alembic", AGGREGATOR_JOB, *EXECUTION_JOBS])
 def test_required_jobs_are_not_softened(job_name: str) -> None:
     job = _jobs()[job_name]
     assert "continue-on-error" not in job, f"{job_name} is advisory instead of required"
@@ -377,16 +400,30 @@ def test_lint_runs_only_for_pull_requests() -> None:
     assert _condition_source(_jobs()["lint"].get("if")) == _REQUIRED_PR_JOB_IF
 
 
-@pytest.mark.parametrize("job_name", ["alembic", "tests"])
+@pytest.mark.parametrize("job_name", ["alembic", *EXECUTION_JOBS])
 def test_alembic_and_tests_run_only_for_pull_requests_after_successful_lint(job_name: str) -> None:
     """Event-scoped, but still gated behind a green lint so runners aren't wasted."""
     assert _needs(job_name) == {"lint"}
     assert _condition_source(_jobs()[job_name].get("if")) == _REQUIRED_PR_JOB_IF_AFTER_LINT
 
 
+def test_the_reporting_job_is_pull_request_scoped_and_always_runs() -> None:
+    """It must not be skippable: a skipped required check reports as neutral.
+
+    So unlike the execution jobs it cannot be gated behind lint's result — it
+    runs on every pull request and then refuses any dependency that did not
+    succeed.
+    """
+    condition = _condition_source(_jobs()[AGGREGATOR_JOB].get("if"))
+    assert condition is not None
+    assert "always()" in condition, "a failed dependency would skip the required check"
+    assert "github.event_name == 'pull_request'" in condition
+    assert _needs(AGGREGATOR_JOB) == {"lint", *EXECUTION_JOBS}
+
+
 def test_push_and_dispatch_do_not_allocate_runners_for_pr_only_jobs() -> None:
     """A job-level ``if`` skips the job before a runner is assigned — no checkout, no services."""
-    for job_name in ("lint", "alembic", "tests"):
+    for job_name in ("lint", "alembic", AGGREGATOR_JOB, *EXECUTION_JOBS):
         job = _jobs()[job_name]
         condition = _condition_source(job.get("if"))
         assert condition is not None
@@ -721,7 +758,7 @@ def test_migration_gate_is_also_mandatory_and_dedicated() -> None:
 def test_general_pytest_step_ignores_both_docker_dependent_suites() -> None:
     general_invocations = [
         invocation
-        for step in _steps("tests")
+        for step in _execution_steps()
         for invocation in _pytest_invocations(step)
         if {NGINX_SUITE, MIGRATION_SUITE} <= _ignored_suites(invocation)
     ]
@@ -731,7 +768,7 @@ def test_general_pytest_step_ignores_both_docker_dependent_suites() -> None:
 
 def test_nginx_suite_is_executed_exactly_once() -> None:
     """Anything else means the container work runs twice in one job."""
-    executing = _suite_executions("tests", NGINX_SUITE)
+    executing = _suite_executions(NGINX_SUITE)
     assert len(executing) == 1, f"the Nginx suite is executed {len(executing)} times"
     step, _ = executing[0]
     assert NGINX_GATE_ENV in (step.get("env") or {}), "the only execution must be the mandatory one"
@@ -740,11 +777,11 @@ def test_nginx_suite_is_executed_exactly_once() -> None:
 @pytest.mark.parametrize("suite", [NGINX_SUITE, MIGRATION_SUITE])
 def test_both_docker_dependent_suites_keep_their_own_gate(suite: str) -> None:
     """The migration gate must not be lost while adding the Nginx one."""
-    executing = _suite_executions("tests", suite)
+    executing = _suite_executions(suite)
     assert len(executing) == 1, f"{suite} must be executed exactly once"
     step, _ = executing[0]
     assert step.get("env"), f"{suite} must run under a mandatory env flag"
-    ignoring = [step for step in _steps("tests") if _ignores_suite(step, suite)]
+    ignoring = [step for step in _execution_steps() if _ignores_suite(step, suite)]
     assert ignoring, f"the general pytest step must --ignore {suite}"
 
 

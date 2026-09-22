@@ -10,12 +10,54 @@ how strict they are. No test is deleted, skipped or xfailed to make CI faster.
 
 | Tier | What it is | When it runs |
 | --- | --- | --- |
-| **Required** | Everything except modules explicitly marked `legacy_altegio`, plus the dedicated migration / Nginx / reminder-handover gates | Every pull request, `CI / Deploy` → job `tests` (`Run Tests`) |
+| **Required** | Everything except modules explicitly marked `legacy_altegio`, plus the dedicated migration / Nginx / reminder-handover gates | Every pull request, `CI / Deploy`, reported by job `tests` (`Run Tests`) |
 | **Legacy** | Exactly the modules marked `legacy_altegio` | Nightly at 02:23 UTC and on demand, workflow `Legacy Altegio Tests` |
 
 A plain `uv run pytest` is **neither** tier: it is the full project suite, and
 it stays that way. The marker filter lives only in the CI invocation, never in
 `addopts`.
+
+## Required-gate topology
+
+The required tier executes on **three runners in parallel** and is reported by
+a fourth, step-only job:
+
+| Job key | Name | What it runs |
+| --- | --- | --- |
+| `required-tests-heavy` | Required Tests (heavy shard) | exactly the 16 heaviest general modules, listed explicitly |
+| `required-tests-rest` | Required Tests (rest shard) | the whole test root **minus** the dedicated suites **minus** heavy |
+| `required-tests-dedicated` | Required Tests (dedicated gates) | the three mandatory gates, under their env flags |
+| `tests` | **Run Tests** | nothing — it aggregates the three above |
+
+Each execution job gets its **own** PostgreSQL 16 service. That is also why
+`pytest-xdist` is deliberately not used: two workers sharing one database would
+race on migrations and on the truncated shared tables. Parallelism here comes
+from separate GitHub jobs with separate databases, not from separate processes
+against one.
+
+`tests` keeps its key and its name because branch protection refers to those
+strings. It runs under `always()` — without that, a failed or cancelled
+dependency would *skip* it, and a skipped required check reports as neutral
+rather than red — and then fails unless every dependency result is exactly
+`success`. Failure, cancelled and skipped are all red.
+
+### Why the split is asymmetric
+
+Only `heavy` is a list. `rest` is a subtraction:
+
+```
+heavy = exactly the 16 listed modules
+rest  = the whole test root − the 5 dedicated suites − the 16 heavy modules
+```
+
+This is the property that makes the union total. A module nobody classified —
+**including every test file added tomorrow** — is collected by `rest` and stays
+required by default. An allowlist of "light" modules would invert that, and the
+first forgotten entry would leave the gate with no failing check to notice it.
+
+`src/altegio_bot/tests/test_ci_required_test_shards.py` refuses a positional
+target on the rest shard for exactly this reason, and proves heavy and rest do
+not overlap.
 
 ## Commands
 
@@ -25,10 +67,16 @@ Full project suite — the local default, unchanged:
 uv run pytest -q
 ```
 
-Required tier, exactly as the pull-request gate runs it:
+Heavy shard, exactly as `required-tests-heavy` runs it:
 
 ```bash
-uv run pytest -q -m "not legacy_altegio" --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py
+uv run pytest -q -m "not legacy_altegio" src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py src/altegio_bot/tests/test_easyweek_migration_live_proof.py src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py src/altegio_bot/tests/test_easyweek_pr4_migration.py src/altegio_bot/tests/test_easyweek_migration_apply.py src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py src/altegio_bot/tests/test_easyweek_manual_recipient.py src/altegio_bot/tests/test_easyweek_visit_counter.py src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py src/altegio_bot/tests/test_easyweek_post_booking_handover.py
+```
+
+Rest shard, exactly as `required-tests-rest` runs it:
+
+```bash
+uv run pytest -q -m "not legacy_altegio" --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py --ignore=src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py --ignore=src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py --ignore=src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py --ignore=src/altegio_bot/tests/test_easyweek_migration_live_proof.py --ignore=src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py --ignore=src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py --ignore=src/altegio_bot/tests/test_easyweek_pr4_migration.py --ignore=src/altegio_bot/tests/test_easyweek_migration_apply.py --ignore=src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py --ignore=src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py --ignore=src/altegio_bot/tests/test_easyweek_manual_recipient.py --ignore=src/altegio_bot/tests/test_easyweek_visit_counter.py --ignore=src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py --ignore=src/altegio_bot/tests/test_easyweek_post_booking_handover.py
 ```
 
 Legacy tier:
@@ -37,10 +85,41 @@ Legacy tier:
 uv run pytest -q -m legacy_altegio
 ```
 
-The five `--ignore` entries are not an exclusion: those suites already ran in
-their own mandatory steps earlier in the same job. Dropping an `--ignore` makes
-the job run heavy container work twice; dropping a dedicated step removes a
-gate. The dedicated steps are **never** marker-filtered.
+The 21 `--ignore` entries on the rest shard are not an exclusion: every one of
+those paths is executed exactly once on another runner — the five dedicated
+suites under their mandatory env flags, the sixteen heavy modules on the heavy
+runner. Dropping an `--ignore` makes a module run twice; dropping a dedicated
+step removes a gate. The dedicated steps are **never** marker-filtered.
+
+### The 16 heavy modules
+
+Chosen from median per-module duration over the three profiling runs below. The
+list is a measurement taken beforehand, never a rule the workflow evaluates at
+run time: it is not a glob, not "modules whose name contains EasyWeek", and not
+anything derived from timings observed during the run being sharded.
+
+```
+src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py
+src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py
+src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py
+src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py
+src/altegio_bot/tests/test_easyweek_migration_live_proof.py
+src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py
+src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py
+src/altegio_bot/tests/test_easyweek_pr4_migration.py
+src/altegio_bot/tests/test_easyweek_migration_apply.py
+src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py
+src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py
+src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py
+src/altegio_bot/tests/test_easyweek_manual_recipient.py
+src/altegio_bot/tests/test_easyweek_visit_counter.py
+src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py
+src/altegio_bot/tests/test_easyweek_post_booking_handover.py
+```
+
+Re-balancing the shard means editing both the workflow and
+`EXPECTED_HEAVY_MODULES` in the shard contract, which is intentional: the two
+must move together or the contract fails.
 
 Dedicated required gates, each in its own step with a mandatory env flag and no
 `continue-on-error` and no `if:`:
@@ -214,11 +293,87 @@ A red `Legacy Altegio Tests` run is a real finding about Altegio behaviour. It
 is triaged like any other failure. It is not muted, not marked `xfail`, and the
 workflow does not get `continue-on-error`.
 
-## Benchmark
+## Shard sizing: profiling and projection
+
+Three GitHub Actions runs of the **pre-split** general required invocation, all
+on one SHA. This is runner data, not laptop data — the local benchmark further
+down measures something else (the Wave 1 marker) on a contended machine.
+
+| Run | Tests | Failures | Errors | pytest time |
+| --- | --- | --- | --- | --- |
+| 1 | 10 071 | 0 | 0 | 2879.097 s |
+| 2 | 10 071 | 0 | 0 | 1593.708 s |
+| 3 | 10 071 | 0 | 0 | 1521.105 s |
+
+All three collected the **same set of test IDs**, so the runs differ in speed
+only. Run 1 was globally slower — every module in it, not one hot spot — so it
+is treated as an outlier of the runner, not as evidence about any test. Nothing
+here was tuned against a single anomalous run.
+
+**Median: 1593.708 s = 26:34.** That is the figure the split is sized against.
+
+### Projected critical path
+
+Summing median per-module durations:
+
+| Group | Median total |
+| --- | --- |
+| the 16 heavy modules | ~800.619 s |
+| all remaining general modules | ~766.715 s |
+
+Running those two groups on separate runners puts the general critical path at
+roughly **13–14 minutes**, against a 26:34 median today.
+
+**This is a projection, not a measured speed-up.** It is arithmetic over
+per-module medians. It ignores per-job setup (checkout, `uv sync --frozen`,
+waiting for PostgreSQL), runner scheduling latency, and the ordinary variance
+that made run 1 nearly twice run 3. The real number has to be read off three
+GitHub runs after this PR is open, exactly as the median above was, and only
+then compared. Until that happens, no percentage should be quoted from this
+table.
+
+### Trade-off: this buys wall time, not runner minutes
+
+The split does not make the work smaller. It runs the same tests on three
+runners instead of one, and each of those runners pays its own checkout,
+dependency sync and PostgreSQL startup. Total consumed runner-minutes therefore
+go **up**, by roughly the setup cost of two extra jobs plus whatever the
+dedicated gates were previously sharing with the general run.
+
+What the split buys is elapsed time to a red or green PR. **No saving of
+billable runner-minutes is claimed, and none should be.**
+
+### Pre-existing gate debt: nine plan-gated skips
+
+`docs/easyweek/INTEGRATION_PLAN.md` is in `.gitignore`, so it does not exist on
+a CI runner. Nine tests are guarded by
+`skipif(not PLAN.exists(), reason="INTEGRATION_PLAN.md is untracked (.gitignore)")`
+and therefore skip in every CI run today:
+
+| Module | Plan-gated tests |
+| --- | --- |
+| `test_easyweek_pr7_4_rollout_contract.py` | 4 |
+| `test_easyweek_multi_service_rollout_contract.py` | 2 |
+| `test_easyweek_visit_counter_contract.py` | 2 |
+| `test_easyweek_failed_cancellation_recovery.py` | 1 |
+
+These predate this PR and are **not** touched by it: the split neither creates
+nor removes a skip, and the same nine skip before and after. They are recorded
+here as known gate debt — nine contract assertions that no CI run has ever
+actually executed — to be resolved separately, not by relaxing anything here.
+This PR adds no new skips.
+
+## Benchmark — Wave 1 marker (local, superseded for sizing)
+
+This section records the local measurement that accompanied the Wave 1 marker
+split. It is kept as the audit trail for that decision. For sizing the shards,
+use the GitHub profiling runs above instead: these numbers come from a
+contended laptop and, as the section itself concludes, wall clock there could
+not measure the effect at all.
 
 ### What was measured, and on what
 
-Every number below comes from the **working tree of this branch**: base commit
+Every number below comes from the **working tree of that branch**: base commit
 `e478a24` (the first-wave quarantine commit) plus the uncommitted review fix
 that returns `campaigns/test_runner_counters.py` to the required tier. No
 measurement describes a released commit, and none of them was taken on
@@ -322,7 +477,7 @@ the marker filter changes no skip. The legacy tier runs with zero skips.
 
 ## Guardrails
 
-`src/altegio_bot/tests/test_ci_legacy_altegio_quarantine.py` enforces this
+`src/altegio_bot/tests/test_ci_legacy_altegio_quarantine.py` enforces the tier
 policy structurally — parsed TOML, parsed YAML and tokenized shell commands,
 not substring grep. It fails if the marker is unregistered, if strict markers
 are turned off, if `addopts` starts filtering the marker, if the general CI run
@@ -330,5 +485,20 @@ loses or duplicates the negative filter, if a dedicated gate acquires one, if
 the required job is renamed, if the legacy workflow gains a push/PR trigger or
 deploy power, or if any gate gains `continue-on-error`.
 
-`src/altegio_bot/tests/test_ci_workflow_nginx_gate.py` keeps its own,
-unchanged, guarantees about the Nginx and migration gates and the deploy split.
+`src/altegio_bot/tests/test_ci_workflow_nginx_gate.py` keeps its guarantees
+about the Nginx and migration gates and the deploy split. Both files now look
+for pytest invocations across the three execution jobs rather than inside
+`tests`, since `tests` no longer runs anything. That widens where a gate may be
+found; it does not widen what counts as one.
+
+`src/altegio_bot/tests/test_ci_required_test_shards.py` owns the split itself.
+It proves the four jobs exist and are pull-request scoped, that each execution
+job has its own healthchecked PostgreSQL 16 and a throwaway database, that
+heavy runs exactly the sixteen listed modules once each, that rest is a
+subtraction and not an allowlist, that heavy and rest do not overlap, that
+every path rest ignores is executed somewhere else, that the dedicated gates
+keep their mandatory env flags and cannot be made conditional, and that the
+aggregator keeps the branch-protection identity and fails closed on any result
+other than `success`. It also tests its own parsers against positive and
+negative examples, and it pins no total test count — new tests must be addable
+without editing a number.

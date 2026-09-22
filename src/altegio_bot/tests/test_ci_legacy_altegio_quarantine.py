@@ -36,12 +36,16 @@ import pytest
 import yaml
 
 from altegio_bot.tests.test_ci_workflow_nginx_gate import (
+    DEDICATED_JOB,
+    EXECUTION_JOBS,
     MIGRATION_GATE_ENV,
     MIGRATION_SUITE,
     NGINX_GATE_ENV,
     NGINX_SUITE,
+    _execution_steps,
     _pytest_invocations,
     _steps,
+    _suite_executions,
     _workflow,
     _workflow_triggers,
 )
@@ -153,22 +157,27 @@ def _legacy_steps() -> list[dict[str, Any]]:
 
 
 def _required_general_invocations() -> list[list[str]]:
-    """The general application run: the one that --ignore's the dedicated gates."""
+    """The general application run: the one that --ignore's the dedicated gates.
+
+    `tests` is now a step-only aggregator, so this looks across the execution
+    jobs. Exactly one of them collects the test root and narrows it with
+    --ignore; that is the run this helper returns.
+    """
     return [
         invocation
-        for step in _steps(REQUIRED_JOB_KEY)
+        for step in _execution_steps()
         for invocation in _pytest_invocations(step)
         if _ignored_suites(invocation)
     ]
 
 
 def _required_dedicated_invocations() -> list[list[str]]:
-    return [
-        invocation
-        for step in _steps(REQUIRED_JOB_KEY)
-        for invocation in _pytest_invocations(step)
-        if not _ignored_suites(invocation)
-    ]
+    """The mandatory gates, identified by the job that owns them.
+
+    Classifying by "has no --ignore" stopped working when the heavy shard
+    arrived: it also names its targets positionally and ignores nothing.
+    """
+    return [invocation for step in _steps(DEDICATED_JOB) for invocation in _pytest_invocations(step)]
 
 
 # ===========================================================================
@@ -241,8 +250,9 @@ def test_required_workflow_keeps_its_branch_protection_identity() -> None:
 
 def test_required_job_has_no_matrix_or_path_filters() -> None:
     """A matrix multiplies the check name; a path filter lets a PR skip it."""
-    job = _workflow()["jobs"][REQUIRED_JOB_KEY]
-    assert "strategy" not in job, "a matrix would rename the required check"
+    jobs = _workflow()["jobs"]
+    for job_name in (REQUIRED_JOB_KEY, *EXECUTION_JOBS):
+        assert "strategy" not in jobs[job_name], f"a matrix on {job_name} would multiply check names"
     triggers = _workflow_triggers(_workflow())
     for event in ("pull_request", "push"):
         config = triggers.get(event) or {}
@@ -258,30 +268,38 @@ def test_exactly_one_general_invocation_filters_the_marker_out() -> None:
 
 
 def test_general_invocation_keeps_all_five_ignores() -> None:
-    """The marker filter must not become an excuse to re-run the heavy gates."""
+    """The marker filter must not become an excuse to re-run the heavy gates.
+
+    The general run now also ignores the heavy shard, which runs on its own
+    runner, so this asserts containment rather than equality. The *exact*
+    composition — these five and the sixteen heavy modules and nothing else —
+    is pinned in ``test_ci_required_test_shards.py``, which is the module that
+    knows the heavy list. What is asserted here is the part this file owns:
+    not one of the five dedicated suites may quietly lose its --ignore and be
+    executed a second time outside its mandatory gate.
+    """
     general = _required_general_invocations()
     assert len(general) == 1
     ignored = _ignored_suites(general[0])
-    assert ignored == EXPECTED_IGNORED_SUITES, f"unexpected --ignore set: {sorted(ignored)}"
-    assert len(ignored) == 5
+    missing = EXPECTED_IGNORED_SUITES - ignored
+    assert not missing, f"the general run stopped ignoring: {sorted(missing)}"
 
 
 @pytest.mark.parametrize("suite", DEDICATED_GATE_SUITES)
 def test_dedicated_gates_are_never_marker_filtered(suite: str) -> None:
-    """A marker filter on a dedicated gate could silence it without a diff to the gate."""
-    running = [
-        invocation
-        for invocation in _required_dedicated_invocations()
-        if any(target == suite for target in invocation[3:])
-    ]
-    assert running, f"no dedicated invocation runs {suite}"
-    for invocation in running:
+    """A marker filter on a dedicated gate could silence it without a diff to the gate.
+
+    Job-agnostic on purpose: wherever the suite is executed across the required
+    gate, that execution must carry no marker filter.
+    """
+    executions = _suite_executions(suite)
+    assert executions, f"no invocation runs {suite}"
+    for _, invocation in executions:
         assert _marker_selections(invocation) == [], f"{suite} must not be marker-filtered"
 
 
 def test_mandatory_env_gates_survive_the_change() -> None:
-    steps = _steps(REQUIRED_JOB_KEY)
-    env_flags = {name for step in steps for name in (step.get("env") or {})}
+    env_flags = {name for step in _execution_steps() for name in (step.get("env") or {})}
     assert {MIGRATION_GATE_ENV, NGINX_GATE_ENV, "REQUIRE_PG_CONCURRENCY"} <= env_flags
 
 
