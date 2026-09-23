@@ -864,6 +864,27 @@ class Settings(BaseSettings):
     easyweek_manual_voucher_staffer_uuid: str = ""
     easyweek_manual_voucher_account_uuid: str = ""
 
+    # --- §41: controlled EasyWeek voucher snapshot BATCH (PR-18) -------------
+    # §37.2 proved the whole irreversible sequence for one manually selected
+    # person. This phase repeats it for a bounded handful — at most five, at
+    # most €75 — out of one frozen preview snapshot.
+    #
+    # Its own fence, again. Turning on §36 or §37.2 must never be what
+    # authorises a batch, and turning this one on must not reopen either of
+    # them. False everywhere by default: with it false every stage refuses
+    # before any HTTP request, the read-only plan included.
+    #
+    # The size limit is deliberately NOT here. Five recipients and €75 are
+    # literals in the code and CHECK constraints in the database, because a
+    # ceiling an environment variable could raise is not a ceiling.
+    easyweek_voucher_snapshot_batch_enabled: bool = False
+
+    # Who performs the sale and which POS account is charged. Production UUIDs
+    # have no business in a repository: they arrive at run time and are
+    # validated as canonical UUIDs. Empty is a refusal, never a guess.
+    easyweek_voucher_snapshot_batch_staffer_uuid: str = ""
+    easyweek_voucher_snapshot_batch_account_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------

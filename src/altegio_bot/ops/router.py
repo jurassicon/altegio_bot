@@ -20,6 +20,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.campaigns.easyweek_manual_voucher.ledger import preview_is_locked_by_manual_canary
+from altegio_bot.campaigns.easyweek_voucher_batch.ledger import preview_is_locked_by_voucher_batch
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
@@ -3468,6 +3469,104 @@ async def ops_manual_voucher_canary_page() -> str:
     return _page("Manual voucher canary", body)
 
 
+@router.get("/docs/voucher-snapshot-batch", response_class=HTMLResponse)
+async def ops_voucher_snapshot_batch_page() -> str:
+    """Read-only status of the §41 batch, and where its runbook lives.
+
+    Deliberately a page with nothing to click, for the same reason as its §37.2
+    sibling and more so: this one can spend up to €75 and message up to five
+    real people. It is driven one stage at a time from a terminal, each stage
+    behind its own freshly approved plan, and a button here would be precisely
+    the one-click "pay and send" this phase exists to avoid. What an operator
+    needs from a browser is the durable state and the name of the document that
+    tells them what to type.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_batch import runner as batch_runner
+
+    try:
+        report = await batch_runner.run_status(SessionLocal)
+        state: dict[str, Any] = report.as_safe_dict()
+    except SQLAlchemyError:
+        # A status page that 500s tells an operator less than one that says the
+        # state could not be read. No SQL and no exception text reach the page.
+        state = {"batch": {}, "recipient_basis": None, "first_visit_proof": None}
+    batch = state.get("batch") or {}
+    items = batch.get("items") or []
+
+    rows = [
+        (
+            "Fence (EASYWEEK_VOUCHER_SNAPSHOT_BATCH_ENABLED)",
+            "открыт" if settings.easyweek_voucher_snapshot_batch_enabled else "закрыт",
+        ),
+        ("Batch", "есть" if batch.get("exists") else "нет"),
+        ("Статус", batch.get("status") or "—"),
+        ("Halted", "да" if batch.get("halted") else "нет"),
+        ("Причина halt", batch.get("halted_reason_code") or "—"),
+        ("Basis", state.get("recipient_basis") or "—"),
+        ("First-visit proof", state.get("first_visit_proof") or "—"),
+        ("Preview run", str(batch.get("campaign_run_id") or "—")),
+        # The entitlement period, not the send date. A transitional August
+        # audience mailed in October is still an August entitlement, and an
+        # operator reading this page has to be able to see which wave the batch
+        # is bound to without opening the CLI.
+        ("Период кампании", batch.get("campaign_period") or "—"),
+        ("Получателей", f"{batch.get('recipient_count', 0)} из максимум {state.get('max_recipients')}"),
+        (
+            "Экспозиция",
+            f"{int(batch.get('total_exposure_minor') or 0) / 100:.2f} € "
+            f"(потолок {int(state.get('max_exposure_minor') or 0) / 100:.2f} €)",
+        ),
+        ("Frozen digest", batch.get("frozen_digest") or "—"),
+        ("Baseline", batch.get("baseline_version") or "—"),
+        ("Требуется reconcile", "да" if batch.get("reconciliation_required") else "нет"),
+        ("Требуется ручная очистка", "да" if state.get("manual_cleanup_required") else "нет"),
+    ]
+    table = "".join(
+        f"<tr><th class='text-nowrap'>{_esc(name)}</th><td><code>{_esc(str(value))}</code></td></tr>"
+        for name, value in rows
+    )
+
+    # Per slot: the state a human needs to see, and nothing about the person.
+    # No phone, no name, no customer UUID, no order UUID and no voucher code.
+    slot_rows = "".join(
+        "<tr>"
+        f"<td><code>{_esc(str(entry.get('slot')))}</code></td>"
+        f"<td><code>{_esc(str(entry.get('status') or '—'))}</code></td>"
+        f"<td><code>{_esc(str(entry.get('reason_code') or '—'))}</code></td>"
+        f"<td><code>{_esc('да' if entry.get('target_order_recorded') else 'нет')}</code></td>"
+        f"<td><code>{_esc(str(entry.get('send_attempt_count', 0)))}</code></td>"
+        f"<td><code>{_esc('да' if entry.get('reconciliation_required') else 'нет')}</code></td>"
+        "</tr>"
+        for entry in items
+    )
+    slots_table = (
+        "<table class='table table-sm w-auto'>"
+        "<thead><tr><th>Slot</th><th>Статус</th><th>Причина</th>"
+        "<th>Заказ</th><th>Попыток</th><th>Reconcile</th></tr></thead>"
+        f"<tbody>{slot_rows}</tbody></table>"
+        if slot_rows
+        else "<p class='text-muted'>Слотов нет: batch ещё не заморожен.</p>"
+    )
+
+    body = f"""
+<h1 class="h4 mb-3">Controlled voucher snapshot batch (§41)</h1>
+<div class="alert alert-secondary">
+  До пяти вручную выбранных получателей, по одному ваучеру €15 на каждого,
+  максимум €75. Страница только читает состояние: все стадии выполняются из CLI
+  <code>easyweek_voucher_snapshot_batch</code>, каждая — по отдельно
+  утверждённому плану. Кнопок здесь нет намеренно.
+</div>
+<table class="table table-sm w-auto">{table}</table>
+{slots_table}
+<div class="alert alert-warning">
+  <b>Инструкция:</b> <code>docs/easyweek/VOUCHER_SNAPSHOT_BATCH_RUNBOOK.md</code> в репозитории.
+  Массовая отправка не разрешена: <code>campaign_send_authorized=false</code>,
+  <code>bulk_delivery_authorized=false</code>, <code>ready_for_send=false</code>.
+</div>
+"""
+    return _page("Voucher snapshot batch", body)
+
+
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
 async def ops_new_clients_campaign_page(request: Request) -> str:
     """Страница запуска кампании новых клиентов из браузера."""
@@ -5589,15 +5688,24 @@ async def ops_campaign_run_detail(run_id: int) -> str:
                 )
             )
             used_as_source = int(src_count or 0) > 0
-        # A preview the §36 canary has attached itself to is frozen. The backend
-        # refuses the edits under a row lock; not offering the buttons is how an
-        # operator finds out before they click.
+        # A preview a canary or a batch has attached itself to is frozen. The
+        # backend refuses the edits under a row lock; not offering the buttons
+        # is how an operator finds out before they click.
         canary_locked = await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
-        # Which one, for the operator reading the page. Two canaries can hold a
-        # preview and they are driven by different commands, so "a canary" is
-        # not enough to act on.
+        # Which one, for the operator reading the page. Three different things
+        # can hold a preview and they are driven by different commands and
+        # different runbooks, so "a canary" is not enough to act on.
         manual_locked = await preview_is_locked_by_manual_canary(session, campaign_run_id=run_id)
-        canary_label = "§37.2, ручной выбор" if manual_locked else "§36"
+        batch_locked = await preview_is_locked_by_voucher_batch(session, campaign_run_id=run_id)
+        if batch_locked:
+            canary_label = "§41, snapshot batch"
+            canary_runbook_url = "/ops/docs/voucher-snapshot-batch"
+        elif manual_locked:
+            canary_label = "§37.2, ручной выбор"
+            canary_runbook_url = "/ops/docs/manual-voucher-canary"
+        else:
+            canary_label = "§36"
+            canary_runbook_url = "/ops/docs/manual-voucher-canary"
 
         # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
         # not computed: it is Altegio follow-up machinery, and running it would
@@ -5743,7 +5851,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <span>Этот preview занят controlled voucher canary ({_esc(canary_label)}).
         Add, Remove, Discard и Delete заблокированы бэкендом до завершения canary.
         Статус и стадии — только из операторского CLI.</span>
-  <a href="/ops/docs/manual-voucher-canary" class="btn btn-sm btn-outline-secondary">Инструкция</a>
+  <a href="{_esc(canary_runbook_url)}" class="btn btn-sm btn-outline-secondary">Инструкция</a>
 </div>
 """
     elif run.mode == "preview" and run.status == "completed":
