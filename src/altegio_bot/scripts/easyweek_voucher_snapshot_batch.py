@@ -332,16 +332,21 @@ _EFFECTFUL_COMMANDS: Final = frozenset({STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, 
 _DURABLE_COMMANDS: Final = _EFFECTFUL_COMMANDS | {STAGE_FREEZE}
 
 
-def _durable_batch() -> dict[str, Any] | None:
+async def _durable_batch() -> dict[str, Any] | None:
     """The batch as the database currently reads it, or ``None`` if unreadable.
 
-    Used only on the failure path, to answer an operator's real question — what
-    does the ledger say NOW — rather than repeating what the crashed command
-    believed a moment ago. Fails silently to ``None``: a second exception here
-    must not replace the first report with a worse one.
+    Answers an operator's real question — what does the ledger say NOW — rather
+    than repeating what the crashed command believed a moment ago. Fails
+    silently to ``None``: a second exception here must not replace the first
+    report with a worse one.
+
+    Awaited, never ``asyncio.run``. See :func:`_run_command`: every database
+    read of one invocation has to happen in the SAME event loop, because the
+    connections behind ``SessionLocal`` are pooled and a pooled asyncpg
+    connection belongs to the loop that created it.
     """
     try:
-        report = asyncio.run(runner_module.run_status(SessionLocal))
+        report = await runner_module.run_status(SessionLocal)
     except Exception:  # noqa: BLE001 - an unreadable database is itself the answer
         return None
     return report.as_safe_dict().get("batch")
@@ -389,7 +394,7 @@ def _fail_closed(
     return report.as_safe_dict(), EXIT_UNKNOWN
 
 
-def _unexpected_failure(
+async def _unexpected_failure(
     command: str,
     *,
     before: dict[str, Any] | None,
@@ -438,7 +443,7 @@ def _unexpected_failure(
     Nothing here prints a traceback, an exception message, SQL, a URL, a
     customer UUID, a phone number or a voucher code.
     """
-    after = _durable_batch()
+    after = await _durable_batch()
     effectful = command in _EFFECTFUL_COMMANDS
 
     # A slot is sitting claimed or unknown: something may be in flight.
@@ -497,27 +502,53 @@ def _unexpected_failure(
     return payload, code
 
 
-def main(argv: list[str] | None = None) -> int:
-    redact_easyweek_url_logging()
-    args = _build_parser().parse_args(argv)
+async def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """The whole life of one invocation, inside ONE event loop.
+
+    Why this function exists at all
+    -------------------------------
+    ``SessionLocal`` is the production engine, and it pools. A pooled asyncpg
+    connection belongs to the event loop that opened it: hand it to a second
+    loop and the checkout fails with *Event loop is closed* or *got Future
+    attached to a different loop*. An earlier version ran the baseline read,
+    the command and the failure read in three separate ``asyncio.run`` calls,
+    which is three loops over one pool — the first read poisoned it for
+    everything after, and the broad catch below then turned that into a
+    perfectly healthy database reported as unreadable.
+
+    So the async lifecycle is not split. The baseline, the dispatch and both
+    failure paths are awaited here, and the only ``asyncio.run`` in this module
+    is the one line in :func:`main` that enters it.
+    """
     # The ledger BEFORE this command touches anything, for the commands that
     # can write durably. It is the only way a failure handler can tell what
     # this invocation did from what earlier ones left behind.
-    before = _durable_batch() if args.command in _DURABLE_COMMANDS else None
+    before = await _durable_batch() if args.command in _DURABLE_COMMANDS else None
     try:
-        payload, code = asyncio.run(_dispatch(args))
+        return await _dispatch(args)
     except EasyWeekConfigError:
         # A deployment fault, raised while building the transport — before any
         # claim and before any request. Named, without the configuration it is
         # complaining about, and still checked against the evidence so that a
         # misconfiguration discovered late cannot report a clean refusal over
         # work this command already did.
-        payload, code = _unexpected_failure(args.command, before=before, reason=RUNTIME_IDENTITY_UNUSABLE)
+        return await _unexpected_failure(args.command, before=before, reason=RUNTIME_IDENTITY_UNUSABLE)
     except Exception:  # noqa: BLE001 - a stable, PII-free surface for operators
         # Deliberately no traceback, no exception text and no SQL: an operator
         # report is pasted into tickets, and an exception string here could
         # carry a URL with a customer UUID in it.
-        payload, code = _unexpected_failure(args.command, before=before)
+        return await _unexpected_failure(args.command, before=before)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The sync entry point: parse, run one loop, print, exit.
+
+    Exactly one ``asyncio.run``. One CLI process is one invocation is one event
+    loop, which is the boundary the pooled database engine requires.
+    """
+    redact_easyweek_url_logging()
+    args = _build_parser().parse_args(argv)
+    payload, code = asyncio.run(_run_command(args))
     _print_json(payload)
     return code
 

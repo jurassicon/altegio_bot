@@ -3329,3 +3329,243 @@ def test_a_terminal_slot_alone_is_not_proof_that_nothing_happened() -> None:
 
     before = {**settled, "items": [{"slot": 1, "status": VOUCHER_BATCH_ITEM_PLANNED}, settled["items"][1]]}
     assert before != settled
+
+
+# ===========================================================================
+# One CLI invocation is one event loop
+# ===========================================================================
+
+
+async def _run_cli_pooled(argv: list[str]) -> tuple[dict, int]:
+    """Drive the entry point against the REAL pooled engine, as production does.
+
+    The sibling helper above swaps in a ``NullPool`` engine, which is right for
+    isolating the other tests and wrong for this one: NullPool opens and closes
+    a connection per checkout, so it cannot reproduce a pooled connection being
+    handed to a second event loop. That is the whole bug, so this helper leaves
+    ``altegio_bot.db.SessionLocal`` exactly as the deployed CLI finds it.
+
+    Why the cleanup is safe
+    -----------------------
+    After the invocation the pool holds a connection belonging to the loop that
+    ``main`` created and then closed. ``dispose(close=False)`` ABANDONS those
+    connections instead of closing them: nothing is scheduled on the dead loop,
+    so there is no ``Event loop is closed`` and no "coroutine was never awaited"
+    warning to leak into unrelated tests, and the next checkout opens a fresh
+    connection. The abandoned socket is released when this test process exits —
+    at most one per invocation here, which is why this is affordable for a
+    couple of tests and not a pattern to spread.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    import altegio_bot.db as app_db
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    assert cli.SessionLocal is app_db.SessionLocal, "this test must use the production engine"
+
+    def run() -> tuple[str, int]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli.main(argv)
+        return buffer.getvalue(), code
+
+    try:
+        printed, code = await asyncio.to_thread(run)
+    finally:
+        await app_db.engine.dispose(close=False)
+    return json.loads(printed), code
+
+
+async def test_the_cli_survives_the_production_pooled_engine(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """A baseline read and then a command, over one pooled engine.
+
+    ``SessionLocal`` pools, and a pooled asyncpg connection belongs to the loop
+    that opened it. When the baseline read, the command and the failure read
+    each ran in their own ``asyncio.run``, the first read poisoned the pool for
+    everything after it: the second checkout died with *Event loop is closed* /
+    *got Future attached to a different loop*, the broad handler swallowed it,
+    and a perfectly healthy database was reported to the operator as
+    unreadable.
+
+    So this drives the real entry point against the real engine and asserts the
+    database was readable the whole way through.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+
+    # `create` is a durable command, so it takes a baseline read first and then
+    # reads again inside the dispatch — two checkouts in one invocation, which
+    # is exactly the shape that used to break.
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(FakeMutator()))
+
+    payload, code = await _run_cli_pooled(
+        [
+            "create",
+            "--preview-run-id",
+            str(run_id),
+            "--apply",
+            "--plan-digest",
+            "0" * 64,
+            "--plan-issued-at",
+            utcnow().isoformat(),
+            "--confirm",
+            "wrong-phrase",
+        ]
+    )
+
+    # A stale approval, refused on its merits — NOT a database failure.
+    assert DATABASE_UNAVAILABLE not in payload["reasons"], payload["reasons"]
+    assert payload["outcome"] == "refused"
+    assert PLAN_DIGEST_MISMATCH in payload["reasons"]
+    assert code == cli.EXIT_CONTRACT_MISMATCH
+    # The ledger really was read, in both directions.
+    assert payload["batch"]["exists"] is True
+    assert payload["batch"]["recipient_count"] == count
+    _assert_pii_free(payload, count=count)
+
+
+async def test_the_cli_survives_a_pooled_engine_on_the_failure_path(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """The same, for the path that reads the ledger a SECOND time.
+
+    The failure handler takes its own reading to classify what happened. Under
+    the old split that was a third event loop over the same pool, so the
+    classification itself could only ever come back "unreadable" — turning a
+    proven pre-claim refusal into a fail-closed unknown.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(FakeMutator()))
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure before anything was claimed")
+
+    monkeypatch.setattr(runner_module, "build_stage_plan", explode)
+
+    payload, code = await _run_cli_pooled(
+        ["create", "--preview-run-id", str(run_id), "--apply", "--plan-digest", "x", "--confirm", "y"]
+    )
+
+    # Nothing was claimed and the ledger said so, so the refusal is provable
+    # and exit 4 is honest. Under the old split this could not be established
+    # at all and the command fell back to a fail-closed unknown.
+    assert code == cli.EXIT_CONTRACT_MISMATCH
+    assert payload["outcome"] == "refused"
+    assert payload["external_effect_attempted"] is False
+    assert payload["batch"]["exists"] is True
+    _assert_pii_free(payload, count=count)
+
+
+async def test_one_invocation_enters_exactly_one_event_loop(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """The structural half of the same guarantee.
+
+    A pooled connection belongs to one loop, so the number of loops an
+    invocation enters is the number of times it can poison its own pool. One
+    CLI process is one invocation is one event loop; ``main`` is the only place
+    that enters it.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    await _freeze(session_maker, reader, batch_request(run_id=run_id))
+
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(FakeMutator()))
+
+    entered: list[str] = []
+
+    def run() -> int:
+        # Counted inside the worker thread and restored before it returns, so
+        # nothing about the test's own loop is disturbed.
+        original = asyncio.run
+
+        def counting_run(coro, **kwargs):
+            entered.append("loop")
+            return original(coro, **kwargs)
+
+        asyncio.run = counting_run  # type: ignore[assignment]
+        try:
+            import io
+            from contextlib import redirect_stdout
+
+            with redirect_stdout(io.StringIO()):
+                return cli.main(
+                    [
+                        "create",
+                        "--preview-run-id",
+                        str(run_id),
+                        "--apply",
+                        "--plan-digest",
+                        "x",
+                        "--confirm",
+                        "y",
+                    ]
+                )
+        finally:
+            asyncio.run = original  # type: ignore[assignment]
+
+    import altegio_bot.db as app_db
+
+    try:
+        await asyncio.to_thread(run)
+    finally:
+        await app_db.engine.dispose(close=False)
+
+    assert entered == ["loop"], f"expected exactly one event loop, entered {len(entered)}"
+
+
+def test_the_module_enters_the_event_loop_in_exactly_one_place() -> None:
+    """Read from the source, so a future helper cannot quietly add a second.
+
+    Docstrings mention ``asyncio.run`` on purpose — the rule is worth
+    explaining where it is enforced — so only executable statements are
+    counted.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path("src/altegio_bot/scripts/easyweek_voucher_snapshot_batch.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+    ]
+    assert len(sites) == 1, f"expected one asyncio.run call site, found {len(sites)}"
+
+    # And it is in the sync entry point, not buried in a helper.
+    enclosing = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and any(call is sites[0] for call in ast.walk(node))
+    ]
+    assert enclosing == ["main"], enclosing
