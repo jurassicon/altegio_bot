@@ -49,7 +49,9 @@ from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     COMPOSITION_MIXED_BASIS,
     COMPOSITION_TOO_LARGE,
     CONFIRMATION_MISMATCH,
+    DATABASE_UNAVAILABLE,
     ENTITLEMENT_ALREADY_EXISTS,
+    EXECUTION_INTERRUPTED,
     FROZEN_DIGEST_MISMATCH,
     HALTED_BY_PREDECESSOR,
     IDENTITY_BINDING_MISMATCH,
@@ -2907,3 +2909,423 @@ def test_the_runbook_still_states_the_limits_it_is_built_on() -> None:
     # No command that would run two external stages in one go.
     for block in _command_blocks(text):
         assert block.count("easyweek_voucher_snapshot_batch ") <= 1, block
+
+
+# ===========================================================================
+# A command that died AFTER an external effect of its own
+# ===========================================================================
+
+
+def _raise_on_call(monkeypatch, module, name: str, *, nth: int) -> dict[str, int]:
+    """Let the real function run, then blow up on its *nth* call.
+
+    Models the failure the blocker is about: slot 1's request really went out
+    and was really recorded, and the command then stopped before reaching
+    slot 2. The counter is returned so a test can assert where it happened.
+    """
+    original = getattr(module, name)
+    seen = {"calls": 0}
+
+    async def flaky(*args, **kwargs):
+        seen["calls"] += 1
+        if seen["calls"] >= nth:
+            raise RuntimeError("synthetic failure before the next slot was claimed")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, flaky)
+    return seen
+
+
+async def _cli_stage(session_maker, reader, request, *, stage, slot=None):
+    """A fresh plan plus the argv an operator would type for that stage."""
+    plan = await _plan(session_maker, reader, stage=stage, request=request, slot=slot)
+    assert plan.ready, plan.reasons
+    argv = [stage, "--preview-run-id", str(request.preview_run_id)]
+    if slot is not None:
+        argv += ["--slot", str(slot)]
+    argv += [
+        "--apply",
+        "--plan-digest",
+        plan.digest,
+        "--plan-issued-at",
+        plan.issued_at.isoformat(),
+        "--confirm",
+        plan.confirmation_phrase,
+    ]
+    return argv
+
+
+def _assert_pii_free(payload: dict, *, count: int) -> None:
+    printed = json.dumps(payload, ensure_ascii=False, default=str)
+    for secret in [
+        *VOUCHER_CODE_SENTINELS[:count],
+        *PHONES[:count],
+        *CUSTOMER_NAMES[:count],
+        *CUSTOMER_UUIDS[:count],
+        *ORDER_UUIDS[:count],
+    ]:
+        assert secret not in printed, secret
+    assert "Traceback" not in printed
+    assert "synthetic failure" not in printed
+
+
+async def test_a_multi_slot_create_that_died_after_slot_one_never_reports_a_refusal(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """The blocker, in the shape that makes it dangerous.
+
+    Slot 1 creates a real voucher and is recorded as ``created`` — proven,
+    resolved, terminal. The command then dies before claiming slot 2. The
+    ledger holds nothing unresolved, so the old handler read that as "nothing
+    started" and printed `refused`, `external_effect_attempted=false`, exit 4,
+    over an order that exists in the POS.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+    reader.orders = await marker_orders(session_maker, count=count)
+
+    mutator = FakeMutator(create_sequence=[_ok_response(index) for index in range(count)])
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_CREATE)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+    # Slot 1 runs for real; the second claim is where it stops.
+    _raise_on_call(monkeypatch, ledger_module, "claim_create", nth=2)
+
+    payload, code = await _run_cli(argv)
+
+    # Exactly one voucher was created, and it is on the record.
+    assert len(mutator.create_calls) == 1
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.item(1).status == VOUCHER_BATCH_ITEM_CREATED
+    assert snapshot.item(2).status == VOUCHER_BATCH_ITEM_PLANNED
+
+    assert code != cli.EXIT_CONTRACT_MISMATCH
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "interrupted"
+    assert payload["external_effect_attempted"] is True
+    assert EXECUTION_INTERRUPTED in payload["reasons"]
+    # The durable state, as it really is — not forced.
+    assert payload["batch"]["items"][0]["status"] == VOUCHER_BATCH_ITEM_CREATED
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_multi_slot_pay_that_died_after_slot_one_never_denies_the_charge(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """€15 left the account and the command stopped. It may not say otherwise."""
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+
+    paid = await marker_orders(session_maker, count=count, status="paid")
+    mutator = FakeMutator(pay_sequence=[_ok_response(index) for index in range(count)], reader=reader, settles=paid)
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_PAY)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+    _raise_on_call(monkeypatch, ledger_module, "claim_pay", nth=2)
+
+    payload, code = await _run_cli(argv)
+
+    assert len(mutator.pay_calls) == 1
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.item(1).status == VOUCHER_BATCH_ITEM_PAID
+    assert snapshot.item(2).status == VOUCHER_BATCH_ITEM_CREATED
+
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "interrupted"
+    assert payload["external_effect_attempted"] is True
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_multi_slot_deliver_that_died_after_slot_one_never_reports_a_refusal(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """Meta took the message. One attempt is spent and a person may be reading it."""
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+    await _full_pay(session_maker, reader, request, count=count)
+
+    sender = FakeSender()
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_DELIVER)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "VoucherDeliveryClient", lambda *a, **k: _AsyncCM(sender))
+    _raise_on_call(monkeypatch, ledger_module, "claim_send", nth=2)
+
+    payload, code = await _run_cli(argv)
+
+    assert sender.calls == 1
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.item(1).status == VOUCHER_BATCH_ITEM_PROVIDER_ACCEPTED
+    assert snapshot.item(1).send_attempt_count == 1
+    assert snapshot.item(1).provider_message_id_recorded is True
+    assert snapshot.item(2).send_attempt_count == 0
+
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "interrupted"
+    assert payload["external_effect_attempted"] is True
+    assert payload["external_send_attempted"] is True
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_refund_that_died_while_printing_still_says_it_happened(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """A single-slot terminal effect, and the crash is in the report itself."""
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _full_create(session_maker, reader, request, count=count)
+    await _full_pay(session_maker, reader, request, count=count)
+
+    refunded = await marker_orders(session_maker, count=count, status="refunded")
+    mutator = FakeMutator(refund=_ok_response(1), reader=reader, settles={ORDER_UUIDS[1]: refunded[ORDER_UUIDS[1]]})
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_REFUND, slot=2)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+
+    # The refund is made and recorded; building the final report is not.
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure while building the final report")
+
+    monkeypatch.setattr(runner_module, "_stage_report", explode)
+
+    payload, code = await _run_cli(argv)
+
+    assert mutator.calls == ["refund"]
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.item(2).status == "refunded"
+
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["external_effect_attempted"] is True
+    assert payload["outcome"] == "interrupted"
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_create_that_died_reading_its_own_final_state_still_says_it_happened(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """The terminal outcome is written; the read that follows it is not.
+
+    The durable state survives, so the fallback has everything it needs — and
+    what it must not do is mistake "I could not finish looking" for "nothing
+    happened".
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 1
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+    reader.orders = await marker_orders(session_maker, count=count)
+
+    mutator = FakeMutator(create_sequence=[_ok_response(0)])
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_CREATE)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+
+    # The first read taken once a slot is `created` fails — exactly the final
+    # `load` of the stage. Later reads, including the failure handler's own,
+    # work again, so this is not a database outage.
+    original_load = ledger_module.load
+    tripped = {"done": False}
+
+    async def failing_load(session_maker_arg):
+        snapshot = await original_load(session_maker_arg)
+        created = any(entry.status == VOUCHER_BATCH_ITEM_CREATED for entry in snapshot.items)
+        if created and not tripped["done"]:
+            tripped["done"] = True
+            raise RuntimeError("synthetic failure reading the final state")
+        return snapshot
+
+    monkeypatch.setattr(ledger_module, "load", failing_load)
+
+    payload, code = await _run_cli(argv)
+
+    assert tripped["done"] is True
+    assert len(mutator.create_calls) == 1
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "interrupted"
+    assert payload["external_effect_attempted"] is True
+    # Built from the durable ledger, which did survive.
+    assert payload["batch"]["items"][0]["status"] == VOUCHER_BATCH_ITEM_CREATED
+    _assert_pii_free(payload, count=count)
+
+
+async def test_an_unreadable_ledger_fails_closed_for_an_effectful_command(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """A ledger that will not answer proves nothing, so exit 4 is not available."""
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+
+    mutator = FakeMutator(create=_ok_response(0))
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic database failure")
+
+    # Both the command and every attempt to read the durable state fail.
+    monkeypatch.setattr(runner_module, "build_stage_plan", explode)
+    monkeypatch.setattr(runner_module, "run_status", explode)
+
+    payload, code = await _run_cli(
+        ["create", "--preview-run-id", str(run_id), "--apply", "--plan-digest", "x", "--confirm", "y"]
+    )
+
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "unknown"
+    assert payload["external_effect_attempted"] is True
+    assert payload["reconciliation_required"] is True
+    assert DATABASE_UNAVAILABLE in payload["reasons"]
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_freeze_that_died_after_committing_does_not_read_as_refused(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """A freeze reaches nobody, and it still must not deny what it wrote.
+
+    `external_effect_attempted` stays false here, and provably so: the freeze
+    path never constructs a mutation transport at all.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+
+    argv = await _cli_stage(session_maker, reader, request, stage=STAGE_FREEZE)
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", _forbidden_transport)
+
+    # The freeze runs for real and commits; the command then dies on its way
+    # back out. Wrapped rather than replaced, so what is being tested is a
+    # crash AFTER durable work, not instead of it.
+    original_freeze = runner_module.run_freeze
+
+    async def freeze_then_die(*args, **kwargs):
+        await original_freeze(*args, **kwargs)
+        raise RuntimeError("synthetic failure after the freeze committed")
+
+    monkeypatch.setattr(runner_module, "run_freeze", freeze_then_die)
+
+    payload, code = await _run_cli(argv)
+
+    assert (await ledger_module.load(session_maker)).exists
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "interrupted"
+    assert payload["external_effect_attempted"] is False
+    _assert_pii_free(payload, count=count)
+
+
+async def test_a_missing_baseline_is_as_disqualifying_as_an_unreadable_ledger(
+    session_maker, batch_configuration, binding_key, monkeypatch
+) -> None:
+    """ "Unchanged" is a comparison, and it needs something to compare against.
+
+    If the reading taken BEFORE the command fails — a momentary database
+    hiccup, say — then a later ledger with nothing unresolved in it proves
+    nothing at all about what this invocation did. Falling through to a
+    refusal there would reintroduce the same false "nothing happened" by a
+    different door.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    count = 2
+    run_id, _ = await seed_batch_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    request = batch_request(run_id=run_id)
+    await _freeze(session_maker, reader, request)
+
+    mutator = FakeMutator(create=_ok_response(0))
+    monkeypatch.setattr(cli, "EasyWeekClient", lambda *a, **k: _AsyncCM(reader))
+    monkeypatch.setattr(cli, "EasyWeekVoucherMutationClient", lambda *a, **k: _AsyncCM(mutator))
+
+    # The FIRST read — the baseline — fails; everything afterwards works.
+    original_status = runner_module.run_status
+    first = {"seen": False}
+
+    async def status_once(*args, **kwargs):
+        if not first["seen"]:
+            first["seen"] = True
+            raise RuntimeError("synthetic failure taking the baseline")
+        return await original_status(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "run_status", status_once)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure before anything was claimed")
+
+    monkeypatch.setattr(runner_module, "build_stage_plan", explode)
+
+    payload, code = await _run_cli(
+        ["create", "--preview-run-id", str(run_id), "--apply", "--plan-digest", "x", "--confirm", "y"]
+    )
+
+    assert first["seen"] is True
+    # Nothing was actually claimed — but this run cannot prove that, and it
+    # does not pretend to.
+    assert code == cli.EXIT_UNKNOWN
+    assert payload["outcome"] == "unknown"
+    assert payload["external_effect_attempted"] is True
+    assert DATABASE_UNAVAILABLE in payload["reasons"]
+    _assert_pii_free(payload, count=count)
+
+
+def test_a_terminal_slot_alone_is_not_proof_that_nothing_happened() -> None:
+    """The blocker, stated as the unit it lives in.
+
+    Without a baseline to compare against, a batch whose every slot is in a
+    proven terminal state is indistinguishable from one this command never
+    touched — which is precisely how a created voucher came to be reported as
+    `refused`. The classifier must refuse to guess.
+    """
+    from altegio_bot.scripts import easyweek_voucher_snapshot_batch as cli
+
+    settled = {
+        "exists": True,
+        "halted": False,
+        "reconciliation_required": False,
+        "items": [
+            {"slot": 1, "status": VOUCHER_BATCH_ITEM_CREATED},
+            {"slot": 2, "status": VOUCHER_BATCH_ITEM_PLANNED},
+        ],
+    }
+    # Nothing unresolved, so the old rule read this as "nothing started".
+    assert cli._has_unresolved_slot(settled) is False
+
+    before = {**settled, "items": [{"slot": 1, "status": VOUCHER_BATCH_ITEM_PLANNED}, settled["items"][1]]}
+    assert before != settled

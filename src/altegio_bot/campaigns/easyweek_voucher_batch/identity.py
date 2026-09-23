@@ -149,6 +149,14 @@ REFUND_FORBIDDEN_AFTER_SEND: Final = "voucher_batch_refund_forbidden_after_send"
 # The slot an operator named is not one this batch has.
 SLOT_UNKNOWN: Final = "voucher_batch_slot_unknown"
 
+# -- a command that died part-way through ------------------------------------
+# Not an unknown and not a refusal. Something this invocation did IS on the
+# record — a voucher created, €15 charged, a message Meta accepted — and then
+# the command stopped before finishing the rest of its slots or printing its
+# report. What happened is known; what did not get to happen is the question,
+# and it is one for a human with a fresh plan.
+EXECUTION_INTERRUPTED: Final = "voucher_batch_execution_interrupted"
+
 # -- the halt ----------------------------------------------------------------
 # The first unknown stops the whole remaining suffix. Its own code, because
 # "this slot was never attempted" is a different fact from any refusal about the

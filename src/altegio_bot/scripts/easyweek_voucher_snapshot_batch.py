@@ -66,6 +66,7 @@ from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     BATCH_DISABLED,
     BATCH_STAGES,
     DATABASE_UNAVAILABLE,
+    EXECUTION_INTERRUPTED,
     MUTATION_UNKNOWN,
     RUNTIME_IDENTITY_UNUSABLE,
     STAFFER_UNCONFIGURED,
@@ -324,6 +325,12 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 # so their failure provably started no external effect.
 _EFFECTFUL_COMMANDS: Final = frozenset({STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND})
 
+# Everything that writes durable state, which is the set worth taking a
+# before-snapshot of. `freeze` reaches nobody, but it does create the batch,
+# and a freeze that committed and then failed to print must not read as though
+# no batch exists.
+_DURABLE_COMMANDS: Final = _EFFECTFUL_COMMANDS | {STAGE_FREEZE}
+
 
 def _durable_batch() -> dict[str, Any] | None:
     """The batch as the database currently reads it, or ``None`` if unreadable.
@@ -353,70 +360,164 @@ def _has_unresolved_slot(batch: dict[str, Any] | None) -> bool:
     return any(str(item.get("status")) in ledger_module.UNRESOLVED_ITEM_STATUSES for item in (batch.get("items") or []))
 
 
-def _unexpected_failure(command: str) -> tuple[dict[str, Any], int]:
-    """What to print when a mutating stage died somewhere nobody planned for.
+def _fail_closed(
+    command: str,
+    *,
+    outcome: str,
+    reasons: list[str],
+    batch: dict[str, Any] | None,
+    external_effect_attempted: bool,
+) -> tuple[dict[str, Any], int]:
+    """One non-success report, built from the durable ledger, exit 3.
 
-    The old behaviour was the dangerous one: a blanket handler that answered
-    `refused`, `external_effect_attempted=false` and exit 4 for ANY exception —
-    including one raised after a voucher had been created, after €15 had been
-    charged, or after Meta had accepted a message. Exit 4 is a promise that
-    nothing started. That promise may only be made when it is provable.
-
-    What makes "nothing started" PROVABLE is the invariant the whole phase is
-    built on: a request only ever leaves after its claim is committed. So a
-    ledger that still answers, and that holds no slot in an unresolved state,
-    is proof that no CREATE, PAY, REFUND or Meta POST was made by the command
-    that just died — and only then is exit 4 honest. A ledger that cannot be
-    read proves nothing at all, and neither does one holding a claim.
-
-    Nothing here prints a traceback, an exception message, SQL, a URL, a
-    customer UUID, a phone number or a voucher code.
+    ``halted`` and ``reconciliation_required`` come from what the ledger
+    actually says rather than being forced true. When an outcome is already
+    proven and written down, claiming the batch is halted would be inventing a
+    state the database does not hold — and an operator who then found it
+    running would trust the next report less.
     """
-    batch = _durable_batch()
-    claimed = _has_unresolved_slot(batch)
-
-    if command not in _EFFECTFUL_COMMANDS or (batch is not None and not claimed):
-        payload = _refusal_report(command, [DATABASE_UNAVAILABLE])
-        if batch is not None:
-            # Still worth showing: a freeze that committed and then failed to
-            # print must not read as though no batch exists.
-            payload["batch"] = batch
-        return payload, EXIT_CONTRACT_MISMATCH
-
-    reasons = [MUTATION_UNKNOWN] if batch is not None else [MUTATION_UNKNOWN, DATABASE_UNAVAILABLE]
     report = runner_module.StageReport(
         stage=command,
-        outcome="unknown",
+        outcome=outcome,
         reasons=reasons,
-        # Not proven to have happened — and, crucially, not proven not to.
-        external_effect_attempted=True,
-        external_send_attempted=command == STAGE_DELIVER,
-        reconciliation_required=True,
-        # The claim halts the batch in its own transaction, so a readable
-        # ledger says so itself. When it is unreadable, the conservative
-        # reading is the only safe one, and `DATABASE_UNAVAILABLE` above says
-        # which case this is.
+        external_effect_attempted=external_effect_attempted,
+        external_send_attempted=external_effect_attempted and command == STAGE_DELIVER,
+        reconciliation_required=bool(batch.get("reconciliation_required")) if batch is not None else True,
         halted=bool(batch.get("halted")) if batch is not None else True,
         batch=batch or {},
     )
     return report.as_safe_dict(), EXIT_UNKNOWN
 
 
+def _unexpected_failure(
+    command: str,
+    *,
+    before: dict[str, Any] | None,
+    reason: str = DATABASE_UNAVAILABLE,
+) -> tuple[dict[str, Any], int]:
+    """What to print when a command died somewhere nobody planned for.
+
+    Exit 4 is a promise that nothing started, and it may only be made when it
+    is provable FOR THIS INVOCATION.
+
+    Why the ledger alone cannot prove it
+    ------------------------------------
+    An earlier version asked "does the ledger hold an unresolved slot?" and
+    read no for proof that nothing had happened. In a multi-slot stage that is
+    simply false: slot 1 can create a voucher, be recorded as ``created`` — a
+    proven, resolved, terminal state — and the command can then die before it
+    claims slot 2. The ledger holds nothing unresolved, and the operator would
+    have been told `refused`, `external_effect_attempted=false`, exit 4, over a
+    €15 order that exists.
+
+    The evidence has to belong to this invocation, so it is a before/after
+    comparison of the batch taken around the command. Every external request in
+    this phase is preceded by a committed claim, and a committed claim always
+    moves a slot's status — so a ledger that is byte-identical afterwards is
+    proof that THIS command claimed nothing and therefore sent nothing.
+
+    Three answers, and only one of them is exit 4:
+
+    * **unresolved slot** — a request may be in flight right now. Unknown.
+    * **the ledger moved** — this invocation did something and then stopped
+      part-way. Interrupted: what happened is on the record, what did not is a
+      question for a human with a fresh plan.
+    * **nothing moved, and the ledger answered** — provably pre-claim. Refused.
+
+    Both readings are required. An unreadable ledger afterwards proves nothing,
+    and a baseline that could not be taken before the command ran is just as
+    disqualifying — "unchanged" is a comparison, and there is nothing to
+    compare against. Either way a durable command falls back to unknown rather
+    than to a refusal.
+
+    A concurrent command that moved the ledger while this one failed early
+    would be read as "interrupted" here. That is the conservative direction and
+    deliberately so: the cost is one extra look by a human, and the cost of the
+    other mistake is an operator who believes no voucher was issued.
+
+    Nothing here prints a traceback, an exception message, SQL, a URL, a
+    customer UUID, a phone number or a voucher code.
+    """
+    after = _durable_batch()
+    effectful = command in _EFFECTFUL_COMMANDS
+
+    # A slot is sitting claimed or unknown: something may be in flight.
+    if _has_unresolved_slot(after):
+        return _fail_closed(
+            command,
+            outcome="unknown",
+            reasons=[MUTATION_UNKNOWN] if after is not None else [MUTATION_UNKNOWN, DATABASE_UNAVAILABLE],
+            batch=after,
+            external_effect_attempted=True,
+        )
+
+    # This invocation moved the ledger and then stopped. For an effectful
+    # command that means a CREATE, a PAY, a REFUND or a Meta POST of its own
+    # has already been proven and written down.
+    if before is not None and after is not None and before != after:
+        return _fail_closed(
+            command,
+            outcome="interrupted",
+            reasons=[EXECUTION_INTERRUPTED],
+            batch=after,
+            # A freeze writes durably and reaches nobody: it never constructs a
+            # mutation transport, so `false` here is provable rather than
+            # hopeful.
+            external_effect_attempted=effectful,
+        )
+
+    # Nothing is provable without both readings. A ledger that will not answer
+    # afterwards says nothing; a baseline that could not be taken BEFORE the
+    # command ran is just as disqualifying, because "unchanged" can only be
+    # asserted against something. Both fail closed rather than quietly falling
+    # through to a refusal.
+    if command in _DURABLE_COMMANDS and (after is None or before is None):
+        return _fail_closed(
+            command,
+            outcome="unknown",
+            reasons=[MUTATION_UNKNOWN, DATABASE_UNAVAILABLE],
+            batch=after,
+            # A freeze reaches nobody whatever happened to the ledger.
+            external_effect_attempted=effectful,
+        )
+
+    # Proven pre-claim: this command claimed nothing, so it sent nothing.
+    report = runner_module.StageReport(
+        stage=command,
+        outcome="refused",
+        reasons=[reason],
+        external_effect_attempted=False,
+        reconciliation_required=bool(after.get("reconciliation_required")) if after is not None else False,
+        halted=bool(after.get("halted")) if after is not None else False,
+        batch=after or {},
+    )
+    payload = report.as_safe_dict()
+    # A batch that already needed a human before this command ran still does.
+    code = EXIT_UNKNOWN if (report.halted or report.reconciliation_required) else EXIT_CONTRACT_MISMATCH
+    return payload, code
+
+
 def main(argv: list[str] | None = None) -> int:
     redact_easyweek_url_logging()
     args = _build_parser().parse_args(argv)
+    # The ledger BEFORE this command touches anything, for the commands that
+    # can write durably. It is the only way a failure handler can tell what
+    # this invocation did from what earlier ones left behind.
+    before = _durable_batch() if args.command in _DURABLE_COMMANDS else None
     try:
         payload, code = asyncio.run(_dispatch(args))
     except EasyWeekConfigError:
-        # A deployment fault, and one raised while building the transport —
-        # before any claim and before any request. Named, without the
-        # configuration it is complaining about.
-        payload, code = _refusal_report(args.command, [RUNTIME_IDENTITY_UNUSABLE]), EXIT_CONTRACT_MISMATCH
+        # A deployment fault, raised while building the transport — before any
+        # claim and before any request. Named, without the configuration it is
+        # complaining about, and still checked against the evidence so that a
+        # misconfiguration discovered late cannot report a clean refusal over
+        # work this command already did.
+        payload, code = _unexpected_failure(args.command, before=before, reason=RUNTIME_IDENTITY_UNUSABLE)
     except Exception:  # noqa: BLE001 - a stable, PII-free surface for operators
         # Deliberately no traceback, no exception text and no SQL: an operator
         # report is pasted into tickets, and an exception string here could
         # carry a URL with a customer UUID in it.
-        payload, code = _unexpected_failure(args.command)
+        payload, code = _unexpected_failure(args.command, before=before)
     _print_json(payload)
     return code
 
