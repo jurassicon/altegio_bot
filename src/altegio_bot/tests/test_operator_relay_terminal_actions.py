@@ -16,8 +16,11 @@ Covers the last blocker set before merge:
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 from sqlalchemy import func, select
@@ -530,3 +533,101 @@ async def test_two_concurrent_recovery_workers_claim_at_most_once(session_maker,
     assert provider.calls == 1
     assert await _row_count(session_maker) == 1
     assert (await _row(session_maker, event_id)).status == "sent"
+
+
+# ===========================================================================
+# Click-to-Chat link in the closed-window note, on BOTH closure paths
+# ===========================================================================
+#
+# The window-closed note kind covers the closure found at the first check and the
+# closure that happens between prepare and claim. Both must reach the operator
+# with the same named link, and neither may send anything to Meta.
+
+_CLICK_TO_CHAT_LABEL = "Dem Kunden auf WhatsApp schreiben"
+
+
+def _link_url(note: str) -> str:
+    match = re.search(rf"\[{re.escape(_CLICK_TO_CHAT_LABEL)}\]\((\S+)\)", note)
+    assert match is not None, note
+    return match.group(1)
+
+
+@pytest.mark.asyncio
+async def test_window_closed_before_claim_note_carries_the_click_to_chat_link(session_maker, monkeypatch) -> None:
+    _enable(monkeypatch, session_maker)
+    sent: list[str] = []
+    monkeypatch.setattr(wiw, "ChatwootClient", _chatwoot_double(sent))
+    event_id, _ = await _queued_intent(session_maker, monkeypatch, sender_id=70, dedupe="link1", conv=1200)
+
+    async def _window_closed(session: Any, phone: str, now: Any) -> tuple[bool, Any]:
+        return False, None
+
+    monkeypatch.setattr(wiw, "is_whatsapp_customer_window_open", _window_closed)
+    provider = _Provider()
+    await wiw.resume_queued_operator_relay(provider)
+
+    # No Meta policy violation: the link is an operator affordance, not a send.
+    assert provider.calls == 0
+    row = await _row(session_maker, event_id)
+    assert row.status == "canceled"
+    assert row.meta.get("cancel_reason") == "customer_service_window_closed_before_claim"
+    assert len(sent) == 1
+    note = sent[0]
+    assert f"[{_CLICK_TO_CHAT_LABEL}]" in note
+    url = _link_url(note)
+    assert url.startswith("https://wa.me/49111222333?text=")
+    # The prefill decodes back to the exact stored operator text.
+    assert unquote(url.partition("?text=")[2]) == row.body == "Hallo"
+
+
+@pytest.mark.asyncio
+async def test_window_closed_at_first_check_note_carries_the_same_link(session_maker, monkeypatch) -> None:
+    """The immediate closure path produces the identical note, link included."""
+    _enable(monkeypatch, session_maker)
+    sent: list[str] = []
+    monkeypatch.setattr(wiw, "ChatwootClient", _chatwoot_double(sent))
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "private_note_only")
+    await _make_sender(session_maker, sender_id=71)
+    # No window event at all → the window is closed at the first check.
+    event_id = await _insert_relay(session_maker, dedupe_key="cw:link2", conversation_id=1210)
+
+    provider = _Provider()
+    await wiw.process_one_event(event_id, provider)
+
+    assert provider.calls == 0
+    row = await _row(session_maker, event_id)
+    assert row.status == "canceled"
+    assert row.meta.get("cancel_reason") == "customer_service_window_closed"
+    assert len(sent) == 1
+    assert _link_url(sent[0]).startswith("https://wa.me/49111222333?text=")
+    assert unquote(_link_url(sent[0]).partition("?text=")[2]) == row.body
+
+
+@pytest.mark.asyncio
+async def test_window_closed_note_never_logs_the_url_or_the_prefilled_text(
+    session_maker,
+    monkeypatch,
+    caplog,
+) -> None:
+    """Neither the finished URL, the query string nor the operator text may be
+    logged by any logger on the closed-window note path."""
+    _enable(monkeypatch, session_maker)
+    sent: list[str] = []
+    monkeypatch.setattr(wiw, "ChatwootClient", _chatwoot_double(sent))
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "private_note_only")
+    await _make_sender(session_maker, sender_id=72)
+    event_id = await _insert_relay(session_maker, dedupe_key="cw:link3", conversation_id=1220)
+
+    with caplog.at_level(logging.DEBUG):
+        await wiw.process_one_event(event_id, _Provider())
+
+    assert len(sent) == 1
+    url = _link_url(sent[0])
+    encoded_query = url.partition("?text=")[2]
+    logged = "\n".join(f"{r.name} {r.getMessage()}" for r in caplog.records)
+    assert url not in logged
+    assert encoded_query not in logged
+    assert "?text=" not in logged
+    assert "wa.me" not in logged
+    # The operator's own text never appears either.
+    assert "Hallo" not in logged

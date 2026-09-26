@@ -462,20 +462,102 @@ Incoming (Customer → Bot via Chatwoot):
 ```
 
 WhatsApp reactions (`messages[].type == "reaction"`) are mirrored into Chatwoot as
-incoming messages so operators see that the client reacted. A native Chatwoot
-reply (`content_attributes.in_reply_to`) is attached only when the reacted-to
-message has a real Chatwoot message id in the same conversation; automatic
-outbox-message targets get a visible fallback line (e.g.
-`👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)`), and a removed
-reaction shows `Реакция удалена в WhatsApp`. Reactions never trigger commands,
-opt-out, or any send back to WhatsApp. Reactions are handled going forward;
-historical reactions processed before this change are not backfilled.
+incoming messages so operators see that the client reacted. Reactions never
+trigger commands, opt-out, promo or any send back to WhatsApp, and nothing is
+ever written directly to Chatwoot's database.
+
+A native Chatwoot reply (`content_attributes.in_reply_to`) is attached only from
+a **proven** target in the destination conversation. There are exactly two
+proofs:
+
+1. the reacted-to message is an operator relay or a prior inbound event that
+   carries a real Chatwoot message id in that same conversation;
+2. the reacted-to message is a bot/automation send whose **private mirror note**
+   is proven in that same conversation by its technical marker (below).
+
+**Native marker contract.** Since a bot send exists in Chatwoot only as a
+private mirror note, `ChatwootClient.mirror_outbound_as_note` writes two — and
+only two — technical `content_attributes` through the REST API:
+
+```json
+{
+  "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+  "whatsapp_provider_message_id": "<exact Meta wamid>"
+}
+```
+
+The wamid travels from `ChatwootHybridProvider` as its own named argument; no
+internal meta dict is ever forwarded to Chatwoot. On an inbound reaction,
+`ChatwootClient.find_outbound_mirror_note` accepts a note as the native target
+only when **all** of these hold at once: it is listed by the destination
+conversation, `message_type` is outgoing, `private` is exactly `true`, the marker
+has the expected version, `whatsapp_provider_message_id` equals the reaction
+target wamid exactly, and exactly one such message with a positive integer id
+was found. The lookup never matches by body, template code, "last message" or
+result order, and it never picks one result out of several.
+
+**Fail-closed fallback.** Zero matches, several matches, a malformed API
+response, an HTTP error, or a conversation mismatch all fall back to a visible
+short quote of the original text plus the emoji — never a false native link:
+
+```text
+↩️ Ответ на сообщение:
+«Ваша запись завтра в 10:00»
+
+👍
+```
+
+The quote collapses whitespace to a single line, caps at 100 characters and adds
+`…` only on real truncation. A removed reaction shows
+`Реакция удалена в WhatsApp` in place of the emoji, with the same context. The
+technical `template_code` stays in `content_attributes` for audit and is no
+longer part of the operator-visible text.
+
+**No historical backfill.** Mirror notes created before this change carry no
+marker, so reactions to them keep the visible quote. No migration and no
+backfill are performed. An accidentally populated `chatwoot_message_id` /
+`chatwoot_conversation_id` on a bot Outbox row is still no evidence at all: only
+the proven marker can make a bot target native. The Chatwoot mirror stays
+best-effort — a Chatwoot failure never turns a successful Meta send into a
+failed send, and a failing marker lookup costs the native link, never the
+reaction.
 
 Known limitation (pre-existing, not specific to reactions): the inbox worker
 processes only the first extracted inbound action per webhook event, so a single
 webhook batching multiple `messages[]` (e.g. a text and a reaction together) has
 only its first action handled. Delivery `statuses[]` are processed independently
 and are not affected by this.
+
+#### Closed 24h window: Click-to-Chat link in the operator note
+
+When an operator replies from Chatwoot after Meta's 24h customer service window
+has closed and `CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE=private_note_only`, nothing
+is sent to WhatsApp: the relay row is canceled and the operator gets a private
+note with the original message. That note now ends with a short named
+Click-to-Chat link:
+
+```text
+💬 [Dem Kunden auf WhatsApp schreiben](https://wa.me/4917630316130?text=…)
+```
+
+`build_wa_click_to_chat_url` builds it: `https://wa.me/<digits>` with the number
+as bare international digits (no `+`, spaces, brackets or hyphens), and the
+operator's exact text percent-encoded with `quote(text, safe="")` so spaces,
+newlines, `&`, `?`, `#`, `%`, quotes, Unicode and emoji survive a round trip.
+The length check applies to the finished ASCII URL after encoding: at most 2000
+characters keeps the prefill, above that the plain `wa.me` URL is returned — the
+text is never truncated or partially inserted. 2000 is a conservative internal
+compatibility ceiling, **not** an official Meta limit; Meta publishes no maximum
+for Click-to-Chat. An unusable phone leaves the note without a link and logs a
+stable reason. The URL, its query string and the original text are never logged.
+
+The operator sees only the label, and `Originalnachricht` stays visible as
+before. **The link does not bypass Meta's customer service window.** It only
+opens WhatsApp and fills the composer; nothing is sent automatically, and
+whatever the operator then sends comes from their own WhatsApp account, so that
+message may not appear in the Chatwoot audit trail. This applies to the
+window-closed note only — the other failure notes and the reopen-template
+behaviour are unchanged.
 
 ### Configuration
 

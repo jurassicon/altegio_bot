@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+import re
+from urllib.parse import unquote
 
 import httpx
 import pytest
 import respx
 
-from altegio_bot.chatwoot_client import ChatwootClient, append_wa_deeplink
+from altegio_bot.chatwoot_client import (
+    WA_CLICK_TO_CHAT_MAX_URL_CHARS,
+    ChatwootClient,
+    append_wa_deeplink,
+    build_wa_click_to_chat_url,
+    outbound_mirror_content_attributes,
+)
 
 # ---------------------------------------------------------------------------
 # append_wa_deeplink – unit tests
@@ -814,3 +822,384 @@ async def test_send_message_returns_id_and_does_not_touch_chatwoot_db(client: Ch
     assert not any(name.startswith("_chatwoot_db") for name in module_names)
     assert not any("async_engine" in name for name in module_names)
     assert not any("NORMALIZE" in name for name in module_names)
+
+
+# ---------------------------------------------------------------------------
+# build_wa_click_to_chat_url – Click-to-Chat URL contract
+# ---------------------------------------------------------------------------
+#
+# The URL only opens WhatsApp and prefills its composer. It sends nothing and
+# does not bypass Meta's 24h customer service window.
+
+
+def test_click_to_chat_normalises_messy_phone_to_digits() -> None:
+    assert build_wa_click_to_chat_url("+49 (176) 303-16130") == "https://wa.me/4917630316130"
+
+
+def test_click_to_chat_without_text_is_the_bare_base_url() -> None:
+    assert build_wa_click_to_chat_url("+4917630316130") == "https://wa.me/4917630316130"
+    assert build_wa_click_to_chat_url("+4917630316130", "") == "https://wa.me/4917630316130"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Guten Tag Frau Müller",
+        "Zeile eins\nZeile zwei\r\nZeile drei",
+        "Rabatt & Gutschein",
+        "Passt 14:00?",
+        "Termin #7",
+        "100% zufrieden",
+        'Sie sagten "morgen"',
+        "Скидка 20% — приходите",
+        "Bis morgen! 👍🏽💬🎉",
+        "a+b=c/d?e&f#g%h;i,j:k@l$m!n'o(p)q~r_s-t.u",
+        "   führende und nachgestellte Leerzeichen   ",
+    ],
+    ids=[
+        "plain",
+        "newlines",
+        "ampersand",
+        "question",
+        "hash",
+        "percent",
+        "quotes",
+        "cyrillic",
+        "emoji",
+        "reserved",
+        "whitespace",
+    ],
+)
+def test_click_to_chat_query_round_trips_exactly(text: str) -> None:
+    """The prefilled text must decode back byte-for-byte."""
+    url = build_wa_click_to_chat_url("+4917630316130", text)
+    assert url is not None
+    base, _, query = url.partition("?text=")
+    assert base == "https://wa.me/4917630316130"
+    assert unquote(query) == text
+    # Fully percent-encoded: the finished URL is pure ASCII, and no raw
+    # separator survives that could break the Markdown link or the query
+    # string (``%`` itself is the escape prefix, so it is expected).
+    assert url.isascii()
+    assert not any(ch in query for ch in " \n\r&?#\"'()")
+
+
+def _click_to_chat_prefix_len(phone_e164: str) -> int:
+    return len(f"https://wa.me/{re.sub(r'[^0-9]', '', phone_e164)}?text=")
+
+
+def test_click_to_chat_exactly_at_the_limit_keeps_the_text() -> None:
+    phone = "+4917630316130"
+    # ASCII letters encode 1:1, so the finished URL length is exactly 2000.
+    text = "a" * (WA_CLICK_TO_CHAT_MAX_URL_CHARS - _click_to_chat_prefix_len(phone))
+    url = build_wa_click_to_chat_url(phone, text)
+    assert url is not None
+    assert len(url) == 2000 == WA_CLICK_TO_CHAT_MAX_URL_CHARS
+    assert unquote(url.partition("?text=")[2]) == text
+
+
+def test_click_to_chat_one_char_over_the_limit_drops_the_query() -> None:
+    phone = "+4917630316130"
+    text = "a" * (WA_CLICK_TO_CHAT_MAX_URL_CHARS - _click_to_chat_prefix_len(phone) + 1)
+    assert build_wa_click_to_chat_url(phone, text) == "https://wa.me/4917630316130"
+
+
+def test_click_to_chat_measures_the_encoded_length_not_the_raw_text() -> None:
+    """A short Unicode text can still exceed the limit once percent-encoded."""
+    phone = "+4917630316130"
+    # Each emoji is 4 UTF-8 bytes → 12 encoded characters.
+    text = "🎉" * 200
+    assert len(text) == 200
+    assert build_wa_click_to_chat_url(phone, text) == "https://wa.me/4917630316130"
+
+
+def test_click_to_chat_never_truncates_the_text() -> None:
+    """Over the limit the prefill is dropped whole — never shortened."""
+    phone = "+4917630316130"
+    text = "Sehr wichtige Nachricht. " * 200
+    url = build_wa_click_to_chat_url(phone, text)
+    assert url == "https://wa.me/4917630316130"
+    assert "?text=" not in url
+    # And nothing below the limit loses a single character.
+    short = "Sehr wichtige Nachricht."
+    short_url = build_wa_click_to_chat_url(phone, short)
+    assert short_url is not None
+    assert unquote(short_url.partition("?text=")[2]) == short
+
+
+@pytest.mark.parametrize("phone", [None, "", "   ", "+++---", "no digits here"])
+def test_click_to_chat_unusable_phone_returns_none(phone: str | None) -> None:
+    assert build_wa_click_to_chat_url(phone, "Hallo") is None
+    assert build_wa_click_to_chat_url(phone) is None
+
+
+# ---------------------------------------------------------------------------
+# outbound_mirror_content_attributes – the native marker contract
+# ---------------------------------------------------------------------------
+
+
+def test_outbound_mirror_content_attributes_holds_only_marker_and_wamid() -> None:
+    attrs = outbound_mirror_content_attributes("wamid.ABC")
+    assert attrs == {
+        "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+        "whatsapp_provider_message_id": "wamid.ABC",
+    }
+
+
+@pytest.mark.parametrize("wamid", [None, "", "   "])
+def test_outbound_mirror_content_attributes_without_wamid_is_none(wamid: str | None) -> None:
+    """No wamid → a plain note that can never be proven native."""
+    assert outbound_mirror_content_attributes(wamid) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_as_note_sends_the_native_marker(client: ChatwootClient) -> None:
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    _mock_messages(20, [{"id": 1, "message_type": 0, "content": "client wrote"}])
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 310, "content": "x"})
+    )
+
+    await client.mirror_outbound_as_note(
+        "+4917630316130",
+        "Ihr Termin morgen um 10:00",
+        provider_message_id="wamid.MIRROR",
+    )
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert sent["private"] is True
+    assert sent["message_type"] == "outgoing"
+    assert sent["content_attributes"] == {
+        "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+        "whatsapp_provider_message_id": "wamid.MIRROR",
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mirror_outbound_as_note_without_wamid_omits_content_attributes(client: ChatwootClient) -> None:
+    """Historical behaviour is unchanged when no wamid is passed."""
+    _mock_contact_and_conv("+4917630316130", 5, 20)
+    _mock_messages(20, [{"id": 1, "message_type": 0, "content": "client wrote"}])
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/20/messages").mock(
+        return_value=httpx.Response(200, json={"id": 311, "content": "x"})
+    )
+
+    await client.mirror_outbound_as_note("+4917630316130", "Ihr Termin morgen um 10:00")
+
+    sent = json.loads(post_route.calls[0].request.content)
+    assert "content_attributes" not in sent
+
+
+# ---------------------------------------------------------------------------
+# find_outbound_mirror_note – fail-closed proof of one native target
+# ---------------------------------------------------------------------------
+
+_MIRROR_WAMID = "wamid.PROVEN"
+
+
+def _mirror_note(
+    *,
+    message_id: int = 4242,
+    conversation_id: int | None = 30,
+    message_type: object = "outgoing",
+    private: object = True,
+    kind: object = "whatsapp_outbound_mirror_v1",
+    wamid: object = _MIRROR_WAMID,
+    content_attributes: object = "__build__",
+) -> dict:
+    attrs: object
+    if content_attributes == "__build__":
+        attrs = {"altegio_bot_message_kind": kind, "whatsapp_provider_message_id": wamid}
+    else:
+        attrs = content_attributes
+    message: dict = {
+        "id": message_id,
+        "message_type": message_type,
+        "private": private,
+        "content": "Ihr Termin morgen um 10:00",
+        "content_attributes": attrs,
+    }
+    if conversation_id is not None:
+        message["conversation_id"] = conversation_id
+    return message
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_proves_single_match(client: ChatwootClient) -> None:
+    _mock_messages(
+        30,
+        [
+            {"id": 1, "message_type": 0, "private": False, "content": "client wrote"},
+            _mirror_note(message_id=4242),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 4242
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_accepts_numeric_outgoing_enum(client: ChatwootClient) -> None:
+    _mock_messages(30, [_mirror_note(message_id=4243, message_type=1)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 4243
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_accepts_serialized_content_attributes(client: ChatwootClient) -> None:
+    """Some Chatwoot versions return content_attributes as a JSON string."""
+    serialized = json.dumps(
+        {
+            "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+            "whatsapp_provider_message_id": _MIRROR_WAMID,
+        }
+    )
+    _mock_messages(30, [_mirror_note(message_id=4244, content_attributes=serialized)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 4244
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        _mirror_note(kind="whatsapp_outbound_mirror_v0"),
+        _mirror_note(kind=None),
+        _mirror_note(wamid="wamid.SOMEONE_ELSE"),
+        _mirror_note(wamid=None),
+        _mirror_note(private=False),
+        _mirror_note(private=None),
+        _mirror_note(private="true"),
+        _mirror_note(message_type="incoming"),
+        _mirror_note(message_type=0),
+        _mirror_note(message_type=True),
+        _mirror_note(conversation_id=31),
+        _mirror_note(content_attributes=None),
+        _mirror_note(content_attributes="not json"),
+        _mirror_note(content_attributes="[1, 2]"),
+        _mirror_note(content_attributes=["not", "a", "mapping"]),
+        _mirror_note(message_id=0),
+        _mirror_note(message_id=-5),
+        _mirror_note(message_id="4242"),
+        _mirror_note(message_id=None),
+        _mirror_note(message_id=True),
+    ],
+    ids=[
+        "old_marker_version",
+        "missing_marker",
+        "foreign_wamid",
+        "missing_wamid",
+        "not_private",
+        "private_none",
+        "private_string",
+        "incoming",
+        "incoming_enum",
+        "private_bool_message_type",
+        "other_conversation",
+        "no_content_attributes",
+        "malformed_content_attributes",
+        "content_attributes_not_object",
+        "content_attributes_list",
+        "zero_id",
+        "negative_id",
+        "string_id",
+        "missing_id",
+        "bool_id",
+    ],
+)
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_unproven_candidate(
+    client: ChatwootClient,
+    message: dict,
+) -> None:
+    _mock_messages(30, [message])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_duplicate_marker(client: ChatwootClient) -> None:
+    """Two distinct proven notes are as unusable as none — never pick one."""
+    _mock_messages(30, [_mirror_note(message_id=4242), _mirror_note(message_id=4343)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_tolerates_repeated_identical_row(client: ChatwootClient) -> None:
+    """The same message listed twice is one target, not an ambiguity."""
+    _mock_messages(30, [_mirror_note(message_id=4242), _mirror_note(message_id=4242)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 4242
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_empty_conversation(client: ChatwootClient) -> None:
+    _mock_messages(30, [])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_http_error(client: ChatwootClient) -> None:
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/30/messages").mock(
+        return_value=httpx.Response(500)
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_malformed_payload(client: ChatwootClient) -> None:
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/30/messages").mock(
+        return_value=httpx.Response(200, text="not json at all")
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_fails_closed_on_transport_error(client: ChatwootClient) -> None:
+    respx.get("https://chatwoot.example.com/api/v1/accounts/1/conversations/30/messages").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+
+@pytest.mark.parametrize(("conversation_id", "wamid"), [(0, _MIRROR_WAMID), (30, ""), (30, "   ")])
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_never_calls_the_api_without_inputs(
+    client: ChatwootClient,
+    conversation_id: int,
+    wamid: str,
+) -> None:
+    route = respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/conversations/{conversation_id}/messages").mock(
+        return_value=httpx.Response(200, json={"payload": [_mirror_note()]})
+    )
+
+    assert await client.find_outbound_mirror_note(conversation_id, wamid) is None
+    assert not route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_is_read_only(client: ChatwootClient) -> None:
+    """The lookup only reads the conversation; it posts nothing."""
+    _mock_messages(30, [_mirror_note(message_id=4242)])
+    post_route = respx.post("https://chatwoot.example.com/api/v1/accounts/1/conversations/30/messages")
+
+    await client.find_outbound_mirror_note(30, _MIRROR_WAMID)
+
+    assert not post_route.called

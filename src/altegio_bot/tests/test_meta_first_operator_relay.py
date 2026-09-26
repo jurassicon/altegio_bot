@@ -25,9 +25,11 @@ Covers all required scenarios:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import unquote
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -3165,3 +3167,168 @@ async def test_operator_relay_permanent_error_does_not_close_circuit(session_mak
         ).scalar_one()
     assert outbox.status == "failed"
     assert outbox.provider_message_id is None
+
+
+# ---------------------------------------------------------------------------
+# 18. Click-to-Chat link in the closed-24h-window private note
+# ---------------------------------------------------------------------------
+#
+# The link only opens WhatsApp and prefills the composer. It does NOT bypass
+# Meta's 24h customer service window: the message is then sent by the operator
+# from their own WhatsApp account, and such a send may not reach the Chatwoot
+# audit trail. Nothing is sent automatically.
+
+_WINDOW_CLOSED_LINK_LABEL = "Dem Kunden auf WhatsApp schreiben"
+
+
+def _click_to_chat_url(note: str) -> str:
+    """Extract the URL of the single named Markdown link in a note."""
+    match = re.search(rf"\[{re.escape(_WINDOW_CLOSED_LINK_LABEL)}\]\((\S+)\)", note)
+    assert match is not None, note
+    return match.group(1)
+
+
+def _window_closed_row(*, phone_e164: str, body: str) -> OutboxMessage:
+    return OutboxMessage(
+        id=1,
+        company_id=1,
+        phone_e164=phone_e164,
+        template_code="operator_relay",
+        language="de",
+        body=body,
+        status="canceled",
+        scheduled_at=datetime.now(timezone.utc),
+        message_source="operator",
+        meta={},
+    )
+
+
+def test_window_closed_note_carries_a_named_click_to_chat_link() -> None:
+    body = 'Ihr Termin morgen um 11 Uhr — passt das? 100% & "sicher"? 🎉\nBis dann!'
+    note = wiw._relay_note_text(
+        wiw._NOTE_KIND_WINDOW_CLOSED, _window_closed_row(phone_e164="+49 176 303 16130", body=body)
+    )
+
+    assert note is not None
+    # The original message stays visible exactly as before.
+    assert f'Originalnachricht:\n"{body}"' in note
+    # The operator sees the label, never the long query string.
+    assert f"[{_WINDOW_CLOSED_LINK_LABEL}]" in note
+    assert "?text=" not in note.split("](")[0]
+
+    url = _click_to_chat_url(note)
+    assert url.startswith("https://wa.me/4917630316130?text=")
+    # The prefill decodes back to the operator's exact original text.
+    assert unquote(url.partition("?text=")[2]) == body
+
+
+def test_window_closed_note_drops_the_prefill_instead_of_truncating() -> None:
+    body = "Sehr wichtige Nachricht. " * 200
+    note = wiw._relay_note_text(
+        wiw._NOTE_KIND_WINDOW_CLOSED, _window_closed_row(phone_e164="+4917630316130", body=body)
+    )
+
+    assert note is not None
+    # Full text still visible in the note; only the prefill is dropped.
+    assert f'Originalnachricht:\n"{body}"' in note
+    assert _click_to_chat_url(note) == "https://wa.me/4917630316130"
+    assert "?text=" not in note
+
+
+@pytest.mark.parametrize("phone_e164", ["", "   ", "+++---", "keine Ziffern"])
+def test_window_closed_note_has_no_link_for_an_unusable_phone(phone_e164: str) -> None:
+    note = wiw._relay_note_text(
+        wiw._NOTE_KIND_WINDOW_CLOSED,
+        _window_closed_row(phone_e164=phone_e164, body="Ihr Termin morgen"),
+    )
+
+    assert note is not None
+    assert "wa.me" not in note
+    assert _WINDOW_CLOSED_LINK_LABEL not in note
+    # Everything the operator had before is still there.
+    assert "Das 24h-WhatsApp-Fenster ist geschlossen" in note
+    assert 'Originalnachricht:\n"Ihr Termin morgen"' in note
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        wiw._NOTE_KIND_UNKNOWN,
+        wiw._NOTE_KIND_TEXT_FAILED,
+        wiw._NOTE_KIND_TEMPLATE_FAILED,
+        wiw._NOTE_KIND_CIRCUIT_PAUSED,
+        wiw._NOTE_KIND_TEMPLATE_SENT,
+    ],
+)
+def test_only_the_window_closed_note_gets_the_link(kind: str) -> None:
+    """The change is scoped: no other failure or reopen note grows a link."""
+    note = wiw._relay_note_text(kind, _window_closed_row(phone_e164="+4917630316130", body="Ihr Termin morgen"))
+
+    assert note is not None
+    assert "wa.me" not in note
+
+
+@pytest.mark.asyncio
+async def test_private_note_only_window_closed_note_links_to_whatsapp(session_maker, monkeypatch) -> None:
+    """End to end: the delivered private note carries the prefilled link, stays
+    private, and still sends nothing to Meta."""
+    operator_text = 'Ihr Termin morgen um 11 Uhr — passt das? 100% & "sicher"? 🎉'
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.setattr(wiw, "SessionLocal", session_maker)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_relay_enabled", True)
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_closed_window_mode", "private_note_only")
+    monkeypatch.setattr(wiw.settings, "chatwoot_operator_reopen_private_note_enabled", True)
+    provider = _FakeProvider(wamid="wamid.SHOULD_NOT_APPEAR_LINK")
+
+    mock_cw_class = MagicMock()
+    mock_cw = MagicMock()
+    mock_cw.send_message = AsyncMock(return_value=99)
+    mock_cw.aclose = AsyncMock(return_value=None)
+    mock_cw_class.return_value = mock_cw
+
+    async with session_maker() as session:
+        async with session.begin():
+            await _make_sender(session, sender_id=380, company_id=1, phone_number_id="PNID_LINK")
+            # No inbound events → window closed.
+            evt = WhatsAppEvent(
+                dedupe_key="chatwoot_out:3800:4800",
+                status="received",
+                error=None,
+                query={},
+                headers={},
+                payload=_operator_relay_payload(
+                    recipient_phone="+49 176 303 16130",
+                    text=operator_text,
+                    phone_number_id="PNID_LINK",
+                    conversation_id=3800,
+                    message_id=4800,
+                    agent_name="Klaus",
+                ),
+                chatwoot_conversation_id=3800,
+            )
+            session.add(evt)
+            await session.flush()
+            evt_id = evt.id
+
+    with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cw_class):
+        await wiw.process_one_event(evt_id, provider)
+
+    # Nothing reached Meta: the link is the ONLY new outbound affordance.
+    assert len(provider.sent) == 0
+    assert len(provider.templates_sent) == 0
+
+    mock_cw.send_message.assert_called_once()
+    assert mock_cw.send_message.call_args.kwargs.get("private") is True
+    note = mock_cw.send_message.call_args.args[1]
+
+    async with session_maker() as session:
+        ob = (
+            await session.execute(select(OutboxMessage).where(OutboxMessage.meta["agent_name"].astext == "Klaus"))
+        ).scalar_one()
+
+    assert ob.status == "canceled"
+    assert ob.meta.get("private_note_status") == "sent"
+    # The query decodes back to the exact stored OutboxMessage.body.
+    url = _click_to_chat_url(note)
+    assert url.startswith("https://wa.me/4917630316130?text=")
+    assert unquote(url.partition("?text=")[2]) == ob.body == operator_text

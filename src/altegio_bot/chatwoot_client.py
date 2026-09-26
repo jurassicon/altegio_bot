@@ -5,6 +5,7 @@ Only the methods required for the dual-write integration are implemented:
 - get_or_create_conversation – open/reuse a conversation for a contact
 - send_message               – post an outbound message to a conversation
 - mirror_outbound_as_note    – mirror outbound message as a private agent note
+- find_outbound_mirror_note  – prove the mirror note of one outbound wamid
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import logging
 import re
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -23,21 +25,160 @@ from altegio_bot.settings import settings
 logger = logging.getLogger(__name__)
 
 
+# Technical marker written on a bot/automation private mirror note so a later
+# inbound WhatsApp reaction can prove WHICH Chatwoot message a Meta wamid became.
+# The version suffix is part of the contract: an unknown or older value is never
+# accepted as a native reply target.
+OUTBOUND_MIRROR_MESSAGE_KIND = "whatsapp_outbound_mirror_v1"
+
+# Conservative INTERNAL compatibility ceiling for a finished Click-to-Chat URL —
+# not an official Meta limit. Meta publishes no maximum length for the wa.me
+# prefill text. Above this the prefill is dropped entirely; the operator's text
+# is never truncated or partially inserted.
+WA_CLICK_TO_CHAT_MAX_URL_CHARS = 2000
+
+# Chatwoot returns message_type either as its numeric enum or as a string.
+_OUTGOING_MESSAGE_TYPES: frozenset[object] = frozenset({1, "outgoing"})
+
+
+def _wa_phone_digits(phone_e164: str | None) -> str | None:
+    """Return the international number as bare digits, or None when unusable.
+
+    wa.me accepts digits only: no ``+``, spaces, brackets or hyphens.
+    """
+    if not phone_e164:
+        return None
+    digits = re.sub(r"\D", "", phone_e164)
+    return digits or None
+
+
 def append_wa_deeplink(text: str, phone_e164: str | None) -> str:
     """Append a WhatsApp deeplink footer to a Chatwoot message body.
 
     Idempotent: skipped when the deeplink is already present or when
     phone_e164 contains no digits.
     """
-    if not phone_e164:
-        return text
-    digits = re.sub(r"\D", "", phone_e164)
-    if not digits:
+    digits = _wa_phone_digits(phone_e164)
+    if digits is None:
         return text
     wa_url = f"https://wa.me/{digits}"
     if wa_url in text:
         return text
     return f"{text}\n\n---\n\U0001f4ac Написать в WhatsApp: {wa_url}"
+
+
+def build_wa_click_to_chat_url(phone_e164: str | None, text: str | None = None) -> str | None:
+    """Build a wa.me Click-to-Chat URL, optionally prefilling the composer.
+
+    ``https://wa.me/<digits>`` without ``text``, ``https://wa.me/<digits>?text=
+    <percent-encoded>`` with it. Encoding uses ``quote(text, safe="")``, so
+    spaces, newlines, ``&``, ``?``, ``#``, ``%``, quotes, brackets, Unicode and
+    emoji all survive a round trip through ``unquote``.
+
+    The length test is applied to the FINISHED ASCII URL after percent-encoding.
+    Over :data:`WA_CLICK_TO_CHAT_MAX_URL_CHARS` the prefill is dropped and the
+    plain wa.me URL is returned — the text is never truncated or partially
+    inserted. An unusable phone returns ``None``.
+
+    The link only opens WhatsApp and fills the composer. It sends nothing, and it
+    does not bypass Meta's 24h customer service window: whatever the operator
+    then sends comes from their own WhatsApp account.
+    """
+    digits = _wa_phone_digits(phone_e164)
+    if digits is None:
+        return None
+    base_url = f"https://wa.me/{digits}"
+    if not text:
+        return base_url
+    prefilled_url = f"{base_url}?text={quote(text, safe='')}"
+    if len(prefilled_url) > WA_CLICK_TO_CHAT_MAX_URL_CHARS:
+        return base_url
+    return prefilled_url
+
+
+def outbound_mirror_content_attributes(provider_message_id: str | None) -> dict[str, Any] | None:
+    """Narrow technical ``content_attributes`` for an outbound mirror note.
+
+    Exactly two keys — the versioned marker and the exact Meta wamid. No internal
+    meta dict, no PII, no template/job/record fields are forwarded to Chatwoot.
+    Returns ``None`` when there is no wamid to bind, so the note is posted
+    unchanged and stays a plain historical note that can never be proven native.
+    """
+    wamid = (provider_message_id or "").strip()
+    if not wamid:
+        return None
+    return {
+        "altegio_bot_message_kind": OUTBOUND_MIRROR_MESSAGE_KIND,
+        "whatsapp_provider_message_id": wamid,
+    }
+
+
+def _iter_conversation_messages(data: Any) -> list[Any]:
+    """Normalize the payload shapes of the conversation messages endpoint."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    payload = data.get("payload")
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            return messages
+    return []
+
+
+def _parse_returned_content_attributes(value: Any) -> dict[str, Any] | None:
+    """Read ``content_attributes`` off an API response, or None when unusable.
+
+    Accepts a JSON object and a JSON-object string (older Chatwoot versions
+    serialize the column). Anything else is malformed for our purposes and must
+    make the candidate fail closed instead of being guessed at.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _mirror_note_message_id(
+    message: Any,
+    *,
+    conversation_id: int,
+    provider_message_id: str,
+) -> int | None:
+    """Return the message id when this message is a PROVEN mirror note.
+
+    Every condition must hold at once; a single missing proof returns ``None``.
+    Nothing here looks at the body, the template code, recency or result order.
+    """
+    if not isinstance(message, dict):
+        return None
+    own_conversation_id = message.get("conversation_id")
+    if own_conversation_id is not None and own_conversation_id != conversation_id:
+        return None
+    message_type = message.get("message_type")
+    if isinstance(message_type, bool) or message_type not in _OUTGOING_MESSAGE_TYPES:
+        return None
+    if message.get("private") is not True:
+        return None
+    attributes = _parse_returned_content_attributes(message.get("content_attributes"))
+    if attributes is None:
+        return None
+    if attributes.get("altegio_bot_message_kind") != OUTBOUND_MIRROR_MESSAGE_KIND:
+        return None
+    if attributes.get("whatsapp_provider_message_id") != provider_message_id:
+        return None
+    message_id = message.get("id")
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+        return None
+    return message_id
 
 
 def _log_and_raise(res: httpx.Response, ctx: str) -> None:
@@ -413,12 +554,90 @@ class ChatwootClient:
         )
         return conversation_id, message_id
 
+    async def find_outbound_mirror_note(
+        self,
+        conversation_id: int,
+        provider_message_id: str,
+    ) -> int | None:
+        """Prove the private mirror note of one outbound wamid, or return None.
+
+        Best-effort and fail-closed. ``None`` means "no native target proven" and
+        the caller must keep its visible-quote fallback. ``None`` is returned for
+        an HTTP/transport error, a malformed payload, no match, and — decisively —
+        for more than one distinct match: one result is never picked out of
+        several, and nothing is matched by body, template code, recency or result
+        order.
+
+        A candidate counts only when ALL of these hold at once:
+
+        - it is listed by THIS conversation's messages endpoint, and its own
+          ``conversation_id`` (when the payload carries one) is this conversation;
+        - ``message_type`` is outgoing;
+        - ``private`` is exactly ``True``;
+        - ``content_attributes.altegio_bot_message_kind`` equals the expected
+          marker version :data:`OUTBOUND_MIRROR_MESSAGE_KIND`;
+        - ``content_attributes.whatsapp_provider_message_id`` equals the wamid
+          exactly;
+        - ``id`` is a positive integer.
+
+        Read-only through the REST API; Chatwoot's database is never touched.
+        """
+        wamid = (provider_message_id or "").strip()
+        if not conversation_id or not wamid:
+            return None
+
+        url = self._api(f"/conversations/{conversation_id}/messages")
+        try:
+            res = await self._client.get(url, headers=self._headers())
+        except Exception as exc:
+            logger.debug(
+                "chatwoot: mirror note lookup transport error conversation_id=%s error_type=%s",
+                conversation_id,
+                type(exc).__name__,
+            )
+            return None
+        if res.status_code != 200:
+            logger.debug(
+                "chatwoot: mirror note lookup failed conversation_id=%s status=%s",
+                conversation_id,
+                res.status_code,
+            )
+            return None
+        try:
+            data = res.json()
+        except ValueError:
+            logger.debug(
+                "chatwoot: mirror note lookup malformed payload conversation_id=%s",
+                conversation_id,
+            )
+            return None
+
+        matches: set[int] = set()
+        for message in _iter_conversation_messages(data):
+            candidate = _mirror_note_message_id(
+                message,
+                conversation_id=conversation_id,
+                provider_message_id=wamid,
+            )
+            if candidate is not None:
+                matches.add(candidate)
+
+        if len(matches) != 1:
+            logger.debug(
+                "chatwoot: mirror note not proven conversation_id=%s match_count=%s",
+                conversation_id,
+                len(matches),
+            )
+            return None
+        return next(iter(matches))
+
     async def mirror_outbound_as_note(
         self,
         phone_e164: str,
         text: str,
         *,
         contact_name: str | None = None,
+        provider_message_id: str | None = None,
     ) -> None:
         """Mirror an outbound message to Chatwoot as a private agent note.
 
@@ -429,6 +648,11 @@ class ChatwootClient:
         Deeplink policy: attach a wa.me link only when the conversation has
         no prior inbound from the client.  Once the client has written in,
         the deeplink is redundant and pollutes the conversation view.
+
+        ``provider_message_id`` is the exact Meta wamid of the message this note
+        mirrors. When present it is written as the narrow versioned marker from
+        :func:`outbound_mirror_content_attributes`, which is the ONLY evidence a
+        later inbound reaction accepts for a native ``in_reply_to``.
 
         Never raises — best-effort.
         """
@@ -442,6 +666,7 @@ class ChatwootClient:
                 body,
                 message_type="outgoing",
                 private=True,
+                content_attributes=outbound_mirror_content_attributes(provider_message_id),
             )
             # DEBUG, not INFO: normal per-message mirroring. Failures below stay
             # at logger.exception.

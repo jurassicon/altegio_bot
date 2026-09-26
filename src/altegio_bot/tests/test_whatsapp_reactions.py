@@ -113,13 +113,26 @@ def _reaction_payload(
 def _mock_chatwoot_client(
     conversation_id: int = DEST_CONVERSATION_ID,
     message_id: int = MESSAGE_ID,
+    mirror_note_id: Any = None,
 ) -> tuple[MagicMock, MagicMock]:
     inst = MagicMock()
     inst.get_or_create_incoming_conversation = AsyncMock(return_value=conversation_id)
     inst.send_message = AsyncMock(return_value=message_id)
+    # Default: the client proves NO mirror note, so every historical target stays
+    # on the visible-quote fallback unless a test explicitly proves one. An
+    # exception stands for a Chatwoot API/transport failure during the lookup.
+    if isinstance(mirror_note_id, BaseException):
+        inst.find_outbound_mirror_note = AsyncMock(side_effect=mirror_note_id)
+    else:
+        inst.find_outbound_mirror_note = AsyncMock(return_value=mirror_note_id)
     inst.aclose = AsyncMock(return_value=None)
     cls = MagicMock(return_value=inst)
     return cls, inst
+
+
+def _quote_fallback(body: str, reaction_line: str) -> str:
+    """The exact visible fallback body: short quote + emoji / removal line."""
+    return f"↩️ Ответ на сообщение:\n«{body}»\n\n{reaction_line}"
 
 
 def _outbox(
@@ -223,6 +236,7 @@ async def _run_reaction(
     message_id: int = MESSAGE_ID,
     dedupe_key: str = "wa:reaction-test",
     provider: WhatsAppProvider | None = None,
+    mirror_note_id: Any = None,
 ) -> tuple[WhatsAppEvent, MagicMock]:
     provider = provider or _CaptureProvider()
     async with session_maker() as session:
@@ -239,6 +253,7 @@ async def _run_reaction(
             mock_cls, mock_inst = _mock_chatwoot_client(
                 conversation_id=destination_conversation_id,
                 message_id=message_id,
+                mirror_note_id=mirror_note_id,
             )
             with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cls):
                 await handle_event(session, evt, provider)
@@ -319,13 +334,17 @@ async def _run_tenant_reaction(
     prior_inbound_events: list[WhatsAppEvent] | None = None,
     general_inbox_id: int = 999,
     outboxes: list[OutboxMessage] | None = None,
+    mirror_note_id: Any = None,
 ) -> tuple[WhatsAppEvent, MagicMock, MagicMock]:
     import altegio_bot.workers.whatsapp_inbox_worker as wiw
 
     monkeypatch.setattr(wiw.settings, "chatwoot_inbox_company_map", raw_map)
     monkeypatch.setattr(wiw.settings, "chatwoot_inbox_id", general_inbox_id)
     provider = _CaptureProvider()
-    mock_cls, mock_inst = _mock_chatwoot_client(conversation_id=destination_conversation_id)
+    mock_cls, mock_inst = _mock_chatwoot_client(
+        conversation_id=destination_conversation_id,
+        mirror_note_id=mirror_note_id,
+    )
 
     async with session_maker() as session:
         async with session.begin():
@@ -1048,9 +1067,10 @@ async def test_reaction_fallback_when_target_is_outbox_message_without_chatwoot_
     evt, cw = await _run_reaction(session_maker, payload=_reaction_payload(), seeds=seeds)
 
     call = cw.send_message.call_args
-    assert call.args[1] == "👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)"
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
     attrs = call.kwargs["content_attributes"]
     assert "in_reply_to" not in attrs
+    assert "whatsapp_reaction_native_source" not in attrs
     assert attrs["whatsapp_reaction_target_kind"] == "outbox_message"
     assert attrs["whatsapp_reaction_target_outbox_id"] is not None
     assert attrs["whatsapp_reaction_target_template_code"] == "reminder_24h"
@@ -1118,7 +1138,7 @@ async def test_reaction_outbox_target_prefers_matching_phone_over_wrong_phone_du
     attrs = call.kwargs["content_attributes"]
     assert attrs["whatsapp_reaction_target_kind"] == "outbox_message"
     assert attrs["whatsapp_reaction_target_template_code"] == "reminder_24h"
-    assert call.args[1] == "👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)"
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
 
 
 # ---------------------------------------------------------------------------
@@ -1293,7 +1313,8 @@ async def test_reaction_native_target_cross_conversation_falls_back_without_in_r
     )
 
     call = cw.send_message.call_args
-    assert call.args[1] == "👍 Реакция на сообщение в WhatsApp"
+    # Cross-conversation: a visible quote, never a cross-conversation in_reply_to.
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
     attrs = call.kwargs["content_attributes"]
     assert "in_reply_to" not in attrs
     assert attrs["whatsapp_reaction_target_conversation_mismatch"] is True
@@ -1323,7 +1344,7 @@ async def test_reaction_bot_outbox_with_chatwoot_ids_is_not_native_agent_target(
     )
 
     call = cw.send_message.call_args
-    assert call.args[1] == "👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)"
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
     attrs = call.kwargs["content_attributes"]
     assert attrs["whatsapp_reaction_target_kind"] == "outbox_message"
     assert attrs["whatsapp_reaction_target_outbox_id"] is not None
@@ -1380,3 +1401,371 @@ async def test_reaction_prior_inbound_event_must_be_meta_origin(session_maker) -
     attrs = call.kwargs["content_attributes"]
     assert attrs["whatsapp_reaction_target_kind"] == "unknown"
     assert "in_reply_to" not in attrs
+
+
+# ---------------------------------------------------------------------------
+# 17. native reply → proven private mirror note of a bot/automation send
+# ---------------------------------------------------------------------------
+#
+# A bot send exists in Chatwoot only as a private mirror note, so its native
+# target has to be PROVEN in Chatwoot by the versioned marker
+# (``altegio_bot_message_kind`` + exact wamid) inside the destination
+# conversation. Nothing else — not a body match, not a template code, not the
+# last message, not an accidentally populated Outbox Chatwoot id — may stand in
+# for that proof, and every unproven case falls closed to a visible quote.
+
+MIRROR_NOTE_ID = 7777
+LONG_BODY = (
+    "Guten Tag Frau Müller,\n\nIhr Termin am Montag um 10:00 Uhr wurde bestätigt."
+    " Bitte kommen Sie zehn Minuten früher.\nVielen Dank!"
+)
+LONG_BODY_QUOTE = (
+    "Guten Tag Frau Müller, Ihr Termin am Montag um 10:00 Uhr wurde bestätigt. Bitte kommen Sie zehn Minu…"
+)
+
+
+@pytest.mark.asyncio
+async def test_reaction_to_proven_mirror_note_renders_as_native_bare_emoji(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    # The proof is asked for inside the ALREADY chosen destination conversation,
+    # with the exact reaction target wamid.
+    cw.find_outbound_mirror_note.assert_awaited_once_with(DEST_CONVERSATION_ID, TARGET_WAMID)
+
+    call = cw.send_message.call_args
+    assert call.args[0] == DEST_CONVERSATION_ID
+    # Native: Chatwoot renders the quoted original itself, the body is the emoji.
+    assert call.args[1] == "👍"
+    assert call.kwargs["message_type"] == "incoming"
+    attrs = call.kwargs["content_attributes"]
+    assert attrs["in_reply_to"] == MIRROR_NOTE_ID
+    assert attrs["in_reply_to_external_id"] == TARGET_WAMID
+    assert attrs["whatsapp_reaction_native_source"] == "outbound_mirror_note"
+    assert attrs["whatsapp_reaction_target_kind"] == "outbox_message"
+    assert evt.forwarded_chatwoot_conversation_id == DEST_CONVERSATION_ID
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_mirror_proof_is_scoped_to_the_destination_conversation(session_maker) -> None:
+    """The lookup may only ever read the conversation the reaction lands in."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        destination_conversation_id=8100,
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    cw.find_outbound_mirror_note.assert_awaited_once_with(8100, TARGET_WAMID)
+    assert cw.send_message.call_args.args[0] == 8100
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_without_a_proven_marker_falls_back_to_a_visible_quote(session_maker) -> None:
+    """Historical notes carry no marker; there is no backfill, so they quote."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        mirror_note_id=None,
+    )
+
+    cw.find_outbound_mirror_note.assert_awaited_once_with(DEST_CONVERSATION_ID, TARGET_WAMID)
+    call = cw.send_message.call_args
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
+    attrs = call.kwargs["content_attributes"]
+    assert "in_reply_to" not in attrs
+    assert "in_reply_to_external_id" not in attrs
+    assert "whatsapp_reaction_native_source" not in attrs
+    # The technical template code is audit metadata only, never the user text.
+    assert attrs["whatsapp_reaction_target_template_code"] == "reminder_24h"
+    assert "reminder_24h" not in call.args[1]
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_survives_a_failing_mirror_lookup(session_maker) -> None:
+    """A Chatwoot lookup error must cost the native link, never the reaction."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        mirror_note_id=RuntimeError("chatwoot messages endpoint exploded"),
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
+    assert "in_reply_to" not in call.kwargs["content_attributes"]
+    assert evt.chatwoot_message_id == MESSAGE_ID
+    assert evt.forwarded_chatwoot_conversation_id == DEST_CONVERSATION_ID
+    assert evt.error is None
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [0, -1, "7777", True, 7777.0, None],
+    ids=["zero", "negative", "string", "bool", "float", "none"],
+)
+@pytest.mark.asyncio
+async def test_reaction_rejects_a_malformed_mirror_note_id(session_maker, returned: Any) -> None:
+    """Only a positive integer message id counts as a proven native target."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        mirror_note_id=returned,
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
+    assert "in_reply_to" not in call.kwargs["content_attributes"]
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_fallback_quote_is_collapsed_and_capped_at_100_chars(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h", body=LONG_BODY)),
+    )
+
+    content = cw.send_message.call_args.args[1]
+    assert content == _quote_fallback(LONG_BODY_QUOTE, "👍")
+    quote = content.split("«", 1)[1].split("»", 1)[0]
+    # Single line, 100 chars plus the ellipsis that marks the real truncation.
+    assert "\n" not in quote
+    assert len(quote) == 101
+    assert quote.endswith("…")
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_fallback_quote_has_no_ellipsis_without_truncation(session_maker) -> None:
+    body = "A" * 100
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h", body=body)),
+    )
+
+    assert cw.send_message.call_args.args[1] == _quote_fallback(body, "👍")
+    assert "…" not in cw.send_message.call_args.args[1]
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_removal_keeps_the_quoted_context(session_maker) -> None:
+    """Removal shows the same context, with the removal line instead of an emoji."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(emoji=None),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+    )
+
+    content = cw.send_message.call_args.args[1]
+    assert content == _quote_fallback("Ваша запись завтра в 10:00", "Реакция удалена в WhatsApp")
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_removal_on_a_proven_mirror_note_stays_native(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(emoji=None),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == "Реакция удалена в WhatsApp"
+    assert call.kwargs["content_attributes"]["in_reply_to"] == MIRROR_NOTE_ID
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 18. the pre-existing native paths must not regress
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaction_operator_native_path_never_consults_the_mirror_lookup(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _outbox(
+                message_source="operator",
+                template_code="operator_relay",
+                chatwoot_message_id=123,
+                chatwoot_conversation_id=DEST_CONVERSATION_ID,
+            )
+        ),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    cw.find_outbound_mirror_note.assert_not_awaited()
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍"
+    attrs = call.kwargs["content_attributes"]
+    assert attrs["in_reply_to"] == 123
+    assert attrs["whatsapp_reaction_native_source"] == "target_chatwoot_message"
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_prior_inbound_native_path_never_consults_the_mirror_lookup(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _prior_inbound_event(chatwoot_message_id=456, forwarded_chatwoot_conversation_id=DEST_CONVERSATION_ID)
+        ),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    cw.find_outbound_mirror_note.assert_not_awaited()
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍"
+    assert call.kwargs["content_attributes"]["in_reply_to"] == 456
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_cross_conversation_operator_target_never_gets_native_metadata(session_maker) -> None:
+    """A proven mirror note elsewhere may not rescue a cross-conversation target."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _outbox(
+                message_source="operator",
+                template_code="operator_relay",
+                chatwoot_message_id=123,
+                chatwoot_conversation_id=100,
+            )
+        ),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    # An operator relay is not mirrored as a private note, so no lookup happens.
+    cw.find_outbound_mirror_note.assert_not_awaited()
+    attrs = cw.send_message.call_args.kwargs["content_attributes"]
+    assert "in_reply_to" not in attrs
+    assert attrs["whatsapp_reaction_target_conversation_mismatch"] is True
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_unknown_target_never_consults_the_mirror_lookup(session_maker) -> None:
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    cw.find_outbound_mirror_note.assert_not_awaited()
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍 Реакция на сообщение в WhatsApp"
+    assert "in_reply_to" not in call.kwargs["content_attributes"]
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 19. accidental operator-only Chatwoot ids on a bot row stay worthless
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bot_row_with_operator_only_chatwoot_ids_is_still_not_a_native_target(session_maker) -> None:
+    """Even pointing at the destination conversation, the ids prove nothing."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _outbox(
+                message_source="bot",
+                template_code="reminder_24h",
+                chatwoot_message_id=999,
+                chatwoot_conversation_id=DEST_CONVERSATION_ID,
+            )
+        ),
+        mirror_note_id=None,
+    )
+
+    call = cw.send_message.call_args
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
+    attrs = call.kwargs["content_attributes"]
+    assert "in_reply_to" not in attrs
+    assert evt.error is None
+
+
+@pytest.mark.asyncio
+async def test_bot_row_accidental_ids_never_replace_the_proven_mirror_note_id(session_maker) -> None:
+    """The proven marker wins; the accidental Outbox id is never threaded."""
+    evt, cw = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(
+            _outbox(
+                message_source="bot",
+                template_code="reminder_24h",
+                chatwoot_message_id=999,
+                chatwoot_conversation_id=DEST_CONVERSATION_ID,
+            )
+        ),
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    attrs = cw.send_message.call_args.kwargs["content_attributes"]
+    assert attrs["in_reply_to"] == MIRROR_NOTE_ID
+    assert attrs["in_reply_to"] != 999
+    assert attrs["whatsapp_reaction_native_source"] == "outbound_mirror_note"
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 20. a proven mirror note keeps provider/company isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tenant_provider", "company_id", "inbox_id"),
+    [
+        (PROVIDER_EASYWEEK, 900001, 101),
+        (PROVIDER_EASYWEEK, 900002, 102),
+        (PROVIDER_ALTEGIO, 900003, 103),
+    ],
+    ids=["durlach", "rastatt", "karlsruhe"],
+)
+@pytest.mark.asyncio
+async def test_native_mirror_reaction_stays_inside_its_branch_inbox(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_provider: str,
+    company_id: int,
+    inbox_id: int,
+) -> None:
+    evt, mock_cls, cw = await _run_tenant_reaction(
+        session_maker,
+        monkeypatch,
+        raw_map=BRANCH_MAP,
+        targets=[(tenant_provider, company_id, "bot")],
+        dedupe_key=f"wa:tenant-reaction:mirror:{inbox_id}",
+        mirror_note_id=MIRROR_NOTE_ID,
+    )
+
+    # The proof is read through the branch client only — never the General one.
+    mock_cls.assert_called_once_with(inbox_id=inbox_id)
+    cw.find_outbound_mirror_note.assert_awaited_once_with(DEST_CONVERSATION_ID, TARGET_WAMID)
+    call = cw.send_message.call_args
+    assert call.args[1] == "👍"
+    assert call.kwargs["content_attributes"]["in_reply_to"] == MIRROR_NOTE_ID
+    assert evt.error is None

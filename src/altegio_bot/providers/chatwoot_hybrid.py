@@ -128,7 +128,7 @@ class ChatwootHybridProvider:
                 company_id=company_id,
                 chatwoot_route=chatwoot_route,
                 contact_name=contact_name,
-                meta={"msg_id": msg_id},
+                provider_message_id=msg_id,
             )
         )
 
@@ -169,7 +169,7 @@ class ChatwootHybridProvider:
                 tenant_provider=tenant_provider,
                 company_id=company_id,
                 contact_name=contact_name,
-                meta={"msg_id": msg_id},
+                provider_message_id=msg_id,
             )
         )
 
@@ -184,8 +184,15 @@ class ChatwootHybridProvider:
         company_id: int = 0,
         chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         contact_name: str | None = None,
-        meta: dict[str, Any] | None = None,
+        provider_message_id: str | None = None,
     ) -> None:
+        """Mirror one outbound message as a private note, best-effort.
+
+        ``provider_message_id`` is the exact Meta wamid, passed as its own named
+        argument: no internal meta dict ever reaches Chatwoot. A Chatwoot failure
+        stays a warning here — it must never turn a successful Meta send into a
+        failed send.
+        """
         chatwoot, inbox_id, routing_error = self._chatwoot_for_route(
             chatwoot_route,
             tenant_provider,
@@ -198,7 +205,12 @@ class ChatwootHybridProvider:
             return
 
         try:
-            await chatwoot.mirror_outbound_as_note(phone_e164, content, contact_name=contact_name)
+            await chatwoot.mirror_outbound_as_note(
+                phone_e164,
+                content,
+                contact_name=contact_name,
+                provider_message_id=provider_message_id,
+            )
             logger.debug(
                 "Chatwoot mirror ok company_id=%s inbox_id=%s",
                 company_id,

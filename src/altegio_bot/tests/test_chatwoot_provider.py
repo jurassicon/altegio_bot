@@ -49,14 +49,23 @@ class _FakeChatwootClient:
     def __init__(self, raise_on_log: bool = False) -> None:
         self.notes: list[tuple[str, str]] = []
         self.contact_names: list[str | None] = []
+        self.provider_message_ids: list[str | None] = []
         self.close_calls = 0
         self._raise = raise_on_log
 
-    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+    async def mirror_outbound_as_note(
+        self,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         if self._raise:
             raise RuntimeError("Chatwoot API failure")
         self.notes.append((phone_e164, text))
         self.contact_names.append(contact_name)
+        self.provider_message_ids.append(provider_message_id)
 
     async def aclose(self) -> None:
         self.close_calls += 1
@@ -68,10 +77,22 @@ class _InboxChatwootClient(_FakeChatwootClient):
         self.inbox_id = inbox_id
         self.delay = delay
 
-    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+    async def mirror_outbound_as_note(
+        self,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         if self.delay:
             await asyncio.sleep(self.delay)
-        await super().mirror_outbound_as_note(phone_e164, text, contact_name=contact_name)
+        await super().mirror_outbound_as_note(
+            phone_e164,
+            text,
+            contact_name=contact_name,
+            provider_message_id=provider_message_id,
+        )
 
 
 class _InboxClientFactory:
@@ -179,7 +200,7 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
         company_id: int = 0,
         chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         contact_name: str | None = None,
-        meta: object = None,
+        provider_message_id: str | None = None,
     ) -> None:
         captured_names.append(contact_name)
         await original_log(
@@ -189,7 +210,7 @@ async def test_send_propagates_contact_name(monkeypatch: pytest.MonkeyPatch) -> 
             company_id=company_id,
             chatwoot_route=chatwoot_route,
             contact_name=contact_name,
-            meta=meta,  # type: ignore[arg-type]
+            provider_message_id=provider_message_id,
         )
 
     monkeypatch.setattr(provider, "_log_to_chatwoot", _spy_log)
@@ -697,3 +718,89 @@ async def test_aclose_does_not_close_same_client_twice(monkeypatch: pytest.Monke
     await provider.aclose()
 
     assert shared.close_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Meta wamid → private mirror note (native reaction marker source)
+# ---------------------------------------------------------------------------
+#
+# The wamid travels as its own named argument so the mirror note can carry the
+# narrow versioned marker. No internal meta dict is ever handed to Chatwoot, and
+# a Chatwoot failure still never turns a successful Meta send into a failed send.
+
+
+async def test_send_passes_the_meta_wamid_to_the_mirror_note() -> None:
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+    await provider.aclose()
+
+    # Meta-first semantics unchanged: the returned wamid is the primary's.
+    assert msg_id.startswith("meta-")
+    assert len(meta.sent) == 1
+    assert cw.notes == [("+49123456789", "Ihr Termin morgen um 10:00")]
+    assert cw.provider_message_ids == [msg_id]
+
+
+async def test_send_template_passes_the_meta_wamid_to_the_mirror_note() -> None:
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient()
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send_template(
+        1,
+        "+49123456789",
+        "reminder_24h",
+        "de",
+        ["Anna"],
+        fallback_text="Ihr Termin morgen um 10:00",
+    )
+    await provider.aclose()
+
+    assert msg_id.startswith("meta-tpl-")
+    assert len(meta.templates) == 1
+    assert cw.notes == [("+49123456789", "Ihr Termin morgen um 10:00")]
+    assert cw.provider_message_ids == [msg_id]
+
+
+async def test_routed_mirror_note_carries_its_own_branch_wamid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each tenant inbox gets the wamid of its own send — never another branch's."""
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    meta = _FakeMetaProvider()
+    factory = _InboxClientFactory()
+    provider = ChatwootHybridProvider(
+        primary=meta,
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=factory,  # type: ignore[arg-type]
+    )
+
+    sent_ids: dict[int, str] = {}
+    for tenant_provider, company_id, inbox_id, branch in _BRANCH_ROUTES:
+        sent_ids[inbox_id] = await provider.send(
+            1,
+            "+49123000000",
+            branch,
+            tenant_provider=tenant_provider,
+            company_id=company_id,
+        )
+    await provider.aclose()
+
+    assert set(factory.clients) == set(sent_ids)
+    for inbox_id, client in factory.clients.items():
+        assert client.provider_message_ids == [sent_ids[inbox_id]]
+
+
+async def test_mirror_failure_still_keeps_a_successful_meta_send() -> None:
+    """Best-effort mirror semantics are untouched by the wamid argument."""
+    meta = _FakeMetaProvider()
+    cw = _FakeChatwootClient(raise_on_log=True)
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+    await provider.aclose()
+
+    assert msg_id.startswith("meta-")
+    assert len(meta.sent) == 1
+    assert cw.notes == []
