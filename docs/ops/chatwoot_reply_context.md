@@ -113,16 +113,63 @@ message only when **every** condition holds at once:
 | `private` is exactly `true` | a public message is not a mirror note |
 | marker equals `whatsapp_outbound_mirror_v1` | version-pinned contract |
 | `whatsapp_provider_message_id` equals the reaction target wamid exactly | the reaction must hit *that* message |
-| exactly one match, id a positive integer | ambiguity is never resolved by picking one |
+| exactly one match across the whole walked history, id a positive integer | ambiguity is never resolved by picking one |
 
-Nothing is matched by body text, `template_code`, "the last message" or result
-order.
+Nothing is matched by body text, `template_code`, `created_at`, "the last
+message" or result order.
+
+### Bounded pagination
+
+Chatwoot serves one page of a conversation per request — `_MIRROR_NOTE_PAGE_SIZE`
+= 20 messages, newest first — so a mirror note in a busy conversation is not on
+the first page. The lookup therefore walks backwards:
+
+1. the first request carries no query cursor;
+2. each following request carries `before=<smallest usable message id of the
+   previous page>`;
+3. the cursor must **strictly decrease**;
+4. matches are collected across every page and deduplicated by Chatwoot message
+   id, so one row served on both sides of a page boundary stays one match, while
+   two distinct ids with the same marker stay an ambiguity;
+5. the walk ends when a page comes back shorter than the page size — an empty
+   page included — which is the proof that the walked history ended;
+6. only then may a single match be trusted. The lookup never returns early on
+   the first hit.
+
+The walk is bounded by `_MIRROR_NOTE_MAX_PAGES` = 10 pages (~200 messages). The
+budget is deliberately small: the lookup is best-effort, runs inline on the
+inbound reaction path, and each page is one more Chatwoot round trip. There is no
+unbounded network scan and no possibility of an infinite loop.
+
+**This is a bounded recent-window proof, not a full-history search.** In a
+conversation with more than roughly 200 messages newer than the mirror note the
+budget runs out before the end of history is proven, and the reaction keeps the
+visible quote. Raising `_MIRROR_NOTE_MAX_PAGES` widens the window at the cost of
+more Chatwoot requests per reaction.
 
 ### Fail-closed fallback
 
-Zero matches, multiple matches, a malformed API response, an HTTP/transport
-error, or a conversation mismatch all produce the visible quote instead — a short
-single-line preview of the original text plus the emoji, and no `in_reply_to`:
+All of these produce the visible quote instead — a short single-line preview of
+the original text plus the emoji, and no `in_reply_to`:
+
+- zero matches, or two or more distinct matches;
+- an HTTP status other than 200, or a transport error, on **any** page;
+- a body that is not JSON, or not a recognizable messages payload, on any page
+  (a malformed page is never read as "no more messages");
+- a full page that yields no usable id for the next cursor;
+- a cursor that would not strictly decrease, which is what a replayed page looks
+  like;
+- the page budget running out before the end of history is proven — **even when
+  exactly one match was already collected**;
+- a conversation mismatch.
+
+Page-level logs carry only the conversation id, whether a cursor was in use, the
+page/message counts and a stable reason code (`transport_error`, `http_status`,
+`malformed_json`, `malformed_payload`, `page_budget_exhausted`,
+`no_pagination_cursor`, `cursor_not_advancing`, `match_count`). No wamid, phone,
+message body, URL, token or response body is ever logged.
+
+Example of the resulting body:
 
 ```text
 ↩️ Ответ на сообщение:

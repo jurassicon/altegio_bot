@@ -40,6 +40,21 @@ WA_CLICK_TO_CHAT_MAX_URL_CHARS = 2000
 # Chatwoot returns message_type either as its numeric enum or as a string.
 _OUTGOING_MESSAGE_TYPES: frozenset[object] = frozenset({1, "outgoing"})
 
+# Chatwoot serves a conversation's messages one page at a time, newest first, and
+# pages backwards through ``before=<message id>``. A full page is this many
+# messages; a shorter page is therefore a proof that the walked history ended.
+_MIRROR_NOTE_PAGE_SIZE = 20
+
+# Conservative page budget for one marker lookup. It bounds the walk to
+# ~_MIRROR_NOTE_PAGE_SIZE * _MIRROR_NOTE_MAX_PAGES ≈ 200 messages, which covers a
+# conversation that kept talking after the automatic message without turning a
+# single inbound reaction into an unbounded scan: the lookup is best-effort, runs
+# inline on the reaction path, and every page is one more Chatwoot round trip.
+# Because a single match may only be trusted once the walk reached a proven end of
+# history, exhausting this budget first is a fail-closed miss, NOT a match. This
+# is why neither the code nor the docs claim a full-history search.
+_MIRROR_NOTE_MAX_PAGES = 10
+
 
 def _wa_phone_digits(phone_e164: str | None) -> str | None:
     """Return the international number as bare digits, or None when unusable.
@@ -113,12 +128,18 @@ def outbound_mirror_content_attributes(provider_message_id: str | None) -> dict[
     }
 
 
-def _iter_conversation_messages(data: Any) -> list[Any]:
-    """Normalize the payload shapes of the conversation messages endpoint."""
+def _parse_conversation_messages(data: Any) -> list[Any] | None:
+    """Normalize one page of the conversation messages endpoint.
+
+    Returns the page as a list — possibly EMPTY, which is a legitimate final page
+    and a valid proof that the walked history ended. Returns ``None`` only when
+    the body is not a recognizable messages payload at all, so a malformed
+    response can never be mistaken for "no more messages" and must fail closed.
+    """
     if isinstance(data, list):
         return data
     if not isinstance(data, dict):
-        return []
+        return None
     payload = data.get("payload")
     if isinstance(payload, list):
         return payload
@@ -126,7 +147,7 @@ def _iter_conversation_messages(data: Any) -> list[Any]:
         messages = payload.get("messages")
         if isinstance(messages, list):
             return messages
-    return []
+    return None
 
 
 def _parse_returned_content_attributes(value: Any) -> dict[str, Any] | None:
@@ -145,6 +166,30 @@ def _parse_returned_content_attributes(value: Any) -> dict[str, Any] | None:
             return None
         return parsed if isinstance(parsed, dict) else None
     return None
+
+
+def _message_id(message: Any) -> int | None:
+    """The usable Chatwoot message id, or None.
+
+    Usable means a positive integer — the same rule for a proven native target
+    and for a pagination cursor, so the two can never drift apart.
+    """
+    if not isinstance(message, dict):
+        return None
+    message_id = message.get("id")
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+        return None
+    return message_id
+
+
+def _oldest_message_id(page: list[Any]) -> int | None:
+    """Smallest usable id on a page — the next ``before`` cursor, or None.
+
+    ``None`` means the page carried no usable id at all, so the walk cannot be
+    continued and must fail closed instead of re-requesting the same page.
+    """
+    ids = [candidate for candidate in (_message_id(message) for message in page) if candidate is not None]
+    return min(ids) if ids else None
 
 
 def _mirror_note_message_id(
@@ -175,10 +220,7 @@ def _mirror_note_message_id(
         return None
     if attributes.get("whatsapp_provider_message_id") != provider_message_id:
         return None
-    message_id = message.get("id")
-    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
-        return None
-    return message_id
+    return _message_id(message)
 
 
 def _log_and_raise(res: httpx.Response, ctx: str) -> None:
@@ -554,6 +596,59 @@ class ChatwootClient:
         )
         return conversation_id, message_id
 
+    async def _conversation_messages_page(
+        self,
+        conversation_id: int,
+        *,
+        before: int | None,
+    ) -> list[Any] | None:
+        """One page of a conversation's messages, or None when unusable.
+
+        ``None`` is the single fail-closed signal covering a transport error, any
+        status other than 200, a body that is not JSON, and a body that is not a
+        recognizable messages payload. An empty list is a real, usable page.
+
+        Logs carry only the conversation id, the cursor presence and a stable
+        reason — never a wamid, phone, message body, URL, token or response body.
+        """
+        url = self._api(f"/conversations/{conversation_id}/messages")
+        params = {"before": str(before)} if before is not None else None
+        try:
+            res = await self._client.get(url, headers=self._headers(), params=params)
+        except Exception as exc:
+            logger.debug(
+                "chatwoot: mirror note page conversation_id=%s paged=%s reason=transport_error error_type=%s",
+                conversation_id,
+                before is not None,
+                type(exc).__name__,
+            )
+            return None
+        if res.status_code != 200:
+            logger.debug(
+                "chatwoot: mirror note page conversation_id=%s paged=%s reason=http_status status=%s",
+                conversation_id,
+                before is not None,
+                res.status_code,
+            )
+            return None
+        try:
+            data = res.json()
+        except ValueError:
+            logger.debug(
+                "chatwoot: mirror note page conversation_id=%s paged=%s reason=malformed_json",
+                conversation_id,
+                before is not None,
+            )
+            return None
+        messages = _parse_conversation_messages(data)
+        if messages is None:
+            logger.debug(
+                "chatwoot: mirror note page conversation_id=%s paged=%s reason=malformed_payload",
+                conversation_id,
+                before is not None,
+            )
+        return messages
+
     async def find_outbound_mirror_note(
         self,
         conversation_id: int,
@@ -562,11 +657,8 @@ class ChatwootClient:
         """Prove the private mirror note of one outbound wamid, or return None.
 
         Best-effort and fail-closed. ``None`` means "no native target proven" and
-        the caller must keep its visible-quote fallback. ``None`` is returned for
-        an HTTP/transport error, a malformed payload, no match, and — decisively —
-        for more than one distinct match: one result is never picked out of
-        several, and nothing is matched by body, template code, recency or result
-        order.
+        the caller must keep its visible-quote fallback. Nothing is ever matched by
+        body, template code, ``created_at``, recency or result order.
 
         A candidate counts only when ALL of these hold at once:
 
@@ -580,52 +672,91 @@ class ChatwootClient:
           exactly;
         - ``id`` is a positive integer.
 
+        Chatwoot serves only one page per request, so the walk pages backwards
+        with ``before=<oldest usable id of the previous page>``; the cursor must
+        strictly decrease. The walk ends when a page proves the end of the history
+        by coming back shorter than :data:`_MIRROR_NOTE_PAGE_SIZE` (an empty page
+        included), and only then is a single match trusted. Because the match must
+        be unique across the whole walked history, the lookup never returns early
+        on the first hit, dedupes by Chatwoot message id (so one row repeated
+        across overlapping pages stays one match) and refuses two distinct ids.
+
+        The walk is bounded by :data:`_MIRROR_NOTE_MAX_PAGES`. It fails closed —
+        returning ``None`` even when exactly one match was already collected — when
+        that budget runs out before the end of history is proven, when a page
+        yields no usable cursor, when the cursor would not strictly decrease (a
+        repeated page), and on any page-level error. This lookup therefore proves
+        a target inside a bounded recent window, not across all history.
+
         Read-only through the REST API; Chatwoot's database is never touched.
         """
         wamid = (provider_message_id or "").strip()
         if not conversation_id or not wamid:
             return None
 
-        url = self._api(f"/conversations/{conversation_id}/messages")
-        try:
-            res = await self._client.get(url, headers=self._headers())
-        except Exception as exc:
-            logger.debug(
-                "chatwoot: mirror note lookup transport error conversation_id=%s error_type=%s",
-                conversation_id,
-                type(exc).__name__,
-            )
-            return None
-        if res.status_code != 200:
-            logger.debug(
-                "chatwoot: mirror note lookup failed conversation_id=%s status=%s",
-                conversation_id,
-                res.status_code,
-            )
-            return None
-        try:
-            data = res.json()
-        except ValueError:
-            logger.debug(
-                "chatwoot: mirror note lookup malformed payload conversation_id=%s",
-                conversation_id,
-            )
-            return None
-
         matches: set[int] = set()
-        for message in _iter_conversation_messages(data):
-            candidate = _mirror_note_message_id(
-                message,
-                conversation_id=conversation_id,
-                provider_message_id=wamid,
-            )
-            if candidate is not None:
-                matches.add(candidate)
+        cursor: int | None = None
+        pages = 0
+        scanned = 0
+
+        while True:
+            page = await self._conversation_messages_page(conversation_id, before=cursor)
+            if page is None:
+                return None
+            pages += 1
+            scanned += len(page)
+            for message in page:
+                candidate = _mirror_note_message_id(
+                    message,
+                    conversation_id=conversation_id,
+                    provider_message_id=wamid,
+                )
+                if candidate is not None:
+                    matches.add(candidate)
+
+            if len(page) < _MIRROR_NOTE_PAGE_SIZE:
+                # Short (or empty) page: the walked history is proven to end here.
+                break
+
+            if pages >= _MIRROR_NOTE_MAX_PAGES:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=page_budget_exhausted "
+                    "pages=%s messages=%s match_count=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                    len(matches),
+                )
+                return None
+
+            next_cursor = _oldest_message_id(page)
+            if next_cursor is None:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=no_pagination_cursor "
+                    "pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+            if cursor is not None and next_cursor >= cursor:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=cursor_not_advancing "
+                    "pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+            cursor = next_cursor
 
         if len(matches) != 1:
             logger.debug(
-                "chatwoot: mirror note not proven conversation_id=%s match_count=%s",
+                "chatwoot: mirror note not proven conversation_id=%s reason=match_count "
+                "pages=%s messages=%s match_count=%s",
                 conversation_id,
+                pages,
+                scanned,
                 len(matches),
             )
             return None

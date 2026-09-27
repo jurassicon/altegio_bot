@@ -493,12 +493,31 @@ only when **all** of these hold at once: it is listed by the destination
 conversation, `message_type` is outgoing, `private` is exactly `true`, the marker
 has the expected version, `whatsapp_provider_message_id` equals the reaction
 target wamid exactly, and exactly one such message with a positive integer id
-was found. The lookup never matches by body, template code, "last message" or
-result order, and it never picks one result out of several.
+was found. The lookup never matches by body, template code, `created_at`,
+"last message" or result order, and it never picks one result out of several.
+
+**Bounded pagination.** Chatwoot serves only one page of a conversation (20
+messages) per request, so the lookup pages backwards with
+`before=<oldest usable message id of the previous page>`, and the cursor must
+strictly decrease. Matches are collected across the whole walk and deduplicated
+by Chatwoot message id, so a row served on both sides of a page boundary stays
+one match while two distinct ids stay an ambiguity. The walk is bounded by a
+conservative page budget (`_MIRROR_NOTE_MAX_PAGES` = 10 pages, ~200 messages),
+because it runs inline on a best-effort inbound path and every page is one more
+Chatwoot round trip.
+
+A single match is trusted **only** once a page shorter than the page size (an
+empty page included) has proven that the walked history ended. This is therefore
+a bounded recent-window proof, **not** a search across all history: in a
+conversation with more than ~200 messages newer than the mirror note, the
+reaction keeps the visible quote by design.
 
 **Fail-closed fallback.** Zero matches, several matches, a malformed API
-response, an HTTP error, or a conversation mismatch all fall back to a visible
-short quote of the original text plus the emoji — never a false native link:
+response, an HTTP or transport error, a conversation mismatch, a page that yields
+no usable cursor, a cursor that stops advancing (a replayed page), and an
+exhausted page budget all fall back to a visible short quote of the original text
+plus the emoji — never a false native link. Exhausting the budget is a miss even
+when exactly one match was already collected:
 
 ```text
 ↩️ Ответ на сообщение:

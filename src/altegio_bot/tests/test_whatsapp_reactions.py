@@ -15,9 +15,12 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+import respx
 from sqlalchemy import select
 
+from altegio_bot.chatwoot_client import _MIRROR_NOTE_PAGE_SIZE, ChatwootClient
 from altegio_bot.chatwoot_outbox_route import CHATWOOT_ROUTE_META_KEY
 from altegio_bot.models.models import (
     PROVIDER_ALTEGIO,
@@ -237,6 +240,7 @@ async def _run_reaction(
     dedupe_key: str = "wa:reaction-test",
     provider: WhatsAppProvider | None = None,
     mirror_note_id: Any = None,
+    chatwoot_instance: Any = None,
 ) -> tuple[WhatsAppEvent, MagicMock]:
     provider = provider or _CaptureProvider()
     async with session_maker() as session:
@@ -250,11 +254,16 @@ async def _run_reaction(
             session.add(evt)
             await session.flush()
 
-            mock_cls, mock_inst = _mock_chatwoot_client(
-                conversation_id=destination_conversation_id,
-                message_id=message_id,
-                mirror_note_id=mirror_note_id,
-            )
+            if chatwoot_instance is not None:
+                # A real ChatwootClient whose mirror lookup is exercised for real.
+                mock_inst = chatwoot_instance
+                mock_cls = MagicMock(return_value=mock_inst)
+            else:
+                mock_cls, mock_inst = _mock_chatwoot_client(
+                    conversation_id=destination_conversation_id,
+                    message_id=message_id,
+                    mirror_note_id=mirror_note_id,
+                )
             with patch("altegio_bot.workers.whatsapp_inbox_worker.ChatwootClient", mock_cls):
                 await handle_event(session, evt, provider)
 
@@ -1768,4 +1777,140 @@ async def test_native_mirror_reaction_stays_inside_its_branch_inbox(
     call = cw.send_message.call_args
     assert call.args[1] == "👍"
     assert call.kwargs["content_attributes"]["in_reply_to"] == MIRROR_NOTE_ID
+    assert evt.error is None
+
+
+# ---------------------------------------------------------------------------
+# 21. the worker end to end over a REAL bounded paginated mirror lookup
+# ---------------------------------------------------------------------------
+#
+# The tests above drive the lookup through a mock so they can pin one outcome at
+# a time. These two run the genuine ``ChatwootClient.find_outbound_mirror_note``
+# pagination — only the conversation/send plumbing is stubbed — so the worker's
+# native-vs-fallback decision is proven against real Chatwoot page traffic. The
+# exhaustive page matrix (cursors, budget, malformed pages) lives in
+# test_chatwoot_client.py.
+
+CHATWOOT_TEST_BASE_URL = "https://chatwoot.reactions.test"
+
+
+def _page_filler(newest_id: int, count: int = _MIRROR_NOTE_PAGE_SIZE) -> list[dict[str, Any]]:
+    """Ordinary non-marker messages with strictly decreasing ids."""
+    return [
+        {
+            "id": newest_id - offset,
+            "conversation_id": DEST_CONVERSATION_ID,
+            "message_type": 0,
+            "private": False,
+            "content": "client wrote",
+            "content_attributes": {},
+        }
+        for offset in range(count)
+    ]
+
+
+def _page_mirror_note(message_id: int) -> dict[str, Any]:
+    """A private mirror note carrying the proven marker for TARGET_WAMID."""
+    return {
+        "id": message_id,
+        "conversation_id": DEST_CONVERSATION_ID,
+        "message_type": "outgoing",
+        "private": True,
+        "content": "Ваша запись завтра в 10:00",
+        "content_attributes": {
+            "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+            "whatsapp_provider_message_id": TARGET_WAMID,
+        },
+    }
+
+
+def _real_paginated_chatwoot_client(pages: list[Any]) -> tuple[ChatwootClient, list[httpx.Request]]:
+    """A real client whose messages endpoint serves ``pages`` in order."""
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        index = len(requests) - 1
+        assert index < len(pages), f"unexpected extra messages request #{index + 1}"
+        page = pages[index]
+        if isinstance(page, httpx.Response):
+            return page
+        return httpx.Response(200, json={"payload": page})
+
+    respx.get(f"{CHATWOOT_TEST_BASE_URL}/api/v1/accounts/1/conversations/{DEST_CONVERSATION_ID}/messages").mock(
+        side_effect=_handler
+    )
+
+    client = ChatwootClient(
+        base_url=CHATWOOT_TEST_BASE_URL,
+        api_token="test-token",
+        account_id=1,
+        inbox_id=2,
+    )
+    client.get_or_create_incoming_conversation = AsyncMock(  # type: ignore[method-assign]
+        return_value=DEST_CONVERSATION_ID
+    )
+    client.send_message = AsyncMock(return_value=MESSAGE_ID)  # type: ignore[method-assign]
+    return client, requests
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_worker_paginated_lookup_gives_emoji_only_and_in_reply_to(session_maker) -> None:
+    """The marker sits on page two; the reaction still renders as a native reply."""
+    cw, requests = _real_paginated_chatwoot_client(
+        [
+            _page_filler(400),
+            [_page_mirror_note(300), *_page_filler(299, 4)],
+        ]
+    )
+
+    evt, _ = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        chatwoot_instance=cw,
+        dedupe_key="wa:reaction-paginated-native",
+    )
+
+    assert [request.url.params.get("before") for request in requests] == [None, "381"]
+    call = cw.send_message.call_args
+    assert call.args[0] == DEST_CONVERSATION_ID
+    assert call.args[1] == "👍"
+    attrs = call.kwargs["content_attributes"]
+    assert attrs["in_reply_to"] == 300
+    assert attrs["in_reply_to_external_id"] == TARGET_WAMID
+    assert attrs["whatsapp_reaction_native_source"] == "outbound_mirror_note"
+    assert evt.forwarded_chatwoot_conversation_id == DEST_CONVERSATION_ID
+    assert evt.error is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_worker_incomplete_paginated_proof_keeps_the_visible_quote(session_maker) -> None:
+    """An unfinished walk costs the native link, never the reaction itself."""
+    cw, requests = _real_paginated_chatwoot_client(
+        [
+            [*_page_filler(400, _MIRROR_NOTE_PAGE_SIZE - 1), _page_mirror_note(381)],
+            httpx.Response(500),
+        ]
+    )
+
+    evt, _ = await _run_reaction(
+        session_maker,
+        payload=_reaction_payload(),
+        seeds=lambda s: s.add(_outbox(template_code="reminder_24h")),
+        chatwoot_instance=cw,
+        dedupe_key="wa:reaction-paginated-fallback",
+    )
+
+    assert len(requests) == 2
+    call = cw.send_message.call_args
+    # The reaction is still delivered, with the visible quote fallback.
+    assert call.args[1] == _quote_fallback("Ваша запись завтра в 10:00", "👍")
+    attrs = call.kwargs["content_attributes"]
+    assert "in_reply_to" not in attrs
+    assert "whatsapp_reaction_native_source" not in attrs
+    assert evt.chatwoot_message_id == MESSAGE_ID
+    assert evt.forwarded_chatwoot_conversation_id == DEST_CONVERSATION_ID
     assert evt.error is None

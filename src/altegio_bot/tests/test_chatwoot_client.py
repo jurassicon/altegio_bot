@@ -11,6 +11,8 @@ import pytest
 import respx
 
 from altegio_bot.chatwoot_client import (
+    _MIRROR_NOTE_MAX_PAGES,
+    _MIRROR_NOTE_PAGE_SIZE,
     WA_CLICK_TO_CHAT_MAX_URL_CHARS,
     ChatwootClient,
     append_wa_deeplink,
@@ -1026,6 +1028,69 @@ def _mirror_note(
     return message
 
 
+# ---------------------------------------------------------------------------
+# Bounded cursor pagination harness
+# ---------------------------------------------------------------------------
+#
+# Chatwoot answers the conversation messages endpoint one page at a time and
+# pages backwards with ``before=<message id>``. These helpers script a sequence
+# of pages so a test can place the marker anywhere in the walked history.
+
+
+def _mock_paginated_messages(conv_id: int, pages: list[object]) -> list[httpx.Request]:
+    """Serve the messages endpoint as an ordered sequence of Chatwoot pages.
+
+    ``pages[0]`` answers the first request (no ``before``); each later entry
+    answers the next ``before=<cursor>`` request in order. An entry may be a list
+    of messages (wrapped in the usual ``{"payload": ...}`` envelope), a ready
+    ``httpx.Response`` for HTTP/malformed cases, or an exception instance for a
+    transport failure. A request beyond the scripted pages fails the test, which
+    is how "no unbounded scan" and "no infinite loop" are proven.
+    """
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        index = len(requests) - 1
+        assert index < len(pages), f"unexpected extra messages request #{index + 1}"
+        page = pages[index]
+        if isinstance(page, BaseException):
+            raise page
+        if isinstance(page, httpx.Response):
+            return page
+        return httpx.Response(200, json={"payload": page})
+
+    respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/conversations/{conv_id}/messages").mock(
+        side_effect=_handler
+    )
+    return requests
+
+
+def _filler_messages(
+    newest_id: int,
+    count: int = _MIRROR_NOTE_PAGE_SIZE,
+    *,
+    conversation_id: int = 30,
+) -> list[dict]:
+    """Ordinary (non-marker) messages with strictly decreasing ids."""
+    return [
+        {
+            "id": newest_id - offset,
+            "conversation_id": conversation_id,
+            "message_type": 0,
+            "private": False,
+            "content": "client wrote",
+            "content_attributes": {},
+        }
+        for offset in range(count)
+    ]
+
+
+def _before_params(requests: list[httpx.Request]) -> list[str | None]:
+    """The ``before`` query parameter of each issued request, in order."""
+    return [request.url.params.get("before") for request in requests]
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_proves_single_match(client: ChatwootClient) -> None:
@@ -1203,3 +1268,254 @@ async def test_find_outbound_mirror_note_is_read_only(client: ChatwootClient) ->
     await client.find_outbound_mirror_note(30, _MIRROR_WAMID)
 
     assert not post_route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_finds_a_marker_on_the_second_page(client: ChatwootClient) -> None:
+    """Regression: a busy conversation pushes the mirror note off page one.
+
+    Chatwoot returns at most one page per request, so a single unpaginated GET
+    could only ever see the newest messages and reported "not proven".
+    """
+    requests = _mock_paginated_messages(
+        30,
+        [
+            _filler_messages(400),
+            [_mirror_note(message_id=300), *_filler_messages(299, 5)],
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 300
+    # First request carries no cursor; the second pages back from the oldest id.
+    assert _before_params(requests) == [None, "381"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_finds_a_marker_on_the_third_page(client: ChatwootClient) -> None:
+    requests = _mock_paginated_messages(
+        30,
+        [
+            _filler_messages(400),
+            _filler_messages(380),
+            [_mirror_note(message_id=350), *_filler_messages(349, 3)],
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 350
+    assert _before_params(requests) == [None, "381", "361"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_walks_to_the_end_without_a_marker(client: ChatwootClient) -> None:
+    requests = _mock_paginated_messages(
+        30,
+        [
+            _filler_messages(400),
+            _filler_messages(380),
+            _filler_messages(360, 4),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 3
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_an_empty_last_page_completes_the_proof(client: ChatwootClient) -> None:
+    """An empty page is a real page and proves the end of the walked history."""
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            [],
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 381
+    assert _before_params(requests) == [None, "381"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_duplicate_marker_across_pages_fails_closed(client: ChatwootClient) -> None:
+    """Two DISTINCT proven ids anywhere in the walk are as unusable as none."""
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            [_mirror_note(message_id=250), *_filler_messages(249, 3)],
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_overlapping_page_boundary_is_one_match(client: ChatwootClient) -> None:
+    """The same row served on both sides of the cursor stays a single match."""
+    overlapping = _mirror_note(message_id=381)
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), overlapping],
+            # Chatwoot's `before` is exclusive, but an inclusive server must not
+            # manufacture an ambiguity out of one message.
+            [overlapping, *_filler_messages(380, 3)],
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 381
+    assert _before_params(requests) == [None, "381"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_repeated_page_stops_without_looping(client: ChatwootClient) -> None:
+    """A server that keeps replaying the same page must not spin the walk."""
+    replayed = _filler_messages(400)
+    requests = _mock_paginated_messages(30, [replayed, replayed])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    # Exactly two requests: the cursor failed to advance, so the walk stopped.
+    assert _before_params(requests) == [None, "381"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_non_advancing_cursor_stops_without_looping(client: ChatwootClient) -> None:
+    """A later page whose oldest id is not older than the cursor fails closed."""
+    requests = _mock_paginated_messages(
+        30,
+        [
+            _filler_messages(400),
+            # Oldest id 390 > cursor 381: the walk is going backwards nowhere.
+            _filler_messages(409, _MIRROR_NOTE_PAGE_SIZE),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert _before_params(requests) == [None, "381"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_http_error_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
+    """One already-collected match does not survive an unfinished walk."""
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            httpx.Response(500),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_transport_error_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            httpx.ConnectError("boom"),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_malformed_json_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            httpx.Response(200, text="not json at all"),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"unexpected": "shape"}, {"payload": "not a list"}, {"payload": {"messages": "nope"}}, "plain string", 7],
+    ids=["no_payload", "payload_not_list", "messages_not_list", "json_string", "json_number"],
+)
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_malformed_payload_on_a_later_page_fails_closed(
+    client: ChatwootClient,
+    body: object,
+) -> None:
+    """A malformed page must never be read as "no more messages"."""
+    requests = _mock_paginated_messages(
+        30,
+        [
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
+            httpx.Response(200, json=body),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_full_page_without_usable_ids_fails_closed(client: ChatwootClient) -> None:
+    """A full page that yields no cursor cannot be continued, so it fails closed."""
+    unusable = [
+        {"id": value, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}}
+        for value in ["381", None, 0, -1, True] * 4
+    ]
+    assert len(unusable) == _MIRROR_NOTE_PAGE_SIZE
+    requests = _mock_paginated_messages(30, [unusable])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert _before_params(requests) == [None]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_page_budget_exhausted_fails_closed(client: ChatwootClient) -> None:
+    """The budget bounds the walk, and running out of it is a miss, not a match."""
+    pages: list[object] = [[*_filler_messages(1000, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=981)]]
+    pages.extend(_filler_messages(980 - index * _MIRROR_NOTE_PAGE_SIZE) for index in range(_MIRROR_NOTE_MAX_PAGES - 1))
+    requests = _mock_paginated_messages(30, pages)
+
+    # A match was already collected on page one and is still refused, because the
+    # end of the history was never proven.
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == _MIRROR_NOTE_MAX_PAGES
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_first_request_carries_no_cursor(client: ChatwootClient) -> None:
+    """Exact query contract: no `before` first, then the oldest id of each page."""
+    requests = _mock_paginated_messages(
+        30,
+        [_filler_messages(500), _filler_messages(480), _filler_messages(460, 2)],
+    )
+
+    await client.find_outbound_mirror_note(30, _MIRROR_WAMID)
+
+    assert "before" not in requests[0].url.params
+    assert _before_params(requests) == [None, "481", "461"]
+    # Strictly decreasing, never repeated.
+    cursors = [int(value) for value in _before_params(requests)[1:]]
+    assert cursors == sorted(cursors, reverse=True)
+    assert len(set(cursors)) == len(cursors)
