@@ -37,6 +37,11 @@ from altegio_bot.campaigns.configuration import (
 )
 from altegio_bot.campaigns.easyweek_voucher_batch import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_batch import runner as runner_module
+from altegio_bot.campaigns.easyweek_voucher_batch.baseline import (
+    BATCH_BASELINE_TEMPLATE_FACTS,
+    BATCH_BASELINE_VERSION,
+    prove_batch_baseline,
+)
 from altegio_bot.campaigns.easyweek_voucher_batch.composition import prove_batch_composition
 from altegio_bot.campaigns.easyweek_voucher_batch.identity import (
     BASELINE_DRIFT,
@@ -1533,7 +1538,7 @@ async def test_a_stage_that_attempted_nothing_does_not_report_partial(
             runner_module.SlotResult(slot=2, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]),
         ],
         await ledger_module.load(session_maker),
-        runner_module.prove_baseline(template_payload()),
+        runner_module.prove_batch_baseline(template_payload()),
         external_calls={"create": 0, "pay": 0, "refund": 0, "meta": 0},
     )
     assert report.outcome == "refused"
@@ -3569,3 +3574,262 @@ def test_the_module_enters_the_event_loop_in_exactly_one_place() -> None:
         if isinstance(node, ast.FunctionDef) and any(call is sites[0] for call in ast.walk(node))
     ]
     assert enclosing == ["main"], enclosing
+
+
+# ===========================================================================
+# The batch's OWN versioned baseline (43/43), separate from the manual canary's
+# ===========================================================================
+#
+# The batch used to borrow §37.2's baseline. A read-only production probe on
+# 27.09.2026 then read 43/43 — one brow/lash lamination service had been switched
+# back on — while every other frozen field was unchanged. The historical canary's
+# record is not edited to keep a later phase passing, so the batch carries its own
+# version and compares against that. These tests pin both halves of that: the new
+# baseline accepts exactly 43/43, and the old one keeps accepting exactly 42/42.
+
+
+def test_the_exact_batch_template_is_proven() -> None:
+    proof = prove_batch_baseline(template_payload())
+
+    assert proof.proven
+    assert proof.baseline_version == BATCH_BASELINE_VERSION
+    assert proof.baseline_version == "2026-09-27-43"
+    assert proof.mismatched_fields == ()
+    assert proof.counters == {"vouchers_count": 0, "activated_vouchers_count": 0}
+    assert proof.digest
+
+
+def test_the_batch_baseline_expects_every_frozen_field_the_owner_approved() -> None:
+    """The full frozen set, spelled out so a silent edit to one line is visible."""
+    assert BATCH_BASELINE_TEMPLATE_FACTS == {
+        "is_enabled": True,
+        "is_online": False,
+        "is_single_charge": True,
+        "cost": 1500,
+        "value": 1500,
+        "validity": None,
+        "forces_activation": True,
+        "activate_after": 0,
+        "activate_at": None,
+        "is_connected_all_branches": True,
+        "branches_count": 3,
+        "all_branches_count": 3,
+        "is_connected_all_services": True,
+        "services_count": 43,
+        "all_services_count": 43,
+        "goods_count": 0,
+    }
+
+
+def test_the_previous_42_catalogue_is_now_a_drift_on_both_counters() -> None:
+    """The exact production drift this fix answers, and nothing else moved."""
+    proof = prove_batch_baseline(template_payload(services=42, all_services=42))
+
+    assert not proof.proven
+    assert set(proof.mismatched_fields) == {"services_count", "all_services_count"}
+
+
+@pytest.mark.parametrize(
+    ("services", "all_services", "expected"),
+    [
+        (43, 42, {"all_services_count", "services_count_vs_all_services_count"}),
+        (42, 43, {"services_count", "services_count_vs_all_services_count"}),
+    ],
+    ids=["43_42", "42_43"],
+)
+def test_a_half_moved_catalogue_is_refused(services: int, all_services: int, expected: set[str]) -> None:
+    """The two counts must agree with each other, not only with their literals."""
+    proof = prove_batch_baseline(template_payload(services=services, all_services=all_services))
+
+    assert not proof.proven
+    assert set(proof.mismatched_fields) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False],
+    ids=["true", "false"],
+)
+def test_a_bool_is_not_an_integer_counter(value: bool) -> None:
+    """``True == 1`` in Python; a template field is not allowed to exploit that."""
+    proof = prove_batch_baseline(template_payload(services=value, all_services=value))
+
+    assert not proof.proven
+    assert "services_count_vs_all_services_count" in proof.mismatched_fields
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["43", None, 43.0, [43], {"count": 43}],
+    ids=["string", "null", "float", "list", "object"],
+)
+def test_an_unreadable_service_count_is_refused(value: object) -> None:
+    """A count that cannot be read is not the count we approved."""
+    proof = prove_batch_baseline(template_payload(services=value, all_services=value))
+
+    assert not proof.proven
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["vouchers_count", "activated_vouchers_count"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [-1, "0", None, True],
+    ids=["negative", "string", "null", "bool"],
+)
+def test_an_unusable_voucher_counter_is_refused(field: str, value: object) -> None:
+    """A counter we cannot compare is never silently read as zero."""
+    proof = prove_batch_baseline(template_payload(**{field: value}))
+
+    assert not proof.proven
+    assert proof.counters is None
+
+
+def test_more_activated_vouchers_than_issued_is_refused() -> None:
+    """Internally impossible counters mean we are not looking at what we think."""
+    proof = prove_batch_baseline(template_payload(vouchers_count=1, activated_vouchers_count=2))
+
+    assert not proof.proven
+    assert proof.counters is None
+
+
+def test_a_malformed_template_payload_is_refused() -> None:
+    for payload in (None, [], "template", 42):
+        proof = prove_batch_baseline(payload)
+        assert not proof.proven
+        assert proof.baseline_version == BATCH_BASELINE_VERSION
+
+
+def test_the_safe_report_names_fields_and_never_values() -> None:
+    """A drift report is pasted into tickets; observed values stay in EasyWeek."""
+    safe = prove_batch_baseline(template_payload(services=42, all_services=42)).as_safe_dict()
+
+    assert safe["baseline_version"] == "2026-09-27-43"
+    assert safe["baseline_proven"] is False
+    assert set(safe["mismatched_fields"]) == {"services_count", "all_services_count"}
+    # Field names only: the value actually OBSERVED (42) appears nowhere. The two
+    # fields that legitimately carry numbers are excluded first, so the scan means
+    # something: the digest is a hash of the frozen field set, and the version
+    # string names the approved baseline rather than reporting the template.
+    assert isinstance(safe.pop("template_config_digest"), str)
+    assert safe.pop("baseline_version") == "2026-09-27-43"
+    rendered = json.dumps(safe)
+    assert "42" not in rendered
+    assert "43" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# The manual canary keeps its own history
+# ---------------------------------------------------------------------------
+
+
+def test_the_manual_canary_still_proves_its_own_42_baseline() -> None:
+    """§37.2's record is history: its baseline still accepts exactly 42/42."""
+    from altegio_bot.campaigns.easyweek_manual_voucher.baseline import prove_baseline
+    from altegio_bot.campaigns.easyweek_manual_voucher.identity import MANUAL_BASELINE_VERSION
+
+    manual_template = template_payload(services=42, all_services=42)
+    manual = prove_baseline(manual_template)
+
+    assert manual.proven
+    assert manual.baseline_version == MANUAL_BASELINE_VERSION == "2026-09-15-42"
+    # The same payload the manual canary accepts is a drift for the batch, and
+    # vice versa. Two versioned records, neither rewriting the other.
+    assert not prove_batch_baseline(manual_template).proven
+    assert not prove_baseline(template_payload()).proven
+
+
+def test_the_batch_production_package_does_not_depend_on_the_manual_baseline() -> None:
+    """The separation is structural, not just a value that happens to differ."""
+    from pathlib import Path
+
+    package = Path(runner_module.__file__).parent
+    sources = sorted(package.glob("*.py"))
+    assert sources, "expected the batch package to have modules"
+    for module in sources:
+        text_body = module.read_text(encoding="utf-8")
+        assert "easyweek_manual_voucher.baseline" not in text_body, module.name
+        assert "MANUAL_BASELINE_VERSION" not in text_body, module.name
+        assert "MANUAL_BASELINE_TEMPLATE_FACTS" not in text_body, module.name
+
+
+# ---------------------------------------------------------------------------
+# The new version reaches the plan, the report and the frozen row
+# ---------------------------------------------------------------------------
+
+
+async def test_the_plan_reports_the_batch_baseline_version(session_maker, batch_configuration, binding_key) -> None:
+    run_id, _ = await seed_batch_preview(session_maker, count=2)
+    await seed_template_and_sender(session_maker)
+
+    plan = await _plan(session_maker, FakeReader(count=2), stage=STAGE_FREEZE, request=batch_request(run_id=run_id))
+
+    assert plan.ready, plan.reasons
+    assert plan.snapshot["baseline"]["baseline_version"] == "2026-09-27-43"
+    assert plan.snapshot["baseline"]["baseline_proven"] is True
+
+
+async def test_freeze_stores_the_batch_baseline_version_in_the_ledger(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """The frozen row records which baseline authorised it, for the audit."""
+    run_id, _ = await seed_batch_preview(session_maker, count=2)
+    await seed_template_and_sender(session_maker)
+    report = await _freeze(session_maker, FakeReader(count=2), batch_request(run_id=run_id))
+
+    assert report.baseline["baseline_version"] == "2026-09-27-43"
+    async with session_maker() as session:
+        batch = (await session.execute(select(EasyWeekVoucherSnapshotBatch))).scalar_one()
+    assert batch.baseline_version == "2026-09-27-43"
+
+    # The claim compares the identity field by field, so the stored version is
+    # the one a later stage has to re-prove.
+    snapshot = await ledger_module.load(session_maker)
+    assert snapshot.baseline_version == "2026-09-27-43"
+
+
+async def test_a_42_template_now_refuses_the_freeze(session_maker, batch_configuration, binding_key) -> None:
+    """The live drift, end to end: the old catalogue no longer authorises a batch."""
+    run_id, _ = await seed_batch_preview(session_maker, count=2)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=2, template=template_payload(services=42, all_services=42))
+
+    plan = await _plan(session_maker, reader, stage=STAGE_FREEZE, request=batch_request(run_id=run_id))
+
+    assert not plan.ready
+    assert BASELINE_DRIFT in plan.reasons
+    async with session_maker() as session:
+        assert (await session.execute(select(func.count()).select_from(EasyWeekVoucherSnapshotBatch))).scalar() == 0
+
+
+async def test_a_drifted_baseline_costs_zero_external_calls_before_create(
+    session_maker, batch_configuration, binding_key
+) -> None:
+    """Fail-closed means nothing left the process, not that it was rolled back."""
+    run_id, _ = await _frozen_batch(session_maker, count=2)
+    reader = FakeReader(count=2, template=template_payload(services=42, all_services=42))
+    request = batch_request(run_id=run_id)
+    mutator = FakeMutator(create_sequence=[_ok_response(0), _ok_response(1)])
+
+    report = await _apply(
+        session_maker,
+        reader,
+        stage=STAGE_CREATE,
+        request=request,
+        mutator=mutator,
+        expect_ready=False,
+    )
+
+    assert report.outcome == "refused"
+    assert BASELINE_DRIFT in report.reasons
+    assert report.external_effect_attempted is False
+    assert report.external_send_attempted is False
+    assert mutator.create_calls == []
+    assert mutator.pay_calls == []
+    assert mutator.calls == []
+    # And nothing was queued towards Meta either.
+    async with session_maker() as session:
+        assert (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar() == 0
+        assert (await session.execute(select(func.count()).select_from(MessageJob))).scalar() == 0

@@ -43,13 +43,16 @@ from typing import Any, Protocol
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_eligibility import BookingReader
-from altegio_bot.campaigns.easyweek_manual_voucher.baseline import BaselineProof, prove_baseline
-from altegio_bot.campaigns.easyweek_manual_voucher.identity import MANUAL_BASELINE_VERSION
 from altegio_bot.campaigns.easyweek_voucher_batch import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_batch.authorisation import (
     StagePlan,
     stage_digest,
     verify_plan_authorisation,
+)
+from altegio_bot.campaigns.easyweek_voucher_batch.baseline import (
+    BATCH_BASELINE_VERSION,
+    BatchBaselineProof,
+    prove_batch_baseline,
 )
 from altegio_bot.campaigns.easyweek_voucher_batch.composition import (
     BatchComposition,
@@ -370,7 +373,7 @@ def _identity_from_composition(
         staffer_uuid=request.staffer_uuid,
         payment_account_uuid=request.payment_account_uuid,
         voucher_template_uuid=request.voucher_template_uuid,
-        baseline_version=MANUAL_BASELINE_VERSION,
+        baseline_version=BATCH_BASELINE_VERSION,
         frozen_digest=composition.digest(),
         items=tuple(items),
     )
@@ -458,7 +461,7 @@ def _refusal(
     reasons: tuple[str, ...] | list[str],
     snapshot: ledger_module.BatchSnapshot,
     *,
-    baseline: BaselineProof | None = None,
+    baseline: BatchBaselineProof | None = None,
 ) -> StageReport:
     """A stage that did not act. Nothing left this process."""
     return StageReport(
@@ -492,12 +495,13 @@ async def _exact_order(order_reader: Any, order_uuid: str | None) -> tuple[objec
     return payload, None
 
 
-async def _baseline_now(order_reader: Any) -> tuple[BaselineProof, tuple[str, ...]]:
-    """Read the template and compare it with the approved 42/42 baseline.
+async def _baseline_now(order_reader: Any) -> tuple[BatchBaselineProof, tuple[str, ...]]:
+    """Read the template and compare it with this batch's approved 43/43 baseline.
 
-    The same versioned baseline §37.2 proved in production, reused rather than
-    restated: this phase buys the same product from the same template, and two
-    copies of one number are two numbers that can disagree.
+    The batch owns its baseline rather than borrowing the §37.2 manual canary's.
+    Both phases buy the same product from the same template, but the catalogue
+    moved after that canary was proved, and a historical record is not edited to
+    keep a later phase passing.
 
     A drift is reported, never absorbed. The caller decides what a drift means
     for ITS stage — which is not the same answer everywhere: a refund stays
@@ -507,8 +511,8 @@ async def _baseline_now(order_reader: Any) -> tuple[BaselineProof, tuple[str, ..
     try:
         payload = await order_reader.get_voucher_template(EASYWEEK_VOUCHER_TEMPLATE_UUID)
     except Exception:  # noqa: BLE001 - an unread template is an unproven one
-        return BaselineProof(proven=False, baseline_version=MANUAL_BASELINE_VERSION), (BASELINE_DRIFT,)
-    proof = prove_baseline(payload)
+        return BatchBaselineProof(proven=False, baseline_version=BATCH_BASELINE_VERSION), (BASELINE_DRIFT,)
+    proof = prove_batch_baseline(payload)
     return proof, () if proof.proven else (BASELINE_DRIFT,)
 
 
@@ -591,7 +595,7 @@ async def build_stage_plan(
     slot: int | None = None,
     now: datetime | None = None,
     enabled: bool | None = None,
-) -> tuple[StagePlan, BatchComposition, BatchPrerequisites, BaselineProof]:
+) -> tuple[StagePlan, BatchComposition, BatchPrerequisites, BatchBaselineProof]:
     """Re-prove everything THIS stage depends on. Reads only; mutates nothing.
 
     Creates no batch, sends no request and writes nothing. Every failure is one
@@ -818,7 +822,7 @@ async def _authorise(
     StagePlan | None,
     BatchComposition | None,
     BatchPrerequisites | None,
-    BaselineProof | None,
+    BatchBaselineProof | None,
     StageReport | None,
 ]:
     """Rebuild the plan live and check the approval. A report means: refused."""
@@ -1212,7 +1216,7 @@ def _stage_report(
     stage: str,
     results: list[SlotResult],
     snapshot: ledger_module.BatchSnapshot,
-    baseline: BaselineProof,
+    baseline: BatchBaselineProof,
     *,
     external_calls: dict[str, int],
 ) -> StageReport:

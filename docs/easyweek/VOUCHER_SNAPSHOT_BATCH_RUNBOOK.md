@@ -93,7 +93,21 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run alembic upgrade head
 ```
 
-Expected head: `b3f7c2a90d14`.
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run alembic heads
+```
+
+**What to check.** `alembic heads` must print exactly ONE revision, and
+`alembic current` must equal it. Do not compare either against a literal written
+into this runbook: later phases add revisions, and a hard-coded head here would
+send an operator looking for a drift that is simply the next PR.
+
+For the repository state this phase ships with, that single head is
+`d7b2f6a4c318`. `b3f7c2a90d14` is the historical PR-18 migration that created the
+batch tables — it must still be present in the chain (`alembic history` shows it),
+but it is no longer the global head and must not be expected as one.
+
+This phase adds no migration of its own.
 
 ---
 
@@ -144,9 +158,19 @@ Keep three values from the output for the next command:
 They expire in 30 minutes. A plan for one stage never authorises another, and a
 plan built for one composition never authorises a different one.
 
-**Baseline.** `snapshot.baseline.baseline_version` must read `2026-09-15-42` and
-`mismatched_fields` must be empty. A drift stops the stage; it is never adapted
-to. Take a drift to the owner before doing anything else.
+**Baseline.** `snapshot.baseline.baseline_version` must read `2026-09-27-43` and
+`mismatched_fields` must be empty. That baseline expects
+`services_count=43` and `all_services_count=43`, the owner-approved live catalogue
+of 27.09.2026, together with every other frozen template field unchanged.
+
+A drift stops the stage; it is never adapted to. Take a drift to the owner before
+doing anything else — in particular, a report naming `services_count` and
+`all_services_count` means the catalogue moved again, and the answer is a reviewed
+code change to the baseline, never an edit here.
+
+The §37.2 manual canary keeps its own separate, historical baseline
+`2026-09-15-42` at 42/42. It is untouched, and a batch reading 42/42 is a refusal,
+not a fallback.
 
 ---
 
