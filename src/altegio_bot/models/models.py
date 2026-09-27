@@ -3769,3 +3769,87 @@ class EasyWeekVoucherSnapshotBatchAttempt(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Chatwoot outbound mirror registry
+# ---------------------------------------------------------------------------
+# Durable WAMID → Chatwoot Message.id link for the private mirror note of an
+# automatic (bot) WhatsApp send. It exists so an inbound WhatsApp reaction can
+# resolve its native reply target in ONE indexed read, instead of paging the
+# conversation history and hoping the note is still inside the walked window.
+#
+# Written only by the side that CREATED the note, only after Chatwoot answered
+# with a valid message id — never by searching Chatwoot for a plausible match.
+# The row is therefore a record of our own action, not an inference.
+#
+# Deliberately a standalone table rather than a column on ``outbox_messages``:
+# the Chatwoot mirror runs as a background task that races the Outbox row's own
+# ``provider_message_id`` commit, so this write must not depend on that row
+# existing yet, and it must never take a lock on it.
+CHATWOOT_MIRROR_ROUTES = ("tenant", "general")
+_CHATWOOT_MIRROR_ROUTE_SQL = ", ".join(f"'{value}'" for value in CHATWOOT_MIRROR_ROUTES)
+
+
+class ChatwootOutboundMirror(Base):
+    __tablename__ = "chatwoot_outbound_mirrors"
+
+    __table_args__ = (
+        # One Meta message has exactly one mirror note PER CHATWOOT INSTALLATION.
+        # Chatwoot message/conversation ids restart with a new database, so the
+        # namespace has to be part of the key: the same wamid may legitimately map
+        # to a different Chatwoot message in another installation, and neither row
+        # may hide the other. This is also the idempotency key for the write
+        # (INSERT ... ON CONFLICT DO NOTHING) and the lookup index.
+        #
+        # Legacy rows carry a NULL scope. PostgreSQL treats NULLs as distinct here,
+        # so they are neither deduplicated nor trusted — the lookup requires an
+        # exact scope match, which a NULL can never satisfy.
+        UniqueConstraint(
+            "chatwoot_scope_id",
+            "provider_message_id",
+            name="uq_chatwoot_outbound_mirror_scope_provider_message",
+        ),
+        # A zero or negative Chatwoot id is never a real message/conversation,
+        # and storing one would hand the reaction path an unusable "proof".
+        CheckConstraint("chatwoot_message_id > 0", name="ck_chatwoot_outbound_mirror_message_id"),
+        CheckConstraint("chatwoot_conversation_id > 0", name="ck_chatwoot_outbound_mirror_conversation_id"),
+        CheckConstraint("length(provider_message_id) > 0", name="ck_chatwoot_outbound_mirror_wamid_present"),
+        CheckConstraint(
+            f"chatwoot_route IN ({_CHATWOOT_MIRROR_ROUTE_SQL})",
+            name="ck_chatwoot_outbound_mirror_route",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Which Chatwoot installation/account/generation these numeric ids belong to.
+    # Composed once by the ChatwootClient that talks to Chatwoot
+    # (``build_chatwoot_scope_id``: normalized base URL + account id + the operator's
+    # rotatable generation token — never the API token). Nullable ONLY so rows
+    # written before this column existed can stay; they are never trusted.
+    chatwoot_scope_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # The exact Meta wamid of the outbound message this note mirrors, and the
+    # Chatwoot message/conversation the note actually became. Together with the
+    # scope above these are the whole proof the reaction path needs.
+    provider_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    chatwoot_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chatwoot_conversation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # The marker contract version in force when the note was written. A lookup
+    # accepts only the version it expects, so bumping the marker retires old
+    # rows instead of silently trusting a different shape.
+    marker_version: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Routing provenance, recorded for ops and audit. The isolation the reaction
+    # path enforces is the conversation itself — a Chatwoot conversation belongs
+    # to exactly one inbox, and the inbox map binds an inbox to exactly one
+    # provider/company pair — so these columns are descriptive, which is why
+    # they stay nullable for the legacy single-inbox client.
+    chatwoot_route: Mapped[str] = mapped_column(String(16), nullable=False)
+    chatwoot_inbox_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tenant_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    company_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

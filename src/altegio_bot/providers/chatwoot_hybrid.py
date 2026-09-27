@@ -11,7 +11,9 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from altegio_bot.chatwoot_client import ChatwootClient
+from altegio_bot.chatwoot_client import OUTBOUND_MIRROR_MESSAGE_KIND, ChatwootClient, MirroredNote
+from altegio_bot.chatwoot_mirror_registry import record_outbound_mirror
+from altegio_bot.db import SessionLocal
 from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
 from altegio_bot.settings import settings
@@ -128,7 +130,7 @@ class ChatwootHybridProvider:
                 company_id=company_id,
                 chatwoot_route=chatwoot_route,
                 contact_name=contact_name,
-                meta={"msg_id": msg_id},
+                provider_message_id=msg_id,
             )
         )
 
@@ -169,7 +171,7 @@ class ChatwootHybridProvider:
                 tenant_provider=tenant_provider,
                 company_id=company_id,
                 contact_name=contact_name,
-                meta={"msg_id": msg_id},
+                provider_message_id=msg_id,
             )
         )
 
@@ -184,8 +186,15 @@ class ChatwootHybridProvider:
         company_id: int = 0,
         chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT,
         contact_name: str | None = None,
-        meta: dict[str, Any] | None = None,
+        provider_message_id: str | None = None,
     ) -> None:
+        """Mirror one outbound message as a private note, best-effort.
+
+        ``provider_message_id`` is the exact Meta wamid, passed as its own named
+        argument: no internal meta dict ever reaches Chatwoot. A Chatwoot failure
+        stays a warning here — it must never turn a successful Meta send into a
+        failed send.
+        """
         chatwoot, inbox_id, routing_error = self._chatwoot_for_route(
             chatwoot_route,
             tenant_provider,
@@ -198,7 +207,12 @@ class ChatwootHybridProvider:
             return
 
         try:
-            await chatwoot.mirror_outbound_as_note(phone_e164, content, contact_name=contact_name)
+            mirrored = await chatwoot.mirror_outbound_as_note(
+                phone_e164,
+                content,
+                contact_name=contact_name,
+                provider_message_id=provider_message_id,
+            )
             logger.debug(
                 "Chatwoot mirror ok company_id=%s inbox_id=%s",
                 company_id,
@@ -207,6 +221,80 @@ class ChatwootHybridProvider:
         except Exception as exc:
             logger.warning(
                 "Chatwoot log failed company_id=%s inbox_id=%s error_type=%s",
+                company_id,
+                inbox_id,
+                type(exc).__name__,
+            )
+            return
+
+        await self._record_mirror_link(
+            mirrored,
+            # Taken from the very client that posted the note, so the writer and
+            # the reader can never compose the namespace differently.
+            chatwoot_scope_id=getattr(chatwoot, "scope_id", None),
+            provider_message_id=provider_message_id,
+            chatwoot_route=chatwoot_route,
+            inbox_id=inbox_id,
+            tenant_provider=tenant_provider,
+            company_id=company_id,
+        )
+
+    async def _record_mirror_link(
+        self,
+        mirrored: object,
+        *,
+        chatwoot_scope_id: str | None,
+        provider_message_id: str | None,
+        chatwoot_route: ChatwootRoute,
+        inbox_id: int | None,
+        tenant_provider: str | None,
+        company_id: int,
+    ) -> None:
+        """Record the durable wamid → Chatwoot Message.id link, best-effort.
+
+        This is what lets a later inbound reaction resolve its native reply target
+        in one indexed read instead of paging the conversation. It runs in its OWN
+        short transaction: the mirror is a background task that races the Outbox
+        row's own ``provider_message_id`` commit, so this write must not assume
+        that row exists yet and must never wait on it.
+
+        ``chatwoot_scope_id`` comes from the client that actually posted the note.
+        Without a valid one nothing is written at all: an unscoped row could later
+        be read as if it belonged to a different Chatwoot installation, and that is
+        the one mistake this registry exists to prevent.
+
+        Deliberately silent on failure beyond a stable reason: the note itself was
+        already posted, and a missing link only costs the reaction its native
+        preview. A Chatwoot or database problem here must never turn a successful
+        Meta send into a failed one.
+        """
+        if not isinstance(mirrored, MirroredNote) or not provider_message_id:
+            return
+        if not chatwoot_scope_id:
+            logger.debug(
+                "Chatwoot mirror link skipped company_id=%s inbox_id=%s reason=no_chatwoot_scope",
+                company_id,
+                inbox_id,
+            )
+            return
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    await record_outbound_mirror(
+                        session,
+                        chatwoot_scope_id=chatwoot_scope_id,
+                        provider_message_id=provider_message_id,
+                        chatwoot_message_id=mirrored.message_id,
+                        chatwoot_conversation_id=mirrored.conversation_id,
+                        marker_version=OUTBOUND_MIRROR_MESSAGE_KIND,
+                        chatwoot_route=chatwoot_route.value,
+                        chatwoot_inbox_id=inbox_id,
+                        tenant_provider=tenant_provider,
+                        company_id=company_id,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Chatwoot mirror link not recorded company_id=%s inbox_id=%s error_type=%s",
                 company_id,
                 inbox_id,
                 type(exc).__name__,

@@ -161,6 +161,29 @@ class Settings(BaseSettings):
     chatwoot_account_id: int = 0
     chatwoot_webhook_secret: str = ""
 
+    # Rotatable identity of the Chatwoot INSTALLATION behind chatwoot_base_url.
+    #
+    # Chatwoot message and conversation ids are only meaningful inside one
+    # installation and one account: a fresh database behind the same URL with the
+    # same account id restarts those numeric ids, so a stored
+    # wamid -> Chatwoot Message.id mapping from the old installation could match a
+    # completely unrelated new message. The durable mirror registry therefore
+    # namespaces every row by CHATWOOT_BASE_URL + CHATWOOT_ACCOUNT_ID + this
+    # generation token, and refuses any row whose namespace differs.
+    #
+    # Rules:
+    #   * non-secret. Never put the API token or any other credential here.
+    #   * stable across ordinary restarts and redeploys — it must NOT be derived
+    #     from anything ephemeral, or every restart would orphan the mapping.
+    #   * changed deliberately, and only when the Chatwoot installation or account
+    #     behind the same URL is replaced (new database, restored dump, migrated
+    #     account). Bumping it retires every mapping row of the old generation.
+    #   * empty (default) means "no valid scope": the registry is then inert —
+    #     nothing is written, every read is a miss, and reactions fall back to the
+    #     legacy bounded scan and the visible quote. This is the rollout switch.
+    # Example: CHATWOOT_INSTALLATION_GENERATION=2026-09-27-primary
+    chatwoot_installation_generation: str = ""
+
     # Optional X-Forwarded-Proto value for outgoing Chatwoot API calls.
     # Empty (default) — header is not sent, behaviour unchanged.
     # "https" — required for verified internal Docker routes (e.g.

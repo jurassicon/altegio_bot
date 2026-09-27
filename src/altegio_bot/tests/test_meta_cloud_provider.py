@@ -306,6 +306,7 @@ def _hybrid_with_fakes(primary_calls: list[dict[str, Any]], mirror_calls: list[d
             content: str,
             *,
             contact_name: str | None = None,
+            provider_message_id: str | None = None,
         ) -> None:
             mirror_calls.append(
                 {

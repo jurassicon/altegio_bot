@@ -462,20 +462,203 @@ Incoming (Customer → Bot via Chatwoot):
 ```
 
 WhatsApp reactions (`messages[].type == "reaction"`) are mirrored into Chatwoot as
-incoming messages so operators see that the client reacted. A native Chatwoot
-reply (`content_attributes.in_reply_to`) is attached only when the reacted-to
-message has a real Chatwoot message id in the same conversation; automatic
-outbox-message targets get a visible fallback line (e.g.
-`👍 Реакция на отправленное сообщение WhatsApp (reminder_24h)`), and a removed
-reaction shows `Реакция удалена в WhatsApp`. Reactions never trigger commands,
-opt-out, or any send back to WhatsApp. Reactions are handled going forward;
-historical reactions processed before this change are not backfilled.
+incoming messages so operators see that the client reacted. Reactions never
+trigger commands, opt-out, promo or any send back to WhatsApp, and nothing is
+ever written directly to Chatwoot's database.
+
+A native Chatwoot reply (`content_attributes.in_reply_to`) is attached only from
+a **proven** target in the destination conversation. There are exactly two
+proofs:
+
+1. the reacted-to message is an operator relay or a prior inbound event that
+   carries a real Chatwoot message id in that same conversation;
+2. the reacted-to message is a bot/automation send whose **private mirror note**
+   is proven in that same conversation by its technical marker (below).
+
+**Trust model.** A bot send exists in Chatwoot only as a private mirror note, so
+the native target has to be *proven*. The proof is a record of our own action, not
+a search result: when `ChatwootClient.mirror_outbound_as_note` posts the note and
+Chatwoot answers with a valid message id, `ChatwootHybridProvider` stores a
+durable link in `chatwoot_outbound_mirrors`
+(`altegio_bot.chatwoot_mirror_registry`):
+
+| Field | Role |
+| --- | --- |
+| `chatwoot_scope_id` | which Chatwoot **installation + account + generation** these numeric ids belong to |
+| `provider_message_id` | the exact Meta wamid |
+| `chatwoot_message_id` | the private note Chatwoot actually created |
+| `chatwoot_conversation_id` | the conversation it landed in — the tenant boundary |
+| `marker_version` | the marker contract version in force, so bumping it retires old links |
+| `chatwoot_route` / `chatwoot_inbox_id` / `tenant_provider` / `company_id` | routing provenance for ops, descriptive only |
+
+A reaction then resolves its target with **one indexed read** requiring an exact
+match on all four of `(chatwoot_scope_id, provider_message_id,
+chatwoot_conversation_id, marker_version)` — no history walk, so the length of the
+conversation is irrelevant. The write is idempotent **within a scope**
+(`ON CONFLICT DO NOTHING` on `(chatwoot_scope_id, provider_message_id)`), runs in
+its own short transaction because the mirror is a background task that races the
+Outbox row's own `provider_message_id` commit, and never blocks or fails the Meta
+send. A missing, foreign-scope, foreign-conversation, stale-version, unscoped or
+not-yet-committed link is simply a miss.
+
+**Why the scope.** A Chatwoot `Message.id` only means something inside one
+installation and one account: replace the database behind the same URL, restore a
+dump or move account, and those ids restart from low numbers, so an old mapping
+could match an unrelated new message. `chatwoot_scope_id` is composed once by the
+`ChatwootClient` that actually talks to Chatwoot (`ChatwootClient.scope_id`), from
+the normalized `CHATWOOT_BASE_URL`, `CHATWOOT_ACCOUNT_ID` and the operator-rotated
+`CHATWOOT_INSTALLATION_GENERATION` — all non-secret; the API token is never part of
+it. Both the writer and the reader take it from the same client object, so they
+cannot normalize it differently.
+
+`CHATWOOT_INSTALLATION_GENERATION` is also the rollout switch: **empty (the
+default) makes the registry inert** — nothing is recorded, every lookup is a miss,
+and reactions use the legacy scan and the visible quote. Set it once per
+installation to enable the O(1) path; change it only when the installation or
+account behind the same URL is genuinely replaced. Rows written before the scope
+column existed carry `NULL`, are never assumed to be this installation's, and fail
+closed; nothing is backfilled.
+
+The note itself still carries the marker in `content_attributes`, written through
+the REST API and nothing else:
+
+```json
+{
+  "altegio_bot_message_kind": "whatsapp_outbound_mirror_v1",
+  "whatsapp_provider_message_id": "<exact Meta wamid>"
+}
+```
+
+**Legacy bounded scan.** For notes posted before the registry existed,
+`ChatwootClient.find_outbound_mirror_note` still scans the conversation. It
+accepts a note only when **all** of these hold at once: it is listed by the
+destination conversation, `message_type` is outgoing, `private` is exactly `true`,
+the marker has the expected version, `whatsapp_provider_message_id` equals the
+reaction target wamid exactly, and the id is a positive integer. Nothing is ever
+matched by body, template code, `created_at`, time proximity, "last message" or
+result order.
+
+The scan **stops at its proof**, so a note on the first page costs exactly one
+request no matter how much older history exists — network cost tracks the distance
+to the target, not the length of the conversation. Uniqueness is therefore checked
+over the pages actually walked: two distinct proven ids seen before the scan stops
+are refused, and uniqueness is *not* claimed globally. Global uniqueness for new
+notes comes from the registry's unique key on the wamid instead.
+
+Two independent bounds, both named in `chatwoot_client.py`: at most
+`_MIRROR_NOTE_MAX_PAGES` = 10 pages — which bounds how deep a target can still be
+found, and is consulted only *after* a hit would have been returned — and one
+**absolute** wall-clock deadline of `_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s
+covering the whole walk.
+
+That deadline is a real cancellation boundary (`asyncio.timeout`), not just a
+number passed to HTTPX: an HTTPX timeout bounds connect/write/read stages and
+network inactivity, so a trickling transport can outlive it. The same deadline is
+re-checked before every request and again after every await — before a page is
+parsed and before a found id is returned — so a late answer is never accepted as
+evidence. `_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s stays as an additional per-page
+network guard, never the guarantee. An external cancellation (worker shutdown)
+propagates as `asyncio.CancelledError` rather than being reported as a miss.
+
+The deadline exists because the scan runs inline while the `WhatsAppEvent` row is
+locked and events are processed serially: ten independent 15 s client timeouts
+would be 150 s of held lock for a cosmetic improvement, and would delay every
+following event.
+
+**Page order and the cursor.** Chatwoot (4.17) filters the next page by
+`id < before`, orders by `created_at DESC`, takes a page and then **reverses** it.
+The array that comes back is therefore in **ascending chronological order** — it
+is *not* newest-first — and the next cursor is the id of `page[0]`, the
+chronological boundary. It is deliberately **not** `min(id)`: the two coincide only
+while ids happen to increase with `created_at`, and a backdated or imported message
+breaks that, so a `min(id)` cursor would name a message that is not the boundary
+and skip the history in between. The page is never re-sorted locally, and the
+cursor must strictly decrease.
+
+**Known upstream limitation.** Because Chatwoot pages by `id` while ordering by
+`created_at`, no id cursor can express that ordering: a message backdated with an
+id above the first page's boundary is unreachable by the scan. That defect is not
+papered over with a local heuristic — it is the reason new notes are resolved from
+the durable registry and do not depend on the scan at all. For older notes the
+scan simply fails closed.
+
+**Fail-closed fallback.** All of these fall back to a visible short quote of the
+original text plus the emoji — never a false native link: no match; two distinct
+matches inside the region the scan walked; a malformed JSON body or unrecognizable
+payload; an HTTP or transport error; a conversation mismatch; a link recorded under
+a different marker version or a different Chatwoot installation; a page whose
+boundary yields no usable cursor; a cursor that stops advancing (a replayed page);
+the page budget running out; and the wall-clock deadline expiring — between
+requests, during one, or before a late answer could be read. A database problem on
+the registry read is a miss too, never a failed reaction:
+
+```text
+↩️ Ответ на сообщение:
+«Ваша запись завтра в 10:00»
+
+👍
+```
+
+The quote collapses whitespace to a single line, caps at 100 characters and adds
+`…` only on real truncation. A removed reaction shows
+`Реакция удалена в WhatsApp` in place of the emoji, with the same context. The
+technical `template_code` stays in `content_attributes` for audit and is no
+longer part of the operator-visible text.
+
+`content_attributes.whatsapp_reaction_native_source` records which proof was
+used: `target_chatwoot_message` (an operator relay or prior inbound event that
+owns a Chatwoot id), `mirror_registry` (the durable link) or `mirror_scan` (the
+legacy bounded scan).
+
+**No historical backfill.** Notes created before the registry have no link, and
+notes created before the marker itself carry no evidence at all, so reactions to
+them keep the visible quote. Nothing is backfilled. An accidentally populated
+`chatwoot_message_id` / `chatwoot_conversation_id` on a bot Outbox row is still no
+evidence: only a recorded link or a proven marker can make a bot target native.
+The Chatwoot mirror stays best-effort — a Chatwoot failure never turns a
+successful Meta send into a failed send, and a failing lookup costs the native
+link, never the reaction.
+
+`altegio_bot` never connects to Chatwoot's database. Every read and write above
+goes through the Chatwoot REST API, and the durable link lives in `altegio_bot`'s
+own PostgreSQL.
 
 Known limitation (pre-existing, not specific to reactions): the inbox worker
 processes only the first extracted inbound action per webhook event, so a single
 webhook batching multiple `messages[]` (e.g. a text and a reaction together) has
 only its first action handled. Delivery `statuses[]` are processed independently
 and are not affected by this.
+
+#### Closed 24h window: Click-to-Chat link in the operator note
+
+When an operator replies from Chatwoot after Meta's 24h customer service window
+has closed and `CHATWOOT_OPERATOR_CLOSED_WINDOW_MODE=private_note_only`, nothing
+is sent to WhatsApp: the relay row is canceled and the operator gets a private
+note with the original message. That note now ends with a short named
+Click-to-Chat link:
+
+```text
+💬 [Dem Kunden auf WhatsApp schreiben](https://wa.me/4917630316130?text=…)
+```
+
+`build_wa_click_to_chat_url` builds it: `https://wa.me/<digits>` with the number
+as bare international digits (no `+`, spaces, brackets or hyphens), and the
+operator's exact text percent-encoded with `quote(text, safe="")` so spaces,
+newlines, `&`, `?`, `#`, `%`, quotes, Unicode and emoji survive a round trip.
+The length check applies to the finished ASCII URL after encoding: at most 2000
+characters keeps the prefill, above that the plain `wa.me` URL is returned — the
+text is never truncated or partially inserted. 2000 is a conservative internal
+compatibility ceiling, **not** an official Meta limit; Meta publishes no maximum
+for Click-to-Chat. An unusable phone leaves the note without a link and logs a
+stable reason. The URL, its query string and the original text are never logged.
+
+The operator sees only the label, and `Originalnachricht` stays visible as
+before. **The link does not bypass Meta's customer service window.** It only
+opens WhatsApp and fills the composer; nothing is sent automatically, and
+whatever the operator then sends comes from their own WhatsApp account, so that
+message may not appear in the Chatwoot audit trail. This applies to the
+window-closed note only — the other failure notes and the reopen-template
+behaviour are unchanged.
 
 ### Configuration
 

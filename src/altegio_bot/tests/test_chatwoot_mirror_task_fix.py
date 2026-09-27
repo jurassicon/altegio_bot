@@ -37,7 +37,14 @@ class _FakeChatwoot:
     def __init__(self) -> None:
         self.notes: list[tuple[str, str]] = []
 
-    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+    async def mirror_outbound_as_note(
+        self,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         self.notes.append((phone_e164, text))
 
     async def aclose(self) -> None:
@@ -51,7 +58,14 @@ class _SlowChatwoot:
         self._delay = delay
         self.notes: list[tuple[str, str]] = []
 
-    async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+    async def mirror_outbound_as_note(
+        self,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         await asyncio.sleep(self._delay)
         self.notes.append((phone_e164, text))
 
@@ -104,9 +118,15 @@ async def test_aclose_waits_for_background_tasks() -> None:
     original_mirror = cw.mirror_outbound_as_note
     completed: list[bool] = []
 
-    async def _slow_mirror(phone: str, text: str, *, contact_name: str | None = None) -> None:
+    async def _slow_mirror(
+        phone: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         await asyncio.sleep(0.05)
-        await original_mirror(phone, text, contact_name=contact_name)
+        await original_mirror(phone, text, contact_name=contact_name, provider_message_id=provider_message_id)
         completed.append(True)
 
     cw.mirror_outbound_as_note = _slow_mirror  # type: ignore[method-assign]
@@ -152,7 +172,14 @@ async def test_aclose_cancels_pending_tasks_before_closing_client() -> None:
         def __init__(self) -> None:
             self.closed = False
 
-        async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+        async def mirror_outbound_as_note(
+            self,
+            phone_e164: str,
+            text: str,
+            *,
+            contact_name: str | None = None,
+            provider_message_id: str | None = None,
+        ) -> None:
             # Sleep longer than the patched timeout so the task is pending at aclose().
             await asyncio.sleep(10.0)
             # If we ever reach here AFTER close, that's the bug we're guarding against.
@@ -233,7 +260,14 @@ async def test_mirror_task_exception_does_not_crash_send() -> None:
     meta = _FakeMeta()
 
     class _BrokenChatwoot:
-        async def mirror_outbound_as_note(self, phone_e164: str, text: str, *, contact_name: str | None = None) -> None:
+        async def mirror_outbound_as_note(
+            self,
+            phone_e164: str,
+            text: str,
+            *,
+            contact_name: str | None = None,
+            provider_message_id: str | None = None,
+        ) -> None:
             raise RuntimeError("Chatwoot is down")
 
         async def aclose(self) -> None:
@@ -258,9 +292,15 @@ async def test_realistic_shutdown_flow() -> None:
     # Give mirror calls a small delay to simulate network latency.
     original_mirror = cw.mirror_outbound_as_note
 
-    async def _latent_mirror(phone: str, text: str, *, contact_name: str | None = None) -> None:
+    async def _latent_mirror(
+        phone: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> None:
         await asyncio.sleep(0.02)
-        await original_mirror(phone, text, contact_name=contact_name)
+        await original_mirror(phone, text, contact_name=contact_name, provider_message_id=provider_message_id)
 
     cw.mirror_outbound_as_note = _latent_mirror  # type: ignore[method-assign]
 

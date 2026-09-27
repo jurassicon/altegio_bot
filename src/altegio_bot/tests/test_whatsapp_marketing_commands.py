@@ -69,6 +69,7 @@ class _FakeCW:
         text: str,
         *,
         contact_name: str | None = None,
+        provider_message_id: str | None = None,
     ) -> None:
         self.notes.append((phone, text))
 

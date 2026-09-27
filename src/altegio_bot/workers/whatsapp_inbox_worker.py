@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_affinity import AffinityOutcome, resolve_tenant_affinity
-from altegio_bot.chatwoot_client import ChatwootClient
+from altegio_bot.chatwoot_client import (
+    OUTBOUND_MIRROR_MESSAGE_KIND,
+    ChatwootClient,
+    build_wa_click_to_chat_url,
+)
+from altegio_bot.chatwoot_mirror_registry import find_recorded_mirror_message_id
 from altegio_bot.chatwoot_outbox_route import (
     outbox_has_chatwoot_route_marker,
     outbox_meta_with_chatwoot_route,
@@ -2740,6 +2745,13 @@ class ReactionTarget:
     Chatwoot message id (native reply candidate); ``outbox_message`` is an
     automatic bot/outbox send without a Chatwoot message id (visible fallback);
     ``unknown`` is a safe fallback when nothing matched.
+
+    ``outbox_is_automation`` marks a bot/automation Outbox row — the only kind
+    whose Chatwoot counterpart is a private mirror note, so it is the only kind
+    allowed to look for the versioned mirror marker. It never grants native
+    status on its own: the marker still has to be proven in Chatwoot, and an
+    accidentally populated ``chatwoot_message_id`` on a bot row remains no
+    evidence at all.
     """
 
     kind: str
@@ -2755,6 +2767,7 @@ class ReactionTarget:
     tenant_error: str | None = None
     chatwoot_route: ChatwootRoute = ChatwootRoute.TENANT
     exact_conversation: bool = False
+    outbox_is_automation: bool = False
 
 
 async def _resolve_reaction_target(
@@ -2844,6 +2857,7 @@ async def _resolve_reaction_target(
             company_id=bot_target.company_id,
             tenant_error=bot_target.tenant_error,
             chatwoot_route=bot_target.chatwoot_route,
+            outbox_is_automation=True,
         )
 
     # 3. Prior Meta-origin inbound WhatsAppEvent. The shared resolver requires
@@ -2872,22 +2886,105 @@ async def _resolve_reaction_target(
     )
 
 
+# Shown when the client REMOVES a reaction. Kept as a named constant because the
+# fallback path reuses it below the visible quote.
+_REACTION_REMOVED_TEXT = "Реакция удалена в WhatsApp"
+
+
 def _reaction_display_text(emoji: str | None, target: ReactionTarget, *, native_ok: bool) -> str:
     """Visible Chatwoot text for an inbound reaction.
 
-    Native reply targets show the bare emoji (Chatwoot attaches it to the
-    original message); other targets show a descriptive line so the operator
-    sees the reaction even without native rendering.
+    A proven native target shows ONLY the emoji (or the removal line): Chatwoot
+    renders its own preview of the original message above the bubble.
+
+    Everything else falls closed to a visible short quote of the original text
+    plus the emoji, so the operator sees the context without a false native
+    link. The technical ``template_code`` is deliberately no longer part of the
+    user-facing text — it stays in ``content_attributes`` for audit only.
     """
-    if not emoji:
-        return "Реакция удалена в WhatsApp"
+    reaction_line = emoji if emoji else _REACTION_REMOVED_TEXT
     if native_ok:
-        return emoji
+        return reaction_line
+    if target.body_preview:
+        return f"{_format_reply_context_prefix(target.body_preview)}\n\n{reaction_line}"
+    if not emoji:
+        return reaction_line
     if target.kind == "outbox_message":
-        if target.outbox_template_code:
-            return f"{emoji} Реакция на отправленное сообщение WhatsApp ({target.outbox_template_code})"
         return f"{emoji} Реакция на отправленное сообщение WhatsApp"
     return f"{emoji} Реакция на сообщение в WhatsApp"
+
+
+async def _prove_reaction_mirror_note_id(
+    session: AsyncSession,
+    cw: Any,
+    *,
+    conversation_id: int,
+    reaction_target_provider_message_id: str | None,
+) -> tuple[int | None, str | None]:
+    """Best-effort proof of the private mirror note of a bot/automation send.
+
+    Returns ``(chatwoot_message_id, source)``, or ``(None, None)`` when nothing
+    was proven and the caller must keep its visible-quote fallback.
+
+    Two sources, tried in this order:
+
+    1. ``mirror_registry`` — the durable wamid → Message.id link recorded when the
+       note was created, in THIS Chatwoot installation/account/generation. One
+       indexed read, no history walk, so a busy conversation cannot hide a recent
+       note. This is the path every note created after the registry landed takes,
+       once a Chatwoot scope is configured. A row from another installation, or a
+       legacy row with no scope at all, is refused and falls through below.
+    2. ``mirror_scan`` — the legacy bounded Chatwoot scan, for notes posted before
+       the registry existed. It stops as soon as it has proof and is capped by a
+       page budget and one wall-clock deadline.
+
+    Neither source is allowed to fail the reaction: a database or Chatwoot problem
+    costs the native preview only, so every exception is swallowed here and only a
+    stable technical reason is logged.
+    """
+    wamid = _normalize_reply_context_id(reaction_target_provider_message_id)
+    if not wamid:
+        return None, None
+
+    recorded: int | None = None
+    try:
+        # SAVEPOINT, because this read runs inside the event's own transaction and
+        # in PostgreSQL a failed statement aborts the whole transaction. The most
+        # realistic failure is the registry table not existing yet — code deployed
+        # ahead of its migration — and that must cost the native preview only, not
+        # the event's own bookkeeping. Rolling back to the savepoint leaves the
+        # outer transaction usable, so the legacy scan below still gets its turn.
+        async with session.begin_nested():
+            recorded = await find_recorded_mirror_message_id(
+                session,
+                # From the very client this reaction will be sent through, so the
+                # namespace matches the one the writer composed.
+                chatwoot_scope_id=getattr(cw, "scope_id", None),
+                provider_message_id=wamid,
+                chatwoot_conversation_id=conversation_id,
+                marker_version=OUTBOUND_MIRROR_MESSAGE_KIND,
+            )
+    except Exception as exc:
+        logger.debug(
+            "reaction_context: mirror registry unavailable conversation_id=%s error_type=%s",
+            safe_log_value(conversation_id, limit=32),
+            type(exc).__name__,
+        )
+    if recorded is not None:
+        return recorded, "mirror_registry"
+
+    try:
+        scanned = await cw.find_outbound_mirror_note(conversation_id, wamid)
+    except Exception as exc:
+        logger.debug(
+            "reaction_context: mirror note scan unavailable conversation_id=%s error_type=%s",
+            safe_log_value(conversation_id, limit=32),
+            type(exc).__name__,
+        )
+        return None, None
+    if isinstance(scanned, int) and not isinstance(scanned, bool) and scanned > 0:
+        return scanned, "mirror_scan"
+    return None, None
 
 
 def _reaction_content_attributes(
@@ -2897,12 +2994,16 @@ def _reaction_content_attributes(
     reaction_target_provider_message_id: str | None,
     whatsapp_message_id: str | None,
     destination_conversation_id: int,
+    native_message_id: int | None,
+    native_source: str | None,
 ) -> dict[str, Any]:
     """Build safe Chatwoot content_attributes for an inbound reaction.
 
-    Native ``in_reply_to`` is set only when the target carries a real Chatwoot
-    message id that lives in the destination conversation; a cross-conversation
-    target is flagged instead.  No PII / tokens / raw webhook are stored.
+    Native ``in_reply_to`` is set only from an already-proven
+    ``native_message_id`` — either the target's own Chatwoot message id in this
+    same conversation, or a mirror note proven by its versioned marker. A
+    cross-conversation target is flagged instead and never threaded.  No PII /
+    tokens / raw webhook are stored.
     """
     attrs: dict[str, Any] = {
         "whatsapp_event_type": "reaction",
@@ -2912,12 +3013,13 @@ def _reaction_content_attributes(
         "whatsapp_reaction_target_kind": target.kind,
     }
 
-    if target.chatwoot_message_id is not None:
-        if target.chatwoot_conversation_id == destination_conversation_id:
-            attrs["in_reply_to"] = target.chatwoot_message_id
-            attrs["in_reply_to_external_id"] = reaction_target_provider_message_id
-        else:
-            attrs["whatsapp_reaction_target_conversation_mismatch"] = True
+    if target.chatwoot_message_id is not None and target.chatwoot_conversation_id != destination_conversation_id:
+        attrs["whatsapp_reaction_target_conversation_mismatch"] = True
+
+    if native_message_id is not None:
+        attrs["in_reply_to"] = native_message_id
+        attrs["in_reply_to_external_id"] = reaction_target_provider_message_id
+        attrs["whatsapp_reaction_native_source"] = native_source
 
     if target.kind == "outbox_message":
         attrs["whatsapp_reaction_target_outbox_id"] = target.outbox_id
@@ -3023,7 +3125,26 @@ async def _forward_reaction_to_chatwoot(
                 contact_name=client_name,
             )
 
-        native_ok = target.chatwoot_message_id is not None and target.chatwoot_conversation_id == conversation_id
+        native_message_id: int | None = None
+        native_source: str | None = None
+        if target.chatwoot_message_id is not None and target.chatwoot_conversation_id == conversation_id:
+            native_message_id = target.chatwoot_message_id
+            native_source = "target_chatwoot_message"
+        elif target.outbox_is_automation:
+            # A bot/automation send exists in Chatwoot only as a private mirror
+            # note, so its native target has to be proven: from the durable
+            # registry for notes created after it landed, otherwise from the
+            # bounded legacy scan. Notes older than the marker itself carry no
+            # evidence at all and stay on the visible-quote fallback; there is no
+            # backfill.
+            native_message_id, native_source = await _prove_reaction_mirror_note_id(
+                session,
+                cw,
+                conversation_id=conversation_id,
+                reaction_target_provider_message_id=reaction_target_provider_message_id,
+            )
+
+        native_ok = native_message_id is not None
         content = _reaction_display_text(reaction_emoji, target, native_ok=native_ok)
         content_attributes = _reaction_content_attributes(
             target=target,
@@ -3031,6 +3152,8 @@ async def _forward_reaction_to_chatwoot(
             reaction_target_provider_message_id=reaction_target_provider_message_id,
             whatsapp_message_id=whatsapp_message_id,
             destination_conversation_id=conversation_id,
+            native_message_id=native_message_id,
+            native_source=native_source,
         )
 
         message_id = await cw.send_message(
@@ -3059,12 +3182,13 @@ async def _forward_reaction_to_chatwoot(
     event.error = None
     logger.info(
         "Forwarded WhatsApp reaction to Chatwoot event_id=%s conversation_id=%s message_id=%s "
-        "target_kind=%s native_reply=%s",
+        "target_kind=%s native_reply=%s native_source=%s",
         event.id,
         safe_log_value(conversation_id, limit=32),
         safe_log_value(message_id, limit=32),
         target.kind,
         native_ok,
+        native_source,
     )
     return message_id
 
@@ -3116,6 +3240,31 @@ _TERMINAL_ACTION_MAX_ATTEMPTS = 5
 _TERMINAL_RELAY_STATUSES = ("sent", "failed", "canceled", "unknown", "delivered", "read")
 
 
+# Named Markdown link appended to the window-closed note only. The operator sees
+# the label, never the long percent-encoded query string.
+_WINDOW_CLOSED_CLICK_TO_CHAT_LABEL = "Dem Kunden auf WhatsApp schreiben"
+
+
+def _window_closed_click_to_chat_suffix(row: OutboxMessage) -> str:
+    """Named Click-to-Chat link for the window-closed note, or "" when impossible.
+
+    The link only opens WhatsApp with the composer prefilled — it sends nothing,
+    and it does NOT bypass Meta's 24h customer service window: the message is
+    then sent by the operator from their own WhatsApp, which Chatwoot may not
+    audit. An unusable phone leaves the note without a link and logs a stable
+    reason; the URL, the query string and the original text are never logged.
+    """
+    url = build_wa_click_to_chat_url(row.phone_e164, row.body)
+    if url is None:
+        logger.warning(
+            "operator_relay: window-closed note without click-to-chat link outbox_id=%s reason=%s",
+            row.id,
+            "phone_unusable",
+        )
+        return ""
+    return f"\n\n\U0001f4ac [{_WINDOW_CLOSED_CLICK_TO_CHAT_LABEL}]({url})"
+
+
 def _relay_note_text(kind: str, row: OutboxMessage) -> str | None:
     """Rebuild the operator note text from the durable kind + the Outbox row."""
     if kind == _NOTE_KIND_UNKNOWN:
@@ -3131,7 +3280,7 @@ def _relay_note_text(kind: str, row: OutboxMessage) -> str | None:
             "⚠️ Das 24h-WhatsApp-Fenster ist geschlossen."
             " Die Nachricht wurde nicht an WhatsApp zugestellt.\n"
             "Bitte warte, bis der Kunde erneut schreibt, oder wende dich direkt an ihn.\n\n"
-            f'Originalnachricht:\n"{row.body}"'
+            f'Originalnachricht:\n"{row.body}"' + _window_closed_click_to_chat_suffix(row)
         )
     if kind == _NOTE_KIND_TEMPLATE_SENT:
         return (
