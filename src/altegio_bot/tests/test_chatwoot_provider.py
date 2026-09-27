@@ -47,8 +47,17 @@ class _FakeMetaProvider:
         return f"meta-tpl-{uuid4()}"
 
 
+# One configured Chatwoot installation namespace for these tests. The registry is
+# inert without one, which is the documented rollout switch.
+SCOPE_A = "https://chatwoot.a.test|1|generation-a"
+SCOPE_B = "https://chatwoot.b.test|1|generation-a"
+
+
 class _FakeChatwootClient:
     """Stub ChatwootClient that records calls."""
+
+    # The provider reads the namespace off the very client that posted the note.
+    scope_id: str | None = SCOPE_A
 
     def __init__(self, raise_on_log: bool = False) -> None:
         self.notes: list[tuple[str, str]] = []
@@ -824,8 +833,15 @@ async def test_mirror_failure_still_keeps_a_successful_meta_send() -> None:
 class _MirroringChatwootClient(_FakeChatwootClient):
     """Fake client that answers like Chatwoot did create the note."""
 
-    def __init__(self, *, conversation_id: int = 77, message_id: int = 4242) -> None:
+    def __init__(
+        self,
+        *,
+        conversation_id: int = 77,
+        message_id: int = 4242,
+        scope_id: str | None = SCOPE_A,
+    ) -> None:
         super().__init__()
+        self.scope_id = scope_id
         self._mirrored = MirroredNote(conversation_id=conversation_id, message_id=message_id)
 
     async def mirror_outbound_as_note(
@@ -869,6 +885,8 @@ async def test_send_records_the_durable_mirror_link(session_maker, monkeypatch: 
     assert link.chatwoot_conversation_id == 77
     assert link.marker_version == OUTBOUND_MIRROR_MESSAGE_KIND
     assert link.chatwoot_route == "tenant"
+    # Namespaced by the installation that produced those numeric ids.
+    assert link.chatwoot_scope_id == SCOPE_A
 
 
 @pytest.mark.asyncio
@@ -1020,3 +1038,123 @@ async def test_a_failing_link_write_never_fails_the_send(
     # Stable reason only: no phone, no text, no Chatwoot ids in the warning.
     assert not any("+49123456789" in message for message in messages)
     assert not any("Ihr Termin" in message for message in messages)
+
+
+# ---------------------------------------------------------------------------
+# The link is namespaced by the Chatwoot installation that produced the ids
+# ---------------------------------------------------------------------------
+#
+# Chatwoot message/conversation ids restart with a new database, so a mapping is
+# only meaningful inside one installation + account + generation. The namespace
+# comes from the very client that posted the note, so writer and reader cannot
+# normalize it differently.
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_recorded_without_a_configured_scope(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollout switch: no generation configured → the registry stays inert."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+    cw = _MirroringChatwootClient(scope_id=None)
+    provider = ChatwootHybridProvider(primary=_FakeMetaProvider(), chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+    await provider.aclose()
+
+    assert msg_id.startswith("meta-")  # the send is unaffected
+    assert cw.notes  # the note itself was still posted
+    assert await _links(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_one_wamid_can_be_recorded_once_per_installation(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two installations, one wamid, two different Chatwoot messages — both kept."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+
+    class _FixedWamidMeta(_FakeMetaProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            self.sent.append((sender_id, phone_e164, text, contact_name))
+            return "wamid.TWO_INSTALLATIONS"
+
+    for scope, message_id in ((SCOPE_A, 4242), (SCOPE_B, 9999)):
+        provider = ChatwootHybridProvider(
+            primary=_FixedWamidMeta(),  # type: ignore[arg-type]
+            # Same numeric conversation id in both installations on purpose: the
+            # numbers collide, the namespaces do not.
+            chatwoot=_MirroringChatwootClient(conversation_id=77, message_id=message_id, scope_id=scope),  # type: ignore[arg-type]
+        )
+        await provider.send(1, "+49123456789", "same wamid, other installation")
+        await provider.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 2
+    by_scope = {row.chatwoot_scope_id: row.chatwoot_message_id for row in rows}
+    assert by_scope == {SCOPE_A: 4242, SCOPE_B: 9999}
+    # The wamid and the conversation id are identical in both rows.
+    assert {row.provider_message_id for row in rows} == {"wamid.TWO_INSTALLATIONS"}
+    assert {row.chatwoot_conversation_id for row in rows} == {77}
+
+
+@pytest.mark.asyncio
+async def test_replaying_one_wamid_inside_one_installation_stays_idempotent(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idempotency is per scope: the first response for that installation wins."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+
+    class _FixedWamidMeta(_FakeMetaProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            self.sent.append((sender_id, phone_e164, text, contact_name))
+            return "wamid.SAME_SCOPE_REPLAY"
+
+    for message_id in (4242, 9999):
+        provider = ChatwootHybridProvider(
+            primary=_FixedWamidMeta(),  # type: ignore[arg-type]
+            chatwoot=_MirroringChatwootClient(message_id=message_id, scope_id=SCOPE_A),  # type: ignore[arg-type]
+        )
+        await provider.send(1, "+49123456789", "replay")
+        await provider.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 1
+    assert rows[0].chatwoot_message_id == 4242
+    assert rows[0].chatwoot_scope_id == SCOPE_A
+
+
+def test_the_real_client_exposes_one_scope_for_both_directions() -> None:
+    """Writer and reader read the SAME value off the same client object."""
+    from altegio_bot.chatwoot_client import ChatwootClient, build_chatwoot_scope_id
+
+    client = ChatwootClient(
+        base_url="https://chatwoot.example.com/",
+        api_token="never-part-of-the-scope",
+        account_id=7,
+        inbox_id=2,
+        installation_generation="gen-1",
+    )
+    expected = build_chatwoot_scope_id("https://chatwoot.example.com", 7, "gen-1")
+
+    assert client.scope_id == expected
+    assert expected is not None
+    # Non-secret: the API token never leaks into the namespace.
+    assert "never-part-of-the-scope" not in client.scope_id
+
+
+def test_no_generation_means_no_scope_at_all() -> None:
+    from altegio_bot.chatwoot_client import ChatwootClient
+
+    client = ChatwootClient(
+        base_url="https://chatwoot.example.com",
+        api_token="t",
+        account_id=7,
+        inbox_id=2,
+        installation_generation="   ",
+    )
+
+    assert client.scope_id is None

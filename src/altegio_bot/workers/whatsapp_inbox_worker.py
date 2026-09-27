@@ -2929,9 +2929,11 @@ async def _prove_reaction_mirror_note_id(
     Two sources, tried in this order:
 
     1. ``mirror_registry`` — the durable wamid → Message.id link recorded when the
-       note was created. One indexed read, no history walk, so a busy conversation
-       cannot hide a recent note. This is the path every note created after the
-       registry landed takes.
+       note was created, in THIS Chatwoot installation/account/generation. One
+       indexed read, no history walk, so a busy conversation cannot hide a recent
+       note. This is the path every note created after the registry landed takes,
+       once a Chatwoot scope is configured. A row from another installation, or a
+       legacy row with no scope at all, is refused and falls through below.
     2. ``mirror_scan`` — the legacy bounded Chatwoot scan, for notes posted before
        the registry existed. It stops as soon as it has proof and is capped by a
        page budget and one wall-clock deadline.
@@ -2955,6 +2957,9 @@ async def _prove_reaction_mirror_note_id(
         async with session.begin_nested():
             recorded = await find_recorded_mirror_message_id(
                 session,
+                # From the very client this reaction will be sent through, so the
+                # namespace matches the one the writer composed.
+                chatwoot_scope_id=getattr(cw, "scope_id", None),
                 provider_message_id=wamid,
                 chatwoot_conversation_id=conversation_id,
                 marker_version=OUTBOUND_MIRROR_MESSAGE_KIND,

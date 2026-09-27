@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from urllib.parse import unquote
@@ -1770,3 +1771,148 @@ async def test_find_outbound_mirror_note_first_request_carries_no_cursor(client:
     cursors = [int(value) for value in _before_params(requests)[1:]]
     assert cursors == sorted(cursors, reverse=True)
     assert len(set(cursors)) == len(cursors)
+
+
+# ---------------------------------------------------------------------------
+# The deadline is a real cancellation boundary, not an HTTPX argument
+# ---------------------------------------------------------------------------
+#
+# An HTTPX timeout bounds pool/connect/write/read stages and network inactivity.
+# It does not bound the wall-clock time this coroutine spends, so a hung or
+# trickling transport can outlive it — and the scan runs inline while the
+# WhatsAppEvent row is locked. These tests deliberately run under respx, whose
+# mock transport ignores HTTPX timeouts entirely, so anything that stops the walk
+# here can only be the asyncio boundary.
+
+# Small enough to keep the suite fast, large enough not to be flaky.
+_TEST_BUDGET_SEC = 0.05
+# Outer guard: if the boundary ever stopped working, the test fails instead of
+# hanging the suite.
+_TEST_GUARD_SEC = 5.0
+
+
+def _mock_blocking_page(conv_id: int) -> tuple[asyncio.Event, list[httpx.Request]]:
+    """Serve a page that never answers. Returns (started, requests)."""
+    started = asyncio.Event()
+    requests: list[httpx.Request] = []
+    never = asyncio.Event()
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        started.set()
+        await never.wait()  # pragma: no cover - never released
+        return httpx.Response(200, json={"payload": []})
+
+    respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/conversations/{conv_id}/messages").mock(
+        side_effect=_handler
+    )
+    return started, requests
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_absolute_deadline_interrupts_a_hung_page(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page that never answers must not hold the scan past its budget."""
+    monkeypatch.setattr(cc, "_MIRROR_NOTE_TOTAL_DEADLINE_SEC", _TEST_BUDGET_SEC)
+    started, requests = _mock_blocking_page(30)
+
+    result = await asyncio.wait_for(
+        client.find_outbound_mirror_note(30, _MIRROR_WAMID),
+        timeout=_TEST_GUARD_SEC,
+    )
+
+    assert result is None
+    # The request really was in flight and really was cut off.
+    assert started.is_set()
+    assert len(requests) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_deadline_bounds_the_whole_walk_not_one_page(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget covers every page together, so a slow walk cannot accumulate.
+
+    Each page answers, but only after a delay longer than a share of the budget.
+    A per-page-only limit would let ten of them run; one absolute deadline cannot.
+    """
+    monkeypatch.setattr(cc, "_MIRROR_NOTE_TOTAL_DEADLINE_SEC", 0.2)
+    requests: list[httpx.Request] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await asyncio.sleep(0.08)
+        # Always a full page with no marker, so the walk would keep going.
+        return httpx.Response(200, json={"payload": _filler_messages(1000 - 20 * len(requests))})
+
+    respx.get(_MESSAGES_URL).mock(side_effect=_handler)
+
+    result = await asyncio.wait_for(
+        client.find_outbound_mirror_note(30, _MIRROR_WAMID),
+        timeout=_TEST_GUARD_SEC,
+    )
+
+    assert result is None
+    # Far fewer than the page budget: time ran out first, not pages.
+    assert 1 <= len(requests) < _MIRROR_NOTE_MAX_PAGES
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_late_marker_response_is_not_accepted(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching page that only arrived after the budget is not evidence.
+
+    The deadline is re-checked after the await and BEFORE the page is parsed, so
+    this holds even when nothing was cancelled: the answer is simply too late.
+    """
+    # deadline is taken at 0.0; the request is issued at 0.0; the answer is read
+    # at 100.0, long past the budget.
+    _fake_monotonic(monkeypatch, [0.0, 0.0, 100.0])
+    requests = _mock_paginated_messages(30, [[_mirror_note(message_id=4242), *_filler_messages(400, 4)]])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    # The page WAS fetched and did contain a perfectly valid marker.
+    assert len(requests) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_external_cancellation_propagates(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker shutdown must cancel the scan, not be reported as a lookup miss."""
+    # A budget far longer than the test, so nothing can be confused with a timeout.
+    monkeypatch.setattr(cc, "_MIRROR_NOTE_TOTAL_DEADLINE_SEC", 60.0)
+    started, _requests = _mock_blocking_page(30)
+
+    task = asyncio.create_task(client.find_outbound_mirror_note(30, _MIRROR_WAMID))
+    await asyncio.wait_for(started.wait(), timeout=_TEST_GUARD_SEC)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_first_page_success_is_unaffected_by_the_boundary(
+    client: ChatwootClient,
+) -> None:
+    """The happy path still returns its id through the new cancellation scope."""
+    requests = _mock_paginated_messages(
+        30,
+        [[*_filler_messages(2000, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=2019)]],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 2019
+    assert _before_params(requests) == [None]

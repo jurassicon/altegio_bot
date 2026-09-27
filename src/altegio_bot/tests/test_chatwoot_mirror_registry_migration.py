@@ -42,6 +42,13 @@ ALEMBIC_INI = _REPO_ROOT / "alembic.ini"
 
 MIRROR_REVISION = "c4e9a1b78d52"
 PARENT_REVISION = "b3f7c2a90d14"
+SCOPE_REVISION = "d7b2f6a4c318"
+
+_SCOPE_A = "https://chatwoot.a.test|1|generation-a"
+_SCOPE_B = "https://chatwoot.b.test|1|generation-a"
+
+OLD_UNIQUE = "uq_chatwoot_outbound_mirror_provider_message"
+NEW_UNIQUE = "uq_chatwoot_outbound_mirror_scope_provider_message"
 
 MIRRORS = "chatwoot_outbound_mirrors"
 
@@ -147,6 +154,25 @@ async def _execute(db_url: str, sql: str, params: dict | None = None) -> None:
         await engine.dispose()
 
 
+async def _columns(db_url: str, table: str) -> set[str]:
+    rows = await _fetch(
+        db_url,
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :table",
+        {"table": table},
+    )
+    return {row[0] for row in rows}
+
+
+async def _unique_constraints(db_url: str, table: str) -> set[str]:
+    rows = await _fetch(
+        db_url,
+        "SELECT constraint_name FROM information_schema.table_constraints "
+        "WHERE table_schema = 'public' AND table_name = :table AND constraint_type = 'UNIQUE'",
+        {"table": table},
+    )
+    return {row[0] for row in rows}
+
+
 async def _tables(db_url: str) -> set[str]:
     rows = await _fetch(
         db_url,
@@ -157,6 +183,7 @@ async def _tables(db_url: str) -> set[str]:
 
 def _insert_sql(**overrides: object) -> tuple[str, dict]:
     params: dict = {
+        "chatwoot_scope_id": _SCOPE_A,
         "provider_message_id": _WAMID,
         "chatwoot_message_id": 4242,
         "chatwoot_conversation_id": 77,
@@ -183,12 +210,18 @@ def test_exactly_one_alembic_head() -> None:
     heads = script.get_heads()
 
     assert len(heads) == 1, f"expected exactly one Alembic head, got {heads}"
-    assert heads[0] == MIRROR_REVISION
+    assert heads[0] == SCOPE_REVISION
 
 
 def test_the_registry_revision_is_a_direct_child_of_the_previous_head() -> None:
     script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
     assert script.get_revision(MIRROR_REVISION).down_revision == PARENT_REVISION
+
+
+def test_the_scope_revision_is_a_separate_child_of_the_registry_revision() -> None:
+    """A new child, not an edit: c4e9a1b78d52 may already be applied somewhere."""
+    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    assert script.get_revision(SCOPE_REVISION).down_revision == MIRROR_REVISION
 
 
 def test_the_orm_and_the_migration_describe_the_same_table() -> None:
@@ -203,11 +236,19 @@ def test_the_orm_columns_match_the_migration_columns() -> None:
     exists only in the model would pass every other test and be missing in
     production.
     """
-    migration = (
-        _REPO_ROOT / "alembic" / "versions" / f"{MIRROR_REVISION}_add_chatwoot_outbound_mirror_registry.py"
-    ).read_text(encoding="utf-8")
+    versions = _REPO_ROOT / "alembic" / "versions"
+    migration = (versions / f"{MIRROR_REVISION}_add_chatwoot_outbound_mirror_registry.py").read_text(
+        encoding="utf-8"
+    ) + (versions / f"{SCOPE_REVISION}_scope_chatwoot_outbound_mirrors.py").read_text(encoding="utf-8")
     for column in Base.metadata.tables[MIRRORS].columns:
         assert f'"{column.name}"' in migration, f"{column.name} is in the ORM but not in the migration"
+
+
+def test_the_orm_unique_key_is_the_scoped_one() -> None:
+    """The ORM must not still be describing the pre-scope global unique key."""
+    constraints = {constraint.name for constraint in Base.metadata.tables[MIRRORS].constraints}
+    assert NEW_UNIQUE in constraints
+    assert OLD_UNIQUE not in constraints
 
 
 # ===========================================================================
@@ -221,7 +262,7 @@ async def test_upgrade_creates_the_table_and_downgrade_removes_only_it(temp_db_u
     before = await _tables(temp_db_url)
     assert MIRRORS not in before
 
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
     after_upgrade = await _tables(temp_db_url)
     assert MIRRORS in after_upgrade
     for table in UNTOUCHED_TABLES:
@@ -234,8 +275,115 @@ async def test_upgrade_creates_the_table_and_downgrade_removes_only_it(temp_db_u
     assert after_downgrade == before
 
     # Re-upgrade must work: a downgrade is not a one-way door.
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
     assert MIRRORS in await _tables(temp_db_url)
+
+
+@pytest.mark.asyncio
+async def test_the_scope_revision_round_trips_on_its_own(temp_db_url: str) -> None:
+    """upgrade → downgrade → upgrade across the scope step alone."""
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    assert await _columns(temp_db_url, MIRRORS) >= {"chatwoot_scope_id"}
+    assert await _unique_constraints(temp_db_url, MIRRORS) >= {NEW_UNIQUE}
+
+    _alembic_ok("downgrade", MIRROR_REVISION, db_url=temp_db_url)
+    assert "chatwoot_scope_id" not in await _columns(temp_db_url, MIRRORS)
+    uniques = await _unique_constraints(temp_db_url, MIRRORS)
+    assert OLD_UNIQUE in uniques
+    assert NEW_UNIQUE not in uniques
+
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    assert "chatwoot_scope_id" in await _columns(temp_db_url, MIRRORS)
+    assert NEW_UNIQUE in await _unique_constraints(temp_db_url, MIRRORS)
+
+
+@pytest.mark.asyncio
+async def test_downgrade_deduplicates_one_wamid_shared_by_two_scopes(temp_db_url: str) -> None:
+    """The documented deterministic dedupe: the lowest id survives, no failure.
+
+    After the scope revision two installations may legitimately hold the same
+    wamid, which the old global unique key cannot express. A rollback must not trip
+    over live data — and losing a derived mapping row only costs a safe fallback.
+    """
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    first_sql, first = _insert_sql(chatwoot_scope_id=_SCOPE_A, chatwoot_message_id=4242)
+    await _execute(temp_db_url, first_sql, first)
+    second_sql, second = _insert_sql(chatwoot_scope_id=_SCOPE_B, chatwoot_message_id=9999)
+    await _execute(temp_db_url, second_sql, second)
+    assert len(await _fetch(temp_db_url, f"SELECT id FROM {MIRRORS}")) == 2
+
+    _alembic_ok("downgrade", MIRROR_REVISION, db_url=temp_db_url)
+
+    rows = await _fetch(temp_db_url, f"SELECT chatwoot_message_id FROM {MIRRORS}")
+    assert rows == [(4242,)]  # the lowest id, deterministically
+    assert OLD_UNIQUE in await _unique_constraints(temp_db_url, MIRRORS)
+
+
+# ===========================================================================
+# The scope namespace
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_one_wamid_may_exist_once_per_scope(temp_db_url: str) -> None:
+    """Same wamid, same numeric conversation id, two installations — both stored."""
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    for scope, message_id in ((_SCOPE_A, 4242), (_SCOPE_B, 9999)):
+        sql, params = _insert_sql(chatwoot_scope_id=scope, chatwoot_message_id=message_id)
+        await _execute(temp_db_url, sql, params)
+
+    rows = await _fetch(
+        temp_db_url,
+        f"SELECT chatwoot_scope_id, chatwoot_message_id, chatwoot_conversation_id FROM {MIRRORS} ORDER BY id",
+    )
+    assert rows == [(_SCOPE_A, 4242, 77), (_SCOPE_B, 9999, 77)]
+
+
+@pytest.mark.asyncio
+async def test_one_wamid_inside_one_scope_is_still_unique(temp_db_url: str) -> None:
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    sql, params = _insert_sql()
+    await _execute(temp_db_url, sql, params)
+
+    conflicting_sql, conflicting = _insert_sql(chatwoot_message_id=9999)
+    with pytest.raises(Exception, match=NEW_UNIQUE):
+        await _execute(temp_db_url, conflicting_sql, conflicting)
+
+    assert await _fetch(temp_db_url, f"SELECT chatwoot_message_id FROM {MIRRORS}") == [(4242,)]
+
+
+@pytest.mark.asyncio
+async def test_on_conflict_do_nothing_is_scoped(temp_db_url: str) -> None:
+    """The application's idempotent write names the scoped constraint."""
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    sql, params = _insert_sql()
+    await _execute(temp_db_url, sql, params)
+
+    replay_sql, replay = _insert_sql(chatwoot_message_id=9999)
+    await _execute(
+        temp_db_url,
+        replay_sql + f" ON CONFLICT ON CONSTRAINT {NEW_UNIQUE} DO NOTHING",
+        replay,
+    )
+
+    assert await _fetch(temp_db_url, f"SELECT chatwoot_message_id FROM {MIRRORS}") == [(4242,)]
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_unscoped_row_can_still_be_stored_but_is_not_deduplicated(temp_db_url: str) -> None:
+    """NULL scope models rows written before this revision: kept, never trusted.
+
+    PostgreSQL treats NULLs as distinct in a unique key, so these rows are neither
+    constrained nor merged — which is right for rows the application refuses to
+    read (the lookup requires an exact scope match).
+    """
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+    for message_id in (4242, 9999):
+        sql, params = _insert_sql(chatwoot_scope_id=None, chatwoot_message_id=message_id)
+        await _execute(temp_db_url, sql, params)
+
+    rows = await _fetch(temp_db_url, f"SELECT chatwoot_scope_id, chatwoot_message_id FROM {MIRRORS} ORDER BY id")
+    assert rows == [(None, 4242), (None, 9999)]
 
 
 # ===========================================================================
@@ -244,14 +392,18 @@ async def test_upgrade_creates_the_table_and_downgrade_removes_only_it(temp_db_u
 
 
 @pytest.mark.asyncio
-async def test_one_wamid_can_hold_only_one_link(temp_db_url: str) -> None:
-    """The uniqueness that lets the reaction path trust a single row."""
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+async def test_one_wamid_can_hold_only_one_link_per_scope(temp_db_url: str) -> None:
+    """The uniqueness that lets the reaction path trust a single row.
+
+    At head the key is ``(chatwoot_scope_id, provider_message_id)``, so the clash
+    is reported against the scoped constraint.
+    """
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
     sql, params = _insert_sql()
     await _execute(temp_db_url, sql, params)
 
     conflicting_sql, conflicting = _insert_sql(chatwoot_message_id=9999, chatwoot_conversation_id=88)
-    with pytest.raises(Exception, match="uq_chatwoot_outbound_mirror_provider_message"):
+    with pytest.raises(Exception, match=NEW_UNIQUE):
         await _execute(temp_db_url, conflicting_sql, conflicting)
 
     rows = await _fetch(
@@ -262,21 +414,24 @@ async def test_one_wamid_can_hold_only_one_link(temp_db_url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_on_conflict_do_nothing_keeps_the_first_link(temp_db_url: str) -> None:
-    """The application's idempotent write is a no-op, not an error."""
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+async def test_the_pre_scope_global_unique_key_is_really_gone(temp_db_url: str) -> None:
+    """The migration must DROP the old key, not just add the new one beside it.
+
+    A leftover global key on ``provider_message_id`` would make the whole scope
+    namespace pointless: the second installation could never store its own row.
+    """
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
+
+    assert OLD_UNIQUE not in await _unique_constraints(temp_db_url, MIRRORS)
+    # And a write naming it is rejected by PostgreSQL rather than silently
+    # resolving against some other constraint.
     sql, params = _insert_sql()
-    await _execute(temp_db_url, sql, params)
-
-    replay_sql, replay = _insert_sql(chatwoot_message_id=9999, chatwoot_conversation_id=88)
-    await _execute(
-        temp_db_url,
-        replay_sql + " ON CONFLICT ON CONSTRAINT uq_chatwoot_outbound_mirror_provider_message DO NOTHING",
-        replay,
-    )
-
-    rows = await _fetch(temp_db_url, f"SELECT chatwoot_message_id FROM {MIRRORS}")
-    assert rows == [(4242,)]
+    with pytest.raises(Exception, match=OLD_UNIQUE):
+        await _execute(
+            temp_db_url,
+            sql + f" ON CONFLICT ON CONSTRAINT {OLD_UNIQUE} DO NOTHING",
+            params,
+        )
 
 
 @pytest.mark.parametrize(
@@ -305,7 +460,7 @@ async def test_an_unusable_link_cannot_be_stored(
     constraint: str,
 ) -> None:
     """A row that could not serve as proof is one PostgreSQL refuses to keep."""
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
     sql, params = _insert_sql(**overrides)
 
     with pytest.raises(Exception, match=constraint):
@@ -317,7 +472,7 @@ async def test_an_unusable_link_cannot_be_stored(
 @pytest.mark.asyncio
 async def test_the_general_route_may_omit_its_tenant_provenance(temp_db_url: str) -> None:
     """Provenance is descriptive, so the legacy single-inbox client can omit it."""
-    _alembic_ok("upgrade", MIRROR_REVISION, db_url=temp_db_url)
+    _alembic_ok("upgrade", SCOPE_REVISION, db_url=temp_db_url)
     sql, params = _insert_sql(
         chatwoot_route="general",
         chatwoot_inbox_id=None,

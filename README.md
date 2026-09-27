@@ -484,19 +484,40 @@ durable link in `chatwoot_outbound_mirrors`
 
 | Field | Role |
 | --- | --- |
-| `provider_message_id` | the exact Meta wamid — globally unique per message, so it is both the idempotency key and the lookup key |
+| `chatwoot_scope_id` | which Chatwoot **installation + account + generation** these numeric ids belong to |
+| `provider_message_id` | the exact Meta wamid |
 | `chatwoot_message_id` | the private note Chatwoot actually created |
-| `chatwoot_conversation_id` | the conversation it landed in — the isolation boundary |
+| `chatwoot_conversation_id` | the conversation it landed in — the tenant boundary |
 | `marker_version` | the marker contract version in force, so bumping it retires old links |
 | `chatwoot_route` / `chatwoot_inbox_id` / `tenant_provider` / `company_id` | routing provenance for ops, descriptive only |
 
-A reaction then resolves its target with **one indexed read** on
-`(provider_message_id, chatwoot_conversation_id, marker_version)` — no history
-walk, so the length of the conversation is irrelevant. The write is idempotent
-(`ON CONFLICT DO NOTHING` on the wamid), runs in its own short transaction
-because the mirror is a background task that races the Outbox row's own
-`provider_message_id` commit, and never blocks or fails the Meta send. A missing,
-foreign, stale-version or not-yet-committed link is simply a miss.
+A reaction then resolves its target with **one indexed read** requiring an exact
+match on all four of `(chatwoot_scope_id, provider_message_id,
+chatwoot_conversation_id, marker_version)` — no history walk, so the length of the
+conversation is irrelevant. The write is idempotent **within a scope**
+(`ON CONFLICT DO NOTHING` on `(chatwoot_scope_id, provider_message_id)`), runs in
+its own short transaction because the mirror is a background task that races the
+Outbox row's own `provider_message_id` commit, and never blocks or fails the Meta
+send. A missing, foreign-scope, foreign-conversation, stale-version, unscoped or
+not-yet-committed link is simply a miss.
+
+**Why the scope.** A Chatwoot `Message.id` only means something inside one
+installation and one account: replace the database behind the same URL, restore a
+dump or move account, and those ids restart from low numbers, so an old mapping
+could match an unrelated new message. `chatwoot_scope_id` is composed once by the
+`ChatwootClient` that actually talks to Chatwoot (`ChatwootClient.scope_id`), from
+the normalized `CHATWOOT_BASE_URL`, `CHATWOOT_ACCOUNT_ID` and the operator-rotated
+`CHATWOOT_INSTALLATION_GENERATION` — all non-secret; the API token is never part of
+it. Both the writer and the reader take it from the same client object, so they
+cannot normalize it differently.
+
+`CHATWOOT_INSTALLATION_GENERATION` is also the rollout switch: **empty (the
+default) makes the registry inert** — nothing is recorded, every lookup is a miss,
+and reactions use the legacy scan and the visible quote. Set it once per
+installation to enable the O(1) path; change it only when the installation or
+account behind the same URL is genuinely replaced. Rows written before the scope
+column existed carry `NULL`, are never assumed to be this installation's, and fail
+closed; nothing is backfilled.
 
 The note itself still carries the marker in `content_attributes`, written through
 the REST API and nothing else:
@@ -527,12 +548,22 @@ notes comes from the registry's unique key on the wamid instead.
 Two independent bounds, both named in `chatwoot_client.py`: at most
 `_MIRROR_NOTE_MAX_PAGES` = 10 pages — which bounds how deep a target can still be
 found, and is consulted only *after* a hit would have been returned — and one
-overall wall-clock deadline of
-`_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s covering **every** page, with each request
-additionally capped at `_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s. The deadline exists
-because the scan runs inline while the `WhatsAppEvent` row is locked and events
-are processed serially: ten independent 15 s client timeouts would be 150 s of
-held lock for a cosmetic improvement.
+**absolute** wall-clock deadline of `_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s
+covering the whole walk.
+
+That deadline is a real cancellation boundary (`asyncio.timeout`), not just a
+number passed to HTTPX: an HTTPX timeout bounds connect/write/read stages and
+network inactivity, so a trickling transport can outlive it. The same deadline is
+re-checked before every request and again after every await — before a page is
+parsed and before a found id is returned — so a late answer is never accepted as
+evidence. `_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s stays as an additional per-page
+network guard, never the guarantee. An external cancellation (worker shutdown)
+propagates as `asyncio.CancelledError` rather than being reported as a miss.
+
+The deadline exists because the scan runs inline while the `WhatsAppEvent` row is
+locked and events are processed serially: ten independent 15 s client timeouts
+would be 150 s of held lock for a cosmetic improvement, and would delay every
+following event.
 
 **Page order and the cursor.** Chatwoot (4.17) filters the next page by
 `id < before`, orders by `created_at DESC`, takes a page and then **reverses** it.
@@ -555,10 +586,11 @@ scan simply fails closed.
 original text plus the emoji — never a false native link: no match; two distinct
 matches inside the region the scan walked; a malformed JSON body or unrecognizable
 payload; an HTTP or transport error; a conversation mismatch; a link recorded under
-a different marker version; a page whose boundary yields no usable cursor; a cursor
-that stops advancing (a replayed page); the page budget running out; and the
-wall-clock deadline expiring. A database problem on the registry read is a miss
-too, never a failed reaction:
+a different marker version or a different Chatwoot installation; a page whose
+boundary yields no usable cursor; a cursor that stops advancing (a replayed page);
+the page budget running out; and the wall-clock deadline expiring — between
+requests, during one, or before a late answer could be read. A database problem on
+the registry read is a miss too, never a failed reaction:
 
 ```text
 ↩️ Ответ на сообщение:

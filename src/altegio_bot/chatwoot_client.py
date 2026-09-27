@@ -10,6 +10,8 @@ Only the methods required for the dual-write integration are implemented:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -17,7 +19,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -62,16 +64,20 @@ _MIRROR_NOTE_PAGE_SIZE = 20
 # the durable registry in ``chatwoot_mirror_registry`` in one indexed read.
 _MIRROR_NOTE_MAX_PAGES = 10
 
-# One wall-clock ceiling for the WHOLE scan, not a per-request timeout and not
-# the sum of ten of them. The scan runs inline while the WhatsAppEvent row is
-# locked and events are processed serially, so the entire proof must be cheap in
-# latency terms: ten independent 15s client timeouts would be 150 seconds of held
-# lock, which is not an acceptable cost for a best-effort cosmetic improvement.
+# One wall-clock ceiling for the WHOLE scan, enforced as a real cancellation
+# boundary (``asyncio.timeout``) and not merely as an HTTPX timeout argument.
+#
+# The difference matters: an HTTPX timeout bounds the pool/connect/write/read
+# stages and network inactivity, so a transport that keeps dribbling bytes, or a
+# coroutine that is slow between awaits, can outlive it. The scan runs inline
+# while the WhatsAppEvent row is locked and events are processed serially, so the
+# whole proof must be bounded in real time — ten independent 15s client timeouts
+# would be 150 seconds of held lock for a best-effort cosmetic improvement.
 _MIRROR_NOTE_TOTAL_DEADLINE_SEC = 5.0
 
-# Per-page ceiling, so one stalled page cannot eat the whole budget on its own.
-# The effective timeout of each request is the smaller of this and the deadline
-# that remains, which is what makes the total bound strict rather than nominal.
+# Per-page ceiling handed to HTTPX as an ADDITIONAL network guard, never as the
+# absolute guarantee. The effective value is the smaller of this and the budget
+# that remains, so a stalled page cannot eat the whole deadline on its own.
 _MIRROR_NOTE_PAGE_TIMEOUT_SEC = 2.0
 
 
@@ -92,6 +98,69 @@ class MirroredNote:
 
     conversation_id: int
     message_id: int
+
+
+# Bound for a composed scope id, matching the registry column. A longer
+# composition collapses to a deterministic digest rather than being truncated,
+# because a truncated namespace could collide with a different installation.
+CHATWOOT_SCOPE_ID_MAX_CHARS = 200
+
+# Characters kept literal when composing a scope id. ``|`` is deliberately NOT
+# safe: it is the field separator, so any ``|`` inside a part is percent-encoded
+# and the composition stays injective (two different installations can never
+# compose to the same string) while remaining readable for ops.
+_SCOPE_PART_SAFE = ":/.-_~"
+
+
+def _scope_part(value: str) -> str:
+    return quote(value, safe=_SCOPE_PART_SAFE)
+
+
+def build_chatwoot_scope_id(
+    base_url: str | None,
+    account_id: object,
+    installation_generation: str | None,
+) -> str | None:
+    """Namespace that pins a Chatwoot id to one installation, account and generation.
+
+    Chatwoot message and conversation ids only mean something inside one
+    installation and one account. A fresh database behind the same URL restarts
+    those ids, so a stored ``wamid -> Message.id`` mapping from the previous
+    installation could match an unrelated new message. Every registry row is
+    therefore namespaced by this value, and a lookup requires an exact match.
+
+    Composed from three non-secret parts — the normalized base URL (the
+    installation), the account id, and the operator's rotatable generation token.
+    The API token is never part of it.
+
+    Returns ``None`` when any part is missing or unusable. ``None`` means "no
+    valid scope", and the caller must then treat the registry as unavailable:
+    write nothing, read nothing, fall back. That is also the rollout switch —
+    until the generation token is configured the registry stays inert.
+    """
+    generation = (installation_generation or "").strip()
+    if not generation:
+        return None
+
+    raw_url = (base_url or "").strip()
+    if not raw_url:
+        return None
+    split = urlsplit(raw_url)
+    if not split.scheme or not split.netloc:
+        return None
+    # Case-insensitive parts lowered, path kept (Chatwoot may be mounted under
+    # one), query/fragment dropped — they are not part of an installation's
+    # identity and would only add spurious differences.
+    installation = f"{split.scheme.lower()}://{split.netloc.lower()}{split.path.rstrip('/')}"
+
+    if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+        return None
+
+    scope = f"{_scope_part(installation)}|{account_id}|{_scope_part(generation)}"
+    if len(scope) <= CHATWOOT_SCOPE_ID_MAX_CHARS:
+        return scope
+    # Still deterministic and still injective, just no longer readable.
+    return f"sha256:{hashlib.sha256(scope.encode('utf-8')).hexdigest()}"
 
 
 def _wa_phone_digits(phone_e164: str | None) -> str | None:
@@ -328,6 +397,7 @@ class ChatwootClient:
         inbox_id: int | None = None,
         timeout_sec: float = 15.0,
         forwarded_proto: str | None = None,
+        installation_generation: str | None = None,
     ) -> None:
         self._base_url = (base_url or settings.chatwoot_base_url).rstrip("/")
         self._api_token = api_token or settings.chatwoot_api_token
@@ -338,7 +408,27 @@ class ChatwootClient:
         self._forwarded_proto = normalize_forwarded_proto(
             forwarded_proto if forwarded_proto is not None else settings.chatwoot_api_forwarded_proto
         )
+        # Composed ONCE, here, from this client's own base_url/account. Both the
+        # writer (the provider that posts the mirror note) and the reader (the
+        # worker that answers the reaction) take it from the client object they
+        # actually talk to, so the two sides can never normalize it differently.
+        self._scope_id = build_chatwoot_scope_id(
+            self._base_url,
+            self._account_id,
+            installation_generation
+            if installation_generation is not None
+            else settings.chatwoot_installation_generation,
+        )
         self._client = httpx.AsyncClient(timeout=timeout_sec)
+
+    @property
+    def scope_id(self) -> str | None:
+        """Installation/account/generation namespace of this client, or None.
+
+        ``None`` means no valid scope is configured, and the durable mirror
+        registry must then be treated as unavailable in both directions.
+        """
+        return self._scope_id
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -748,11 +838,21 @@ class ChatwootClient:
         ---------------
         A note on the first page costs exactly one request, regardless of how much
         older history the conversation has. Network cost scales with the distance
-        to the target, not with the length of the conversation. The walk is capped
-        by :data:`_MIRROR_NOTE_MAX_PAGES` pages AND by one overall wall-clock
-        deadline of :data:`_MIRROR_NOTE_TOTAL_DEADLINE_SEC` seconds covering every
-        page, with each request additionally capped by
-        :data:`_MIRROR_NOTE_PAGE_TIMEOUT_SEC`.
+        to the target, not with the length of the conversation.
+
+        Two bounds. :data:`_MIRROR_NOTE_MAX_PAGES` caps how many pages may be read.
+        :data:`_MIRROR_NOTE_TOTAL_DEADLINE_SEC` caps the real time of the whole
+        walk and is enforced as an actual cancellation boundary via
+        ``asyncio.timeout``, not merely as an HTTPX timeout argument: an HTTPX
+        timeout bounds connect/write/read stages and network inactivity, so a
+        trickling transport can outlive it. The same absolute deadline is also
+        re-checked before every request and again after every await — before a page
+        is parsed and before a found id is returned — so a response that arrived
+        late is never accepted. :data:`_MIRROR_NOTE_PAGE_TIMEOUT_SEC` remains an
+        additional per-page network guard, never the guarantee.
+
+        An external cancellation (worker shutdown) propagates as
+        ``asyncio.CancelledError``; it is never reported as an ordinary miss.
 
         Pagination
         ----------
@@ -773,7 +873,8 @@ class ChatwootClient:
         malformed JSON body or an unrecognizable payload on any page, for a page
         whose boundary yields no usable cursor, for a cursor that would not
         strictly decrease (a replayed page), for the page budget running out, and
-        for the wall-clock deadline expiring.
+        for the wall-clock deadline expiring — whether it expired between requests,
+        during one, or before a late answer could be read.
 
         Read-only through the REST API; Chatwoot's database is never touched.
         """
@@ -781,11 +882,46 @@ class ChatwootClient:
         if not conversation_id or not wamid:
             return None
 
+        budget = _MIRROR_NOTE_TOTAL_DEADLINE_SEC
+        deadline = _monotonic() + budget
+        try:
+            # The real boundary. ``asyncio.timeout`` cancels whatever the scan is
+            # awaiting when the budget runs out, so a hung or trickling transport
+            # cannot outlive it the way a bare HTTPX timeout argument can. An
+            # EXTERNAL cancellation (worker shutdown) is re-raised as
+            # CancelledError by this context manager rather than converted, and
+            # CancelledError is a BaseException, so nothing below swallows it.
+            async with asyncio.timeout(budget):
+                return await self._scan_for_outbound_mirror_note(
+                    conversation_id,
+                    wamid,
+                    deadline=deadline,
+                )
+        except TimeoutError:
+            logger.debug(
+                "chatwoot: mirror note not proven conversation_id=%s reason=deadline_cancelled",
+                conversation_id,
+            )
+            return None
+
+    async def _scan_for_outbound_mirror_note(
+        self,
+        conversation_id: int,
+        wamid: str,
+        *,
+        deadline: float,
+    ) -> int | None:
+        """Walk the conversation for the marker. See :meth:`find_outbound_mirror_note`.
+
+        ``deadline`` is one absolute monotonic instant for the whole walk. It is
+        re-checked before every request AND after every await — before the page is
+        parsed and before a found message id is returned — so a response that only
+        arrived after the budget expired is never accepted as a native target.
+        """
         matches: set[int] = set()
         cursor: int | None = None
         pages = 0
         scanned = 0
-        deadline = _monotonic() + _MIRROR_NOTE_TOTAL_DEADLINE_SEC
 
         while True:
             remaining = deadline - _monotonic()
@@ -803,6 +939,20 @@ class ChatwootClient:
                 before=cursor,
                 timeout=min(_MIRROR_NOTE_PAGE_TIMEOUT_SEC, remaining),
             )
+
+            # Re-checked AFTER the await and BEFORE the page is parsed: the HTTPX
+            # timeout bounds network stages, not the real time this coroutine
+            # spent, so a late answer must not become evidence.
+            if deadline - _monotonic() <= 0:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=deadline_exceeded_after_response "
+                    "pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+
             if page is None:
                 return None
             pages += 1

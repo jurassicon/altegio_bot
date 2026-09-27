@@ -3795,10 +3795,21 @@ class ChatwootOutboundMirror(Base):
     __tablename__ = "chatwoot_outbound_mirrors"
 
     __table_args__ = (
-        # One Meta message has exactly one mirror note. The WAMID is globally
-        # unique per Meta message, so this is both the idempotency key for the
-        # write (INSERT ... ON CONFLICT DO NOTHING) and the lookup index.
-        UniqueConstraint("provider_message_id", name="uq_chatwoot_outbound_mirror_provider_message"),
+        # One Meta message has exactly one mirror note PER CHATWOOT INSTALLATION.
+        # Chatwoot message/conversation ids restart with a new database, so the
+        # namespace has to be part of the key: the same wamid may legitimately map
+        # to a different Chatwoot message in another installation, and neither row
+        # may hide the other. This is also the idempotency key for the write
+        # (INSERT ... ON CONFLICT DO NOTHING) and the lookup index.
+        #
+        # Legacy rows carry a NULL scope. PostgreSQL treats NULLs as distinct here,
+        # so they are neither deduplicated nor trusted — the lookup requires an
+        # exact scope match, which a NULL can never satisfy.
+        UniqueConstraint(
+            "chatwoot_scope_id",
+            "provider_message_id",
+            name="uq_chatwoot_outbound_mirror_scope_provider_message",
+        ),
         # A zero or negative Chatwoot id is never a real message/conversation,
         # and storing one would hand the reaction path an unusable "proof".
         CheckConstraint("chatwoot_message_id > 0", name="ck_chatwoot_outbound_mirror_message_id"),
@@ -3812,9 +3823,16 @@ class ChatwootOutboundMirror(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # Which Chatwoot installation/account/generation these numeric ids belong to.
+    # Composed once by the ChatwootClient that talks to Chatwoot
+    # (``build_chatwoot_scope_id``: normalized base URL + account id + the operator's
+    # rotatable generation token — never the API token). Nullable ONLY so rows
+    # written before this column existed can stay; they are never trusted.
+    chatwoot_scope_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
     # The exact Meta wamid of the outbound message this note mirrors, and the
-    # Chatwoot message/conversation the note actually became. These four values
-    # are the whole proof the reaction path needs.
+    # Chatwoot message/conversation the note actually became. Together with the
+    # scope above these are the whole proof the reaction path needs.
     provider_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
     chatwoot_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chatwoot_conversation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)

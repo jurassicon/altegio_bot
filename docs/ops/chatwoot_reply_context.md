@@ -94,22 +94,26 @@ answers with a valid message id, `ChatwootHybridProvider` stores a row in
 
 | Column | Role |
 | --- | --- |
-| `provider_message_id` | exact Meta wamid — globally unique per message; idempotency key AND lookup key |
+| `chatwoot_scope_id` | which Chatwoot **installation + account + generation** these numeric ids belong to |
+| `provider_message_id` | exact Meta wamid |
 | `chatwoot_message_id` | the private note Chatwoot actually created |
-| `chatwoot_conversation_id` | the conversation it landed in — the isolation boundary |
+| `chatwoot_conversation_id` | the conversation it landed in — the tenant boundary |
 | `marker_version` | marker contract version in force when written |
 | `chatwoot_route`, `chatwoot_inbox_id`, `tenant_provider`, `company_id` | routing provenance for ops — descriptive, never the gate |
 
-The reaction path resolves the target with **one indexed read** on
-`(provider_message_id, chatwoot_conversation_id, marker_version)`. No history is
-walked, so conversation length is irrelevant and the cost is O(1).
+The reaction path resolves the target with **one indexed read** requiring an exact
+match on all four of `(chatwoot_scope_id, provider_message_id,
+chatwoot_conversation_id, marker_version)`. No history is walked, so conversation
+length is irrelevant and the cost is O(1).
 
 Properties that matter:
 
-- the write is idempotent (`ON CONFLICT DO NOTHING` on the wamid). The first
-  successful Chatwoot response wins; a replay cannot overwrite it, and the unique
-  constraint is what makes a global conflict impossible rather than merely
-  unlikely;
+- the write is idempotent **within a scope** (`ON CONFLICT DO NOTHING` on
+  `(chatwoot_scope_id, provider_message_id)`). The first successful Chatwoot
+  response for that installation wins and a replay cannot overwrite it. Because
+  the key includes the scope, the same wamid can legitimately hold a *different*
+  Chatwoot message id in a different installation, and neither row hides the
+  other;
 - it runs in its **own short transaction**. The mirror is a background task that
   races the Outbox row's own `provider_message_id` commit, so the write must not
   assume that row exists yet and must never lock it. There is no foreign key to
@@ -117,8 +121,55 @@ Properties that matter:
 - `outbox_messages.chatwoot_message_id` is deliberately **not** reused: it already
   means the operator-relay message id, and an accidentally populated value must
   never look like proof;
-- a missing, foreign-conversation, stale-version or not-yet-committed link is a
-  miss. Nothing is guessed.
+- a missing, foreign-scope, foreign-conversation, stale-version, unscoped or
+  not-yet-committed link is a miss. Nothing is guessed.
+
+### The Chatwoot scope, and why it exists
+
+A Chatwoot `Message.id` is only meaningful inside one installation and one
+account. Replace the database behind the same URL, restore a dump, or move to
+another account, and those ids start again from low numbers — at which point a
+mapping recorded by the old installation could match a completely unrelated new
+message and point a reaction at the wrong thing.
+
+`chatwoot_scope_id` is that namespace. It is composed **once**, by the
+`ChatwootClient` that actually talks to Chatwoot
+(`build_chatwoot_scope_id` → `ChatwootClient.scope_id`), from three non-secret
+parts:
+
+1. the normalized `CHATWOOT_BASE_URL` (scheme + host + port + path, lowercased,
+   trailing slashes and query dropped) — the installation;
+2. `CHATWOOT_ACCOUNT_ID`;
+3. `CHATWOOT_INSTALLATION_GENERATION` — an operator-rotated label.
+
+The parts are percent-encoded so the composition is injective, and the result is
+capped at 200 characters (a longer one collapses to a `sha256:` digest rather than
+being truncated, because a truncated namespace could collide). **The API token is
+never part of it.**
+
+Both directions read the value off the same client object — the writer from the
+client that posted the note, the reader from the client the reaction will be sent
+through — so the two sides cannot normalize it differently.
+
+**Configuration and rollout contract.**
+
+```env
+CHATWOOT_INSTALLATION_GENERATION=2026-09-27-primary
+```
+
+| State | Behaviour |
+| --- | --- |
+| empty (default) | **the registry is inert**: nothing is recorded, every lookup is a miss, reactions use the legacy bounded scan and then the visible quote. Existing behaviour unchanged — this is the safe starting point |
+| set | the O(1) native path is active for notes created from then on |
+| changed | every mapping of the previous generation is orphaned and fails closed. Change it **only** when the installation or account behind the same URL is actually replaced |
+
+Keep it stable across ordinary restarts and redeploys; it must not be derived from
+anything ephemeral, or every restart would orphan the mapping.
+
+Rows written before the scope column existed carry `NULL` and are **never** assumed
+to belong to the current installation: the lookup requires an exact match, which a
+`NULL` can never satisfy, so they fail closed into the legacy scan. Nothing is
+backfilled — there is no way to know which installation they came from.
 
 **Fallback — legacy bounded scan (old notes).** `find_outbound_mirror_note`
 accepts a message only when **every** condition holds at once:
@@ -154,17 +205,32 @@ Two independent limits, both named in `chatwoot_client.py`:
 - `_MIRROR_NOTE_MAX_PAGES` = 10 pages (~200 messages) — how far back the walk may
   reach. It bounds how DEEP a target can still be found, and it no longer vetoes a
   target already found: a hit is returned before the budget is consulted;
-- `_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s — **one wall-clock deadline for the whole
-  scan**, covering every page, checked before each request. Each request is
-  additionally capped at `_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s, and its effective
-  timeout is the smaller of that and the budget remaining, which makes the total
-  bound strict rather than nominal.
+- `_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s — **one absolute wall-clock deadline for
+  the whole scan**, enforced as a real cancellation boundary with
+  `asyncio.timeout`, not merely as a number handed to HTTPX.
+
+The distinction is the point. An HTTPX timeout bounds the pool/connect/write/read
+stages and network *inactivity*; it does not bound the wall-clock time the
+coroutine spends, so a transport that keeps trickling bytes — or anything slow
+between awaits — can outlive it. `asyncio.timeout` cancels whatever the scan is
+awaiting when the budget runs out, so the walk cannot exceed it. The same absolute
+deadline is also re-checked **before every request and again after every await** —
+before a page is parsed and before a found id is returned — so an answer that only
+arrived after the budget is never accepted as evidence, even when nothing needed
+cancelling.
+
+`_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s remains as an *additional* per-page network
+guard (its effective value is the smaller of itself and the budget remaining), and
+is explicitly **not** treated as the guarantee.
+
+An external cancellation — worker shutdown cancelling the task — propagates as
+`asyncio.CancelledError` and is never reported as an ordinary lookup miss.
 
 The deadline exists because the scan runs inline while the `WhatsAppEvent` row is
 locked `FOR UPDATE` and events are processed serially. Ten independent 15 s client
 timeouts would be 150 s of held lock — unacceptable for a best-effort cosmetic
 improvement, and it would delay every following event. Hitting the deadline returns
-a miss and the reaction is delivered with the visible quote, so the next event is
+a miss, the reaction is delivered with the visible quote, and the next event is
 processed normally.
 
 ### Page order and the cursor
@@ -212,7 +278,8 @@ text plus the emoji, and no `in_reply_to`:
 - a cursor that would not strictly decrease, which is what a replayed page looks
   like;
 - the page budget running out;
-- the overall wall-clock deadline expiring;
+- the overall wall-clock deadline expiring — between requests, during one, or
+  before a late answer could be read;
 - a database error on the registry read.
 
 None of these can fail the reaction, the WhatsAppEvent or the Meta send: the
@@ -220,10 +287,11 @@ reaction is always delivered, only its native preview is lost.
 
 Logs carry the conversation id, whether a cursor was in use, page/message counts and
 a stable reason code (`transport_error`, `http_status`, `malformed_json`,
-`malformed_payload`, `deadline_exceeded`, `page_budget_exhausted`,
-`no_pagination_cursor`, `cursor_not_advancing`, `ambiguous_matches`,
-`not_in_history`). No wamid, phone, message body, URL, token or response body is ever
-logged. `content_attributes.whatsapp_reaction_native_source` records which proof was
+`malformed_payload`, `deadline_exceeded`, `deadline_exceeded_after_response`,
+`deadline_cancelled`, `page_budget_exhausted`, `no_pagination_cursor`,
+`cursor_not_advancing`, `ambiguous_matches`, `not_in_history`), plus
+`no_chatwoot_scope` on the write side. No wamid, phone, message body, URL, token or
+response body is ever logged, and the scope id is non-secret by construction. `content_attributes.whatsapp_reaction_native_source` records which proof was
 used: `target_chatwoot_message`, `mirror_registry` or `mirror_scan`.
 
 ### No historical backfill, and no Chatwoot database access
@@ -235,8 +303,19 @@ Outbox row remains no evidence.
 
 `altegio_bot` never connects to Chatwoot's database. Every Chatwoot read and write
 goes through the REST API; the durable link lives in `altegio_bot`'s own PostgreSQL
-(`chatwoot_outbound_mirrors`, Alembic revision `c4e9a1b78d52`, whose downgrade simply
-returns the reaction path to the bounded scan).
+(`chatwoot_outbound_mirrors`, Alembic revisions `c4e9a1b78d52` then `d7b2f6a4c318`,
+whose downgrades simply return the reaction path to the bounded scan).
+
+`d7b2f6a4c318` adds the scope column and swaps the global unique key on
+`provider_message_id` for the scoped one on
+`(chatwoot_scope_id, provider_message_id)`. Its **downgrade deduplicates
+deterministically** before restoring the old global key — after the upgrade two
+installations may legitimately hold the same wamid, which that key cannot express.
+It keeps the lowest `id` per `provider_message_id` and deletes the rest. That is
+safe here specifically because every row is derived state: a lost mapping row only
+means the reaction falls back to the bounded scan and then to the visible quote, and
+a rollback that cannot fail on live data is worth more than rows nothing would trust
+after the rollback anyway.
 
 ## Closed 24h window — Click-to-Chat link in the private note
 

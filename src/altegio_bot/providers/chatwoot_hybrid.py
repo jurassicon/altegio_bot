@@ -229,6 +229,9 @@ class ChatwootHybridProvider:
 
         await self._record_mirror_link(
             mirrored,
+            # Taken from the very client that posted the note, so the writer and
+            # the reader can never compose the namespace differently.
+            chatwoot_scope_id=getattr(chatwoot, "scope_id", None),
             provider_message_id=provider_message_id,
             chatwoot_route=chatwoot_route,
             inbox_id=inbox_id,
@@ -240,6 +243,7 @@ class ChatwootHybridProvider:
         self,
         mirrored: object,
         *,
+        chatwoot_scope_id: str | None,
         provider_message_id: str | None,
         chatwoot_route: ChatwootRoute,
         inbox_id: int | None,
@@ -254,6 +258,11 @@ class ChatwootHybridProvider:
         row's own ``provider_message_id`` commit, so this write must not assume
         that row exists yet and must never wait on it.
 
+        ``chatwoot_scope_id`` comes from the client that actually posted the note.
+        Without a valid one nothing is written at all: an unscoped row could later
+        be read as if it belonged to a different Chatwoot installation, and that is
+        the one mistake this registry exists to prevent.
+
         Deliberately silent on failure beyond a stable reason: the note itself was
         already posted, and a missing link only costs the reaction its native
         preview. A Chatwoot or database problem here must never turn a successful
@@ -261,11 +270,19 @@ class ChatwootHybridProvider:
         """
         if not isinstance(mirrored, MirroredNote) or not provider_message_id:
             return
+        if not chatwoot_scope_id:
+            logger.debug(
+                "Chatwoot mirror link skipped company_id=%s inbox_id=%s reason=no_chatwoot_scope",
+                company_id,
+                inbox_id,
+            )
+            return
         try:
             async with SessionLocal() as session:
                 async with session.begin():
                     await record_outbound_mirror(
                         session,
+                        chatwoot_scope_id=chatwoot_scope_id,
                         provider_message_id=provider_message_id,
                         chatwoot_message_id=mirrored.message_id,
                         chatwoot_conversation_id=mirrored.conversation_id,
