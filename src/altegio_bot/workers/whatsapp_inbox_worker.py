@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_affinity import AffinityOutcome, resolve_tenant_affinity
-from altegio_bot.chatwoot_client import ChatwootClient, build_wa_click_to_chat_url
+from altegio_bot.chatwoot_client import (
+    OUTBOUND_MIRROR_MESSAGE_KIND,
+    ChatwootClient,
+    build_wa_click_to_chat_url,
+)
+from altegio_bot.chatwoot_mirror_registry import find_recorded_mirror_message_id
 from altegio_bot.chatwoot_outbox_route import (
     outbox_has_chatwoot_route_marker,
     outbox_meta_with_chatwoot_route,
@@ -2910,33 +2915,71 @@ def _reaction_display_text(emoji: str | None, target: ReactionTarget, *, native_
 
 
 async def _prove_reaction_mirror_note_id(
+    session: AsyncSession,
     cw: Any,
     *,
     conversation_id: int,
     reaction_target_provider_message_id: str | None,
-) -> int | None:
+) -> tuple[int | None, str | None]:
     """Best-effort proof of the private mirror note of a bot/automation send.
 
-    Returns the Chatwoot message id only when the client proved exactly one
-    mirror note carrying the expected marker version and the exact wamid inside
-    this very conversation. Every other outcome — miss, ambiguity, malformed
-    response, HTTP error, a client double without the lookup — returns ``None``,
-    which keeps the visible-quote fallback. A failure here must never fail the
-    reaction itself, so the exception never escapes.
+    Returns ``(chatwoot_message_id, source)``, or ``(None, None)`` when nothing
+    was proven and the caller must keep its visible-quote fallback.
+
+    Two sources, tried in this order:
+
+    1. ``mirror_registry`` — the durable wamid → Message.id link recorded when the
+       note was created. One indexed read, no history walk, so a busy conversation
+       cannot hide a recent note. This is the path every note created after the
+       registry landed takes.
+    2. ``mirror_scan`` — the legacy bounded Chatwoot scan, for notes posted before
+       the registry existed. It stops as soon as it has proof and is capped by a
+       page budget and one wall-clock deadline.
+
+    Neither source is allowed to fail the reaction: a database or Chatwoot problem
+    costs the native preview only, so every exception is swallowed here and only a
+    stable technical reason is logged.
     """
     wamid = _normalize_reply_context_id(reaction_target_provider_message_id)
     if not wamid:
-        return None
+        return None, None
+
+    recorded: int | None = None
     try:
-        message_id = await cw.find_outbound_mirror_note(conversation_id, wamid)
+        # SAVEPOINT, because this read runs inside the event's own transaction and
+        # in PostgreSQL a failed statement aborts the whole transaction. The most
+        # realistic failure is the registry table not existing yet — code deployed
+        # ahead of its migration — and that must cost the native preview only, not
+        # the event's own bookkeeping. Rolling back to the savepoint leaves the
+        # outer transaction usable, so the legacy scan below still gets its turn.
+        async with session.begin_nested():
+            recorded = await find_recorded_mirror_message_id(
+                session,
+                provider_message_id=wamid,
+                chatwoot_conversation_id=conversation_id,
+                marker_version=OUTBOUND_MIRROR_MESSAGE_KIND,
+            )
     except Exception as exc:
         logger.debug(
-            "reaction_context: mirror note lookup unavailable conversation_id=%s error_type=%s",
+            "reaction_context: mirror registry unavailable conversation_id=%s error_type=%s",
             safe_log_value(conversation_id, limit=32),
             type(exc).__name__,
         )
-        return None
-    return message_id if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0 else None
+    if recorded is not None:
+        return recorded, "mirror_registry"
+
+    try:
+        scanned = await cw.find_outbound_mirror_note(conversation_id, wamid)
+    except Exception as exc:
+        logger.debug(
+            "reaction_context: mirror note scan unavailable conversation_id=%s error_type=%s",
+            safe_log_value(conversation_id, limit=32),
+            type(exc).__name__,
+        )
+        return None, None
+    if isinstance(scanned, int) and not isinstance(scanned, bool) and scanned > 0:
+        return scanned, "mirror_scan"
+    return None, None
 
 
 def _reaction_content_attributes(
@@ -3084,16 +3127,17 @@ async def _forward_reaction_to_chatwoot(
             native_source = "target_chatwoot_message"
         elif target.outbox_is_automation:
             # A bot/automation send exists in Chatwoot only as a private mirror
-            # note, so its native target has to be proven in Chatwoot by the
-            # versioned marker. Historical notes carry no marker and stay on the
-            # visible-quote fallback; there is no backfill.
-            native_message_id = await _prove_reaction_mirror_note_id(
+            # note, so its native target has to be proven: from the durable
+            # registry for notes created after it landed, otherwise from the
+            # bounded legacy scan. Notes older than the marker itself carry no
+            # evidence at all and stay on the visible-quote fallback; there is no
+            # backfill.
+            native_message_id, native_source = await _prove_reaction_mirror_note_id(
+                session,
                 cw,
                 conversation_id=conversation_id,
                 reaction_target_provider_message_id=reaction_target_provider_message_id,
             )
-            if native_message_id is not None:
-                native_source = "outbound_mirror_note"
 
         native_ok = native_message_id is not None
         content = _reaction_display_text(reaction_emoji, target, native_ok=native_ok)

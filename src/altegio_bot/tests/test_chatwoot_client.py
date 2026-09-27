@@ -10,6 +10,7 @@ import httpx
 import pytest
 import respx
 
+import altegio_bot.chatwoot_client as cc
 from altegio_bot.chatwoot_client import (
     _MIRROR_NOTE_MAX_PAGES,
     _MIRROR_NOTE_PAGE_SIZE,
@@ -1032,9 +1033,15 @@ def _mirror_note(
 # Bounded cursor pagination harness
 # ---------------------------------------------------------------------------
 #
-# Chatwoot answers the conversation messages endpoint one page at a time and
-# pages backwards with ``before=<message id>``. These helpers script a sequence
-# of pages so a test can place the marker anywhere in the walked history.
+# Chatwoot (4.17) answers the conversation messages endpoint one page at a time
+# and pages backwards with ``before=<message id>``. Its query filters
+# ``id < before``, orders by ``created_at DESC``, takes a page and then REVERSES
+# it, so the array that comes back is in ASCENDING chronological order and
+# ``page[0]`` is the OLDEST message on the page. These helpers model that exact
+# shape, because the boundary the client must page from is positional, not the
+# numerically smallest id.
+
+_MESSAGES_URL = "https://chatwoot.example.com/api/v1/accounts/1/conversations/30/messages"
 
 
 def _mock_paginated_messages(conv_id: int, pages: list[object]) -> list[httpx.Request]:
@@ -1066,16 +1073,44 @@ def _mock_paginated_messages(conv_id: int, pages: list[object]) -> list[httpx.Re
     return requests
 
 
+def _mock_messages_by_cursor(conv_id: int, pages_by_before: dict[str | None, object]) -> list[httpx.Request]:
+    """Serve pages keyed by the EXACT ``before`` value the client sends.
+
+    An unscripted cursor fails the test immediately, so a wrong boundary choice is
+    caught instead of quietly returning something plausible. This is what proves
+    the cursor is the chronological boundary rather than ``min(id)``.
+    """
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        key = request.url.params.get("before")
+        assert key in pages_by_before, f"client paged from an unscripted cursor before={key!r}"
+        page = pages_by_before[key]
+        if isinstance(page, httpx.Response):
+            return page
+        return httpx.Response(200, json={"payload": page})
+
+    respx.get(f"https://chatwoot.example.com/api/v1/accounts/1/conversations/{conv_id}/messages").mock(
+        side_effect=_handler
+    )
+    return requests
+
+
 def _filler_messages(
-    newest_id: int,
+    oldest_id: int,
     count: int = _MIRROR_NOTE_PAGE_SIZE,
     *,
     conversation_id: int = 30,
 ) -> list[dict]:
-    """Ordinary (non-marker) messages with strictly decreasing ids."""
+    """One page of ordinary messages in Chatwoot's ascending order.
+
+    ``page[0]`` is the oldest and carries ``oldest_id``, which is therefore the
+    cursor the client must page from next.
+    """
     return [
         {
-            "id": newest_id - offset,
+            "id": oldest_id + offset,
             "conversation_id": conversation_id,
             "message_type": 0,
             "private": False,
@@ -1089,6 +1124,25 @@ def _filler_messages(
 def _before_params(requests: list[httpx.Request]) -> list[str | None]:
     """The ``before`` query parameter of each issued request, in order."""
     return [request.url.params.get("before") for request in requests]
+
+
+def _fake_monotonic(monkeypatch: pytest.MonkeyPatch, steps: list[float]) -> None:
+    """Deterministic monotonic clock — no test ever sleeps for a real deadline.
+
+    Each call returns the next value and then holds the last one, so a test can
+    make the scan's wall-clock budget expire between two pages.
+    """
+    values = iter(steps)
+    held = [steps[0] if steps else 0.0]
+
+    def _clock() -> float:
+        try:
+            held[0] = next(values)
+        except StopIteration:
+            pass
+        return held[0]
+
+    monkeypatch.setattr(cc, "_monotonic", _clock)
 
 
 @respx.mock
@@ -1270,6 +1324,32 @@ async def test_find_outbound_mirror_note_is_read_only(client: ChatwootClient) ->
     assert not post_route.called
 
 
+# ---------------------------------------------------------------------------
+# Bounded cursor pagination — cost scales with distance to the target
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_marker_on_the_first_page_ignores_older_history(
+    client: ChatwootClient,
+) -> None:
+    """Regression: a long OLD history must not veto a target already proven.
+
+    The scan used to demand a proven end of history before trusting a single
+    match, so any conversation with 200+ messages lost native reactions outright.
+    Only one page is scripted here: a second request would fail the test.
+    """
+    requests = _mock_paginated_messages(
+        30,
+        [[*_filler_messages(2000, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=2019)]],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 2019
+    # Exactly one request, no cursor: proof on the first page stops the walk.
+    assert _before_params(requests) == [None]
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_finds_a_marker_on_the_second_page(client: ChatwootClient) -> None:
@@ -1282,13 +1362,13 @@ async def test_find_outbound_mirror_note_finds_a_marker_on_the_second_page(clien
         30,
         [
             _filler_messages(400),
-            [_mirror_note(message_id=300), *_filler_messages(299, 5)],
+            [_mirror_note(message_id=380), *_filler_messages(381, 5)],
         ],
     )
 
-    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 300
-    # First request carries no cursor; the second pages back from the oldest id.
-    assert _before_params(requests) == [None, "381"]
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 380
+    # The cursor is the OLDEST message of page one — page[0], id 400.
+    assert _before_params(requests) == [None, "400"]
 
 
 @respx.mock
@@ -1299,12 +1379,13 @@ async def test_find_outbound_mirror_note_finds_a_marker_on_the_third_page(client
         [
             _filler_messages(400),
             _filler_messages(380),
-            [_mirror_note(message_id=350), *_filler_messages(349, 3)],
+            [_mirror_note(message_id=360), *_filler_messages(361, 3)],
         ],
     )
 
-    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 350
-    assert _before_params(requests) == [None, "381", "361"]
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 360
+    # Three requests for a target three pages back: cost tracks distance.
+    assert _before_params(requests) == [None, "400", "380"]
 
 
 @respx.mock
@@ -1315,39 +1396,51 @@ async def test_find_outbound_mirror_note_walks_to_the_end_without_a_marker(clien
         [
             _filler_messages(400),
             _filler_messages(380),
-            _filler_messages(360, 4),
+            _filler_messages(376, 4),
         ],
     )
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
-    assert len(requests) == 3
+    assert _before_params(requests) == [None, "400", "380"]
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_find_outbound_mirror_note_an_empty_last_page_completes_the_proof(client: ChatwootClient) -> None:
-    """An empty page is a real page and proves the end of the walked history."""
+async def test_find_outbound_mirror_note_empty_last_page_ends_the_walk(client: ChatwootClient) -> None:
+    """An empty page is a real page: it ends the walk instead of failing it."""
+    requests = _mock_paginated_messages(30, [_filler_messages(400), []])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert _before_params(requests) == [None, "400"]
+
+
+# ---------------------------------------------------------------------------
+# Uniqueness — inside the region this trust model is responsible for
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_two_matches_on_one_page_fail_closed(client: ChatwootClient) -> None:
+    """Two Chatwoot messages claiming one wamid: never pick one of them."""
     requests = _mock_paginated_messages(
         30,
-        [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            [],
-        ],
+        [[_mirror_note(message_id=381), _mirror_note(message_id=390), *_filler_messages(400, 4)]],
     )
 
-    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 381
-    assert _before_params(requests) == [None, "381"]
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert len(requests) == 1
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_find_outbound_mirror_note_duplicate_marker_across_pages_fails_closed(client: ChatwootClient) -> None:
-    """Two DISTINCT proven ids anywhere in the walk are as unusable as none."""
+async def test_find_outbound_mirror_note_conflict_across_pages_still_fails_closed(client: ChatwootClient) -> None:
+    """A conflict is refused whenever both matches are inside the walked region."""
     requests = _mock_paginated_messages(
         30,
         [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            [_mirror_note(message_id=250), *_filler_messages(249, 3)],
+            _filler_messages(400),
+            [_mirror_note(message_id=380), _mirror_note(message_id=385), *_filler_messages(390, 3)],
         ],
     )
 
@@ -1357,63 +1450,182 @@ async def test_find_outbound_mirror_note_duplicate_marker_across_pages_fails_clo
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_find_outbound_mirror_note_overlapping_page_boundary_is_one_match(client: ChatwootClient) -> None:
-    """The same row served on both sides of the cursor stays a single match."""
-    overlapping = _mirror_note(message_id=381)
+async def test_find_outbound_mirror_note_duplicate_beyond_the_stop_point_is_not_looked_for(
+    client: ChatwootClient,
+) -> None:
+    """Pins the documented boundary of the scan's uniqueness claim.
+
+    The scan stops at its proof, so a second marker further back is never read and
+    uniqueness is NOT claimed globally. Global uniqueness for notes created after
+    the registry landed comes from its unique key on the wamid instead — see
+    chatwoot_mirror_registry.
+    """
     requests = _mock_paginated_messages(
         30,
         [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), overlapping],
-            # Chatwoot's `before` is exclusive, but an inclusive server must not
-            # manufacture an ambiguity out of one message.
-            [overlapping, *_filler_messages(380, 3)],
+            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=419)],
+            # Scripted but never requested; a second request would fail the test.
+            [_mirror_note(message_id=380), *_filler_messages(381, 3)],
         ],
     )
 
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 419
+    assert len(requests) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_same_row_twice_on_one_page_is_one_match(client: ChatwootClient) -> None:
+    duplicated = _mirror_note(message_id=381)
+    _mock_paginated_messages(30, [[duplicated, duplicated, *_filler_messages(400, 4)]])
+
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 381
-    assert _before_params(requests) == [None, "381"]
+
+
+# ---------------------------------------------------------------------------
+# Cursor contract — positional boundary, never min(id)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_cursor_is_the_chronological_boundary(client: ChatwootClient) -> None:
+    """Non-monotonic ids: the boundary is page[0], not the smallest id.
+
+    Chatwoot orders by ``created_at`` and returns the page ascending, so a message
+    imported with a low id can sit in the MIDDLE of the page. Paging from that low
+    id would name something that is not the boundary.
+    """
+    page_one = [
+        {"id": 500, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}},
+        # Backfilled row: numerically the smallest on the page, chronologically
+        # NOT its boundary.
+        {"id": 300, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}},
+        *_filler_messages(600, _MIRROR_NOTE_PAGE_SIZE - 2),
+    ]
+    assert min(message["id"] for message in page_one) == 300
+    assert page_one[0]["id"] == 500
+
+    requests = _mock_messages_by_cursor(
+        30,
+        {
+            None: page_one,
+            # Only the correct boundary is scripted: asking with before=300 fails.
+            "500": [_mirror_note(message_id=450), *_filler_messages(460, 3)],
+        },
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 450
+    assert _before_params(requests) == [None, "500"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_min_id_cursor_would_have_skipped_the_target(
+    client: ChatwootClient,
+) -> None:
+    """The exact regression the positional boundary prevents.
+
+    With a ``min(id)`` cursor the client would have asked for ``before=300`` and
+    Chatwoot would have answered with messages older than id 300 — skipping the
+    page that holds the marker at id 450 entirely, and reporting a false miss.
+    """
+    page_one = [
+        {"id": 500, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}},
+        {"id": 300, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}},
+        *_filler_messages(600, _MIRROR_NOTE_PAGE_SIZE - 2),
+    ]
+    # Both cursors are scripted, so the test cannot pass by accident: the wrong
+    # one returns a page WITHOUT the marker and the walk would end in a miss.
+    requests = _mock_messages_by_cursor(
+        30,
+        {
+            None: page_one,
+            "500": [_mirror_note(message_id=450), *_filler_messages(460, 3)],
+            "300": _filler_messages(200, 4),
+        },
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) == 450
+    assert _before_params(requests) == [None, "500"]
+    assert "300" not in _before_params(requests)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_boundary_without_a_usable_id_fails_closed(client: ChatwootClient) -> None:
+    """A boundary element with no usable id yields no cursor, so the walk stops."""
+    page_one = [
+        {"id": "500", "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}},
+        *_filler_messages(600, _MIRROR_NOTE_PAGE_SIZE - 1),
+    ]
+    requests = _mock_paginated_messages(30, [page_one])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    # Not continued from some other element's id, and not re-requested.
+    assert _before_params(requests) == [None]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_backdated_high_id_message_is_a_documented_miss(
+    client: ChatwootClient,
+) -> None:
+    """Known upstream limitation, pinned as a SAFE miss rather than papered over.
+
+    Chatwoot filters the next page by ``id < before`` while ordering by
+    ``created_at``. A message backdated with an id ABOVE the first page's boundary
+    is in neither the newest-by-created_at page nor any ``id <`` page, so no id
+    cursor can reach it. The scan must then fall back, not invent a match — and
+    this is exactly why notes created after the registry landed are resolved from
+    the durable mapping instead of from this scan.
+    """
+    requests = _mock_paginated_messages(
+        30,
+        [
+            # Newest 20 by created_at; the backdated marker (id 900, old
+            # created_at) is not among them.
+            _filler_messages(500),
+            # id < 500 — the backdated marker's id is 900, so it is excluded here
+            # too, forever.
+            _filler_messages(480, 4),
+        ],
+    )
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert _before_params(requests) == [None, "500"]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed on every page-level failure
+# ---------------------------------------------------------------------------
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_repeated_page_stops_without_looping(client: ChatwootClient) -> None:
-    """A server that keeps replaying the same page must not spin the walk."""
+    """A server replaying the same page must not spin the walk."""
     replayed = _filler_messages(400)
     requests = _mock_paginated_messages(30, [replayed, replayed])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
-    # Exactly two requests: the cursor failed to advance, so the walk stopped.
-    assert _before_params(requests) == [None, "381"]
+    assert _before_params(requests) == [None, "400"]
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_non_advancing_cursor_stops_without_looping(client: ChatwootClient) -> None:
-    """A later page whose oldest id is not older than the cursor fails closed."""
-    requests = _mock_paginated_messages(
-        30,
-        [
-            _filler_messages(400),
-            # Oldest id 390 > cursor 381: the walk is going backwards nowhere.
-            _filler_messages(409, _MIRROR_NOTE_PAGE_SIZE),
-        ],
-    )
+    """A later page whose boundary is not older than the cursor fails closed."""
+    requests = _mock_paginated_messages(30, [_filler_messages(400), _filler_messages(409)])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
-    assert _before_params(requests) == [None, "381"]
+    assert _before_params(requests) == [None, "400"]
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_http_error_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
-    """One already-collected match does not survive an unfinished walk."""
-    requests = _mock_paginated_messages(
-        30,
-        [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            httpx.Response(500),
-        ],
-    )
+    requests = _mock_paginated_messages(30, [_filler_messages(400), httpx.Response(500)])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
     assert len(requests) == 2
@@ -1422,13 +1634,7 @@ async def test_find_outbound_mirror_note_http_error_on_a_later_page_fails_closed
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_transport_error_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
-    requests = _mock_paginated_messages(
-        30,
-        [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            httpx.ConnectError("boom"),
-        ],
-    )
+    requests = _mock_paginated_messages(30, [_filler_messages(400), httpx.ConnectError("boom")])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
     assert len(requests) == 2
@@ -1437,13 +1643,7 @@ async def test_find_outbound_mirror_note_transport_error_on_a_later_page_fails_c
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_malformed_json_on_a_later_page_fails_closed(client: ChatwootClient) -> None:
-    requests = _mock_paginated_messages(
-        30,
-        [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            httpx.Response(200, text="not json at all"),
-        ],
-    )
+    requests = _mock_paginated_messages(30, [_filler_messages(400), httpx.Response(200, text="not json at all")])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
     assert len(requests) == 2
@@ -1461,13 +1661,7 @@ async def test_find_outbound_mirror_note_malformed_payload_on_a_later_page_fails
     body: object,
 ) -> None:
     """A malformed page must never be read as "no more messages"."""
-    requests = _mock_paginated_messages(
-        30,
-        [
-            [*_filler_messages(400, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=381)],
-            httpx.Response(200, json=body),
-        ],
-    )
+    requests = _mock_paginated_messages(30, [_filler_messages(400), httpx.Response(200, json=body)])
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
     assert len(requests) == 2
@@ -1475,47 +1669,104 @@ async def test_find_outbound_mirror_note_malformed_payload_on_a_later_page_fails
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_find_outbound_mirror_note_full_page_without_usable_ids_fails_closed(client: ChatwootClient) -> None:
-    """A full page that yields no cursor cannot be continued, so it fails closed."""
-    unusable = [
-        {"id": value, "conversation_id": 30, "message_type": 0, "private": False, "content_attributes": {}}
-        for value in ["381", None, 0, -1, True] * 4
+async def test_find_outbound_mirror_note_page_budget_exhausted_without_a_marker_fails_closed(
+    client: ChatwootClient,
+) -> None:
+    """The budget bounds how far back a MISS will look, and running out is a miss.
+
+    It no longer vetoes an already proven target: that case is covered by
+    test_find_outbound_mirror_note_marker_on_the_first_page_ignores_older_history.
+    """
+    pages: list[object] = [
+        _filler_messages(1000 - index * _MIRROR_NOTE_PAGE_SIZE) for index in range(_MIRROR_NOTE_MAX_PAGES)
     ]
-    assert len(unusable) == _MIRROR_NOTE_PAGE_SIZE
-    requests = _mock_paginated_messages(30, [unusable])
+    requests = _mock_paginated_messages(30, pages)
 
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
-    assert _before_params(requests) == [None]
+    assert len(requests) == _MIRROR_NOTE_MAX_PAGES
+
+
+# ---------------------------------------------------------------------------
+# One wall-clock deadline for the whole scan
+# ---------------------------------------------------------------------------
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_find_outbound_mirror_note_page_budget_exhausted_fails_closed(client: ChatwootClient) -> None:
-    """The budget bounds the walk, and running out of it is a miss, not a match."""
-    pages: list[object] = [[*_filler_messages(1000, _MIRROR_NOTE_PAGE_SIZE - 1), _mirror_note(message_id=981)]]
-    pages.extend(_filler_messages(980 - index * _MIRROR_NOTE_PAGE_SIZE) for index in range(_MIRROR_NOTE_MAX_PAGES - 1))
-    requests = _mock_paginated_messages(30, pages)
+async def test_find_outbound_mirror_note_overall_deadline_stops_the_walk(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scan is bounded in TIME as well as in pages — without sleeping.
 
-    # A match was already collected on page one and is still refused, because the
-    # end of the history was never proven.
+    The clock jumps past the budget between page one and page two, so a slow
+    Chatwoot cannot hold the event transaction for ten page timeouts in a row.
+    """
+    # deadline is taken at 0.0; the first page starts at 0.1, the second would
+    # start after the budget has already expired.
+    _fake_monotonic(monkeypatch, [0.0, 0.1, cc._MIRROR_NOTE_TOTAL_DEADLINE_SEC + 1.0])
+    requests = _mock_paginated_messages(30, [_filler_messages(400)])
+
     assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
-    assert len(requests) == _MIRROR_NOTE_MAX_PAGES
+    assert len(requests) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_deadline_expired_before_the_first_page(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-exhausted budget issues no request at all."""
+    _fake_monotonic(monkeypatch, [0.0, cc._MIRROR_NOTE_TOTAL_DEADLINE_SEC + 1.0])
+    requests = _mock_paginated_messages(30, [_filler_messages(400)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+    assert requests == []
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_find_outbound_mirror_note_each_page_timeout_is_capped(
+    client: ChatwootClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each request is capped by the per-page ceiling AND by the budget left.
+
+    This is what makes the total bound strict instead of nominal: ten independent
+    15s client timeouts would be 150 seconds of held lock.
+    """
+    # Page one starts fresh (plenty of budget); page two starts with only 0.5s of
+    # the overall deadline left, so its timeout must shrink to that.
+    remaining_at_page_two = 0.5
+    _fake_monotonic(
+        monkeypatch,
+        [0.0, 0.0, cc._MIRROR_NOTE_TOTAL_DEADLINE_SEC - remaining_at_page_two],
+    )
+    requests = _mock_paginated_messages(30, [_filler_messages(400), _filler_messages(380, 4)])
+
+    assert await client.find_outbound_mirror_note(30, _MIRROR_WAMID) is None
+
+    timeouts = [request.extensions["timeout"]["read"] for request in requests]
+    assert timeouts[0] == pytest.approx(cc._MIRROR_NOTE_PAGE_TIMEOUT_SEC)
+    assert timeouts[1] == pytest.approx(remaining_at_page_two)
+    # Never the client's own 15s default, and never more than the ceiling.
+    assert all(value <= cc._MIRROR_NOTE_PAGE_TIMEOUT_SEC for value in timeouts)
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_find_outbound_mirror_note_first_request_carries_no_cursor(client: ChatwootClient) -> None:
-    """Exact query contract: no `before` first, then the oldest id of each page."""
+    """Exact query contract: no `before` first, then each page's boundary id."""
     requests = _mock_paginated_messages(
         30,
-        [_filler_messages(500), _filler_messages(480), _filler_messages(460, 2)],
+        [_filler_messages(500), _filler_messages(480), _filler_messages(476, 2)],
     )
 
     await client.find_outbound_mirror_note(30, _MIRROR_WAMID)
 
     assert "before" not in requests[0].url.params
-    assert _before_params(requests) == [None, "481", "461"]
-    # Strictly decreasing, never repeated.
+    assert _before_params(requests) == [None, "500", "480"]
     cursors = [int(value) for value in _before_params(requests)[1:]]
     assert cursors == sorted(cursors, reverse=True)
     assert len(set(cursors)) == len(cursors)

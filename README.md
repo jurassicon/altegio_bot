@@ -475,9 +475,31 @@ proofs:
 2. the reacted-to message is a bot/automation send whose **private mirror note**
    is proven in that same conversation by its technical marker (below).
 
-**Native marker contract.** Since a bot send exists in Chatwoot only as a
-private mirror note, `ChatwootClient.mirror_outbound_as_note` writes two — and
-only two — technical `content_attributes` through the REST API:
+**Trust model.** A bot send exists in Chatwoot only as a private mirror note, so
+the native target has to be *proven*. The proof is a record of our own action, not
+a search result: when `ChatwootClient.mirror_outbound_as_note` posts the note and
+Chatwoot answers with a valid message id, `ChatwootHybridProvider` stores a
+durable link in `chatwoot_outbound_mirrors`
+(`altegio_bot.chatwoot_mirror_registry`):
+
+| Field | Role |
+| --- | --- |
+| `provider_message_id` | the exact Meta wamid — globally unique per message, so it is both the idempotency key and the lookup key |
+| `chatwoot_message_id` | the private note Chatwoot actually created |
+| `chatwoot_conversation_id` | the conversation it landed in — the isolation boundary |
+| `marker_version` | the marker contract version in force, so bumping it retires old links |
+| `chatwoot_route` / `chatwoot_inbox_id` / `tenant_provider` / `company_id` | routing provenance for ops, descriptive only |
+
+A reaction then resolves its target with **one indexed read** on
+`(provider_message_id, chatwoot_conversation_id, marker_version)` — no history
+walk, so the length of the conversation is irrelevant. The write is idempotent
+(`ON CONFLICT DO NOTHING` on the wamid), runs in its own short transaction
+because the mirror is a background task that races the Outbox row's own
+`provider_message_id` commit, and never blocks or fails the Meta send. A missing,
+foreign, stale-version or not-yet-committed link is simply a miss.
+
+The note itself still carries the marker in `content_attributes`, written through
+the REST API and nothing else:
 
 ```json
 {
@@ -486,38 +508,57 @@ only two — technical `content_attributes` through the REST API:
 }
 ```
 
-The wamid travels from `ChatwootHybridProvider` as its own named argument; no
-internal meta dict is ever forwarded to Chatwoot. On an inbound reaction,
-`ChatwootClient.find_outbound_mirror_note` accepts a note as the native target
-only when **all** of these hold at once: it is listed by the destination
-conversation, `message_type` is outgoing, `private` is exactly `true`, the marker
-has the expected version, `whatsapp_provider_message_id` equals the reaction
-target wamid exactly, and exactly one such message with a positive integer id
-was found. The lookup never matches by body, template code, `created_at`,
-"last message" or result order, and it never picks one result out of several.
+**Legacy bounded scan.** For notes posted before the registry existed,
+`ChatwootClient.find_outbound_mirror_note` still scans the conversation. It
+accepts a note only when **all** of these hold at once: it is listed by the
+destination conversation, `message_type` is outgoing, `private` is exactly `true`,
+the marker has the expected version, `whatsapp_provider_message_id` equals the
+reaction target wamid exactly, and the id is a positive integer. Nothing is ever
+matched by body, template code, `created_at`, time proximity, "last message" or
+result order.
 
-**Bounded pagination.** Chatwoot serves only one page of a conversation (20
-messages) per request, so the lookup pages backwards with
-`before=<oldest usable message id of the previous page>`, and the cursor must
-strictly decrease. Matches are collected across the whole walk and deduplicated
-by Chatwoot message id, so a row served on both sides of a page boundary stays
-one match while two distinct ids stay an ambiguity. The walk is bounded by a
-conservative page budget (`_MIRROR_NOTE_MAX_PAGES` = 10 pages, ~200 messages),
-because it runs inline on a best-effort inbound path and every page is one more
-Chatwoot round trip.
+The scan **stops at its proof**, so a note on the first page costs exactly one
+request no matter how much older history exists — network cost tracks the distance
+to the target, not the length of the conversation. Uniqueness is therefore checked
+over the pages actually walked: two distinct proven ids seen before the scan stops
+are refused, and uniqueness is *not* claimed globally. Global uniqueness for new
+notes comes from the registry's unique key on the wamid instead.
 
-A single match is trusted **only** once a page shorter than the page size (an
-empty page included) has proven that the walked history ended. This is therefore
-a bounded recent-window proof, **not** a search across all history: in a
-conversation with more than ~200 messages newer than the mirror note, the
-reaction keeps the visible quote by design.
+Two independent bounds, both named in `chatwoot_client.py`: at most
+`_MIRROR_NOTE_MAX_PAGES` = 10 pages — which bounds how deep a target can still be
+found, and is consulted only *after* a hit would have been returned — and one
+overall wall-clock deadline of
+`_MIRROR_NOTE_TOTAL_DEADLINE_SEC` = 5 s covering **every** page, with each request
+additionally capped at `_MIRROR_NOTE_PAGE_TIMEOUT_SEC` = 2 s. The deadline exists
+because the scan runs inline while the `WhatsAppEvent` row is locked and events
+are processed serially: ten independent 15 s client timeouts would be 150 s of
+held lock for a cosmetic improvement.
 
-**Fail-closed fallback.** Zero matches, several matches, a malformed API
-response, an HTTP or transport error, a conversation mismatch, a page that yields
-no usable cursor, a cursor that stops advancing (a replayed page), and an
-exhausted page budget all fall back to a visible short quote of the original text
-plus the emoji — never a false native link. Exhausting the budget is a miss even
-when exactly one match was already collected:
+**Page order and the cursor.** Chatwoot (4.17) filters the next page by
+`id < before`, orders by `created_at DESC`, takes a page and then **reverses** it.
+The array that comes back is therefore in **ascending chronological order** — it
+is *not* newest-first — and the next cursor is the id of `page[0]`, the
+chronological boundary. It is deliberately **not** `min(id)`: the two coincide only
+while ids happen to increase with `created_at`, and a backdated or imported message
+breaks that, so a `min(id)` cursor would name a message that is not the boundary
+and skip the history in between. The page is never re-sorted locally, and the
+cursor must strictly decrease.
+
+**Known upstream limitation.** Because Chatwoot pages by `id` while ordering by
+`created_at`, no id cursor can express that ordering: a message backdated with an
+id above the first page's boundary is unreachable by the scan. That defect is not
+papered over with a local heuristic — it is the reason new notes are resolved from
+the durable registry and do not depend on the scan at all. For older notes the
+scan simply fails closed.
+
+**Fail-closed fallback.** All of these fall back to a visible short quote of the
+original text plus the emoji — never a false native link: no match; two distinct
+matches inside the region the scan walked; a malformed JSON body or unrecognizable
+payload; an HTTP or transport error; a conversation mismatch; a link recorded under
+a different marker version; a page whose boundary yields no usable cursor; a cursor
+that stops advancing (a replayed page); the page budget running out; and the
+wall-clock deadline expiring. A database problem on the registry read is a miss
+too, never a failed reaction:
 
 ```text
 ↩️ Ответ на сообщение:
@@ -532,14 +573,23 @@ The quote collapses whitespace to a single line, caps at 100 characters and adds
 technical `template_code` stays in `content_attributes` for audit and is no
 longer part of the operator-visible text.
 
-**No historical backfill.** Mirror notes created before this change carry no
-marker, so reactions to them keep the visible quote. No migration and no
-backfill are performed. An accidentally populated `chatwoot_message_id` /
-`chatwoot_conversation_id` on a bot Outbox row is still no evidence at all: only
-the proven marker can make a bot target native. The Chatwoot mirror stays
-best-effort — a Chatwoot failure never turns a successful Meta send into a
-failed send, and a failing marker lookup costs the native link, never the
-reaction.
+`content_attributes.whatsapp_reaction_native_source` records which proof was
+used: `target_chatwoot_message` (an operator relay or prior inbound event that
+owns a Chatwoot id), `mirror_registry` (the durable link) or `mirror_scan` (the
+legacy bounded scan).
+
+**No historical backfill.** Notes created before the registry have no link, and
+notes created before the marker itself carry no evidence at all, so reactions to
+them keep the visible quote. Nothing is backfilled. An accidentally populated
+`chatwoot_message_id` / `chatwoot_conversation_id` on a bot Outbox row is still no
+evidence: only a recorded link or a proven marker can make a bot target native.
+The Chatwoot mirror stays best-effort — a Chatwoot failure never turns a
+successful Meta send into a failed send, and a failing lookup costs the native
+link, never the reaction.
+
+`altegio_bot` never connects to Chatwoot's database. Every read and write above
+goes through the Chatwoot REST API, and the durable link lives in `altegio_bot`'s
+own PostgreSQL.
 
 Known limitation (pre-existing, not specific to reactions): the inbox worker
 processes only the first extracted inbound action per webhook event, so a single

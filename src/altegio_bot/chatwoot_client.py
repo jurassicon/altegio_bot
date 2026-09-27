@@ -5,7 +5,7 @@ Only the methods required for the dual-write integration are implemented:
 - get_or_create_conversation – open/reuse a conversation for a contact
 - send_message               – post an outbound message to a conversation
 - mirror_outbound_as_note    – mirror outbound message as a private agent note
-- find_outbound_mirror_note  – prove the mirror note of one outbound wamid
+- find_outbound_mirror_note  – legacy bounded scan for one outbound wamid
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -40,20 +42,56 @@ WA_CLICK_TO_CHAT_MAX_URL_CHARS = 2000
 # Chatwoot returns message_type either as its numeric enum or as a string.
 _OUTGOING_MESSAGE_TYPES: frozenset[object] = frozenset({1, "outgoing"})
 
-# Chatwoot serves a conversation's messages one page at a time, newest first, and
-# pages backwards through ``before=<message id>``. A full page is this many
-# messages; a shorter page is therefore a proof that the walked history ended.
+# Chatwoot (4.17) serves a conversation's messages one page at a time and pages
+# backwards through ``before=<message id>``. Its query filters ``id < before``,
+# orders by ``created_at DESC``, takes a page, and then REVERSES it — so the array
+# that comes back is in ASCENDING chronological order and ``page[0]`` is the
+# oldest message on the page. It is NOT newest-first, and the numerically
+# smallest id on the page is NOT necessarily its chronological boundary.
+#
+# A full page is this many messages; a shorter page therefore proves the walked
+# history ended there.
 _MIRROR_NOTE_PAGE_SIZE = 20
 
-# Conservative page budget for one marker lookup. It bounds the walk to
-# ~_MIRROR_NOTE_PAGE_SIZE * _MIRROR_NOTE_MAX_PAGES ≈ 200 messages, which covers a
-# conversation that kept talking after the automatic message without turning a
-# single inbound reaction into an unbounded scan: the lookup is best-effort, runs
-# inline on the reaction path, and every page is one more Chatwoot round trip.
-# Because a single match may only be trusted once the walk reached a proven end of
-# history, exhausting this budget first is a fail-closed miss, NOT a match. This
-# is why neither the code nor the docs claim a full-history search.
+# Conservative page budget for one legacy marker scan, bounding it to
+# ~_MIRROR_NOTE_PAGE_SIZE * _MIRROR_NOTE_MAX_PAGES ≈ 200 messages. The scan stops
+# the moment it has proof, so a note on the first page costs exactly one request
+# no matter how much older history exists; this budget only limits how far back a
+# scan will look for a note it has not found yet. Exhausting it is a fail-closed
+# miss. New mirror notes do not depend on this at all — they are resolved through
+# the durable registry in ``chatwoot_mirror_registry`` in one indexed read.
 _MIRROR_NOTE_MAX_PAGES = 10
+
+# One wall-clock ceiling for the WHOLE scan, not a per-request timeout and not
+# the sum of ten of them. The scan runs inline while the WhatsAppEvent row is
+# locked and events are processed serially, so the entire proof must be cheap in
+# latency terms: ten independent 15s client timeouts would be 150 seconds of held
+# lock, which is not an acceptable cost for a best-effort cosmetic improvement.
+_MIRROR_NOTE_TOTAL_DEADLINE_SEC = 5.0
+
+# Per-page ceiling, so one stalled page cannot eat the whole budget on its own.
+# The effective timeout of each request is the smaller of this and the deadline
+# that remains, which is what makes the total bound strict rather than nominal.
+_MIRROR_NOTE_PAGE_TIMEOUT_SEC = 2.0
+
+
+def _monotonic() -> float:
+    """Monotonic clock for the scan deadline (patched in tests, never mocked in prod)."""
+    return time.monotonic()
+
+
+@dataclass(frozen=True)
+class MirroredNote:
+    """The Chatwoot message a private mirror note actually became.
+
+    Returned by :meth:`ChatwootClient.mirror_outbound_as_note` so the caller can
+    record a durable WAMID → Message.id link. ``None`` is returned instead
+    whenever Chatwoot did not answer with a usable id, and then no link is
+    recorded and the reaction path degrades to its visible quote.
+    """
+
+    conversation_id: int
+    message_id: int
 
 
 def _wa_phone_digits(phone_e164: str | None) -> str | None:
@@ -168,6 +206,13 @@ def _parse_returned_content_attributes(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _positive_chatwoot_id(value: Any) -> int | None:
+    """A usable Chatwoot id: a positive integer, and not a bool."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
 def _message_id(message: Any) -> int | None:
     """The usable Chatwoot message id, or None.
 
@@ -176,20 +221,29 @@ def _message_id(message: Any) -> int | None:
     """
     if not isinstance(message, dict):
         return None
-    message_id = message.get("id")
-    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
-        return None
-    return message_id
+    return _positive_chatwoot_id(message.get("id"))
 
 
-def _oldest_message_id(page: list[Any]) -> int | None:
-    """Smallest usable id on a page — the next ``before`` cursor, or None.
+def _page_boundary_message_id(page: list[Any]) -> int | None:
+    """The id of the page's CHRONOLOGICAL boundary — the next ``before`` cursor.
 
-    ``None`` means the page carried no usable id at all, so the walk cannot be
-    continued and must fail closed instead of re-requesting the same page.
+    Chatwoot returns the page in ascending chronological order, so the boundary is
+    ``page[0]``: the oldest message on the page. This is deliberately positional
+    and deliberately NOT ``min(id)``. The two coincide only while ids happen to
+    increase with ``created_at``; a backdated or imported message breaks that, and
+    a cursor taken from the numerically smallest id would then name a message that
+    is not the boundary and skip real history between the two.
+
+    The page is never re-sorted here — reordering the server's answer would throw
+    away the only ordering information the response carries.
+
+    ``None`` when the page is empty or its boundary message has no usable id, in
+    which case the walk cannot be continued and must fail closed rather than
+    re-request the same page or guess a different boundary.
     """
-    ids = [candidate for candidate in (_message_id(message) for message in page) if candidate is not None]
-    return min(ids) if ids else None
+    if not page:
+        return None
+    return _message_id(page[0])
 
 
 def _mirror_note_message_id(
@@ -601,6 +655,7 @@ class ChatwootClient:
         conversation_id: int,
         *,
         before: int | None,
+        timeout: float,
     ) -> list[Any] | None:
         """One page of a conversation's messages, or None when unusable.
 
@@ -608,13 +663,16 @@ class ChatwootClient:
         status other than 200, a body that is not JSON, and a body that is not a
         recognizable messages payload. An empty list is a real, usable page.
 
+        ``timeout`` is the remaining share of the scan's overall wall-clock
+        deadline, so no single page can outlive the whole budget.
+
         Logs carry only the conversation id, the cursor presence and a stable
         reason — never a wamid, phone, message body, URL, token or response body.
         """
         url = self._api(f"/conversations/{conversation_id}/messages")
         params = {"before": str(before)} if before is not None else None
         try:
-            res = await self._client.get(url, headers=self._headers(), params=params)
+            res = await self._client.get(url, headers=self._headers(), params=params, timeout=timeout)
         except Exception as exc:
             logger.debug(
                 "chatwoot: mirror note page conversation_id=%s paged=%s reason=transport_error error_type=%s",
@@ -654,13 +712,17 @@ class ChatwootClient:
         conversation_id: int,
         provider_message_id: str,
     ) -> int | None:
-        """Prove the private mirror note of one outbound wamid, or return None.
+        """Legacy bounded scan for the private mirror note of one outbound wamid.
 
-        Best-effort and fail-closed. ``None`` means "no native target proven" and
-        the caller must keep its visible-quote fallback. Nothing is ever matched by
-        body, template code, ``created_at``, recency or result order.
+        This is the FALLBACK path, for notes posted before the durable registry in
+        ``chatwoot_mirror_registry`` existed. New notes are resolved from that
+        registry in one indexed read and never reach this method.
 
-        A candidate counts only when ALL of these hold at once:
+        Trust model
+        -----------
+        The exact versioned marker carrying the exact wamid is accepted as
+        sufficient proof, and the scan stops at the page that proves it. A
+        candidate counts only when ALL of these hold at once:
 
         - it is listed by THIS conversation's messages endpoint, and its own
           ``conversation_id`` (when the payload carries one) is this conversation;
@@ -672,21 +734,46 @@ class ChatwootClient:
           exactly;
         - ``id`` is a positive integer.
 
-        Chatwoot serves only one page per request, so the walk pages backwards
-        with ``before=<oldest usable id of the previous page>``; the cursor must
-        strictly decrease. The walk ends when a page proves the end of the history
-        by coming back shorter than :data:`_MIRROR_NOTE_PAGE_SIZE` (an empty page
-        included), and only then is a single match trusted. Because the match must
-        be unique across the whole walked history, the lookup never returns early
-        on the first hit, dedupes by Chatwoot message id (so one row repeated
-        across overlapping pages stays one match) and refuses two distinct ids.
+        Nothing is ever matched by body, template code, ``created_at``, time
+        proximity or "the last message", and a page is never re-sorted.
 
-        The walk is bounded by :data:`_MIRROR_NOTE_MAX_PAGES`. It fails closed —
-        returning ``None`` even when exactly one match was already collected — when
-        that budget runs out before the end of history is proven, when a page
-        yields no usable cursor, when the cursor would not strictly decrease (a
-        repeated page), and on any page-level error. This lookup therefore proves
-        a target inside a bounded recent window, not across all history.
+        Uniqueness is checked over the pages actually walked, which is the region
+        this trust model is responsible for: two distinct proven ids seen before
+        the scan stops are refused. Uniqueness is NOT claimed globally — the scan
+        stops at its proof, so a duplicate marker further back is not looked for.
+        Global uniqueness for new notes comes from the registry's unique key on the
+        wamid instead.
+
+        Cost and bounds
+        ---------------
+        A note on the first page costs exactly one request, regardless of how much
+        older history the conversation has. Network cost scales with the distance
+        to the target, not with the length of the conversation. The walk is capped
+        by :data:`_MIRROR_NOTE_MAX_PAGES` pages AND by one overall wall-clock
+        deadline of :data:`_MIRROR_NOTE_TOTAL_DEADLINE_SEC` seconds covering every
+        page, with each request additionally capped by
+        :data:`_MIRROR_NOTE_PAGE_TIMEOUT_SEC`.
+
+        Pagination
+        ----------
+        Chatwoot returns each page in ascending chronological order, so the next
+        cursor is the id of ``page[0]`` — the chronological boundary — and never
+        ``min(id)``. The cursor must strictly decrease.
+
+        Known upstream limitation: Chatwoot filters the next page by ``id <
+        before`` while ordering by ``created_at``. When ids are not monotonic with
+        ``created_at`` (backdated or imported messages) no id cursor can express
+        that ordering, so this scan may not reach such a message. That defect is
+        not papered over here; it is the reason new notes use the durable registry.
+
+        Fail-closed
+        -----------
+        ``None`` — keep the caller's visible-quote fallback — for no match, for two
+        distinct matches inside the walked region, for an HTTP/transport error, a
+        malformed JSON body or an unrecognizable payload on any page, for a page
+        whose boundary yields no usable cursor, for a cursor that would not
+        strictly decrease (a replayed page), for the page budget running out, and
+        for the wall-clock deadline expiring.
 
         Read-only through the REST API; Chatwoot's database is never touched.
         """
@@ -698,9 +785,24 @@ class ChatwootClient:
         cursor: int | None = None
         pages = 0
         scanned = 0
+        deadline = _monotonic() + _MIRROR_NOTE_TOTAL_DEADLINE_SEC
 
         while True:
-            page = await self._conversation_messages_page(conversation_id, before=cursor)
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=deadline_exceeded pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+
+            page = await self._conversation_messages_page(
+                conversation_id,
+                before=cursor,
+                timeout=min(_MIRROR_NOTE_PAGE_TIMEOUT_SEC, remaining),
+            )
             if page is None:
                 return None
             pages += 1
@@ -714,13 +816,11 @@ class ChatwootClient:
                 if candidate is not None:
                     matches.add(candidate)
 
-            if len(page) < _MIRROR_NOTE_PAGE_SIZE:
-                # Short (or empty) page: the walked history is proven to end here.
-                break
-
-            if pages >= _MIRROR_NOTE_MAX_PAGES:
+            if len(matches) > 1:
+                # Two different Chatwoot messages claim the same wamid inside the
+                # region this scan is responsible for. Never pick one.
                 logger.debug(
-                    "chatwoot: mirror note not proven conversation_id=%s reason=page_budget_exhausted "
+                    "chatwoot: mirror note not proven conversation_id=%s reason=ambiguous_matches "
                     "pages=%s messages=%s match_count=%s",
                     conversation_id,
                     pages,
@@ -728,8 +828,34 @@ class ChatwootClient:
                     len(matches),
                 )
                 return None
+            if matches:
+                # Proof in hand. Stop here: reading older pages could only cost
+                # latency under a held lock, and a long history must not be able
+                # to veto a target that was already proven.
+                return next(iter(matches))
 
-            next_cursor = _oldest_message_id(page)
+            if len(page) < _MIRROR_NOTE_PAGE_SIZE:
+                # Short (or empty) page: the walked history is proven to end here
+                # and the note is not in it.
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=not_in_history pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+
+            if pages >= _MIRROR_NOTE_MAX_PAGES:
+                logger.debug(
+                    "chatwoot: mirror note not proven conversation_id=%s reason=page_budget_exhausted "
+                    "pages=%s messages=%s",
+                    conversation_id,
+                    pages,
+                    scanned,
+                )
+                return None
+
+            next_cursor = _page_boundary_message_id(page)
             if next_cursor is None:
                 logger.debug(
                     "chatwoot: mirror note not proven conversation_id=%s reason=no_pagination_cursor "
@@ -750,18 +876,6 @@ class ChatwootClient:
                 return None
             cursor = next_cursor
 
-        if len(matches) != 1:
-            logger.debug(
-                "chatwoot: mirror note not proven conversation_id=%s reason=match_count "
-                "pages=%s messages=%s match_count=%s",
-                conversation_id,
-                pages,
-                scanned,
-                len(matches),
-            )
-            return None
-        return next(iter(matches))
-
     async def mirror_outbound_as_note(
         self,
         phone_e164: str,
@@ -769,7 +883,7 @@ class ChatwootClient:
         *,
         contact_name: str | None = None,
         provider_message_id: str | None = None,
-    ) -> None:
+    ) -> MirroredNote | None:
         """Mirror an outbound message to Chatwoot as a private agent note.
 
         Pattern from irida_whisper/_send_private_note:
@@ -782,8 +896,13 @@ class ChatwootClient:
 
         ``provider_message_id`` is the exact Meta wamid of the message this note
         mirrors. When present it is written as the narrow versioned marker from
-        :func:`outbound_mirror_content_attributes`, which is the ONLY evidence a
-        later inbound reaction accepts for a native ``in_reply_to``.
+        :func:`outbound_mirror_content_attributes`.
+
+        Returns the :class:`MirroredNote` Chatwoot created, so the caller can
+        record a durable wamid → Message.id link; that link is what a later
+        inbound reaction resolves its native ``in_reply_to`` from. Returns ``None``
+        when the note could not be posted or Chatwoot gave no usable ids — there is
+        then nothing to record, and the reaction path keeps its visible quote.
 
         Never raises — best-effort.
         """
@@ -807,5 +926,11 @@ class ChatwootClient:
                 conversation_id,
                 phone_e164,
             )
+            message_id = _positive_chatwoot_id(msg_id)
+            resolved_conversation_id = _positive_chatwoot_id(conversation_id)
+            if message_id is None or resolved_conversation_id is None:
+                return None
+            return MirroredNote(conversation_id=resolved_conversation_id, message_id=message_id)
         except Exception:
             logger.exception("Chatwoot mirror failed (best-effort, ignored) phone=%s", phone_e164)
+            return None

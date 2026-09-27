@@ -11,7 +11,9 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from altegio_bot.chatwoot_client import ChatwootClient
+from altegio_bot.chatwoot_client import OUTBOUND_MIRROR_MESSAGE_KIND, ChatwootClient, MirroredNote
+from altegio_bot.chatwoot_mirror_registry import record_outbound_mirror
+from altegio_bot.db import SessionLocal
 from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.meta_cloud import MetaCloudProvider
 from altegio_bot.settings import settings
@@ -205,7 +207,7 @@ class ChatwootHybridProvider:
             return
 
         try:
-            await chatwoot.mirror_outbound_as_note(
+            mirrored = await chatwoot.mirror_outbound_as_note(
                 phone_e164,
                 content,
                 contact_name=contact_name,
@@ -219,6 +221,63 @@ class ChatwootHybridProvider:
         except Exception as exc:
             logger.warning(
                 "Chatwoot log failed company_id=%s inbox_id=%s error_type=%s",
+                company_id,
+                inbox_id,
+                type(exc).__name__,
+            )
+            return
+
+        await self._record_mirror_link(
+            mirrored,
+            provider_message_id=provider_message_id,
+            chatwoot_route=chatwoot_route,
+            inbox_id=inbox_id,
+            tenant_provider=tenant_provider,
+            company_id=company_id,
+        )
+
+    async def _record_mirror_link(
+        self,
+        mirrored: object,
+        *,
+        provider_message_id: str | None,
+        chatwoot_route: ChatwootRoute,
+        inbox_id: int | None,
+        tenant_provider: str | None,
+        company_id: int,
+    ) -> None:
+        """Record the durable wamid → Chatwoot Message.id link, best-effort.
+
+        This is what lets a later inbound reaction resolve its native reply target
+        in one indexed read instead of paging the conversation. It runs in its OWN
+        short transaction: the mirror is a background task that races the Outbox
+        row's own ``provider_message_id`` commit, so this write must not assume
+        that row exists yet and must never wait on it.
+
+        Deliberately silent on failure beyond a stable reason: the note itself was
+        already posted, and a missing link only costs the reaction its native
+        preview. A Chatwoot or database problem here must never turn a successful
+        Meta send into a failed one.
+        """
+        if not isinstance(mirrored, MirroredNote) or not provider_message_id:
+            return
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    await record_outbound_mirror(
+                        session,
+                        provider_message_id=provider_message_id,
+                        chatwoot_message_id=mirrored.message_id,
+                        chatwoot_conversation_id=mirrored.conversation_id,
+                        marker_version=OUTBOUND_MIRROR_MESSAGE_KIND,
+                        chatwoot_route=chatwoot_route.value,
+                        chatwoot_inbox_id=inbox_id,
+                        tenant_provider=tenant_provider,
+                        company_id=company_id,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Chatwoot mirror link not recorded company_id=%s inbox_id=%s error_type=%s",
                 company_id,
                 inbox_id,
                 type(exc).__name__,

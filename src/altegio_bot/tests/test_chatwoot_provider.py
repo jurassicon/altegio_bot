@@ -6,7 +6,11 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
+import altegio_bot.providers.chatwoot_hybrid as chatwoot_hybrid
+from altegio_bot.chatwoot_client import OUTBOUND_MIRROR_MESSAGE_KIND, MirroredNote
+from altegio_bot.models.models import ChatwootOutboundMirror
 from altegio_bot.providers.base import ChatwootRoute
 from altegio_bot.providers.chatwoot_hybrid import ChatwootHybridProvider
 
@@ -804,3 +808,215 @@ async def test_mirror_failure_still_keeps_a_successful_meta_send() -> None:
     assert msg_id.startswith("meta-")
     assert len(meta.sent) == 1
     assert cw.notes == []
+
+
+# ---------------------------------------------------------------------------
+# Durable WAMID → Chatwoot Message.id link
+# ---------------------------------------------------------------------------
+#
+# The side that CREATES the mirror note records what it created, so a later
+# inbound reaction resolves its native reply target in one indexed read instead
+# of paging the conversation. The write is best-effort and idempotent, and it
+# runs in its own short transaction because the mirror is a background task that
+# races the Outbox row's own provider_message_id commit.
+
+
+class _MirroringChatwootClient(_FakeChatwootClient):
+    """Fake client that answers like Chatwoot did create the note."""
+
+    def __init__(self, *, conversation_id: int = 77, message_id: int = 4242) -> None:
+        super().__init__()
+        self._mirrored = MirroredNote(conversation_id=conversation_id, message_id=message_id)
+
+    async def mirror_outbound_as_note(
+        self,
+        phone_e164: str,
+        text: str,
+        *,
+        contact_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> MirroredNote:
+        await super().mirror_outbound_as_note(
+            phone_e164,
+            text,
+            contact_name=contact_name,
+            provider_message_id=provider_message_id,
+        )
+        return self._mirrored
+
+
+async def _links(session_maker) -> list[ChatwootOutboundMirror]:
+    async with session_maker() as session:
+        result = await session.execute(select(ChatwootOutboundMirror).order_by(ChatwootOutboundMirror.id.asc()))
+        return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_send_records_the_durable_mirror_link(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+    meta = _FakeMetaProvider()
+    cw = _MirroringChatwootClient(conversation_id=77, message_id=4242)
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+    await provider.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 1
+    link = rows[0]
+    assert link.provider_message_id == msg_id
+    assert link.chatwoot_message_id == 4242
+    assert link.chatwoot_conversation_id == 77
+    assert link.marker_version == OUTBOUND_MIRROR_MESSAGE_KIND
+    assert link.chatwoot_route == "tenant"
+
+
+@pytest.mark.asyncio
+async def test_send_template_records_the_durable_mirror_link(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+    meta = _FakeMetaProvider()
+    cw = _MirroringChatwootClient(conversation_id=88, message_id=5151)
+    provider = ChatwootHybridProvider(primary=meta, chatwoot=cw)  # type: ignore[arg-type]
+
+    msg_id = await provider.send_template(
+        1,
+        "+49123456789",
+        "reminder_24h",
+        "de",
+        ["Anna"],
+        fallback_text="Ihr Termin morgen um 10:00",
+    )
+    await provider.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 1
+    assert rows[0].provider_message_id == msg_id
+    assert rows[0].chatwoot_message_id == 5151
+    assert rows[0].chatwoot_conversation_id == 88
+
+
+@pytest.mark.asyncio
+async def test_mirror_link_records_its_branch_routing_provenance(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provenance is stored for ops; the conversation remains the isolation gate."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+    monkeypatch.setattr("altegio_bot.providers.chatwoot_hybrid.settings.chatwoot_inbox_company_map", _THREE_BRANCH_MAP)
+    meta = _FakeMetaProvider()
+
+    created: dict[int, _MirroringChatwootClient] = {}
+
+    def _factory(inbox_id: int) -> _MirroringChatwootClient:
+        client = _MirroringChatwootClient(conversation_id=1000 + inbox_id, message_id=2000 + inbox_id)
+        created[inbox_id] = client
+        return client
+
+    provider = ChatwootHybridProvider(
+        primary=meta,
+        chatwoot=_FakeChatwootClient(),  # type: ignore[arg-type]
+        chatwoot_factory=_factory,  # type: ignore[arg-type]
+    )
+
+    msg_id = await provider.send(
+        1,
+        "+49123000000",
+        "DU",
+        tenant_provider="easyweek",
+        company_id=900001,
+    )
+    await provider.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 1
+    link = rows[0]
+    assert link.provider_message_id == msg_id
+    assert link.chatwoot_conversation_id == 1101
+    assert link.chatwoot_message_id == 2101
+    assert link.chatwoot_inbox_id == 101
+    assert link.tenant_provider == "easyweek"
+    assert link.company_id == 900001
+    assert link.chatwoot_route == "tenant"
+
+
+@pytest.mark.asyncio
+async def test_mirror_link_write_is_idempotent_on_the_wamid(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed mirror keeps the first recorded ids and raises nothing."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+
+    class _FixedWamidMeta(_FakeMetaProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            self.sent.append((sender_id, phone_e164, text, contact_name))
+            return "wamid.REPLAYED"
+
+    provider = ChatwootHybridProvider(
+        primary=_FixedWamidMeta(),  # type: ignore[arg-type]
+        chatwoot=_MirroringChatwootClient(conversation_id=77, message_id=4242),  # type: ignore[arg-type]
+    )
+    await provider.send(1, "+49123456789", "first")
+    await provider.aclose()
+
+    second = ChatwootHybridProvider(
+        primary=_FixedWamidMeta(),  # type: ignore[arg-type]
+        # A different Chatwoot message for the same wamid must not overwrite.
+        chatwoot=_MirroringChatwootClient(conversation_id=99, message_id=9999),  # type: ignore[arg-type]
+    )
+    await second.send(1, "+49123456789", "replay")
+    await second.aclose()
+
+    rows = await _links(session_maker)
+    assert len(rows) == 1
+    assert rows[0].chatwoot_message_id == 4242
+    assert rows[0].chatwoot_conversation_id == 77
+
+
+@pytest.mark.asyncio
+async def test_no_link_is_recorded_when_chatwoot_returns_no_ids(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror that produced no usable ids leaves nothing to trust later."""
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", session_maker)
+    cw = _FakeChatwootClient()  # returns None, like a failed or legacy post
+    provider = ChatwootHybridProvider(primary=_FakeMetaProvider(), chatwoot=cw)  # type: ignore[arg-type]
+
+    await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+    await provider.aclose()
+
+    assert cw.notes  # the note itself was posted
+    assert await _links(session_maker) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_link_write_never_fails_the_send(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    """The link is a convenience; the Meta send result is the contract."""
+
+    def _broken_session_local():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(chatwoot_hybrid, "SessionLocal", _broken_session_local)
+    meta = _FakeMetaProvider()
+    provider = ChatwootHybridProvider(
+        primary=meta,
+        chatwoot=_MirroringChatwootClient(),  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level("WARNING", logger="altegio_bot.providers.chatwoot_hybrid"):
+        msg_id = await provider.send(1, "+49123456789", "Ihr Termin morgen um 10:00")
+        await provider.aclose()
+
+    assert msg_id.startswith("meta-")
+    assert len(meta.sent) == 1
+    assert await _links(session_maker) == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("mirror link not recorded" in message for message in messages)
+    # Stable reason only: no phone, no text, no Chatwoot ids in the warning.
+    assert not any("+49123456789" in message for message in messages)
+    assert not any("Ihr Termin" in message for message in messages)
