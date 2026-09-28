@@ -159,8 +159,13 @@ def customers_page(
     }
 
 
-def template_payload(*, services: int = 42, all_services: int = 42, **changes: Any) -> dict[str, Any]:
-    """The voucher template as the 42/42 baseline expects to read it."""
+def template_payload(*, services: int = 43, all_services: int = 43, **changes: Any) -> dict[str, Any]:
+    """The voucher template as the §41 BATCH baseline expects to read it.
+
+    43/43, the owner-approved live catalogue of 27.09.2026 that
+    ``BATCH_BASELINE_VERSION`` pins. The historical §37.2 manual canary keeps its
+    own 42/42 baseline and its own fixtures; this one is the batch's.
+    """
     payload: dict[str, Any] = {
         "uuid": EASYWEEK_VOUCHER_TEMPLATE_UUID,
         "is_enabled": True,
