@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import signal
@@ -8,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Final, Sequence
 
 from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -1740,6 +1741,74 @@ async def _apply_voucher_batch_status(session: AsyncSession, provider_message_id
     return result.reason != voucher_batch_ledger.RECORD_MISSING_ROW
 
 
+async def _apply_voucher_production_status(session: AsyncSession, provider_message_id: str, kind: str) -> bool:
+    """Record a delivered/read callback for the §42 production voucher mailing.
+
+    The same contract as its three siblings and for the same reason: a
+    production slot has no ``OutboxMessage`` either, so a callback naming its
+    message id would otherwise fall through to a lookup that finds nothing and
+    be dropped.
+
+    Deliberately NOT behind the §42 fence. ``delivered`` and ``read`` are facts
+    about messages that have already been sent; dropping them because an
+    operator has since closed the fence would silently corrupt the record of a
+    mailing that really happened — and the fence exists to stop NEW effects, not
+    to stop the truth arriving about old ones.
+
+    The provider message id is unique table-wide across every mailing this
+    phase has run, so this resolves to exactly one slot of exactly one batch.
+
+    Returns whether this callback belonged to that phase. It runs inside the
+    caller's session and transaction; a callback for any other message returns
+    ``False`` immediately and falls through to the ordinary path.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as voucher_production_ledger
+
+    result = await voucher_production_ledger.apply_webhook_transition(
+        session,
+        provider_message_id=provider_message_id,
+        status=kind,
+    )
+    if result.applied:
+        logger.info("status_webhook: voucher production mailing advanced to %s", kind)
+        return True
+    # A refused write is either "not ours" — fall through — or "ours, and
+    # already at or past this status", which is handled and done.
+    return result.reason != voucher_production_ledger.RECORD_MISSING_ROW
+
+
+# The salt for the status-webhook diagnostic handle below. Domain-separated so
+# the same identifier logged by some future call site cannot be correlated with
+# these lines by digest alone.
+_MESSAGE_ID_LOG_DOMAIN: Final = "altegio_bot/whatsapp/status_webhook/provider_message_id/v1"
+
+
+def _message_id_fingerprint(provider_message_id: object) -> str:
+    """A short, stable, one-way handle for one provider message id.
+
+    A Meta message id is not an opaque token. Its base64 payload commonly
+    encodes the recipient's phone number, so writing one to a log writes a
+    customer's number to a log — which is why §42.8 keeps raw Meta IDs out of
+    logs, JSON, exceptions and fixtures altogether.
+
+    What the diagnostic line below actually needs is narrower than the value: an
+    operator has to be able to tell two callbacks about the SAME message from
+    two about different ones, and to match a line against a later report. A
+    stable digest does exactly that and carries nothing back. Truncated to
+    twelve hex characters for the same reason the §35 markers are — long enough
+    that two live identifiers will not collide, short enough to read.
+
+    ``absent`` rather than a digest of the empty string when there is no id at
+    all: a callback that arrived without one is a different fact from one whose
+    id happens to hash to something, and an operator should see which.
+    """
+    text = str(provider_message_id or "")
+    if not text:
+        return "absent"
+    digest = hashlib.sha256(f"{_MESSAGE_ID_LOG_DOMAIN}:{text}".encode("utf-8")).hexdigest()
+    return f"fp:{digest[:12]}"
+
+
 async def _handle_delivery_statuses(
     session: AsyncSession,
     event: WhatsAppEvent | None,
@@ -1767,16 +1836,38 @@ async def _handle_delivery_statuses(
             continue
 
         # And the §41 snapshot batch, whose slots own their message ids the same
-        # way. Asked third, on the same terms: the three ledgers are separate
+        # way. Asked third, on the same terms: the four ledgers are separate
         # tables and one message id belongs to at most one of them.
         if kind in {"delivered", "read"} and await _apply_voucher_batch_status(session, provider_message_id, kind):
             continue
 
+        # And the §42 production mailing, asked fourth on the same terms. This
+        # is the only place a production slot's delivered/read can ever be
+        # observed, and it keeps working with the §42 fence shut: a status
+        # about a message already sent is not a new effect to fence off.
+        if kind in {"delivered", "read"} and await _apply_voucher_production_status(session, provider_message_id, kind):
+            continue
+
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
         if outbox is None:
+            # Reached by every callback kind that nothing above claimed, which is
+            # the reason this line is redacted rather than routed away from.
+            #
+            # The four hooks above only run for `delivered` and `read`, so a
+            # `sent` or `failed` callback for a voucher slot arrives here by
+            # design — and so does a callback whose id no ledger has yet, which
+            # is ordinary: Meta can deliver `sent` while the commit that records
+            # the id is still in flight. Asking "does anybody own this id?" is
+            # therefore not enough to keep the value out of the log, because for
+            # an early or unknown callback the honest answer is "not yet" and the
+            # line still gets written.
+            #
+            # So nothing here depends on ownership: the id is never logged raw,
+            # whatever kind it is and whoever it turns out to belong to. Only the
+            # kind and a one-way handle are recorded.
             logger.info(
-                "status_webhook: no OutboxMessage matched provider_message_id=%s status=%s",
-                provider_message_id,
+                "status_webhook: no OutboxMessage matched provider_message=%s status=%s",
+                _message_id_fingerprint(provider_message_id),
                 kind,
             )
             continue

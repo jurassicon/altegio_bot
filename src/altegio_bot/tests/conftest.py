@@ -163,7 +163,8 @@ async def session_maker(
 
 
 # ---------------------------------------------------------------------------
-# §36 voucher delivery canary, §37.2 manual canary, §41 snapshot batch
+# §36 voucher delivery canary, §37.2 manual canary, §41 snapshot batch,
+# §42 production mailing
 # ---------------------------------------------------------------------------
 # Re-exported here so the delivery suites can request them by name without each
 # module importing them and shadowing the import with its own parameter.
@@ -176,4 +177,7 @@ from altegio_bot.tests.easyweek_voucher_batch_fixtures import (  # noqa: E402,F4
 from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: E402,F401
     binding_key,
     configuration,
+)
+from altegio_bot.tests.easyweek_voucher_production_fixtures import (  # noqa: E402,F401
+    production_configuration,
 )

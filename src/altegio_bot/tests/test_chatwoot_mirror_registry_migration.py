@@ -205,12 +205,21 @@ def _insert_sql(**overrides: object) -> tuple[str, dict]:
 
 
 def test_exactly_one_alembic_head() -> None:
-    """One head — two would mean two lineages and a deploy that cannot upgrade."""
+    """One head — two would mean two lineages and a deploy that cannot upgrade.
+
+    The single-head property is the invariant worth pinning. WHICH revision is
+    the head is not: every later phase adds a child, so an assertion that this
+    revision is still the tip would go red on the next PR and say nothing about
+    this one. What matters here is that these two revisions are still in the
+    chain and still in the right order, which the tests below check directly.
+    """
     script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
     heads = script.get_heads()
 
     assert len(heads) == 1, f"expected exactly one Alembic head, got {heads}"
-    assert heads[0] == SCOPE_REVISION
+    revisions = {revision.revision for revision in script.walk_revisions()}
+    assert MIRROR_REVISION in revisions
+    assert SCOPE_REVISION in revisions
 
 
 def test_the_registry_revision_is_a_direct_child_of_the_previous_head() -> None:

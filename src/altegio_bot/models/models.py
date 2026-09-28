@@ -3772,6 +3772,640 @@ class EasyWeekVoucherSnapshotBatchAttempt(Base):
 
 
 # ---------------------------------------------------------------------------
+# §42: production manual-snapshot voucher MAILING (PR-19)
+# ---------------------------------------------------------------------------
+# §41 proved the whole irreversible sequence — issue, pay, deliver, observe —
+# for a bounded handful of manually selected people, in production, on
+# 28.09.2026. This phase is the working mode: a real operator-curated list, of
+# whatever size that list honestly is, mailed one confirmed stage at a time.
+#
+# What changes from §41, and what deliberately does not
+# -----------------------------------------------------
+# §41 is a SINGLETON by construction: its scope is pinned to one literal, so
+# its table physically holds one row. That was the right shape for a controlled
+# experiment and it is the wrong shape for the working mode, which has to run
+# again next month. So this phase gets its own three tables and its own
+# identity, and §41's tables — rows, constraints and historical HMAC bindings
+# alike — are left exactly as they are.
+#
+# What does NOT change is every safety property that made §41 trustworthy: the
+# claim is committed before the request leaves, a stage cannot be climbed out of
+# order, a delivery has one lifetime attempt, a refund is pre-send only, and one
+# person gets one voucher per campaign period.
+#
+# The size is the operator's, and the schema makes them say it
+# ------------------------------------------------------------
+# §41's ceiling was five recipients and €75, as literals. Carrying that into
+# production would be wrong, and replacing it with an invented number — ten,
+# fifty, a hundred — would be no better: it would be this schema deciding how
+# many real customers a real campaign may have.
+#
+# So there is no ceiling here. What there is instead is an ARITHMETIC IDENTITY
+# the operator has to state up front and the database then refuses to let drift:
+# the count they approved must equal the count that was frozen, and the money
+# they approved must equal the product of that count and €15. A batch whose
+# approved numbers do not describe its own composition is not a batch this
+# schema can store.
+VOUCHER_PRODUCTION_SCOPE = "easyweek_voucher_production_mailing_v1"
+VOUCHER_PRODUCTION_SCHEMA_VERSION = "1"
+
+# €15 per recipient, exactly. Not a default and not a maximum: the one value a
+# slot of this phase is allowed to be worth.
+VOUCHER_PRODUCTION_UNIT_PRICE_MINOR = 1500
+
+# The one branch, the one campaign and the one basis this phase may ever name.
+VOUCHER_PRODUCTION_COMPANY_ID = 322579
+VOUCHER_PRODUCTION_CAMPAIGN_CODE = "new_clients_monthly"
+
+# -- the batch header's own lifecycle ---------------------------------------
+VOUCHER_PRODUCTION_FROZEN = "frozen"
+VOUCHER_PRODUCTION_IN_PROGRESS = "in_progress"
+VOUCHER_PRODUCTION_HALTED = "halted"
+VOUCHER_PRODUCTION_COMPLETED = "completed"
+
+VOUCHER_PRODUCTION_STATUSES = (
+    VOUCHER_PRODUCTION_FROZEN,
+    VOUCHER_PRODUCTION_IN_PROGRESS,
+    VOUCHER_PRODUCTION_HALTED,
+    VOUCHER_PRODUCTION_COMPLETED,
+)
+
+_VOUCHER_PRODUCTION_STATUS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_PRODUCTION_STATUSES)
+
+# -- one item's ladder -------------------------------------------------------
+# The same vocabulary as §§36, 37.2 and 41, and repeated rather than imported
+# for the same reason: these are durable strings in a database, and a future
+# edit to one phase's states must not silently redefine another's.
+VOUCHER_PRODUCTION_ITEM_PLANNED = "planned"
+VOUCHER_PRODUCTION_ITEM_CREATE_CLAIMED = "create_claimed"
+VOUCHER_PRODUCTION_ITEM_CREATE_UNKNOWN = "create_unknown"
+VOUCHER_PRODUCTION_ITEM_CREATE_REJECTED = "create_rejected"
+VOUCHER_PRODUCTION_ITEM_CREATED = "created"
+VOUCHER_PRODUCTION_ITEM_PAY_CLAIMED = "pay_claimed"
+VOUCHER_PRODUCTION_ITEM_PAY_UNKNOWN = "pay_unknown"
+VOUCHER_PRODUCTION_ITEM_PAY_REJECTED = "pay_rejected"
+VOUCHER_PRODUCTION_ITEM_PAID = "paid"
+VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED = "send_claimed"
+VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN = "send_unknown"
+VOUCHER_PRODUCTION_ITEM_SEND_REJECTED = "send_rejected"
+VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED = "provider_accepted"
+VOUCHER_PRODUCTION_ITEM_DELIVERED = "delivered"
+VOUCHER_PRODUCTION_ITEM_READ = "read"
+VOUCHER_PRODUCTION_ITEM_REFUND_CLAIMED = "refund_claimed"
+VOUCHER_PRODUCTION_ITEM_REFUND_UNKNOWN = "refund_unknown"
+VOUCHER_PRODUCTION_ITEM_REFUND_REJECTED = "refund_rejected"
+VOUCHER_PRODUCTION_ITEM_REFUNDED = "refunded"
+VOUCHER_PRODUCTION_ITEM_MANUALLY_CLEANED = "manually_cleaned"
+VOUCHER_PRODUCTION_ITEM_AMBIGUOUS = "ambiguous"
+
+VOUCHER_PRODUCTION_ITEM_STATUSES = (
+    VOUCHER_PRODUCTION_ITEM_PLANNED,
+    VOUCHER_PRODUCTION_ITEM_CREATE_CLAIMED,
+    VOUCHER_PRODUCTION_ITEM_CREATE_UNKNOWN,
+    VOUCHER_PRODUCTION_ITEM_CREATE_REJECTED,
+    VOUCHER_PRODUCTION_ITEM_CREATED,
+    VOUCHER_PRODUCTION_ITEM_PAY_CLAIMED,
+    VOUCHER_PRODUCTION_ITEM_PAY_UNKNOWN,
+    VOUCHER_PRODUCTION_ITEM_PAY_REJECTED,
+    VOUCHER_PRODUCTION_ITEM_PAID,
+    VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED,
+    VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN,
+    VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
+    VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
+    VOUCHER_PRODUCTION_ITEM_DELIVERED,
+    VOUCHER_PRODUCTION_ITEM_READ,
+    VOUCHER_PRODUCTION_ITEM_REFUND_CLAIMED,
+    VOUCHER_PRODUCTION_ITEM_REFUND_UNKNOWN,
+    VOUCHER_PRODUCTION_ITEM_REFUND_REJECTED,
+    VOUCHER_PRODUCTION_ITEM_REFUNDED,
+    VOUCHER_PRODUCTION_ITEM_MANUALLY_CLEANED,
+    VOUCHER_PRODUCTION_ITEM_AMBIGUOUS,
+)
+
+_VOUCHER_PRODUCTION_ITEM_STATUS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_PRODUCTION_ITEM_STATUSES)
+
+
+class EasyWeekVoucherProductionBatch(Base):
+    """One frozen production mailing batch (§42).
+
+    Many batches, each addressed by its own id
+    ------------------------------------------
+    Unlike §41 this table holds more than one row, and that is the whole point
+    of the phase: the working mode has to run again next month. What replaces
+    §41's singleton constraint is a durable per-batch identity — the primary key
+    — plus one rule that keeps the batches from overlapping: ``campaign_run_id``
+    is UNIQUE, so one preview can be frozen into at most one batch, ever. There
+    is no "the current batch" and no "the latest batch"; every stage after the
+    freeze names the id it means.
+
+    The approved numbers are checked against the composition, by the database
+    ----------------------------------------------------------------------------
+    Four columns and three CHECKs carry §42.5 in full:
+
+    * ``approved_recipient_count`` is what the operator typed, and it must equal
+      ``recipient_count``, which is what the freeze actually counted;
+    * ``approved_exposure_minor`` is the money they approved, and it must equal
+      ``total_exposure_minor``;
+    * ``total_exposure_minor`` must itself equal
+      ``voucher_unit_price_minor * recipient_count``, with the unit price pinned
+      to €15.
+
+    Storing the approved values rather than merely validating them is the point.
+    A batch that has been frozen carries, forever, the two numbers a human
+    agreed to — and the constraints mean those numbers cannot describe anything
+    other than the batch's own composition.
+
+    There is deliberately no upper bound on ``recipient_count``. §41's ceiling
+    of five was right for an experiment; inventing a replacement ceiling here
+    would be this table deciding how many real customers a real campaign may
+    have. What is bounded is not the size but the operator's ignorance of it:
+    they cannot freeze a batch without stating its size and its cost correctly.
+
+    What is NOT here
+    ----------------
+    No phone, no name, no customer-facing text and no voucher code. The frozen
+    digest is a hash over the composition, so an operator can prove the batch
+    they approved is the batch that ran without the header carrying any of the
+    identities it is about.
+    """
+
+    __tablename__ = "easyweek_voucher_production_batches"
+
+    __table_args__ = (
+        # 1. One production batch per preview, ever. This is what replaces
+        # §41's singleton scope: batches are plural, previews are not reusable.
+        UniqueConstraint("campaign_run_id", name="uq_ew_voucher_production_batch_run"),
+        # 2. The FK target items use to prove their slot is inside this batch's
+        # own declared size. Redundant next to the primary key, and load
+        # bearing: without it the composite foreign key on items cannot exist.
+        UniqueConstraint("id", "recipient_count", name="uq_ew_voucher_production_batch_id_count"),
+        # 3. The preview this batch was frozen from, under the same provider.
+        ForeignKeyConstraint(
+            ["campaign_run_id", "provider"],
+            ["campaign_runs.id", "campaign_runs.provider"],
+            name="fk_ew_voucher_production_batch_run_provider",
+            ondelete="RESTRICT",
+        ),
+        # 4-8. The topology the owner approved, as literals rather than as
+        # configuration a misconfigured environment could point elsewhere.
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_batch_provider"),
+        CheckConstraint(
+            f"batch_scope = '{VOUCHER_PRODUCTION_SCOPE}'",
+            name="ck_ew_voucher_production_batch_scope",
+        ),
+        CheckConstraint(
+            f"company_id = {VOUCHER_PRODUCTION_COMPANY_ID}",
+            name="ck_ew_voucher_production_batch_company",
+        ),
+        CheckConstraint(
+            f"campaign_code = '{VOUCHER_PRODUCTION_CAMPAIGN_CODE}'",
+            name="ck_ew_voucher_production_batch_campaign",
+        ),
+        CheckConstraint(
+            f"recipient_basis = '{RECIPIENT_BASIS_MANUAL}'",
+            name="ck_ew_voucher_production_batch_basis",
+        ),
+        # 9. At least one recipient. An empty batch is not a small batch: there
+        # is nothing to approve. Deliberately no upper bound — see the docstring.
+        CheckConstraint("recipient_count >= 1", name="ck_ew_voucher_production_batch_recipient_count"),
+        # 10-13. §42.5, as arithmetic the database will not let drift: €15 each,
+        # a total that is exactly the product, and the two numbers the operator
+        # approved equal to the two the freeze computed.
+        CheckConstraint(
+            f"voucher_unit_price_minor = {VOUCHER_PRODUCTION_UNIT_PRICE_MINOR}",
+            name="ck_ew_voucher_production_batch_unit_price",
+        ),
+        CheckConstraint(
+            "total_exposure_minor = voucher_unit_price_minor * recipient_count",
+            name="ck_ew_voucher_production_batch_exposure_matches",
+        ),
+        CheckConstraint(
+            "approved_recipient_count = recipient_count",
+            name="ck_ew_voucher_production_batch_count_approved",
+        ),
+        CheckConstraint(
+            "approved_exposure_minor = total_exposure_minor",
+            name="ck_ew_voucher_production_batch_exposure_approved",
+        ),
+        # 14. A campaign period is an interval; an entitlement key built on a
+        # backwards one would be meaningless.
+        CheckConstraint(
+            "campaign_period_start < campaign_period_end",
+            name="ck_ew_voucher_production_batch_period_order",
+        ),
+        # 15. A closed status vocabulary. An unknown string is not a state.
+        CheckConstraint(
+            f"status IN ({_VOUCHER_PRODUCTION_STATUS_SQL})",
+            name="ck_ew_voucher_production_batch_status",
+        ),
+        # 16. A halt must say why, and only a halt may.
+        CheckConstraint(
+            f"(status = '{VOUCHER_PRODUCTION_HALTED}') = (halted_reason_code IS NOT NULL)",
+            name="ck_ew_voucher_production_batch_halt_has_reason",
+        ),
+        Index("ix_ew_voucher_production_batch_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- identity ----------------------------------------------------------
+    batch_scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    baseline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    recipient_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # The exact completed preview this composition was frozen from.
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    campaign_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- the frozen EasyWeek identity this batch may act on -----------------
+    location_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    staffer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    payment_account_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    voucher_template_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+
+    # -- the frozen composition --------------------------------------------
+    frozen_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    voucher_unit_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- what the operator explicitly approved, kept for the record ---------
+    # Not validation leftovers. These are the two numbers a human agreed to
+    # before any money moved, and the CHECKs above mean they cannot describe
+    # anything other than this batch's own composition.
+    approved_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- state -------------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    halted_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # -- operator authorisation provenance ---------------------------------
+    freeze_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    halted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Shape facts, proof labels and reason codes. Never a value, never a body.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekVoucherProductionBatchItem(Base):
+    """One slot of a production batch: one person, one €15 voucher, one message.
+
+    Its slot cannot escape its batch
+    --------------------------------
+    ``batch_recipient_count`` is not a convenience copy. It is half of a
+    composite foreign key into ``(id, recipient_count)`` of the header, so the
+    database itself knows what this batch's declared size is, and a CHECK then
+    requires ``1 <= slot <= batch_recipient_count``. Together with the
+    uniqueness of ``(batch_id, slot)`` that makes an out-of-range slot
+    unrepresentable rather than merely refused.
+
+    Slot numbers are per batch, deliberately. Two independent batches both
+    holding a slot 1 is normal and correct: a slot is a position inside one
+    frozen composition, never a global identifier, which is why nothing in this
+    phase may look an item up by slot alone.
+
+    One person, once
+    ----------------
+    Three separate uniqueness rules, for three different mistakes:
+
+    * ``(batch_id, campaign_recipient_id)`` — the same preview row twice;
+    * ``(batch_id, easyweek_customer_uuid)`` — two preview rows, one human;
+    * the entitlement key — provider, company, campaign, customer and both
+      period bounds — which is TABLE-WIDE, so a second batch built from a
+      different preview cannot hand the same person a second €15 for the same
+      wave. This is the constraint that makes "one voucher per client per
+      campaign period" true across batches rather than only inside one, and it
+      is enforced by PostgreSQL rather than by a check somebody could forget.
+
+    Nothing here is the voucher
+    ---------------------------
+    The code is a bearer secret and is never a column: what is stored is a keyed
+    MAC bound to this row and this order, plus the id of the key that made it.
+    """
+
+    __tablename__ = "easyweek_voucher_production_batch_items"
+
+    __table_args__ = (
+        # 1. The slot belongs to this batch and to this batch's declared size.
+        ForeignKeyConstraint(
+            ["batch_id", "batch_recipient_count"],
+            [
+                "easyweek_voucher_production_batches.id",
+                "easyweek_voucher_production_batches.recipient_count",
+            ],
+            name="fk_ew_voucher_production_item_batch_size",
+            ondelete="RESTRICT",
+        ),
+        # 2. 1 <= slot <= the batch's own declared size. No global ceiling.
+        CheckConstraint(
+            "slot >= 1 AND slot <= batch_recipient_count AND batch_recipient_count >= 1",
+            name="ck_ew_voucher_production_item_slot_range",
+        ),
+        # 3-5. Three uniqueness rules for three different mistakes, all of them
+        # scoped to ONE batch: slot numbers repeat across batches by design.
+        UniqueConstraint("batch_id", "slot", name="uq_ew_voucher_production_item_slot"),
+        UniqueConstraint("batch_id", "campaign_recipient_id", name="uq_ew_voucher_production_item_recipient"),
+        UniqueConstraint("batch_id", "easyweek_customer_uuid", name="uq_ew_voucher_production_item_customer"),
+        # 6. One voucher per person per campaign period, TABLE-WIDE. The rule
+        # that survives a second preview and a second batch.
+        UniqueConstraint(
+            "provider",
+            "company_id",
+            "campaign_code",
+            "easyweek_customer_uuid",
+            "campaign_period_start",
+            "campaign_period_end",
+            name="uq_ew_voucher_production_item_entitlement",
+        ),
+        # 7-10. A result may belong to exactly one slot, table-wide.
+        UniqueConstraint("reconciliation_marker", name="uq_ew_voucher_production_item_marker"),
+        UniqueConstraint("target_order_uuid", name="uq_ew_voucher_production_item_target_order"),
+        UniqueConstraint("outbound_intent_uuid", name="uq_ew_voucher_production_item_intent"),
+        UniqueConstraint("provider_message_id", name="uq_ew_voucher_production_item_provider_message"),
+        # 11. The recipient and the run must belong together, under the same
+        # provider. Composite FKs, because two separate ones would each be
+        # satisfied by rows that have nothing to do with each other.
+        ForeignKeyConstraint(
+            ["campaign_recipient_id", "provider"],
+            ["campaign_recipients.id", "campaign_recipients.provider"],
+            name="fk_ew_voucher_production_item_recipient_provider",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["campaign_run_id", "provider"],
+            ["campaign_runs.id", "campaign_runs.provider"],
+            name="fk_ew_voucher_production_item_run_provider",
+            ondelete="RESTRICT",
+        ),
+        # 12-16. The approved topology and a closed status vocabulary.
+        CheckConstraint(
+            f"status IN ({_VOUCHER_PRODUCTION_ITEM_STATUS_SQL})",
+            name="ck_ew_voucher_production_item_status",
+        ),
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_item_provider"),
+        CheckConstraint(
+            f"company_id = {VOUCHER_PRODUCTION_COMPANY_ID}",
+            name="ck_ew_voucher_production_item_company",
+        ),
+        CheckConstraint(
+            f"campaign_code = '{VOUCHER_PRODUCTION_CAMPAIGN_CODE}'",
+            name="ck_ew_voucher_production_item_campaign",
+        ),
+        CheckConstraint(
+            f"recipient_basis = '{RECIPIENT_BASIS_MANUAL}'",
+            name="ck_ew_voucher_production_item_basis",
+        ),
+        # 17. Exactly one voucher of exactly €15. Not a default and not a
+        # maximum: the two numbers this slot is allowed to be worth.
+        CheckConstraint(
+            f"voucher_value_minor = {VOUCHER_PRODUCTION_UNIT_PRICE_MINOR} AND voucher_quantity = 1",
+            name="ck_ew_voucher_production_item_exact_voucher",
+        ),
+        CheckConstraint(
+            "campaign_period_start < campaign_period_end",
+            name="ck_ew_voucher_production_item_period_order",
+        ),
+        # 18. Stage order. A stage cannot be attempted before it was claimed,
+        # nor verified before it was attempted.
+        CheckConstraint(
+            "(create_attempted_at IS NULL OR create_claimed_at IS NOT NULL) "
+            "AND (create_verified_at IS NULL OR create_attempted_at IS NOT NULL) "
+            "AND (pay_attempted_at IS NULL OR pay_claimed_at IS NOT NULL) "
+            "AND (pay_verified_at IS NULL OR pay_attempted_at IS NOT NULL) "
+            "AND (send_attempted_at IS NULL OR send_claimed_at IS NOT NULL) "
+            "AND (refund_attempted_at IS NULL OR refund_claimed_at IS NOT NULL) "
+            "AND (refund_verified_at IS NULL OR refund_attempted_at IS NOT NULL)",
+            name="ck_ew_voucher_production_item_stage_order",
+        ),
+        # 19. Money cannot move before the order it pays for was proven to exist.
+        CheckConstraint(
+            "pay_claimed_at IS NULL OR (create_verified_at IS NOT NULL AND target_order_uuid IS NOT NULL)",
+            name="ck_ew_voucher_production_item_pay_needs_created",
+        ),
+        # 20. Nothing may be sent before the voucher is proven paid for, bound
+        # to this row by MAC, and proven still deliverable by a guard taken
+        # AFTER the payment. A guard from before the payment says nothing.
+        CheckConstraint(
+            "send_claimed_at IS NULL OR ("
+            "pay_verified_at IS NOT NULL "
+            "AND voucher_code_hmac IS NOT NULL "
+            "AND hmac_key_id IS NOT NULL "
+            "AND live_guard_reproven_at IS NOT NULL "
+            "AND live_guard_reproven_at >= pay_verified_at)",
+            name="ck_ew_voucher_production_item_send_needs_paid",
+        ),
+        # 21-23. Acceptance needs both the attempt and Meta's identifier; the
+        # webhook ladder may not be climbed out of order. This is what makes
+        # "completed is not read" a fact about the schema and not a caveat in a
+        # report.
+        CheckConstraint(
+            "provider_accepted_at IS NULL OR (send_attempted_at IS NOT NULL AND provider_message_id IS NOT NULL)",
+            name="ck_ew_voucher_production_item_accepted_needs_attempt",
+        ),
+        CheckConstraint(
+            "delivered_at IS NULL OR provider_accepted_at IS NOT NULL",
+            name="ck_ew_voucher_production_item_delivered_needs_accepted",
+        ),
+        CheckConstraint(
+            "read_at IS NULL OR delivered_at IS NOT NULL",
+            name="ck_ew_voucher_production_item_read_needs_delivered",
+        ),
+        # 24-25. A refund is only ever the pre-send escape hatch.
+        CheckConstraint(
+            "refund_claimed_at IS NULL OR ("
+            "provider_accepted_at IS NULL "
+            "AND delivered_at IS NULL "
+            "AND read_at IS NULL "
+            "AND send_claimed_at IS NULL "
+            "AND send_attempted_at IS NULL)",
+            name="ck_ew_voucher_production_item_refund_is_pre_send",
+        ),
+        CheckConstraint(
+            f"status <> '{VOUCHER_PRODUCTION_ITEM_REFUNDED}' OR ("
+            "provider_accepted_at IS NULL AND delivered_at IS NULL AND read_at IS NULL)",
+            name="ck_ew_voucher_production_item_refunded_never_sent",
+        ),
+        # 26-27. At most one delivery attempt in the lifetime of this slot. Not
+        # a retry budget: a counter that can only be zero or one.
+        CheckConstraint(
+            "send_attempt_count >= 0 AND send_attempt_count <= 1",
+            name="ck_ew_voucher_production_item_single_attempt",
+        ),
+        CheckConstraint(
+            "(send_attempt_count = 0) = (send_attempted_at IS NULL)",
+            name="ck_ew_voucher_production_item_attempt_count_matches",
+        ),
+        # 28. A MAC without the key that made it cannot be verified later.
+        CheckConstraint(
+            "(voucher_code_hmac IS NULL) = (hmac_key_id IS NULL)",
+            name="ck_ew_voucher_production_item_hmac_pair",
+        ),
+        Index("ix_ew_voucher_production_item_batch", "batch_id"),
+        Index("ix_ew_voucher_production_item_status", "status"),
+        Index("ix_ew_voucher_production_item_run", "campaign_run_id"),
+        Index("ix_ew_voucher_production_item_recipient", "campaign_recipient_id"),
+        # The header settle reads its items by (batch, status) and the stage
+        # walk reads them by (batch, slot). Both are per batch, which is what
+        # keeps a batch of fifty from costing fifty full-table reads.
+        Index("ix_ew_voucher_production_item_batch_status", "batch_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- membership --------------------------------------------------------
+    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # The batch's declared size, carried here so the foreign key above can
+    # anchor this slot to it. Never edited independently: the composite FK makes
+    # a disagreement unrepresentable.
+    batch_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    slot: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- identity ----------------------------------------------------------
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    recipient_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    campaign_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- the exact sale this slot authorises -------------------------------
+    voucher_value_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    voucher_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Recomputable, non-personal, and findable in the EasyWeek dashboard.
+    reconciliation_marker: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- results -----------------------------------------------------------
+    target_order_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    outbound_intent_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # -- the voucher, as a keyed proof and nothing else ---------------------
+    voucher_code_hmac: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hmac_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- state -------------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manual_cleanup_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    manual_cleanup_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- operator authorisation provenance ---------------------------------
+    create_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pay_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deliver_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refund_plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- claim / attempt / verification, per stage -------------------------
+    create_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    create_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    pay_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pay_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    live_guard_reproven_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    send_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    provider_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    refund_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refund_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- safe evidence -----------------------------------------------------
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekVoucherProductionBatchAttempt(Base):
+    """One redacted outbound intent, written and committed BEFORE a send.
+
+    Its own table rather than an ``OutboxMessage``, for the same reason as
+    §§36, 37.2 and 41: the outbox is swept by a generic worker whose purpose is
+    to retry what it finds, and the one property this row must have is that
+    nothing may ever pick it up and send it again.
+
+    It stores no message. No rendered body, no parameter list, no voucher code,
+    no phone number and no name — so nothing downstream could re-render the
+    message even if it tried.
+    """
+
+    __tablename__ = "easyweek_voucher_production_batch_attempts"
+
+    __table_args__ = (
+        UniqueConstraint("intent_uuid", name="uq_ew_voucher_production_attempt_intent"),
+        # RESTRICT in both directions of intent: the audit of a real send
+        # attempt must not disappear with the slot, nor allow it to be deleted.
+        ForeignKeyConstraint(
+            ["item_id"],
+            ["easyweek_voucher_production_batch_items.id"],
+            name="fk_ew_voucher_production_attempt_item",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "outcome IN ('claimed', 'provider_accepted', 'unknown', 'rejected')",
+            name="ck_ew_voucher_production_attempt_outcome",
+        ),
+        CheckConstraint(
+            "outcome <> 'provider_accepted' OR provider_message_id IS NOT NULL",
+            name="ck_ew_voucher_production_attempt_accepted_has_id",
+        ),
+        Index("ix_ew_voucher_production_attempt_item", "item_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    intent_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+
+    # Enough to audit WHICH approved template was used, and nothing about what
+    # it said to whom.
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    meta_template_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_language: Mapped[str] = mapped_column(String(8), nullable=False)
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    slot: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # Chatwoot outbound mirror registry
 # ---------------------------------------------------------------------------
 # Durable WAMID → Chatwoot Message.id link for the private mirror note of an
