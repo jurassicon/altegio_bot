@@ -213,9 +213,19 @@ async def test_head_upgrade_on_an_empty_database_creates_the_three_tables(temp_d
 
 @pytest.mark.asyncio
 async def test_downgrade_removes_only_the_new_objects(temp_db_url: str) -> None:
-    """Exactly the three new tables go, and the historical ledgers stay."""
+    """Exactly the three new tables go, and the historical ledgers stay.
+
+    Measured across THIS revision's own step, not from ``head``. A later phase
+    that also names its tables ``easyweek_*voucher*`` — §42 is the first — would
+    otherwise be counted as part of what PR-18's downgrade removed, and the
+    assertion would fail while saying nothing about PR-18. So the database is
+    first brought down to this revision, and the comparison brackets the one
+    step under test.
+    """
     _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    _alembic_ok("downgrade", PR18_REVISION, db_url=temp_db_url)
     before = await _tables(temp_db_url, "easyweek_%voucher%")
+    assert await _tables(temp_db_url, "easyweek_voucher_snapshot%") == set(PR18_TABLES)
 
     _alembic_ok("downgrade", PR17_3_REVISION, db_url=temp_db_url)
     after = await _tables(temp_db_url, "easyweek_%voucher%")

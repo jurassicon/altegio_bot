@@ -1,0 +1,253 @@
+"""The pinned identity, the money contract and the reason vocabulary of §42.
+
+§41 proved the whole irreversible sequence — issue, pay, deliver, observe — for
+a bounded handful of manually selected people, in production, on 28.09.2026.
+This phase is the working mode: a real operator-curated list, of whatever size
+that list honestly is.
+
+What is pinned, and what is not
+-------------------------------
+Pinned here as literals, because they are the topology the owner approved: the
+branch, the campaign, the basis, €15 per recipient, the internal template code.
+
+**Not** pinned, deliberately: how many people. §41's ceiling of five was right
+for a controlled experiment, and carrying it into production would be wrong.
+Replacing it with an invented number — ten, fifty, a hundred — would be no
+better; it would be this module deciding how many real customers a real
+campaign may have.
+
+So the size is the operator's to state and the schema's to verify. What
+:data:`APPROVAL_ARITHMETIC` describes is the only thing this phase insists on:
+the operator must say the count and the money BEFORE the freeze, and both must
+describe the full active snapshot exactly. A batch may have fifty recipients;
+it may not have a size nobody stated.
+
+What arrives per run instead of being pinned — which preview, which recipients,
+which staffer, which payment account — is proven live, every stage, from
+scratch.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Final
+
+from altegio_bot.models.models import (
+    VOUCHER_PRODUCTION_CAMPAIGN_CODE,
+    VOUCHER_PRODUCTION_COMPANY_ID,
+    VOUCHER_PRODUCTION_SCHEMA_VERSION,
+    VOUCHER_PRODUCTION_SCOPE,
+    VOUCHER_PRODUCTION_UNIT_PRICE_MINOR,
+)
+
+# Re-exported from the model layer rather than re-declared, so that the literal
+# a CHECK constraint enforces and the literal this package compares against can
+# never drift apart.
+PRODUCTION_SCOPE: Final = VOUCHER_PRODUCTION_SCOPE
+PRODUCTION_SCHEMA_VERSION: Final = VOUCHER_PRODUCTION_SCHEMA_VERSION
+UNIT_PRICE_MINOR: Final = VOUCHER_PRODUCTION_UNIT_PRICE_MINOR
+KARLSRUHE_COMPANY_ID: Final = VOUCHER_PRODUCTION_COMPANY_ID
+NEW_CLIENT_CAMPAIGN_CODE: Final = VOUCHER_PRODUCTION_CAMPAIGN_CODE
+
+# Printed on every plan and every report, in place of the ceiling §41 had. It
+# says what this phase actually guarantees about money, which is a relationship
+# rather than a maximum.
+APPROVAL_ARITHMETIC: Final = "approved_exposure_minor = expected_recipient_count * 1500"
+
+# The internal template code of the message that carries the voucher. NOT the
+# old `newsletter_new_clients_monthly`: that one promises 10% and a Kundenkarte,
+# which is a different offer and would be a false statement to a customer.
+VOUCHER_TEMPLATE_CODE: Final = "new_client_voucher"
+
+# The stages, in the only order they may happen. `freeze` is first and is the
+# only one that is purely local: it writes the composition and nothing leaves
+# the process. The other three each reach EasyWeek or Meta.
+STAGE_FREEZE: Final = "freeze"
+STAGE_CREATE: Final = "create"
+STAGE_PAY: Final = "pay"
+STAGE_DELIVER: Final = "deliver"
+STAGE_REFUND: Final = "refund"
+PRODUCTION_STAGES: Final = (STAGE_FREEZE, STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND)
+
+# The stages that may reach the outside world, in the order an operator walks
+# them. Deliberately a tuple a reader can see rather than a sequence some
+# command executes: there is no function that runs two of these.
+EXTERNAL_STAGES: Final = (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER)
+
+# ---------------------------------------------------------------------------
+# The closed reason vocabulary
+# ---------------------------------------------------------------------------
+# Stable, PII-free strings. A wrapper acts on these; prose is for humans only.
+# Prefixed `voucher_production_` so a report can never be mistaken for a §36,
+# §37.2 or §41 one, and so an operator reading a refusal knows which phase
+# refused.
+
+# -- fences ------------------------------------------------------------------
+PRODUCTION_DISABLED: Final = "voucher_production_disabled"
+STAFFER_UNCONFIGURED: Final = "voucher_production_staffer_unconfigured"
+ACCOUNT_UNCONFIGURED: Final = "voucher_production_account_unconfigured"
+HMAC_KEY_MISSING: Final = "voucher_production_hmac_key_missing"
+HMAC_KEY_INVALID: Final = "voucher_production_hmac_key_invalid"
+RUNTIME_IDENTITY_UNUSABLE: Final = "voucher_production_runtime_identity_unusable"
+
+# -- the message it would be delivered with ----------------------------------
+TEMPLATE_UNPROVEN: Final = "voucher_production_template_unproven"
+SENDER_UNPROVEN: Final = "voucher_production_sender_unproven"
+BOOKING_LINK_UNPROVEN: Final = "voucher_production_booking_link_unproven"
+TEMPLATE_PARAMETERS_UNPROVEN: Final = "voucher_production_template_parameters_unproven"
+
+# -- the preview this batch would be frozen from -----------------------------
+RUN_UNPROVEN: Final = "voucher_production_run_unproven"
+# The preview holds no active manually selected candidate at all. An empty batch
+# is not a small batch: there is nothing to approve.
+COMPOSITION_EMPTY: Final = "voucher_production_composition_empty"
+# An earned or owner-test candidate sits in the same snapshot. This phase serves
+# one basis, and a mixed snapshot is an operator's decision to make again, not
+# one for a tool to resolve by filtering.
+COMPOSITION_MIXED_BASIS: Final = "voucher_production_composition_mixed_basis"
+# Two active rows resolve to one EasyWeek customer.
+COMPOSITION_DUPLICATE_CUSTOMER: Final = "voucher_production_composition_duplicate_customer"
+# This preview, or one of its recipients, already belongs to a historical
+# voucher canary or to the §41 batch. Old evidence is not a fresh snapshot.
+PREVIEW_ALREADY_CONSUMED: Final = "voucher_production_preview_already_consumed"
+ENTITLEMENT_ALREADY_EXISTS: Final = "voucher_production_entitlement_already_exists"
+# This preview already has a production batch. One preview is frozen once.
+PREVIEW_ALREADY_FROZEN: Final = "voucher_production_preview_already_frozen"
+BATCH_NOT_FROZEN: Final = "voucher_production_batch_not_frozen"
+# The operator named a batch id this phase does not have.
+BATCH_UNKNOWN: Final = "voucher_production_batch_unknown"
+# The named batch exists but is not the one this preview is bound to.
+BATCH_PREVIEW_MISMATCH: Final = "voucher_production_batch_preview_mismatch"
+# The composition in the database is not the composition the operator approved.
+FROZEN_DIGEST_MISMATCH: Final = "voucher_production_frozen_digest_mismatch"
+SNAPSHOT_NOT_FROZEN: Final = "voucher_production_snapshot_not_frozen"
+
+# -- the size and the money an operator must state ---------------------------
+# §42.5, as refusals. Three different mistakes, three different codes, because
+# "you did not say" and "what you said was wrong" are not the same problem and
+# an operator has to be able to tell them apart.
+APPROVAL_COUNT_MISSING: Final = "voucher_production_approved_count_missing"
+APPROVAL_EXPOSURE_MISSING: Final = "voucher_production_approved_exposure_missing"
+APPROVAL_COUNT_MISMATCH: Final = "voucher_production_approved_count_mismatch"
+APPROVAL_EXPOSURE_MISMATCH: Final = "voucher_production_approved_exposure_mismatch"
+
+# -- who it would be delivered to --------------------------------------------
+RECIPIENT_UNPROVEN: Final = "voucher_production_recipient_unproven"
+RECIPIENT_BASIS_UNSUPPORTED: Final = "voucher_production_recipient_basis_unsupported"
+RECIPIENT_NOT_CANDIDATE: Final = "voucher_production_recipient_not_candidate"
+CUSTOMER_UUID_MISSING: Final = "voucher_production_customer_uuid_missing"
+CUSTOMER_IDENTITY_NOT_CURRENT: Final = "voucher_production_customer_identity_not_current"
+CUSTOMER_PHONE_NOT_CURRENT: Final = "voucher_production_customer_phone_not_current"
+CUSTOMER_NAME_MISSING: Final = "voucher_production_customer_name_missing"
+LOCAL_CLIENT_UNPROVEN: Final = "voucher_production_local_client_unproven"
+CUSTOMER_AMBIGUOUS: Final = "voucher_production_customer_ambiguous"
+CUSTOMER_LOOKUP_UNDETERMINED: Final = "voucher_production_customer_lookup_undetermined"
+RECIPIENT_OPTED_OUT: Final = "voucher_production_recipient_opted_out"
+LIVE_GUARD_UNCERTAIN: Final = "voucher_production_live_guard_uncertain"
+# Between the freeze and this stage the snapshot changed under us.
+COMPOSITION_DRIFTED: Final = "voucher_production_composition_drifted"
+
+# -- the voucher itself ------------------------------------------------------
+ORDER_UNPROVEN: Final = "voucher_production_order_unproven"
+ARTIFACT_UNPROVEN: Final = "voucher_production_artifact_unproven"
+BINDING_MISMATCH: Final = "voucher_production_binding_mismatch"
+ORDER_NOT_PAYABLE: Final = "voucher_production_order_not_payable"
+ORDER_NOT_PAID: Final = "voucher_production_order_not_paid"
+ORDER_ALREADY_REFUNDED: Final = "voucher_production_order_already_refunded"
+
+# -- the baseline ------------------------------------------------------------
+BASELINE_DRIFT: Final = "voucher_production_baseline_drift"
+
+# -- reconciliation of an unknown create -------------------------------------
+MARKER_SEARCH_UNRESOLVED: Final = "voucher_production_marker_search_unresolved"
+MARKER_SEARCH_AMBIGUOUS: Final = "voucher_production_marker_search_ambiguous"
+MARKER_SEARCH_INCOMPLETE: Final = "voucher_production_marker_search_incomplete"
+RECONCILE_UNRESOLVED: Final = "voucher_production_reconcile_unresolved"
+
+# -- the send ----------------------------------------------------------------
+DELIVERY_ALREADY_ATTEMPTED: Final = "voucher_production_delivery_already_attempted"
+MANUAL_CLEANUP_REQUIRED: Final = "voucher_production_manual_cleanup_required"
+REFUND_FORBIDDEN_AFTER_SEND: Final = "voucher_production_refund_forbidden_after_send"
+# The slot an operator named is not one this batch has.
+SLOT_UNKNOWN: Final = "voucher_production_slot_unknown"
+
+# -- a command that died part-way through ------------------------------------
+# Not an unknown and not a refusal. Something this invocation did IS on the
+# record — a voucher created, €15 charged, a message Meta accepted — and then
+# the command stopped before finishing the rest of its slots or printing its
+# report. What happened is known; what did not get to happen is the question,
+# and it is one for a human with a fresh plan.
+EXECUTION_INTERRUPTED: Final = "voucher_production_execution_interrupted"
+
+# -- the halt ----------------------------------------------------------------
+# The first unknown stops the whole remaining suffix OF THIS BATCH. Its own
+# code, because "this slot was never attempted" is a different fact from any
+# refusal about the slot itself, and an operator has to tell them apart.
+BATCH_HALTED: Final = "voucher_production_batch_halted"
+HALTED_BY_PREDECESSOR: Final = "voucher_production_halted_by_predecessor"
+
+# -- operator authorisation --------------------------------------------------
+LEDGER_STATE_UNEXPECTED: Final = "voucher_production_ledger_state_unexpected"
+IDENTITY_BINDING_MISMATCH: Final = "voucher_production_identity_binding_mismatch"
+PLAN_DIGEST_MISMATCH: Final = "voucher_production_plan_digest_mismatch"
+PLAN_EXPIRED: Final = "voucher_production_plan_expired"
+CONFIRMATION_MISMATCH: Final = "voucher_production_confirmation_mismatch"
+UNKNOWN_STAGE: Final = "voucher_production_unknown_stage"
+APPLY_FLAG_MISSING: Final = "voucher_production_apply_flag_missing"
+API_UNAVAILABLE: Final = "voucher_production_api_unavailable"
+MUTATION_UNKNOWN: Final = "voucher_production_mutation_unknown"
+MUTATION_REJECTED: Final = "voucher_production_mutation_rejected"
+DATABASE_UNAVAILABLE: Final = "voucher_production_database_unavailable"
+
+
+def production_marker(*, preview_run_id: int, campaign_recipient_id: int, slot: int) -> str:
+    """The non-personal comment marker for one slot's order.
+
+    Deterministic, so a reconciliation after a crash recomputes exactly the
+    marker it would have sent and an operator can paste it into the EasyWeek
+    dashboard to find an open draft. Derived from THIS scope, THIS preview and
+    THIS slot, so it can collide neither with §35's, §36's, §37.2's and §41's
+    markers nor with another slot of the same batch nor with the same slot
+    number of a different batch.
+
+    Keyed on the preview rather than on the batch id deliberately: the marker
+    has to be recomputable by a reconcile, and the preview is part of the
+    identity from before the batch row exists.
+
+    A digest rather than the ids themselves: the marker lands on a real order in
+    a real POS system that other people read.
+    """
+    material = f"{PRODUCTION_SCOPE}:{preview_run_id}:{campaign_recipient_id}:{slot}"
+    return "ewvp1-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def binding_material(*, batch_id: int, slot: int) -> str:
+    """What a slot's voucher MAC is bound to, besides the order and the product.
+
+    Both halves matter and neither is enough alone. The slot alone repeats
+    across batches — slot 1 exists in every one of them — so a MAC bound to the
+    slot only would verify a code from a different batch. The batch alone
+    ignores which of its recipients the code belongs to. Together they name
+    exactly one row, table-wide, for the lifetime of the phase.
+    """
+    return f"{PRODUCTION_SCOPE}:{batch_id}:{slot}"
+
+
+__all__ = [
+    "APPROVAL_ARITHMETIC",
+    "EXTERNAL_STAGES",
+    "KARLSRUHE_COMPANY_ID",
+    "NEW_CLIENT_CAMPAIGN_CODE",
+    "PRODUCTION_SCHEMA_VERSION",
+    "PRODUCTION_SCOPE",
+    "PRODUCTION_STAGES",
+    "STAGE_CREATE",
+    "STAGE_DELIVER",
+    "STAGE_FREEZE",
+    "STAGE_PAY",
+    "STAGE_REFUND",
+    "UNIT_PRICE_MINOR",
+    "VOUCHER_TEMPLATE_CODE",
+    "binding_material",
+    "production_marker",
+]

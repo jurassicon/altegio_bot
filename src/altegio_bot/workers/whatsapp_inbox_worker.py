@@ -1740,6 +1740,42 @@ async def _apply_voucher_batch_status(session: AsyncSession, provider_message_id
     return result.reason != voucher_batch_ledger.RECORD_MISSING_ROW
 
 
+async def _apply_voucher_production_status(session: AsyncSession, provider_message_id: str, kind: str) -> bool:
+    """Record a delivered/read callback for the §42 production voucher mailing.
+
+    The same contract as its three siblings and for the same reason: a
+    production slot has no ``OutboxMessage`` either, so a callback naming its
+    message id would otherwise fall through to a lookup that finds nothing and
+    be dropped.
+
+    Deliberately NOT behind the §42 fence. ``delivered`` and ``read`` are facts
+    about messages that have already been sent; dropping them because an
+    operator has since closed the fence would silently corrupt the record of a
+    mailing that really happened — and the fence exists to stop NEW effects, not
+    to stop the truth arriving about old ones.
+
+    The provider message id is unique table-wide across every mailing this
+    phase has run, so this resolves to exactly one slot of exactly one batch.
+
+    Returns whether this callback belonged to that phase. It runs inside the
+    caller's session and transaction; a callback for any other message returns
+    ``False`` immediately and falls through to the ordinary path.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as voucher_production_ledger
+
+    result = await voucher_production_ledger.apply_webhook_transition(
+        session,
+        provider_message_id=provider_message_id,
+        status=kind,
+    )
+    if result.applied:
+        logger.info("status_webhook: voucher production mailing advanced to %s", kind)
+        return True
+    # A refused write is either "not ours" — fall through — or "ours, and
+    # already at or past this status", which is handled and done.
+    return result.reason != voucher_production_ledger.RECORD_MISSING_ROW
+
+
 async def _handle_delivery_statuses(
     session: AsyncSession,
     event: WhatsAppEvent | None,
@@ -1767,9 +1803,16 @@ async def _handle_delivery_statuses(
             continue
 
         # And the §41 snapshot batch, whose slots own their message ids the same
-        # way. Asked third, on the same terms: the three ledgers are separate
+        # way. Asked third, on the same terms: the four ledgers are separate
         # tables and one message id belongs to at most one of them.
         if kind in {"delivered", "read"} and await _apply_voucher_batch_status(session, provider_message_id, kind):
+            continue
+
+        # And the §42 production mailing, asked fourth on the same terms. This
+        # is the only place a production slot's delivered/read can ever be
+        # observed, and it keeps working with the §42 fence shut: a status
+        # about a message already sent is not a new effect to fence off.
+        if kind in {"delivered", "read"} and await _apply_voucher_production_status(session, provider_message_id, kind):
             continue
 
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)

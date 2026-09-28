@@ -104,6 +104,11 @@ _CANONICAL_PROVIDER_TABLES = (
     # which is only possible because they carry the column themselves.
     "easyweek_voucher_snapshot_batches",
     "easyweek_voucher_snapshot_batch_items",
+    # And §42's, once more for the same reason. The production mailing has many
+    # batches rather than one, so its rows name a campaign row far more often —
+    # which makes the provider column on them load bearing rather than tidy.
+    "easyweek_voucher_production_batches",
+    "easyweek_voucher_production_batch_items",
 )
 
 # (table, pre-PR-3 constraint, provider-scoped replacement)

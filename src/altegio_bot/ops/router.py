@@ -21,6 +21,13 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.campaigns.easyweek_manual_voucher.ledger import preview_is_locked_by_manual_canary
 from altegio_bot.campaigns.easyweek_voucher_batch.ledger import preview_is_locked_by_voucher_batch
+from altegio_bot.campaigns.easyweek_voucher_production.identity import (
+    UNIT_PRICE_MINOR,
+)
+from altegio_bot.campaigns.easyweek_voucher_production.ledger import (
+    preview_is_locked_by_voucher_production,
+    production_batch_id_for_preview,
+)
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
@@ -3567,6 +3574,193 @@ async def ops_voucher_snapshot_batch_page() -> str:
     return _page("Voucher snapshot batch", body)
 
 
+@router.get("/docs/voucher-production-mailing", response_class=HTMLResponse)
+async def ops_voucher_production_mailing_page(batch_id: int | None = None) -> str:
+    """Read-only status of the §42 production mailing, and where its runbook lives.
+
+    Deliberately a page with nothing to click, for the same reason as its §37.2
+    and §41 siblings and more so: this one can spend whatever the operator
+    approved and message everyone on a real curated list. It is driven one stage
+    at a time from a terminal, each stage behind its own freshly approved plan,
+    and a button here would be precisely the one-click "pay and send" this phase
+    exists to avoid.
+
+    With no ``batch_id`` it lists every mailing so an operator can find the id
+    they need to type; with one it shows that mailing in full. Choosing a batch
+    is a read here and a typed argument there — never something this page does
+    on an operator's behalf.
+
+    The four delivery facts are shown as four separate numbers. "Execution
+    completed" means every slot's stage sequence ended; it does not mean the
+    messages were delivered, and it certainly does not mean they were read.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
+
+    try:
+        report = await production_runner.run_status(SessionLocal, batch_id=batch_id)
+        state: dict[str, Any] = report.as_safe_dict()
+    except SQLAlchemyError:
+        # A status page that 500s tells an operator less than one that says the
+        # state could not be read. No SQL and no exception text reach the page.
+        state = {"batch": {}, "batches": [], "recipient_basis": None, "first_visit_proof": None}
+    batch = state.get("batch") or {}
+    items = batch.get("items") or []
+    batches = state.get("batches") or []
+
+    fence_rows = [
+        (
+            "Fence (EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED)",
+            "открыт" if settings.easyweek_voucher_production_mailing_enabled else "закрыт",
+        ),
+        ("Ваучер", f"{UNIT_PRICE_MINOR / 100:.2f} € на получателя"),
+        ("Потолок получателей", "нет — количество и сумму называет оператор при freeze"),
+        ("Всего batches", str(len(batches))),
+    ]
+    fence_table = "".join(
+        f"<tr><th class='text-nowrap'>{_esc(name)}</th><td><code>{_esc(str(value))}</code></td></tr>"
+        for name, value in fence_rows
+    )
+
+    # Every mailing, so an operator can find the id they then have to type.
+    listing_rows = "".join(
+        "<tr>"
+        f"<td><a href='/ops/docs/voucher-production-mailing?batch_id={int(entry.get('batch_id') or 0)}'>"
+        f"<code>{_esc(str(entry.get('batch_id')))}</code></a></td>"
+        f"<td><code>{_esc(str(entry.get('campaign_run_id')))}</code></td>"
+        f"<td><code>{_esc(str(entry.get('status') or '—'))}</code></td>"
+        f"<td><code>{_esc(str(entry.get('campaign_period') or '—'))}</code></td>"
+        f"<td><code>{_esc(str(entry.get('recipient_count') or 0))}</code></td>"
+        f"<td><code>{int(entry.get('total_exposure_minor') or 0) / 100:.2f} €</code></td>"
+        f"<td><code>{_esc('да' if entry.get('reconciliation_required') else 'нет')}</code></td>"
+        "</tr>"
+        for entry in batches
+    )
+    listing_table = (
+        "<table class='table table-sm w-auto'>"
+        "<thead><tr><th>Batch</th><th>Preview</th><th>Статус</th><th>Период</th>"
+        "<th>Получателей</th><th>Сумма</th><th>Reconcile</th></tr></thead>"
+        f"<tbody>{listing_rows}</tbody></table>"
+        if listing_rows
+        else "<p class='text-muted'>Batches нет: ни один preview ещё не заморожен.</p>"
+    )
+
+    detail = ""
+    if batch.get("exists"):
+        rows = [
+            ("Batch id", str(batch.get("batch_id") or "—")),
+            ("Статус исполнения", batch.get("status") or "—"),
+            ("Halted", "да" if batch.get("halted") else "нет"),
+            ("Причина halt", batch.get("halted_reason_code") or "—"),
+            ("Basis", state.get("recipient_basis") or "—"),
+            ("First-visit proof", state.get("first_visit_proof") or "—"),
+            ("Preview run", str(batch.get("campaign_run_id") or "—")),
+            # The entitlement period, not the send date. A transitional August
+            # audience mailed in October is still an August entitlement, and an
+            # operator reading this page has to be able to see which wave the
+            # batch is bound to without opening the CLI.
+            ("Период кампании", batch.get("campaign_period") or "—"),
+            ("Получателей (заморожено)", str(batch.get("recipient_count") or 0)),
+            ("Получателей (подтверждено оператором)", str(batch.get("approved_recipient_count") or "—")),
+            (
+                "Сумма (заморожено)",
+                f"{int(batch.get('total_exposure_minor') or 0) / 100:.2f} €",
+            ),
+            (
+                "Сумма (подтверждено оператором)",
+                f"{int(batch.get('approved_exposure_minor') or 0) / 100:.2f} €",
+            ),
+            ("Арифметика подтверждения", batch.get("approval_arithmetic") or "—"),
+            ("Frozen digest", batch.get("frozen_digest") or "—"),
+            ("Baseline", batch.get("baseline_version") or "—"),
+            ("Требуется reconcile", "да" if batch.get("reconciliation_required") else "нет"),
+            ("Требуется ручная очистка", "да" if state.get("manual_cleanup_required") else "нет"),
+        ]
+        table = "".join(
+            f"<tr><th class='text-nowrap'>{_esc(name)}</th><td><code>{_esc(str(value))}</code></td></tr>"
+            for name, value in rows
+        )
+
+        # The four facts, side by side and never merged. An operator who reads
+        # "исполнение завершено" must not conclude that the messages landed.
+        total = int(batch.get("recipient_count") or 0)
+        delivery_rows = [
+            (
+                "Исполнение стадий завершено",
+                "да" if batch.get("execution_completed") else "нет",
+            ),
+            ("Meta приняла (provider_accepted)", f"{batch.get('provider_accepted_count', 0)} из {total}"),
+            ("Webhook подтвердил delivered", f"{batch.get('webhook_delivered_count', 0)} из {total}"),
+            ("Webhook подтвердил read", f"{batch.get('webhook_read_count', 0)} из {total}"),
+        ]
+        delivery_table = "".join(
+            f"<tr><th class='text-nowrap'>{_esc(name)}</th><td><code>{_esc(str(value))}</code></td></tr>"
+            for name, value in delivery_rows
+        )
+
+        # Per slot: the state a human needs to see, and nothing about the
+        # person. No phone, no name, no customer UUID, no order UUID and no
+        # voucher code.
+        slot_rows = "".join(
+            "<tr>"
+            f"<td><code>{_esc(str(entry.get('slot')))}</code></td>"
+            f"<td><code>{_esc(str(entry.get('status') or '—'))}</code></td>"
+            f"<td><code>{_esc(str(entry.get('reason_code') or '—'))}</code></td>"
+            f"<td><code>{_esc('да' if entry.get('target_order_recorded') else 'нет')}</code></td>"
+            f"<td><code>{_esc(str(entry.get('send_attempt_count', 0)))}</code></td>"
+            f"<td><code>{_esc('да' if entry.get('provider_accepted') else 'нет')}</code></td>"
+            f"<td><code>{_esc('да' if entry.get('webhook_delivered') else 'нет')}</code></td>"
+            f"<td><code>{_esc('да' if entry.get('webhook_read') else 'нет')}</code></td>"
+            f"<td><code>{_esc('да' if entry.get('reconciliation_required') else 'нет')}</code></td>"
+            "</tr>"
+            for entry in items
+        )
+        slots_table = (
+            "<table class='table table-sm w-auto'>"
+            "<thead><tr><th>Slot</th><th>Статус</th><th>Причина</th><th>Заказ</th><th>Попыток</th>"
+            "<th>Accepted</th><th>Delivered</th><th>Read</th><th>Reconcile</th></tr></thead>"
+            f"<tbody>{slot_rows}</tbody></table>"
+            if slot_rows
+            else "<p class='text-muted'>Слотов нет.</p>"
+        )
+        detail = f"""
+<h2 class="h5 mt-4">Batch #{_esc(str(batch.get("batch_id")))}</h2>
+<table class="table table-sm w-auto">{table}</table>
+<h2 class="h6 mt-3">Доставка — четыре разных факта</h2>
+<div class="alert alert-info">
+  «Исполнение завершено» означает, что все стадии отработали. Это
+  <b>не</b> значит, что сообщения доставлены, и тем более не значит, что их
+  прочитали: <code>delivered</code> и <code>read</code> пишет только webhook.
+</div>
+<table class="table table-sm w-auto">{delivery_table}</table>
+{slots_table}
+"""
+    elif batch_id is not None:
+        detail = f"<div class='alert alert-danger'>Batch <code>{_esc(str(batch_id))}</code> не найден.</div>"
+
+    body = f"""
+<h1 class="h4 mb-3">Production voucher mailing (§42)</h1>
+<div class="alert alert-secondary">
+  Рабочий режим рассылки: список готовится в редакторе preview, по одному
+  ваучеру €15 на получателя. Потолка получателей нет — количество и общую сумму
+  оператор называет явно при freeze, и БД требует, чтобы они точно описывали
+  замороженный состав. Страница только читает состояние: все стадии выполняются
+  из CLI <code>easyweek_voucher_production_mailing</code>, каждая — по отдельно
+  утверждённому плану и с явным <code>--batch-id</code>. Кнопок здесь нет
+  намеренно.
+</div>
+<table class="table table-sm w-auto">{fence_table}</table>
+<h2 class="h5 mt-4">Batches</h2>
+{listing_table}
+{detail}
+<div class="alert alert-warning">
+  <b>Инструкция:</b> <code>docs/easyweek/VOUCHER_PRODUCTION_MAILING_RUNBOOK.md</code> в репозитории.
+  Массовая отправка не разрешена: <code>campaign_send_authorized=false</code>,
+  <code>bulk_delivery_authorized=false</code>, <code>ready_for_send=false</code>.
+</div>
+"""
+    return _page("Voucher production mailing", body)
+
+
 @router.get("/campaigns/new-clients", response_class=HTMLResponse)
 async def ops_new_clients_campaign_page(request: Request) -> str:
     """Страница запуска кампании новых клиентов из браузера."""
@@ -5692,12 +5886,22 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # backend refuses the edits under a row lock; not offering the buttons
         # is how an operator finds out before they click.
         canary_locked = await preview_is_locked_by_any_canary(session, campaign_run_id=run_id)
-        # Which one, for the operator reading the page. Three different things
+        # Which one, for the operator reading the page. Four different things
         # can hold a preview and they are driven by different commands and
         # different runbooks, so "a canary" is not enough to act on.
         manual_locked = await preview_is_locked_by_manual_canary(session, campaign_run_id=run_id)
         batch_locked = await preview_is_locked_by_voucher_batch(session, campaign_run_id=run_id)
-        if batch_locked:
+        production_locked = await preview_is_locked_by_voucher_production(session, campaign_run_id=run_id)
+        # The §42 batch this preview became, so an operator can carry the id
+        # straight into the CLI instead of hunting for it. Every post-freeze
+        # command names it, and there is no "latest batch" to fall back on.
+        production_batch_id = (
+            await production_batch_id_for_preview(session, campaign_run_id=run_id) if production_locked else None
+        )
+        if production_locked:
+            canary_label = "§42, production mailing"
+            canary_runbook_url = "/ops/docs/voucher-production-mailing"
+        elif batch_locked:
             canary_label = "§41, snapshot batch"
             canary_runbook_url = "/ops/docs/voucher-snapshot-batch"
         elif manual_locked:
@@ -5706,6 +5910,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         else:
             canary_label = "§36"
             canary_runbook_url = "/ops/docs/manual-voucher-canary"
+        if production_batch_id is not None:
+            canary_label = f"{canary_label} (batch #{production_batch_id})"
 
         # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
         # not computed: it is Altegio follow-up machinery, and running it would

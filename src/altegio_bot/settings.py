@@ -908,6 +908,41 @@ class Settings(BaseSettings):
     easyweek_voucher_snapshot_batch_staffer_uuid: str = ""
     easyweek_voucher_snapshot_batch_account_uuid: str = ""
 
+    # --- §42: production manual-snapshot voucher MAILING (PR-19) -------------
+    # §41 proved the whole irreversible sequence for a bounded handful of
+    # manually selected people. This is the working mode: a real operator-
+    # curated list, of whatever size that list honestly is, mailed one
+    # confirmed stage at a time.
+    #
+    # Its own fence, again, and for the same reason as every fence before it.
+    # Opening §36, §37.2 or §41 must never be what authorises a production
+    # mailing, and opening this one must not reopen any of them. False
+    # everywhere by default.
+    #
+    # With it false every acting stage refuses before any HTTP request, the
+    # read-only plan included. Two things deliberately keep working with the
+    # fence shut: `status`, because the moment an operator most needs to read
+    # what a halted batch left behind is just after an emergency `false`; and
+    # the delivery webhook, because `delivered` and `read` are facts about
+    # messages that have ALREADY been sent, and dropping them would corrupt
+    # the record of a mailing that really happened.
+    #
+    # There is deliberately no variable for the batch size or the exposure.
+    # §41's ceiling of five was a real limit and this phase has no equivalent:
+    # what bounds the money is the count and the exposure an operator states at
+    # freeze time, which the database then pins to the composition. A ceiling an
+    # environment variable could raise would not be a ceiling anyway.
+    easyweek_voucher_production_mailing_enabled: bool = False
+
+    # Who performs the sale and which POS account is charged. Production UUIDs
+    # have no business in a repository: they arrive at run time and are
+    # validated as canonical UUIDs. Empty is a refusal, never a guess.
+    #
+    # Separate from §41's pair, so that configuring the controlled batch never
+    # configures the production mailing.
+    easyweek_voucher_production_mailing_staffer_uuid: str = ""
+    easyweek_voucher_production_mailing_account_uuid: str = ""
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------
