@@ -144,6 +144,24 @@ class StagePlan:
         """The exact phrase an operator must type for THIS stage of THIS plan."""
         return self.phrase_for(self.digest)
 
+    @property
+    def authorised_slots(self) -> tuple[int, ...]:
+        """Exactly the slots this approval covers, read back out of the digest.
+
+        The signed material, not a re-derivation. ``target_slots`` went into
+        :func:`stage_digest` when the plan was built, so an operator who
+        approved this digest approved these slots and no others — and a slot
+        that became actionable afterwards is simply not in here.
+
+        This is the list every acting stage walks. Reading it off the plan
+        rather than re-querying the ledger is what stops "what may be acted on"
+        from growing between the approval and the act: a CREATE that lands in
+        that window makes its slot eligible for the NEXT plan, not for this
+        one's payment.
+        """
+        raw = self.snapshot.get("target_slots") or []
+        return tuple(sorted(int(value) for value in raw))
+
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "mode": "voucher_production_stage_plan",

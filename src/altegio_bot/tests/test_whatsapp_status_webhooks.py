@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -34,6 +35,7 @@ from altegio_bot.workers import outbox_worker as ow
 from altegio_bot.workers.whatsapp_inbox_worker import (
     _apply_status_updates,
     _extract_status_updates,
+    _message_id_fingerprint,
     handle_event,
 )
 
@@ -1461,3 +1463,165 @@ async def test_stop_command_still_sets_opt_out(session_maker) -> None:
         c2 = await session.get(Client, 10)
         assert c2 is not None
         assert c2.wa_opted_out is True
+
+
+# ---------------------------------------------------------------------------
+# The status-webhook fallback never logs a raw Meta message id
+# ---------------------------------------------------------------------------
+# A Meta message id is not an opaque token: its base64 payload commonly encodes
+# the recipient's phone number, so logging one logs a customer's number. §42.8
+# of the EasyWeek plan keeps raw Meta IDs out of logs, JSON, exceptions and
+# fixtures, and the "no OutboxMessage matched" line is the one diagnostic path
+# that used to write one in full.
+#
+# The synthetic ids below carry a recognisable digit run so a leak is visible
+# whether the whole id or only its embedded number reaches a record.
+
+# Deliberately shaped like a real wamid, with a phone-like run inside it.
+_LEAK_PHONE = "491511234567"
+_LEAK_WAMID = f"wamid.HBgL{_LEAK_PHONE}FQIAERgSMUY5RDlBQTNCMkYwQzRENUUA"
+
+
+def _assert_no_raw_id(caplog_records, *, wamid: str = _LEAK_WAMID, phone: str = _LEAK_PHONE) -> None:
+    """No record may carry the id, or its embedded number, anywhere.
+
+    Checks the formatted message AND the raw ``args``: a ``%s`` placeholder
+    keeps the value out of ``record.message`` only until something renders the
+    record, and log shipping renders it.
+    """
+    for record in caplog_records:
+        rendered = record.getMessage()
+        assert wamid not in rendered, record
+        assert phone not in rendered, record
+        for arg in record.args if isinstance(record.args, tuple) else (record.args,):
+            assert wamid not in str(arg), record
+            assert phone not in str(arg), record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sent", "failed", "delivered", "read"])
+async def test_unmatched_status_never_logs_the_raw_message_id(session_maker, caplog, kind) -> None:
+    """Every callback kind that reaches the fallback keeps the id out of the log.
+
+    ``sent`` and ``failed`` are the ones the four voucher hooks deliberately do
+    not handle, so a voucher slot's ``sent`` callback lands here by design. The
+    redaction therefore cannot depend on which kind it is.
+    """
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    caplog.set_level(logging.INFO)
+    async with session_maker() as session:
+        async with session.begin():
+            run_ids = await _apply_status_updates(
+                session,
+                [{"wamid": _LEAK_WAMID, "status": kind, "timestamp": "1700000001", "raw": {}}],
+            )
+
+    assert run_ids == []
+    _assert_no_raw_id(caplog.records)
+    # The line is still written, and still useful: the kind is named and a
+    # stable one-way handle stands in for the identifier.
+    assert any("no OutboxMessage matched" in record.getMessage() for record in caplog.records)
+    assert any(f"status={kind}" in record.getMessage() for record in caplog.records)
+    assert any("provider_message=fp:" in record.getMessage() for record in caplog.records)
+
+    # And nothing unrelated moved.
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_an_early_callback_whose_id_no_ledger_holds_yet_is_redacted(session_maker, caplog) -> None:
+    """The case ownership routing cannot cover.
+
+    Meta can deliver ``sent`` while the commit that records the message id is
+    still in flight, so for a moment no ledger and no Outbox row owns it. Asking
+    "does anybody own this?" answers "not yet" and the line gets written anyway
+    — which is why the fix redacts the line rather than trying to route around
+    it.
+    """
+    caplog.set_level(logging.INFO)
+    async with session_maker() as session:
+        async with session.begin():
+            run_ids = await _apply_status_updates(
+                session,
+                [
+                    {"wamid": _LEAK_WAMID, "status": "sent", "timestamp": "1700000001", "raw": {}},
+                    {"wamid": _LEAK_WAMID, "status": "delivered", "timestamp": "1700000002", "raw": {}},
+                ],
+            )
+
+    assert run_ids == []
+    _assert_no_raw_id(caplog.records)
+    # The same message gets the same handle, which is what makes the line
+    # useful for correlating two callbacks without carrying the value.
+    handles = {
+        part.split("provider_message=")[1].split(" ")[0]
+        for record in caplog.records
+        for part in [record.getMessage()]
+        if "provider_message=" in part
+    }
+    assert len(handles) == 1, handles
+    assert handles.pop().startswith("fp:")
+
+
+@pytest.mark.asyncio
+async def test_two_different_ids_get_two_different_handles(session_maker, caplog) -> None:
+    """Redaction must not collapse distinct messages into one log line."""
+    caplog.set_level(logging.INFO)
+    other = _LEAK_WAMID + "OTHER"
+    async with session_maker() as session:
+        async with session.begin():
+            await _apply_status_updates(
+                session,
+                [
+                    {"wamid": _LEAK_WAMID, "status": "sent", "timestamp": "1700000001", "raw": {}},
+                    {"wamid": other, "status": "sent", "timestamp": "1700000002", "raw": {}},
+                ],
+            )
+
+    _assert_no_raw_id(caplog.records)
+    _assert_no_raw_id(caplog.records, wamid=other)
+    handles = {
+        record.getMessage().split("provider_message=")[1].split(" ")[0]
+        for record in caplog.records
+        if "provider_message=" in record.getMessage()
+    }
+    assert len(handles) == 2, handles
+
+
+def test_the_fingerprint_is_stable_one_way_and_marks_an_absent_id() -> None:
+    """The three properties the log line depends on."""
+    first = _message_id_fingerprint(_LEAK_WAMID)
+    assert first == _message_id_fingerprint(_LEAK_WAMID)
+    assert first != _message_id_fingerprint(_LEAK_WAMID + "X")
+    assert _LEAK_WAMID not in first
+    assert _LEAK_PHONE not in first
+    assert first.startswith("fp:")
+    # A callback with no id at all is a different fact from one that hashed.
+    assert _message_id_fingerprint(None) == "absent"
+    assert _message_id_fingerprint("") == "absent"
+
+
+@pytest.mark.asyncio
+async def test_the_ordinary_outbox_transitions_still_work_after_redaction(session_maker, caplog) -> None:
+    """The redaction touched a log line, not the routing or the state machine."""
+    _, _, outbox_id = await _setup_outbox_with_campaign(session_maker, outbox_status="sent")
+
+    caplog.set_level(logging.INFO)
+    for kind in ("delivered", "read"):
+        async with session_maker() as session:
+            async with session.begin():
+                await _apply_status_updates(
+                    session,
+                    [{"wamid": WAMID, "status": kind, "timestamp": "1700000001", "raw": {}}],
+                )
+
+    async with session_maker() as session:
+        ob = await session.get(OutboxMessage, outbox_id)
+        assert ob is not None
+        assert ob.status == "read"
+    # A matched callback never reaches the fallback line at all.
+    assert not any("no OutboxMessage matched" in record.getMessage() for record in caplog.records)

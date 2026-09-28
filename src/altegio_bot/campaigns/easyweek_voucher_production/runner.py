@@ -637,10 +637,34 @@ async def _item_order_preconditions(
     return reasons, state, observations
 
 
-def _stage_slots(snapshot: ledger_module.BatchSnapshot, stage: str) -> list[int]:
-    """The slots this stage would act on, in slot order. Deterministic, always."""
+def _stage_slots(
+    snapshot: ledger_module.BatchSnapshot,
+    stage: str,
+    *,
+    authorised: tuple[int, ...] | None = None,
+) -> list[int]:
+    """The slots this stage may act on, in slot order. Deterministic, always.
+
+    ``authorised`` is the slot list the operator's approval actually covers, as
+    signed into the plan digest. When it is given, the result is the
+    INTERSECTION of "still actionable" and "was approved", so re-reading the
+    ledger can only ever narrow the work — never widen it.
+
+    That direction is the whole point. The plan is built against one read of the
+    ledger and the claims happen after several live EasyWeek calls, so a CREATE
+    for another slot can legitimately land in between. Without the intersection
+    a PAY would then charge a slot whose ``target_slots`` the owner never saw,
+    which is exactly the drift §42.7 requires to cost zero external calls.
+
+    Omitting ``authorised`` is for the plan itself, which is the thing that
+    establishes the list in the first place.
+    """
     allowed = STAGE_ITEM_SOURCE_STATUSES.get(stage, frozenset())
-    return [entry.slot for entry in snapshot.items if entry.status in allowed]
+    slots = [entry.slot for entry in snapshot.items if entry.status in allowed]
+    if authorised is None:
+        return slots
+    permitted = set(authorised)
+    return [slot for slot in slots if slot in permitted]
 
 
 async def build_stage_plan(
@@ -655,7 +679,13 @@ async def build_stage_plan(
     slot: int | None = None,
     now: datetime | None = None,
     enabled: bool | None = None,
-) -> tuple[StagePlan, ProductionComposition, ProductionPrerequisites, ProductionBaselineProof]:
+) -> tuple[
+    StagePlan,
+    ProductionComposition,
+    ProductionPrerequisites,
+    ProductionBaselineProof,
+    ledger_module.BatchSnapshot,
+]:
     """Re-prove everything THIS stage of THIS batch depends on. Reads only.
 
     Creates no batch, sends no request and writes nothing. Every failure is one
@@ -665,6 +695,13 @@ async def build_stage_plan(
     The composition is proven ONCE here, per stage, against live data. That is
     the whole-snapshot verification for the stage; the per-slot loop that
     follows does not repeat it.
+
+    The snapshot is RETURNED rather than left behind. An earlier version let the
+    caller load its own, which meant the plan was checked against one read of
+    the ledger and acted on against another — and the second read could hold a
+    slot the first did not. Returning it makes the plan, the snapshot it was
+    proven against and the targets it authorises one consistent triple, which is
+    what every caller below acts on.
     """
     issued_at = now or utcnow()
     reasons: list[str] = []
@@ -893,7 +930,7 @@ async def build_stage_plan(
         ledger_state=ledger_state,
         observations=tuple(observations),
     )
-    return plan, composition, prerequisites, baseline
+    return plan, composition, prerequisites, baseline, snapshot
 
 
 async def _authorise(
@@ -919,8 +956,25 @@ async def _authorise(
     ledger_module.BatchSnapshot | None,
     StageReport | None,
 ]:
-    """Rebuild the plan live and check the approval. A report means: refused."""
-    plan, composition, prerequisites, baseline = await build_stage_plan(
+    """Rebuild the plan live and check the approval. A report means: refused.
+
+    The snapshot handed back is the plan's OWN — the one the approval was
+    verified against — and this function deliberately does not read the ledger
+    again.
+
+    It used to. The plan was built and digest-checked against one read, then a
+    second read was loaded here and the acting stages derived their targets from
+    that. Between the two, a CREATE completing for another slot made that slot
+    actionable, so a PAY could reach a slot the approved ``target_slots`` never
+    contained: two payments against a plan that authorised one. A later read can
+    only ever add work, never remove the approval's ignorance of it, so the
+    answer is not to re-read more carefully but not to re-read at all.
+
+    Nothing is lost by using the earlier read. Staleness is handled where it has
+    to be anyway: each slot is claimed under its own row lock, which re-checks
+    the live status and the item identity before anything leaves the process.
+    """
+    plan, composition, prerequisites, baseline, snapshot = await build_stage_plan(
         session,
         session_maker,
         stage=stage,
@@ -930,15 +984,6 @@ async def _authorise(
         approval=approval,
         slot=slot,
         enabled=enabled,
-    )
-    snapshot = (
-        await ledger_module.load_for_preview(session_maker, campaign_run_id=request.preview_run_id)
-        if stage == STAGE_FREEZE
-        else (
-            await ledger_module.load(session_maker, batch_id=request.batch_id)
-            if request.batch_id is not None
-            else ledger_module.BatchSnapshot(exists=False)
-        )
     )
 
     reasons: list[str] = []
@@ -1085,7 +1130,9 @@ async def run_create(
     calls = 0
     halted = False
 
-    for slot in _stage_slots(snapshot, STAGE_CREATE):
+    # Bounded by what the operator's approval actually covers. The
+    # intersection can only narrow this stage's work, never widen it.
+    for slot in _stage_slots(snapshot, STAGE_CREATE, authorised=plan.authorised_slots):
         if halted:
             # The suffix. Not attempted, and said so in the report rather than
             # left to be inferred from a missing entry.
@@ -1438,7 +1485,9 @@ async def run_pay(
     calls = 0
     halted = False
 
-    for slot in _stage_slots(snapshot, STAGE_PAY):
+    # Bounded by what the operator's approval actually covers. The
+    # intersection can only narrow this stage's work, never widen it.
+    for slot in _stage_slots(snapshot, STAGE_PAY, authorised=plan.authorised_slots):
         if halted:
             results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]))
             continue
@@ -1697,7 +1746,9 @@ async def run_deliver(
     calls = 0
     halted = False
 
-    for slot in _stage_slots(snapshot, STAGE_DELIVER):
+    # Bounded by what the operator's approval actually covers. The
+    # intersection can only narrow this stage's work, never widen it.
+    for slot in _stage_slots(snapshot, STAGE_DELIVER, authorised=plan.authorised_slots):
         if halted:
             results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]))
             continue
@@ -1934,6 +1985,13 @@ async def run_refund(
     identity = _identity_from_snapshot(snapshot)
     item = snapshot.item(slot)
     if identity is None or item is None or snapshot.batch_id is None:
+        return _refusal(STAGE_REFUND, [SLOT_UNKNOWN], snapshot, baseline=baseline)
+    # The same bound the other stages apply, stated rather than assumed. A
+    # refund's slot IS the operator's argument and the plan signed that exact
+    # argument, so this holds by construction today — which is precisely why it
+    # is worth asserting: a later change that let the argument and the signed
+    # plan diverge would otherwise refund a slot nobody approved, silently.
+    if slot not in plan.authorised_slots:
         return _refusal(STAGE_REFUND, [SLOT_UNKNOWN], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
     if item.status in ledger_module.SENT_ITEM_STATUSES:

@@ -300,7 +300,7 @@ async def _run_plan(
 ) -> tuple[dict[str, Any], int]:
     async with EasyWeekClient() as reader:
         async with SessionLocal() as session:
-            plan, _composition, _prereq, _baseline = await runner_module.build_stage_plan(
+            plan, _composition, _prereq, _baseline, _snapshot = await runner_module.build_stage_plan(
                 session,
                 SessionLocal,
                 stage=stage,

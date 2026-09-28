@@ -2754,3 +2754,289 @@ async def test_the_ops_page_survives_an_empty_phase_and_an_unknown_id(
 
     missing = await ops_router.ops_voucher_production_mailing_page(batch_id=4242)
     assert "не найден" in missing
+
+
+# ===========================================================================
+# The approved plan bounds what a stage may act on
+# ===========================================================================
+
+
+class _CreateRacingReader(FakeReader):
+    """A reader that lets a real CREATE land at one exact moment.
+
+    The moment is the template read inside :func:`build_stage_plan`, which
+    happens AFTER that function has loaded the ledger snapshot it will build its
+    ``target_slots`` from and BEFORE the acting loop claims anything. That is the
+    window the fixed code has to survive: the approved plan says one thing and
+    the ledger has since grown another eligible slot.
+
+    Armed explicitly, so the plan an operator reads is built against a quiet
+    world and only the live rebuild inside the apply sees the race. Fires once —
+    the CREATE it triggers builds a plan of its own and would otherwise recurse.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._armed = False
+        self._fired = False
+        self._on_template = None
+
+    def arm(self, on_template) -> None:
+        self._armed = True
+        self._on_template = on_template
+
+    async def get_voucher_template(self, template_uuid: str):
+        answer = await super().get_voucher_template(template_uuid)
+        if self._armed and not self._fired:
+            self._fired = True
+            assert self._on_template is not None
+            await self._on_template()
+        return answer
+
+
+async def test_the_plan_hands_back_the_snapshot_it_was_proven_against():
+    """The contract the fix rests on, pinned so a refactor cannot quietly undo it.
+
+    ``build_stage_plan`` returns five values, the last being the ledger snapshot
+    it built its ``target_slots`` from. Callers act on THAT snapshot rather than
+    loading their own — the second load is what let a PAY reach an unapproved
+    slot — so the arity and the pairing are worth asserting directly. The
+    operator CLI unpacks the same five values.
+    """
+    import inspect
+
+    signature = inspect.signature(runner_module.build_stage_plan)
+    annotation = str(signature.return_annotation)
+    assert "BatchSnapshot" in annotation, annotation
+    # And the only place that rebuilds a plan for an apply must not read the
+    # ledger again: the whole blocker was a second read widening the targets.
+    source = inspect.getsource(runner_module._authorise)
+    assert "ledger_module.load" not in source, "_authorise must not re-read the ledger"
+
+
+async def test_a_create_landing_after_the_pay_plan_is_not_paid(session_maker, production_configuration, binding_key):
+    """A slot that became payable after the approval is not paid by it.
+
+    The confirmed P1: the plan was built and digest-checked against one read of
+    the ledger, then a second read decided what to act on. A CREATE completing
+    in between made its slot payable, and the PAY charged a slot the approved
+    ``target_slots`` never contained.
+
+    Real freeze, real claims, real outcomes, real HMAC and real constraints
+    throughout; only the two transports are fakes, and the pay sequence
+    deliberately has TWO answers ready so that the old behaviour would succeed
+    at paying twice rather than erroring on a short fixture.
+    """
+    count = 2
+    run_id, _ = await seed_production_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = _CreateRacingReader(count=count)
+    frozen = await _freeze(session_maker, reader, production_request(run_id=run_id), count=count)
+    batch_id = frozen.batch["batch_id"]
+    request = production_request(run_id=run_id, batch_id=batch_id)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+
+    # Slot 1 is created; slot 2's CREATE is refused by the endpoint's own
+    # validation. A proven pre-action refusal, so the batch is NOT halted and
+    # slot 2 stays re-claimable from a fresh plan — which is what makes the race
+    # reachable at all.
+    first = FakeMutator(create_sequence=[_ok_response(0), EasyWeekPermanentError("422", status_code=422)])
+    created = await _apply(session_maker, reader, stage=STAGE_CREATE, request=request, mutator=first)
+    assert created.outcome == "partial"
+    assert not created.halted
+    before = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert before.item(1).status == VOUCHER_PRODUCTION_ITEM_CREATED
+    assert before.item(2).status == "create_rejected"
+
+    # The PAY plan an operator reads and the owner approves: slot 1 only.
+    plan = await _plan(session_maker, reader, stage=STAGE_PAY, request=request)
+    assert plan.ready, plan.reasons
+    assert plan.authorised_slots == (1,)
+    assert plan.snapshot["target_slots"] == [1]
+
+    # Now arm the race: during the live rebuild inside the apply, slot 2's
+    # CREATE completes for real.
+    async def land_a_create_for_slot_two() -> None:
+        mutator = FakeMutator(create_sequence=[_ok_response(1)])
+        report = await _apply(session_maker, reader, stage=STAGE_CREATE, request=request, mutator=mutator)
+        assert report.outcome == "applied", report.reasons
+        assert len(mutator.create_calls) == 1
+
+    reader.arm(land_a_create_for_slot_two)
+
+    paid_orders = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    mutator = FakeMutator(
+        # TWO answers ready on purpose: the pre-fix code would have used both.
+        pay_sequence=[_ok_response(0), _ok_response(1)],
+        reader=reader,
+        settles=paid_orders,
+    )
+    async with session_maker() as session:
+        report = await runner_module.run_pay(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+
+    # The race really did happen: slot 2 is created, by a CREATE of its own.
+    after = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert after.item(2).target_order_uuid is not None
+
+    # And exactly one payment left the process, for the one approved slot.
+    assert len(mutator.pay_calls) == 1, mutator.pay_calls
+    assert mutator.pay_calls[0]["order_uuid"] == ORDER_UUIDS[0]
+    assert report.external_calls["pay"] == 1
+    assert [entry.slot for entry in report.slots] == [1]
+
+    assert after.item(1).status == VOUCHER_PRODUCTION_ITEM_PAID
+    # Slot 2 was created and NOT paid. It needs a new plan and a new approval.
+    assert after.item(2).status == VOUCHER_PRODUCTION_ITEM_CREATED
+    assert after.item(2).pay_verified_at is None
+
+
+async def test_the_slot_the_race_created_is_payable_under_a_fresh_plan(
+    session_maker, production_configuration, binding_key
+):
+    """Deferred, not lost. The next plan sees it and the owner approves it.
+
+    The fix must not strand the slot — that would be a different bug. What it
+    must do is make the owner see it before any money moves.
+    """
+    count = 2
+    run_id, _ = await seed_production_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = _CreateRacingReader(count=count)
+    frozen = await _freeze(session_maker, reader, production_request(run_id=run_id), count=count)
+    batch_id = frozen.batch["batch_id"]
+    request = production_request(run_id=run_id, batch_id=batch_id)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+
+    first = FakeMutator(create_sequence=[_ok_response(0), EasyWeekPermanentError("422", status_code=422)])
+    await _apply(session_maker, reader, stage=STAGE_CREATE, request=request, mutator=first)
+    plan = await _plan(session_maker, reader, stage=STAGE_PAY, request=request)
+
+    async def land_a_create_for_slot_two() -> None:
+        await _apply(
+            session_maker,
+            reader,
+            stage=STAGE_CREATE,
+            request=request,
+            mutator=FakeMutator(create_sequence=[_ok_response(1)]),
+        )
+
+    reader.arm(land_a_create_for_slot_two)
+    paid_orders = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    async with session_maker() as session:
+        await runner_module.run_pay(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=FakeMutator(pay_sequence=[_ok_response(0)], reader=reader, settles=paid_orders),
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+
+    # A fresh plan now offers exactly the slot the race created.
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+    reader.orders[ORDER_UUIDS[0]] = paid_orders[ORDER_UUIDS[0]]
+    second = await _plan(session_maker, reader, stage=STAGE_PAY, request=request)
+    assert second.ready, second.reasons
+    assert second.authorised_slots == (2,)
+
+    settles = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    mutator = FakeMutator(pay_sequence=[_ok_response(1)], reader=reader, settles=settles)
+    async with session_maker() as session:
+        report = await runner_module.run_pay(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=second.digest,
+            supplied_issued_at=second.issued_at,
+            supplied_phrase=second.confirmation_phrase,
+        )
+
+    assert report.outcome == "applied", report.reasons
+    assert len(mutator.pay_calls) == 1
+    assert mutator.pay_calls[0]["order_uuid"] == ORDER_UUIDS[1]
+    final = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert final.item(1).status == VOUCHER_PRODUCTION_ITEM_PAID
+    assert final.item(2).status == VOUCHER_PRODUCTION_ITEM_PAID
+
+
+async def test_a_create_landing_after_the_create_plan_is_not_created_twice(
+    session_maker, production_configuration, binding_key
+):
+    """The same bound on CREATE, which shares ``_authorise`` with PAY.
+
+    The reviewer asked for the invariant to be checked on the other stages that
+    go through the same helper, not only on the one where it was demonstrated.
+    Here the race makes a slot LEAVE the eligible set rather than join it, and
+    the intersection has to narrow without disturbing the rest of the stage.
+    """
+    count = 3
+    run_id, _ = await seed_production_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = _CreateRacingReader(count=count)
+    frozen = await _freeze(session_maker, reader, production_request(run_id=run_id), count=count)
+    batch_id = frozen.batch["batch_id"]
+    request = production_request(run_id=run_id, batch_id=batch_id)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+
+    plan = await _plan(session_maker, reader, stage=STAGE_CREATE, request=request)
+    assert plan.authorised_slots == (1, 2, 3)
+
+    # Slot 1 gets created by somebody else between the approval and the act.
+    async def land_a_create_for_slot_one() -> None:
+        single = await _plan(session_maker, reader, stage=STAGE_CREATE, request=request)
+        async with session_maker() as session:
+            await runner_module.run_create(
+                session,
+                session_maker,
+                request=request,
+                reader=reader,
+                order_reader=reader,
+                mutator=FakeMutator(create_sequence=[_ok_response(0), _ok_response(1), _ok_response(2)]),
+                apply=True,
+                supplied_digest=single.digest,
+                supplied_issued_at=single.issued_at,
+                supplied_phrase=single.confirmation_phrase,
+            )
+
+    reader.arm(land_a_create_for_slot_one)
+    mutator = FakeMutator(create_sequence=[_ok_response(0), _ok_response(1), _ok_response(2)])
+    async with session_maker() as session:
+        report = await runner_module.run_create(
+            session,
+            session_maker,
+            request=request,
+            reader=reader,
+            order_reader=reader,
+            mutator=mutator,
+            apply=True,
+            supplied_digest=plan.digest,
+            supplied_issued_at=plan.issued_at,
+            supplied_phrase=plan.confirmation_phrase,
+        )
+
+    # Every slot was created exactly once, by the inner run. The outer run's
+    # claims all refuse, because the rows have moved on — no second CREATE.
+    assert len(mutator.create_calls) == 0, mutator.create_calls
+    assert report.external_calls["create"] == 0
+    final = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert [entry.status for entry in final.items] == [VOUCHER_PRODUCTION_ITEM_CREATED] * count
+    assert all(entry.target_order_uuid is not None for entry in final.items)
