@@ -109,6 +109,19 @@ _CANONICAL_PROVIDER_TABLES = (
     # which makes the provider column on them load bearing rather than tidy.
     "easyweek_voucher_production_batches",
     "easyweek_voucher_production_batch_items",
+    # §43's browser-authorised operation storage. An approval names the campaign
+    # run it was built for through the SAME composite foreign key as the batch
+    # header, which is only possible because it carries the provider itself; the
+    # operation and the audit row carry it so that a reader of either can scope a
+    # query the way every other table of this phase does, and so a CHECK can pin
+    # them to `easyweek` rather than leaving the column free.
+    #
+    # `easyweek_voucher_production_stop_requests` is deliberately NOT here: it
+    # names only a batch id, and a batch already says which provider it belongs
+    # to. A provider column on it would be decoration that could disagree.
+    "easyweek_voucher_production_approvals",
+    "easyweek_voucher_production_operations",
+    "easyweek_voucher_production_audit",
 )
 
 # (table, pre-PR-3 constraint, provider-scoped replacement)

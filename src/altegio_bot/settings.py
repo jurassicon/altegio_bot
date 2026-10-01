@@ -943,6 +943,25 @@ class Settings(BaseSettings):
     easyweek_voucher_production_mailing_staffer_uuid: str = ""
     easyweek_voucher_production_mailing_account_uuid: str = ""
 
+    # --- §43: operator-driven mailing from the Ops UI (PR-20) ----------------
+    # A confirmed stage is executed by its own dedicated worker, not inside the
+    # HTTP request that confirmed it and not by the generic campaign worker. This
+    # flag says the deployment RUNS that worker, which is what lets a confirmation
+    # refuse up front instead of parking in a queue nobody drains.
+    #
+    # It is not a second fence and it authorises nothing: with it true and
+    # `..._MAILING_ENABLED` false, every stage still refuses. What it controls is
+    # whether the UI believes a confirmation can be picked up at all.
+    #
+    # Deliberately a weak claim, and the UI says so: it means "this deployment
+    # runs one", never "it is alive this second". An executor that died shows up as
+    # an operation sitting in `queued` on the mailing page.
+    easyweek_voucher_production_executor_enabled: bool = False
+
+    # How long the executor sleeps when the operation queue is empty. Bounded in
+    # the validator below, like every other worker interval.
+    easyweek_voucher_production_executor_poll_sec: float = 2.0
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------
@@ -960,6 +979,7 @@ class Settings(BaseSettings):
         "outbox_worker_poll_sec",
         "whatsapp_inbox_worker_poll_sec",
         "easyweek_inbox_worker_poll_sec",
+        "easyweek_voucher_production_executor_poll_sec",
     )
     @classmethod
     def validate_worker_poll_sec(cls, v: float) -> float:

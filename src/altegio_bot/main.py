@@ -13,6 +13,7 @@ from .models import AltegioEvent
 from .ops.campaigns_api import router as campaigns_router
 from .ops.router import login_router as ops_login_router
 from .ops.router import router as ops_router
+from .ops.voucher_mailing import router as voucher_mailing_router
 from .settings import settings
 from .webhooks.chatwoot import router as chatwoot_router
 from .webhooks.common import (
@@ -45,6 +46,7 @@ app.include_router(ops_login_router)  # public: /ops/login, /ops/logout
 app.include_router(campaigns_router)  # protected: /ops/campaigns/ (JSON) — регистрируем до ops_router,
 # чтобы точные маршруты JSON API (/runs, /runs/{id}, /dashboard/monthly) имели приоритет
 # перед wildcard HTML-маршрутами (/campaigns/{run_id: int})
+app.include_router(voucher_mailing_router)  # protected: /ops/voucher-mailings (§43 operator UI + its JSON API)
 app.include_router(ops_router)  # protected: /ops/ (HTML dashboard)
 
 

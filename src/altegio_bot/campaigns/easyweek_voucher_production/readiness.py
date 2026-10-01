@@ -53,13 +53,18 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ACCOUNT_UNCONFIGURED,
     APPROVAL_ARITHMETIC,
     BOOKING_LINK_UNPROVEN,
+    ISSUER_MEMBERSHIP_INCOMPLETE,
     PRODUCTION_DISABLED,
     SENDER_UNPROVEN,
-    STAFFER_UNCONFIGURED,
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
     UNIT_PRICE_MINOR,
     VOUCHER_TEMPLATE_CODE,
+)
+from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
+    IssuerMembership,
+    PinnedIssuer,
+    pinned_issuer,
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
@@ -95,6 +100,11 @@ class ProductionPrerequisites:
     # ``None`` means proven; a string is the blocker.
     staffer_reason: str | None = None
     account_reason: str | None = None
+    # §43.9. The approved issuer, and whether they still provably belong to this
+    # location. ``None`` membership means the question was not asked, which is
+    # the refund case and never a silent pass.
+    issuer: PinnedIssuer | None = None
+    issuer_membership: IssuerMembership | None = None
     key_reason: str | None = None
     template_reason: str | None = None
     sender_reason: str | None = None
@@ -121,6 +131,11 @@ class ProductionPrerequisites:
             found.extend(
                 [
                     self.staffer_reason,
+                    # The pin and the live membership, in that order: "this is
+                    # not the approved staffer" is a more useful answer than
+                    # "some staffer could not be found in the catalogue".
+                    self.issuer.reason if self.issuer is not None else None,
+                    self.issuer_membership.reason if self.issuer_membership is not None else None,
                     self.key_reason,
                     self.template_reason,
                     self.sender_reason,
@@ -145,6 +160,19 @@ class ProductionPrerequisites:
             # account the money comes back to.
             "payment_account_configured": self.account_reason is None,
             "staffer_configured": applicable(self.staffer_reason),
+            # §43.9, as booleans. The display name is for a human to recognise;
+            # nothing in this phase resolves a staffer by it.
+            **(
+                {
+                    **(self.issuer.as_safe_dict() if self.issuer is not None else {}),
+                    **(self.issuer_membership.as_safe_dict() if self.issuer_membership is not None else {}),
+                }
+                if self.delivery_checks_applied
+                else {
+                    "issuer_pinned": NOT_REQUIRED_FOR_REFUND,
+                    "issuer_membership_proven": NOT_REQUIRED_FOR_REFUND,
+                }
+            ),
             "hmac_key_usable": applicable(self.key_reason),
             "template_proven": applicable(self.template_reason),
             "sender_proven": applicable(self.sender_reason),
@@ -173,6 +201,8 @@ async def prove_prerequisites(
     company_id: int,
     sender_code: str,
     enabled: bool | None = None,
+    issuer_membership: IssuerMembership | None = None,
+    require_membership: bool = True,
 ) -> ProductionPrerequisites:
     """The prerequisites THIS stage actually depends on.
 
@@ -196,7 +226,17 @@ async def prove_prerequisites(
             delivery_checks_applied=False,
         )
 
-    staffer_uuid = _canonical(settings.easyweek_voucher_production_mailing_staffer_uuid)
+    # §43.9: not "is this a UUID" but "is this THE approved issuer". A valid
+    # UUID of one of the other seven people at this branch fails here, which is
+    # the whole reason the pin exists.
+    #
+    # ``issuer_membership`` is proven by the caller, which is the only place that
+    # holds a read-only EasyWeek client, and is asked once per stage plan rather
+    # than once per recipient. ``None`` means the walk was not run; the plan
+    # supplies it for every acting stage, so a missing proof shows up as an
+    # unproven membership rather than as a pass.
+    issuer = pinned_issuer(settings.easyweek_voucher_production_mailing_staffer_uuid)
+    staffer_uuid = issuer.uuid
     key_reason = binding_key_reason()
 
     # The third parameter of the approved template. It comes from the same
@@ -249,7 +289,28 @@ async def prove_prerequisites(
     return ProductionPrerequisites(
         stage=stage,
         fence_open=bool(fence_open),
-        staffer_reason=None if staffer_uuid else STAFFER_UNCONFIGURED,
+        # The pin answers both "configured?" and "the approved one?", so there is
+        # no separate staffer reason left to report: a second code derived from
+        # the same value could only ever disagree with the first.
+        staffer_reason=None,
+        issuer=issuer,
+        # Three states, not two, and the difference is load bearing.
+        #
+        # A caller that WILL act must have asked: a plan with no membership proof
+        # is an unproven membership, never a pass, which is why ``None`` becomes
+        # `incomplete` here. A caller that is only RENDERING A PAGE has not asked
+        # and must not be made to — the proof costs a live EasyWeek walk, and a
+        # readiness panel that reported `incomplete` on every page load would
+        # show every operator a blocker that is not one.
+        #
+        # So `require_membership=False` leaves it ``None``, which contributes no
+        # reason and no field, and the page says the check happens when a step is
+        # prepared.
+        issuer_membership=(
+            issuer_membership
+            if issuer_membership is not None
+            else (IssuerMembership(reason=ISSUER_MEMBERSHIP_INCOMPLETE) if require_membership else None)
+        ),
         account_reason=account_reason,
         key_reason=key_reason,
         template_reason=template_reason,

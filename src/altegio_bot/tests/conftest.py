@@ -178,6 +178,16 @@ from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: E402
     binding_key,
     configuration,
 )
+
+# §43 operator UI (PR-20). Re-exported here for the same reason as the fixtures
+# above: a test module that imported them would shadow its own parameter names.
+from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (  # noqa: E402,F401
+    anon_client,
+    executor_enabled,
+    ops_credentials,
+    transports,
+    ui_client,
+)
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (  # noqa: E402,F401
     production_configuration,
 )

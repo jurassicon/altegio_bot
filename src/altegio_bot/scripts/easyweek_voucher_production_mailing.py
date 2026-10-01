@@ -1,4 +1,28 @@
-"""Operator CLI for the production EasyWeek voucher mailing (§42).
+"""Operator CLI for the production EasyWeek voucher mailing (§42, read-only since §43).
+
+**The mutating stages are closed here.** `freeze`, `create`, `pay`, `deliver` and
+`refund` refuse with ``voucher_production_cli_mutation_closed`` and do nothing:
+the owner decided on 28.09.2026 that the real mailing is driven from the
+interface, and §43 moved the whole operator process into Ops. The subcommands
+remain so that an operator who types one gets an explanation instead of an
+argparse error — and there is no flag, `--apply` included, that reopens them.
+
+What this command is still for is READING::
+
+    ... easyweek_voucher_production_mailing status
+    ... easyweek_voucher_production_mailing status --batch-id B
+    ... easyweek_voucher_production_mailing plan --stage pay --preview-run-id N --batch-id B
+    ... easyweek_voucher_production_mailing reconcile --preview-run-id N --batch-id B
+
+`status` reads the durable ledger with no HTTP at all; `plan` performs GETs and
+writes nothing; `reconcile` reads the outside world back and records what it read.
+None of them buys anything or sends anything, and all three matter most exactly
+when the acting path is blocked: after an emergency fence close, after a halt, and
+while an unknown outcome is being resolved.
+
+The historical contract below still describes how a stage is authorised, because
+the UI did not replace those checks — it replaced who carries the approval. See
+``docs/easyweek/VOUCHER_PRODUCTION_MAILING_RUNBOOK.md``.
 
 Every command is a deliberate stop::
 
@@ -84,6 +108,7 @@ from altegio_bot.campaigns.easyweek_voucher_production import runner as runner_m
 from altegio_bot.campaigns.easyweek_voucher_production.composition import BatchApproval
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ACCOUNT_UNCONFIGURED,
+    CLI_MUTATION_CLOSED,
     DATABASE_UNAVAILABLE,
     EXECUTION_INTERRUPTED,
     MUTATION_UNKNOWN,
@@ -406,7 +431,31 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         return await _run_plan(request, args.stage, args.slot, _approval_from(args))
     if args.command == COMMAND_RECONCILE:
         return await _run_reconcile(request)
-    return await _run_stage(request, args)
+
+    # §43.6: FREEZE, CREATE, PAY, DELIVER and REFUND are no longer things this
+    # command does. The owner's decision of 28.09.2026 is that the real mailing
+    # happens from the interface, and a supported terminal path alongside it would
+    # not be a convenience — it would be a way to spend real money without the
+    # server-held approval, the CSRF-protected session, the recorded operator and
+    # the audit row that the UI contract is made of.
+    #
+    # Closed here, at the dispatch, rather than by deleting the subcommands: the
+    # refusal has to be something an operator READS, naming the reason and where
+    # the action now lives. A removed subcommand would print an argparse error
+    # about an unknown command, which teaches nobody anything.
+    #
+    # There is deliberately no flag that reopens this. `--apply` does not, and
+    # adding a second one would simply recreate what §43 closed. The internal
+    # executor is not a counter-example: it runs a stored, authorised UI action,
+    # never a command somebody typed.
+    #
+    # `status`, `plan` and `reconcile` are above and stay: they read, they
+    # diagnose, and a closed fence or a halted batch is exactly when somebody
+    # needs them.
+    return (
+        _refusal_report(args.command, [CLI_MUTATION_CLOSED]),
+        EXIT_CONTRACT_MISMATCH,
+    )
 
 
 # The commands that can reach EasyWeek or Meta. A failure inside one of these

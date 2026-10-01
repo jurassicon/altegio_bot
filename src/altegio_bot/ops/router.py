@@ -357,6 +357,9 @@ _NAV = """
         <li class="nav-item">
           <a class="nav-link" href="/ops/campaigns">📣 Campaigns</a>
         </li>
+        <li class="nav-item">
+          <a class="nav-link" href="/ops/voucher-mailings">🎁 Ваучеры</a>
+        </li>
       </ul>
       <form method="post" action="/ops/logout" class="d-flex">
         <button type="submit" class="btn btn-outline-light btn-sm">Logout</button>
@@ -3738,15 +3741,18 @@ async def ops_voucher_production_mailing_page(batch_id: int | None = None) -> st
         detail = f"<div class='alert alert-danger'>Batch <code>{_esc(str(batch_id))}</code> не найден.</div>"
 
     body = f"""
-<h1 class="h4 mb-3">Production voucher mailing (§42)</h1>
+<h1 class="h4 mb-3">Production voucher mailing — состояние (§42/§43)</h1>
+<div class="alert alert-primary">
+  <b>Рассылка выполняется в <a href="/ops/voucher-mailings">Ваучерных рассылках</a>.</b>
+  Там оператор проверяет состав, фиксирует список и подтверждает каждый шаг
+  отдельно. Команды <code>freeze/create/pay/deliver/refund</code> в CLI закрыты
+  (§43.6) и отвечают отказом.
+</div>
 <div class="alert alert-secondary">
-  Рабочий режим рассылки: список готовится в редакторе preview, по одному
-  ваучеру €15 на получателя. Потолка получателей нет — количество и общую сумму
-  оператор называет явно при freeze, и БД требует, чтобы они точно описывали
-  замороженный состав. Страница только читает состояние: все стадии выполняются
-  из CLI <code>easyweek_voucher_production_mailing</code>, каждая — по отдельно
-  утверждённому плану и с явным <code>--batch-id</code>. Кнопок здесь нет
-  намеренно.
+  Эта страница — только технический срез состояния. Список готовится в редакторе
+  preview, по одному ваучеру €15 на получателя. Потолка получателей нет:
+  количество и общую сумму оператор подтверждает явно перед фиксацией, и БД
+  требует, чтобы они точно описывали замороженный состав.
 </div>
 <table class="table table-sm w-auto">{fence_table}</table>
 <h2 class="h5 mt-4">Batches</h2>
@@ -5899,8 +5905,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             await production_batch_id_for_preview(session, campaign_run_id=run_id) if production_locked else None
         )
         if production_locked:
-            canary_label = "§42, production mailing"
-            canary_runbook_url = "/ops/docs/voucher-production-mailing"
+            canary_label = "§42/§43, production mailing"
+            canary_runbook_url = "/ops/voucher-mailings"
         elif batch_locked:
             canary_label = "§41, snapshot batch"
             canary_runbook_url = "/ops/docs/voucher-snapshot-batch"
@@ -5912,6 +5918,15 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             canary_runbook_url = "/ops/docs/manual-voucher-canary"
         if production_batch_id is not None:
             canary_label = f"{canary_label} (batch #{production_batch_id})"
+            canary_runbook_url = f"/ops/voucher-mailings/{production_batch_id}"
+        # Where the stages actually live now. §43 moved the production mailing into
+        # the browser, so a banner that still said "from the operator CLI" would
+        # send somebody to a command that refuses.
+        canary_actions_note = (
+            "Шаги рассылки — на странице рассылки."
+            if production_batch_id is not None
+            else "Статус и стадии — из операторского CLI соответствующей фазы."
+        )
 
         # Follow-up eligibility aggregation. Not merely hidden for EasyWeek —
         # not computed: it is Altegio follow-up machinery, and running it would
@@ -6056,7 +6071,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
 <div class="alert alert-warning d-flex align-items-center gap-3 mb-3 flex-wrap">
   <span>Этот preview занят controlled voucher canary ({_esc(canary_label)}).
         Add, Remove, Discard и Delete заблокированы бэкендом до завершения canary.
-        Статус и стадии — только из операторского CLI.</span>
+        {_esc(canary_actions_note)}</span>
   <a href="{_esc(canary_runbook_url)}" class="btn btn-sm btn-outline-secondary">Инструкция</a>
 </div>
 """
