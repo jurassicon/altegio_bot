@@ -18,10 +18,12 @@ a failure. See ``easyweek_voucher_mailing_browser_fixtures``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
+from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (
     assert_no_page_errors,
@@ -1192,3 +1194,311 @@ async def test_another_previews_page_never_shows_this_operation(
         assert_no_page_errors(other)
     finally:
         await other.close()
+
+
+# ===========================================================================
+# An undecided result is neither an absent operation nor a refusal
+# ===========================================================================
+#
+# The last review finding: everything that could not be read was being reported as
+# something that HAD been read. A database error answered 200 with an empty snapshot,
+# so a page reloading during the hiccup concluded there was no operation and threw
+# away the id of a freeze that was queued in that very database; and a 502, a
+# truncated body or an incomplete envelope reached the confirmation as
+# "Отказ: неизвестно" — a refusal nobody had issued, about a stage that had in fact
+# been committed.
+#
+# The substitutions below are made at the test boundary only: the runner's status read
+# is replaced with one that raises, and the confirmation's RESPONSE is replaced after
+# the real request has reached the real server. Every operator action, and everything
+# asserted about what they see, goes through the browser.
+
+
+@contextlib.contextmanager
+def _status_read_broken():
+    """A database that cannot answer the status read, for the length of the block.
+
+    Substituted at the runner seam and restored by hand rather than through
+    ``monkeypatch.undo()``: that would also undo what the fixtures patched for this
+    test — the session factory the in-process app uses, and the production
+    configuration — and the page would then be looking at a different world rather
+    than at a database that had recovered.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    async def boom(*_args, **_kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("connection reset"))
+
+    original = production_runner.run_status
+    production_runner.run_status = boom
+    try:
+        yield
+    finally:
+        production_runner.run_status = original
+
+
+async def _confirm_answer_replaced_by(page, replacement) -> dict[str, int]:
+    """Let the confirmation reach the server, then hand the browser *replacement*.
+
+    ``route.fetch()`` performs the real request — same cookie, same CSRF header, same
+    body — so the operation really is committed. Only the answer is substituted, which
+    is exactly the failure being reproduced: the work happened and the browser cannot
+    tell.
+    """
+    seen = {"posts": 0}
+
+    async def handler(route):
+        seen["posts"] += 1
+        await route.fetch()
+        await route.fulfill(**replacement)
+
+    await page.route("**/api/confirm", handler)
+    return seen
+
+
+async def _freeze_up_to_the_confirmation(page, *, run_id: int, count: int) -> None:
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+
+async def _unconfirmed_result_is_shown(page) -> None:
+    """The page says the result is unknown — never that it was refused."""
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Результат не подтверждён'); }"
+    )
+    assert "Отказ" not in await page.inner_text("#alert-area")
+
+
+async def _one_operation_recovered_and_finished(page, session_maker, *, run_id: int, count: int, seen) -> None:
+    """One confirm, one operation, found by a READ, and the right batch afterwards."""
+    await page.wait_for_selector("#tracked-operation")
+    assert seen["posts"] == 1, f"the confirmation was sent {seen['posts']} times"
+    operations = await operations_module.list_operations(session_maker, campaign_run_id=run_id)
+    assert len(operations) == 1, operations
+
+    await page.unroute("**/api/confirm")
+    await _drain(session_maker)
+    await page.wait_for_url(_MAILING_URL, timeout=20_000)
+    batch_id = int(page.url.rstrip("/").rsplit("/", 1)[-1])
+    snapshot = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert snapshot.recipient_count == count
+    assert len(await operations_module.list_operations(session_maker, batch_id=batch_id)) == 1
+    # Nothing was queued a second time, so nothing can reach EasyWeek or Meta twice.
+    assert await _drain(session_maker) is None, "a second operation was queued"
+    assert_no_page_errors(page)
+
+
+async def test_an_unreadable_status_is_not_an_absent_operation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, ops_server
+):
+    """Scenario A: a queued FREEZE, and the status read fails.
+
+    The reviewed endpoint answered 200 with empty ``batch`` and ``operations``, which a
+    page cannot tell from "this preview has nothing" — so it cleared its tracking and
+    showed an empty panel while the operation sat in the database.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    quiet_run_id, _quiet_reader = await _seed(session_maker, count=1, offset=30)
+    transports.use(reader=reader)
+    await _freeze_up_to_the_confirmation(page, run_id=run_id, count=count)
+    await _press_confirm(page)
+    await page.wait_for_selector("#tracked-operation")
+    assert len(await operations_module.list_operations(session_maker, campaign_run_id=run_id)) == 1
+
+    with _status_read_broken():
+        # A tab with nothing of its own cannot know the id, and must not pretend to
+        # know that there is none.
+        blind = await tab_with_no_cache(page, ops_server)
+        try:
+            await blind.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+            await blind.wait_for_selector("#operation-unreachable")
+            assert await blind.is_hidden("#tracked-operation")
+            assert_no_page_errors(blind)
+        finally:
+            await blind.context.close()
+        # The operation is exactly where it was.
+        assert len(await operations_module.list_operations(session_maker, campaign_run_id=run_id)) == 1
+
+        # The tab that does know the id keeps it, and finds the same operation again.
+        await page.reload()
+        await page.wait_for_selector("#tracked-operation")
+        assert "очереди" in await page.inner_text("#tracked-operation")
+        kept = await page.evaluate("(run) => window.sessionStorage.getItem('ew-voucher-op-' + run)", run_id)
+        assert kept is not None and int(kept) > 0, "the known operation id was thrown away"
+
+    # The database comes back: the same operation, then its batch.
+    await page.reload()
+    await page.wait_for_selector("#tracked-operation")
+    await _drain(session_maker)
+    await page.wait_for_url(_MAILING_URL, timeout=20_000)
+    batch_id = int(page.url.rstrip("/").rsplit("/", 1)[-1])
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).batch_id == batch_id
+    assert len(await operations_module.list_operations(session_maker, batch_id=batch_id)) == 1
+
+    # And a genuinely empty preview still reads as empty — unavailability and absence
+    # are two different answers, not one.
+    empty = await tab_with_no_cache(page, ops_server)
+    try:
+        await empty.goto(f"/ops/voucher-mailings/prepare?preview_run_id={quiet_run_id}")
+        await empty.wait_for_selector("#composition-panel")
+        await empty.wait_for_function(
+            "(run) => window.sessionStorage.getItem('ew-voucher-op-' + run) === null",
+            arg=quiet_run_id,
+        )
+        assert await empty.is_hidden("#tracked-operation")
+        assert await empty.is_hidden("#operation-unreachable")
+        assert_no_page_errors(empty)
+    finally:
+        await empty.context.close()
+    assert_no_page_errors(page)
+
+
+async def test_a_502_page_in_place_of_a_confirm_answer_is_not_a_refusal(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Scenario B: the operation is committed and the browser is handed 502 HTML."""
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    seen = await _confirm_answer_replaced_by(
+        page,
+        {
+            "status": 502,
+            "content_type": "text/html",
+            "body": "<html><head><title>502</title></head><body>Bad Gateway</body></html>",
+        },
+    )
+    await _freeze_up_to_the_confirmation(page, run_id=run_id, count=count)
+    await _press_confirm(page)
+
+    await _unconfirmed_result_is_shown(page)
+    await _one_operation_recovered_and_finished(page, session_maker, run_id=run_id, count=count, seen=seen)
+
+
+async def test_a_truncated_confirm_answer_is_not_a_refusal(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Scenario C: HTTP 200, and a JSON body that stops in the middle."""
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    seen = await _confirm_answer_replaced_by(
+        page,
+        {
+            "status": 200,
+            "content_type": "application/json",
+            "body": '{"accepted": true, "created": true, "operation": {"operation_id"',
+        },
+    )
+    await _freeze_up_to_the_confirmation(page, run_id=run_id, count=count)
+    await _press_confirm(page)
+
+    await _unconfirmed_result_is_shown(page)
+    await _one_operation_recovered_and_finished(page, session_maker, run_id=run_id, count=count, seen=seen)
+
+
+async def test_an_incomplete_success_envelope_is_not_believed_either_way(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Scenario D: valid JSON, ``accepted: true``, and no operation to point at.
+
+    Neither a refusal nor a success: there is no operation id in it, so the page has
+    nothing to watch and must go and read what exists rather than guess which.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    seen = await _confirm_answer_replaced_by(
+        page,
+        {
+            "status": 200,
+            "content_type": "application/json",
+            "body": '{"accepted": true, "created": true, "reasons": [], "operation": {"stage": "freeze"}}',
+        },
+    )
+    await _freeze_up_to_the_confirmation(page, run_id=run_id, count=count)
+    await _press_confirm(page)
+
+    await _unconfirmed_result_is_shown(page)
+    await _one_operation_recovered_and_finished(page, session_maker, run_id=run_id, count=count, seen=seen)
+
+
+async def test_a_real_refusal_is_still_reported_as_a_refusal(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """The other half of the distinction, and the one it must not swallow.
+
+    The refusal here is the server's own: the confirmation's REQUEST is altered so it
+    states a count the approval does not authorise, and the real
+    :func:`confirm_stage` refuses it with its own reason. Nothing is faked about the
+    answer — and nothing must be created.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    async def miscount(route):
+        import json as json_module
+
+        payload = json_module.loads(route.request.post_data or "{}")
+        payload["confirmed_count"] = int(payload.get("confirmed_count") or 0) + 1
+        await route.continue_(post_data=json_module.dumps(payload))
+
+    await page.route("**/api/confirm", miscount)
+    await _freeze_up_to_the_confirmation(page, run_id=run_id, count=count)
+    await _press_confirm(page)
+
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area'); return el && el.innerText.includes('Отказ'); }"
+    )
+    shown = await page.inner_text("#alert-area")
+    assert "voucher_production_approval_count_unconfirmed" in shown, shown
+    assert "не подтверждён" not in shown, shown
+    # A refusal creates nothing, and leaves nothing to watch.
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    assert await page.is_hidden("#tracked-operation")
+    assert_no_page_errors(page)
+
+
+async def test_a_status_error_does_not_blank_a_mailings_progress(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """The mailing page keeps what was proven when the next read fails.
+
+    Repainting from an unavailable answer would empty the slots table and zero the
+    delivery counters of a mailing that is running — the same confusion as scenario A,
+    on the screen where the money is.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    batch_id = await _freeze_through_browser(page, session_maker, transports, run_id=run_id, count=count)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+    mutator = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
+    transports.use(reader=reader, mutator=mutator)
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-create")
+    await _wait_for_slots_text(page, "created")
+    rows_before = await page.locator("#slots-table tbody tr").count()
+    assert rows_before == count
+
+    with _status_read_broken():
+        await page.wait_for_selector("#status-unavailable")
+
+        # The progress is still the progress.
+        assert await page.locator("#slots-table tbody tr").count() == rows_before
+        assert "created" in await page.inner_text("#slots-table")
+        assert "Получателей нет" not in await page.inner_text("#slots-panel")
+
+    # And it repaints again once the read works.
+    await page.wait_for_selector("#status-unavailable", state="hidden")
+    assert await page.locator("#slots-table tbody tr").count() == rows_before
+    assert mutator.calls.count("create") == count
+    assert_no_page_errors(page)

@@ -55,6 +55,7 @@ from altegio_bot.campaigns.easyweek_voucher_production import operations as oper
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     API_UNAVAILABLE,
+    DATABASE_UNAVAILABLE,
     OPERATION_UNKNOWN,
     OPS_CSRF_INVALID,
     OPS_ORIGIN_REJECTED,
@@ -366,20 +367,44 @@ async def api_status(batch_id: int | None = None, preview_run_id: int | None = N
     if batch_id is None and preview_run_id is None:
         return JSONResponse(
             status_code=400,
-            content={"reasons": ["voucher_production_unscoped_status"]},
+            content={"status_known": False, "reasons": ["voucher_production_unscoped_status"]},
         )
     try:
-        report = await production_runner.run_status(SessionLocal, batch_id=batch_id, preview_run_id=preview_run_id)
-        state = report.as_safe_dict()
+        state = await _status_snapshot(batch_id=batch_id, preview_run_id=preview_run_id)
     except SQLAlchemyError:
-        return JSONResponse(status_code=200, content={"batch": {}, "batches": [], "operations": []})
+        # A database that cannot answer is NOT an empty mailing, and this is where the
+        # two used to be confused: the reviewed version answered 200 with empty
+        # ``batch``, ``batches`` and ``operations``, which is indistinguishable from
+        # "this preview has nothing" — so a page that reloaded during a database
+        # hiccup threw away the id of a queued FREEZE that was sitting in that very
+        # database. The answer now says, in its status code and in one reason code,
+        # that the state is UNKNOWN. No SQL, no driver message, no identity: a reader
+        # of this answer learns that the mailing could not be read and nothing else.
+        return JSONResponse(
+            status_code=503,
+            content={"status_known": False, "reasons": [DATABASE_UNAVAILABLE]},
+        )
+    return JSONResponse(status_code=200, content=state)
+
+
+async def _status_snapshot(*, batch_id: int | None, preview_run_id: int | None) -> dict[str, Any]:
+    """The whole scoped status answer, or an exception. Never a half-built one.
+
+    Every read is inside this function so that a failure in any of them — the report,
+    the operations, the stop state, the per-slot actions — reaches the caller as a
+    failure. The reviewed code guarded only the first read, so a database that died
+    between two of them produced either a 500 or, worse, an answer missing the part
+    that had failed.
+    """
+    report = await production_runner.run_status(SessionLocal, batch_id=batch_id, preview_run_id=preview_run_id)
+    state = report.as_safe_dict()
     resolved = batch_id if batch_id is not None else (state.get("batch") or {}).get("batch_id")
     # One of the two is always set, so the listing is never global.
-    scope: dict[str, Any] = (
+    listing_scope: dict[str, Any] = (
         {"batch_id": int(resolved)} if resolved is not None else {"campaign_run_id": int(preview_run_id or 0)}
     )
-    operations = await operations_module.list_operations(SessionLocal, limit=20, **scope)
-    active = await operations_module.active_operation(SessionLocal, **scope)
+    operations = await operations_module.list_operations(SessionLocal, limit=20, **listing_scope)
+    active = await operations_module.active_operation(SessionLocal, **listing_scope)
     stop = (
         (await ledger_module.stop_state(SessionLocal, batch_id=int(resolved))).as_safe_dict()
         if resolved is not None
@@ -396,7 +421,16 @@ async def api_status(batch_id: int | None = None, preview_run_id: int | None = N
         actions = {entry.slot: list(production_runner.available_item_actions(entry)) for entry in snapshot.items}
         for item in state.get("batch", {}).get("items", []):
             item["available_actions"] = actions.get(item.get("slot"), [])
-    return JSONResponse(status_code=200, content=state)
+    # Two positive statements, so that a reader can tell a COMPLETE answer about the
+    # mailing it asked about from anything else — an error page, a truncated body, a
+    # proxy's idea of a response, or a correct answer about a different mailing. A
+    # page may conclude "there is no operation" only from an answer carrying both.
+    state["status_known"] = True
+    state["scope"] = {
+        "batch_id": int(resolved) if resolved is not None else None,
+        "preview_run_id": int(preview_run_id) if preview_run_id is not None else None,
+    }
+    return state
 
 
 @router.get("/api/operation")
@@ -410,10 +444,22 @@ async def api_operation(operation_id: int, preview_run_id: int) -> JSONResponse:
     Scoped by preview and checked against it, so an id guessed or carried over from
     another mailing answers 404 rather than another preview's progress.
     """
-    operation = await operations_module.load_operation(SessionLocal, operation_id=operation_id)
+    try:
+        operation = await operations_module.load_operation(SessionLocal, operation_id=operation_id)
+    except SQLAlchemyError:
+        # The 404 below is the page's evidence that an operation is not this
+        # preview's, and a page acts on it: it stops watching. So a database that
+        # cannot answer must never be able to produce one. It gets its own answer.
+        return JSONResponse(
+            status_code=503,
+            content={"status_known": False, "reasons": [DATABASE_UNAVAILABLE]},
+        )
     if operation is None or operation.campaign_run_id != preview_run_id:
-        return JSONResponse(status_code=404, content={"reasons": [OPERATION_UNKNOWN]})
-    return JSONResponse(status_code=200, content={"operation": operation.as_safe_dict()})
+        return JSONResponse(status_code=404, content={"status_known": True, "reasons": [OPERATION_UNKNOWN]})
+    return JSONResponse(
+        status_code=200,
+        content={"status_known": True, "operation": operation.as_safe_dict()},
+    )
 
 
 @router.post("/api/composition")
@@ -805,6 +851,9 @@ async def page_mailing(request: Request, batch_id: int) -> str:
 <table class="table table-sm w-auto">{header_table}</table>
 
 <div id="stop-banner"></div>
+<!-- Whether what is shown below is CURRENT. Its own element, so an unreadable
+     status can say so without replacing the stop banner or the progress. -->
+<div id="status-health"></div>
 
 <h2 class="h5 mt-4">Шаги</h2>
 <p class="text-muted small">
@@ -1030,11 +1079,20 @@ function mayRefund(item) {
   return actions.indexOf("refund") !== -1;
 }
 
-/* Every POST this page makes. A transport failure is reported as a RESULT rather
-   than thrown, because the callers have to tell three states apart (review F1/F2):
-   the server refused, the server answered, and the answer never arrived. The third
-   one is the dangerous one — it says nothing about whether the request was carried
-   out — and the reviewed code could not express it at all. */
+/* Every POST this page makes, classified into the only three things an answer can
+   be. The distinction is the whole point:
+
+   * the server DECIDED — it carried the request out, or it refused it for a named
+     reason. Either way something is known.
+   * the result is UNDECIDED — the answer never arrived, or arrived as something that
+     carries no decision: a 502 from a proxy, an HTML error page, a body that stops
+     half way, anything that is not a JSON object.
+
+   The reviewed version could only express "the fetch threw". Everything else became
+   ``data: {}`` with ``transport: false`` — a well-formed, empty, confident answer —
+   and the confirmation then told the operator "Отказ: неизвестно" about a stage that
+   was at that moment queued in the database. An absent decision is not a refusal,
+   and this is where the two stop being confused. */
 async function postJson(path, payload) {
   let response = null;
   try {
@@ -1045,11 +1103,49 @@ async function postJson(path, payload) {
       body: JSON.stringify(payload)
     });
   } catch (err) {
-    return {status: 0, transport: true, data: {}};
+    return {status: 0, transport: true, undecided: true, structured: false, data: {}};
   }
-  let data = {};
-  try { data = await response.json(); } catch (err) { data = {}; }
-  return {status: response.status, transport: false, data: data};
+  let data = null;
+  let readable = true;
+  try { data = await response.json(); } catch (err) { readable = false; }
+  const structured = readable && data !== null && typeof data === "object" && !Array.isArray(data);
+  /* A 5xx is the server failing, never its decision about this request, so it is
+     undecided even when it happens to carry a JSON body. */
+  const undecided = !structured || response.status >= 500;
+  return {
+    status: response.status,
+    transport: false,
+    undecided: undecided,
+    structured: structured,
+    data: structured ? data : {}
+  };
+}
+
+/* WHY the result is undecided, in the operator's words. Two different situations,
+   and an operator acts on them differently: nothing came back at all, or something
+   came back that says nothing — a gateway's error page, a body that stops half way.
+   Neither is a decision, and neither is reported as one. */
+function undecidedLabel(result) {
+  return result.transport ? "Ответ не получен" : "Ответ сервера не распознан";
+}
+
+/* Which of the three a CONFIRMATION answer is. Anything short of a complete,
+   well-formed envelope is "unknown" and never "refused": a refusal is a decision the
+   server made about this request, while a truncated body, an error page and an
+   "accepted" without an operation to point at are all the absence of one. */
+function confirmVerdict(result) {
+  if (result.undecided) return "unknown";
+  const data = result.data || {};
+  if (data.accepted === true) {
+    const operation = data.operation;
+    const complete = operation !== null && typeof operation === "object" && !Array.isArray(operation)
+      && Number.isInteger(operation.operation_id) && typeof operation.status === "string";
+    return complete ? "accepted" : "unknown";
+  }
+  if (data.accepted === false && Array.isArray(data.reasons) && data.reasons.length > 0) {
+    return "refused";
+  }
+  return "unknown";
 }
 
 /* ===========================================================================
@@ -1097,14 +1193,15 @@ async function inspectComposition() {
   OFFER = null;
   hideConfirm();
   const panel = document.getElementById("freeze-panel");
-  if (result.transport) {
-    /* No answer is not an empty audience. What was read earlier stays on screen,
-       marked: overwriting it with zeros would turn a lost connection into a mailing
-       that looks like it has nobody in it. */
+  if (result.undecided) {
+    /* No answer is not an empty audience — and neither is an error page or a body
+       that stops half way. What was read earlier stays on screen, marked:
+       overwriting it with zeros would turn a lost connection into a mailing that
+       looks like it has nobody in it. */
     if (panel) panel.classList.add("d-none");
     COMPOSITION_STALE = COMPOSITION !== null;
     renderComposition();
-    setAlert("danger", "Ответ сервера не получен: состав не прочитан. Повторите проверку.");
+    setAlert("danger", undecidedLabel(result) + ": состав не прочитан. Повторите проверку.");
     return;
   }
   const data = result.data || {};
@@ -1174,15 +1271,15 @@ async function planStage(stage, options) {
 
 function renderOffer(stage, result, options) {
   const data = result.data || {};
-  if (result.transport) {
-    /* The plan answer never arrived, so nothing is armed — and for a freeze the
-       list on screen is no longer known to be current. */
+  if (result.undecided) {
+    /* The plan answer carries no decision, so nothing is armed — and for a freeze
+       the list on screen is no longer known to be current. */
     OFFER = null;
     hideConfirm();
     if (stage === "freeze") {
-      markCompositionStale("Ответ сервера не получен. Проверьте состав заново.");
+      markCompositionStale(undecidedLabel(result) + ". Проверьте состав заново.");
     } else {
-      setAlert("danger", "Ответ сервера не получен. Подготовьте шаг заново.");
+      setAlert("danger", undecidedLabel(result) + ". Подготовьте шаг заново.");
     }
     return;
   }
@@ -1313,50 +1410,64 @@ async function confirmStage() {
   OFFER = null;
   hideConfirm();
   if (button) button.disabled = false;
-  if (result.transport) {
-    /* The answer never came back, and the operation may well have been committed
-       before the connection broke (review F2). The one thing that must not happen
-       now is a second confirmation, so none is sent: the page asks the server what
-       exists. A duplicate would be refused by the spent approval anyway — this is
-       about not asking, and about not telling the operator that nothing happened. */
-    setAlert("warning", "Ответ не получен. Повторное подтверждение не отправляется —"
-      + " состояние уточняется на сервере.");
+  const verdict = confirmVerdict(result);
+  if (verdict === "unknown") {
+    /* The request may well have been carried out before the answer went missing or
+       arrived unreadable, so the result is not known from here. The one thing that
+       must not happen now is a second confirmation: none is sent, no batch is
+       invented, and nothing is re-attempted against EasyWeek or Meta. The page asks
+       the server what exists instead — and says that it is doing so, rather than
+       reporting a refusal nobody issued. */
+    setAlert("warning", undecidedLabel(result) + ". Результат не подтверждён —"
+      + " повторное подтверждение не отправляется, состояние уточняется на сервере.");
     await resumeFromServer();
     return;
   }
   const data = result.data || {};
-  if (data.accepted && data.operation) {
-    const where = data.operation.batch_id;
-    if (where) {
-      if (BATCH_ID === null) {
-        window.location.href = "/ops/voucher-mailings/" + where;
-        return;
-      }
-      setAlert("info", data.created
-        ? "Шаг принят в работу."
-        : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
-      refreshStatus();
-      return;
-    }
-    /* A FREEZE is confirmed before its batch exists, so the answer carries no
-       batch id (review R5). The page watches the OPERATION until one appears
-       instead of giving up — and remembers it, so a refresh resumes watching the
-       same operation rather than offering a second freeze. */
-    TRACKED_OPERATION = data.operation.operation_id;
-    rememberTrackedOperation(TRACKED_OPERATION);
-    setAlert("info", data.created
-      ? "Шаг принят в работу. Можно закрыть страницу — работа продолжится на сервере."
-      : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
-    trackOperation();
+  if (verdict === "refused") {
+    /* A real decision, with reasons the server named. Shown as the refusal it is. */
+    setAlert("warning", "Отказ: " + data.reasons.join(", "));
+    await resumeFromServer();
     return;
   }
-  setAlert("warning", "Отказ: " + ((data.reasons || []).join(", ") || "неизвестно"));
-  refreshStatus();
+  /* verdict === "accepted": a complete envelope, naming the operation the server
+     created or found. */
+  const where = data.operation.batch_id;
+  if (where) {
+    if (BATCH_ID === null) {
+      window.location.href = "/ops/voucher-mailings/" + where;
+      return;
+    }
+    setAlert("info", data.created
+      ? "Шаг принят в работу."
+      : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
+    refreshStatus();
+    return;
+  }
+  /* A FREEZE is confirmed before its batch exists, so the answer carries no
+     batch id (review R5). The page watches the OPERATION until one appears
+     instead of giving up — and remembers it, so a refresh resumes watching the
+     same operation rather than offering a second freeze. */
+  TRACKED_OPERATION = data.operation.operation_id;
+  rememberTrackedOperation(TRACKED_OPERATION);
+  setAlert("info", data.created
+    ? "Шаг принят в работу. Можно закрыть страницу — работа продолжится на сервере."
+    : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
+  trackOperation();
+  return;
 }
 
 async function stopBatch() {
   if (BATCH_ID === null) return;
   const result = await postJson("/ops/voucher-mailings/api/stop", {batch_id: BATCH_ID});
+  if (result.undecided) {
+    /* The stop is a durable write, so "no readable answer" must not be reported as
+       "not accepted": it may well have been saved. The poll below is what settles it. */
+    setAlert("warning", undecidedLabel(result) + ". Результат не подтверждён —"
+      + " проверьте состояние ниже.");
+    refreshStatus();
+    return;
+  }
   const data = result.data || {};
   setAlert(data.stop_active ? "warning" : "secondary",
     data.stop_active
@@ -1369,6 +1480,13 @@ async function reconcile() {
   if (BATCH_ID === null) return;
   const result = await postJson("/ops/voucher-mailings/api/reconcile",
     {batch_id: BATCH_ID, preview_run_id: PREVIEW_RUN_ID});
+  if (result.undecided) {
+    /* A readback may have happened. Saying "сверка недоступна" would be a claim about
+       the outside world that this answer does not support. */
+    setAlert("warning", undecidedLabel(result) + ". Результат сверки не подтверждён.");
+    refreshStatus();
+    return;
+  }
   const data = result.data || {};
   setAlert(data.accepted ? "info" : "warning", data.accepted
     ? "Сверка выполнена."
@@ -1378,14 +1496,24 @@ async function reconcile() {
 
 async function loadRecipients() {
   if (BATCH_ID === null) return;
-  const response = await fetch("/ops/voucher-mailings/api/recipients?batch_id=" +
-    encodeURIComponent(BATCH_ID), {credentials: "same-origin"});
-  let data = {};
-  try { data = await response.json(); } catch (err) { return; }
-  RECIPIENTS = {};
-  for (const person of (data.recipients || [])) {
-    RECIPIENTS[person.slot] = person;
+  let response = null;
+  try {
+    response = await fetch("/ops/voucher-mailings/api/recipients?batch_id=" +
+      encodeURIComponent(BATCH_ID), {credentials: "same-origin"});
+  } catch (err) {
+    return;
   }
+  if (!response.ok) return;
+  let data = null;
+  try { data = await response.json(); } catch (err) { return; }
+  if (!isJsonObject(data) || !Array.isArray(data.recipients)) return;
+  /* Replaced only once a complete list has arrived: a failed read must not blank the
+     names beside a mailing's slots. */
+  const lines = {};
+  for (const person of data.recipients) {
+    lines[person.slot] = person;
+  }
+  RECIPIENTS = lines;
 }
 
 function refundSlot(slot) {
@@ -1469,23 +1597,31 @@ async function trackOperation() {
     trackAgainAfterFailure();
     return;
   }
+  let body = null;
+  try { body = await response.json(); } catch (err) { body = null; }
   if (response.status === 404) {
-    /* Authoritative, and not a failure in disguise: this endpoint answers 404 only
-       for an operation that does not exist or belongs to another preview, while a
-       database that cannot answer raises a 500. Another preview's work is never
-       shown here, so the id goes. */
-    TRACKED_OPERATION = null;
-    forgetTrackedOperation();
+    /* Authoritative — but only when the application said it, which it marks. This
+       endpoint answers 404 for an operation that does not exist or belongs to another
+       preview; a database that cannot answer gets a 503, and a proxy's own 404 carries
+       no such mark and is treated as a failed read rather than as an answer. */
+    if (isJsonObject(body) && body.status_known === true) {
+      TRACKED_OPERATION = null;
+      forgetTrackedOperation();
+      return;
+    }
+    trackAgainAfterFailure();
     return;
   }
   if (!response.ok) {
     trackAgainAfterFailure();
     return;
   }
-  let data = null;
-  try { data = await response.json(); } catch (err) { trackAgainAfterFailure(); return; }
+  const data = isJsonObject(body) ? body : null;
   const operation = data && data.operation;
-  if (!operation) { trackAgainAfterFailure(); return; }
+  if (!isJsonObject(operation) || !Number.isInteger(operation.operation_id)) {
+    trackAgainAfterFailure();
+    return;
+  }
   /* A read landed, so the connection notice — if there was one — is over. */
   TRACK_FAILURES = 0;
   renderTrackedOperation(operation);
@@ -1589,8 +1725,34 @@ async function resumeFromServer() {
   if (!operationSettled(operation)) await trackOperation();
 }
 
+/* A JSON object, as opposed to a string, an array, null, or a page of HTML that
+   happened to parse. */
+function isJsonObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/* Is this a COMPLETE status answer about the scope that was asked for?
+
+   Everything that concludes "there is nothing here" hangs off this question, so it is
+   asked explicitly rather than by reading fields and finding them absent. The server
+   states ``status_known`` and the scope it answered about; an error page, a body that
+   stops half way, an empty object and a correct answer about a DIFFERENT mailing all
+   fail to say either, and none of them is evidence of an empty mailing. */
+function answersAbout(state, key, expected) {
+  if (!isJsonObject(state)) return false;
+  if (state.status_known !== true) return false;
+  const scope = state.scope;
+  if (!isJsonObject(scope)) return false;
+  return Number(scope[key]) === Number(expected);
+}
+
+function validPreviewState(state) {
+  return answersAbout(state, "preview_run_id", PREVIEW_RUN_ID) && Array.isArray(state.operations);
+}
+
 /* This preview's durable state, or an honest failure. Scoped by preview, so one
-   preview can never be shown another's work. */
+   preview can never be shown another's work — and never a half-answer passed off as
+   one, which is what let a database hiccup erase a queued freeze. */
 async function readPreviewState() {
   let response = null;
   try {
@@ -1600,11 +1762,14 @@ async function readPreviewState() {
     return {ok: false};
   }
   if (!response.ok) return {ok: false};
+  let state = null;
   try {
-    return {ok: true, state: await response.json()};
+    state = await response.json();
   } catch (err) {
     return {ok: false};
   }
+  if (!validPreviewState(state)) return {ok: false};
+  return {ok: true, state: state};
 }
 
 function renderTrackedOperation(operation) {
@@ -1620,16 +1785,52 @@ function renderTrackedOperation(operation) {
     escapeHtml(text) + "</div>";
 }
 
+/* The mailing page's poll. An unreadable answer leaves the PROGRESS alone — it is
+   the last thing that was actually proven — and says that it may no longer be
+   current. Repainting from an unavailable answer would have emptied the slots table
+   and zeroed the delivery counters of a mailing that was running. */
 async function refreshStatus() {
   if (BATCH_ID === null) return;
-  const response = await fetch("/ops/voucher-mailings/api/status?batch_id=" + BATCH_ID,
-    {credentials: "same-origin"});
-  let state = {};
-  try { state = await response.json(); } catch (err) { return; }
+  let response = null;
+  try {
+    response = await fetch("/ops/voucher-mailings/api/status?batch_id=" +
+      encodeURIComponent(BATCH_ID), {credentials: "same-origin"});
+  } catch (err) {
+    renderStatusUnavailable();
+    return;
+  }
+  if (!response.ok) {
+    renderStatusUnavailable();
+    return;
+  }
+  let state = null;
+  try {
+    state = await response.json();
+  } catch (err) {
+    renderStatusUnavailable();
+    return;
+  }
+  if (!answersAbout(state, "batch_id", BATCH_ID)) {
+    renderStatusUnavailable();
+    return;
+  }
   renderStatus(state);
 }
 
+/* Not "nothing is happening" and not "the mailing is empty": the current state is
+   unknown, the last known one is still on screen, and the page keeps asking. */
+function renderStatusUnavailable() {
+  const area = document.getElementById("status-health");
+  if (!area) return;
+  area.innerHTML = '<div class="alert alert-warning" id="status-unavailable">' +
+    escapeHtml("Состояние сейчас прочитать не удалось. Показано последнее известное —"
+      + " страница продолжает опрашивать сервер.") + "</div>";
+}
+
 function renderStatus(state) {
+  /* Reached only with a complete answer, so the notice — if there was one — is over. */
+  const health = document.getElementById("status-health");
+  if (health) health.innerHTML = "";
   const banner = stateBanner(state);
   const bannerArea = document.getElementById("stop-banner");
   if (bannerArea) {

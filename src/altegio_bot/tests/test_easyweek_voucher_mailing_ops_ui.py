@@ -37,6 +37,7 @@ from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
+from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_PAID,
@@ -1205,3 +1206,186 @@ async def test_no_page_or_api_answer_carries_a_code_or_an_identity(
     for surface in surfaces:
         for secret in forbidden:
             assert secret not in surface, f"leaked {secret!r}"
+
+
+# ===========================================================================
+# An undecided answer is not a decision
+# ===========================================================================
+
+
+async def test_a_status_read_that_fails_is_not_an_empty_mailing(
+    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+):
+    """The endpoint contract behind the last review finding.
+
+    It used to answer 200 with empty ``batch``, ``batches`` and ``operations`` when the
+    database could not be read — an answer a caller cannot tell from "this preview has
+    nothing", and the page acted on it by discarding the id of a queued freeze. The
+    answer now says that the state is unknown, and says nothing else: no SQL, no driver
+    message, no identity.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    run_id, batch_id, _reader = await _frozen(ui_client, session_maker, transports, count=1)
+
+    async def boom(*_args, **_kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("connection reset"))
+
+    monkeypatch.setattr(production_runner, "run_status", boom)
+
+    for url in (f"{STATUS_URL}?preview_run_id={run_id}", f"{STATUS_URL}?batch_id={batch_id}"):
+        answer = await ui_client.get(url)
+        assert answer.status_code == 503, (url, answer.status_code)
+        body = answer.json()
+        assert body["status_known"] is False, body
+        assert body["reasons"] == ["voucher_production_database_unavailable"], body
+        # Nothing that could be mistaken for a state, and nothing internal.
+        assert "operations" not in body and "batch" not in body, body
+        for leak in ("SELECT", "connection reset", "OperationalError", "asyncpg", "Traceback"):
+            assert leak not in answer.text, (leak, answer.text)
+
+
+async def test_an_operation_read_that_fails_is_not_an_unknown_operation(
+    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+):
+    """The 404 is the page's evidence to stop watching, so a failure must not be one."""
+    from sqlalchemy.exc import OperationalError
+
+    run_id, _batch_id, _reader = await _frozen(ui_client, session_maker, transports, count=1)
+    operations = await operations_module.list_operations(session_maker, campaign_run_id=run_id)
+    assert operations
+
+    async def boom(*_args, **_kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("connection reset"))
+
+    monkeypatch.setattr(operations_module, "load_operation", boom)
+    answer = await ui_client.get(
+        f"/ops/voucher-mailings/api/operation?operation_id={operations[0].id}&preview_run_id={run_id}"
+    )
+    assert answer.status_code == 503, answer.status_code
+    assert answer.json()["status_known"] is False
+    assert "voucher_production_operation_unknown" not in answer.text
+
+
+async def test_the_status_answer_says_what_it_is_about(
+    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+):
+    """A complete answer states that it is one, and which mailing it describes.
+
+    This is what lets a page refuse to believe an error page, a truncated body or a
+    correct answer about somebody else's preview — and therefore what lets it conclude
+    "there is no operation" only when there really is none.
+    """
+    run_id, batch_id, _reader = await _frozen(ui_client, session_maker, transports, count=1)
+
+    by_batch = (await ui_client.get(f"{STATUS_URL}?batch_id={batch_id}")).json()
+    assert by_batch["status_known"] is True
+    assert by_batch["scope"]["batch_id"] == batch_id
+
+    by_preview = (await ui_client.get(f"{STATUS_URL}?preview_run_id={run_id}")).json()
+    assert by_preview["status_known"] is True
+    assert by_preview["scope"]["preview_run_id"] == run_id
+    # A frozen preview resolves to its batch, and the answer names both.
+    assert by_preview["scope"]["batch_id"] == batch_id
+
+    unscoped = await ui_client.get(STATUS_URL)
+    assert unscoped.status_code == 400
+    assert unscoped.json()["status_known"] is False
+
+
+@needs_node
+async def test_an_undecided_confirmation_answer_is_never_a_refusal(ui_client, ops_credentials) -> None:
+    """``confirmVerdict`` over every shape an answer can take, as shipped.
+
+    The table is the point: a refusal is a decision the server made about this request,
+    and a 502, an HTML error page, a body that stops half way and an "accepted" with no
+    operation to point at are all the ABSENCE of one. Calling any of them a refusal is
+    what told an operator nothing had happened while their stage was queued.
+    """
+    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=1")
+    script = _page_script(page.text)
+    source = _function_source(script, "confirmVerdict")
+    driver = """
+const complete = {operation_id: 5, status: "queued", stage: "freeze", batch_id: null};
+const cases = {
+  lost_connection: {status: 0, transport: true, undecided: true, structured: false, data: {}},
+  bad_gateway_html: {status: 502, transport: false, undecided: true, structured: false, data: {}},
+  truncated_body: {status: 200, transport: false, undecided: true, structured: false, data: {}},
+  five_hundred_with_json: {status: 500, transport: false, undecided: true, structured: true,
+                           data: {accepted: false, reasons: ["internal"]}},
+  accepted_without_operation: {status: 200, transport: false, undecided: false, structured: true,
+                               data: {accepted: true, created: true}},
+  accepted_with_partial_operation: {status: 200, transport: false, undecided: false, structured: true,
+                                    data: {accepted: true, operation: {stage: "freeze"}}},
+  accepted_with_null_operation: {status: 200, transport: false, undecided: false, structured: true,
+                                 data: {accepted: true, operation: null}},
+  refused_with_reasons: {status: 409, transport: false, undecided: false, structured: true,
+                         data: {accepted: false, reasons: ["voucher_production_approval_expired"]}},
+  refused_without_reasons: {status: 409, transport: false, undecided: false, structured: true,
+                            data: {accepted: false, reasons: []}},
+  accepted_properly: {status: 200, transport: false, undecided: false, structured: true,
+                      data: {accepted: true, created: true, operation: complete}}
+};
+const verdicts = {};
+for (const name of Object.keys(cases)) verdicts[name] = confirmVerdict(cases[name]);
+console.log(JSON.stringify(verdicts));
+"""
+    verdicts = _run_node(source, driver)
+    assert verdicts == {
+        "lost_connection": "unknown",
+        "bad_gateway_html": "unknown",
+        "truncated_body": "unknown",
+        "five_hundred_with_json": "unknown",
+        "accepted_without_operation": "unknown",
+        "accepted_with_partial_operation": "unknown",
+        "accepted_with_null_operation": "unknown",
+        # A server that named its reason made a decision, and it is kept as one.
+        "refused_with_reasons": "refused",
+        # ...but "refused" with nothing said is not a reason, so it is not believed.
+        "refused_without_reasons": "unknown",
+        "accepted_properly": "accepted",
+    }, verdicts
+
+
+@needs_node
+async def test_an_incomplete_status_answer_is_not_evidence_of_an_empty_preview(ui_client, ops_credentials) -> None:
+    """``validPreviewState`` is what guards every "there is nothing here" conclusion."""
+    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=7")
+    script = _page_script(page.text)
+    source = "\n".join(_function_source(script, name) for name in ("validPreviewState", "answersAbout", "isJsonObject"))
+    driver = """
+const PREVIEW_RUN_ID = 7;
+const cases = {
+  complete_and_empty: {status_known: true, scope: {preview_run_id: 7, batch_id: null}, operations: []},
+  complete_with_work: {status_known: true, scope: {preview_run_id: 7, batch_id: 3}, operations: [{operation_id: 1}]},
+  the_old_empty_snapshot: {batch: {}, batches: [], operations: []},
+  no_marker: {scope: {preview_run_id: 7}, operations: []},
+  marker_false: {status_known: false, scope: {preview_run_id: 7}, operations: []},
+  another_preview: {status_known: true, scope: {preview_run_id: 8, batch_id: null}, operations: []},
+  no_scope: {status_known: true, operations: []},
+  operations_missing: {status_known: true, scope: {preview_run_id: 7}},
+  not_an_object: "<html>502 Bad Gateway</html>",
+  an_array: [],
+  nothing: null
+};
+const verdicts = {};
+for (const name of Object.keys(cases)) verdicts[name] = validPreviewState(cases[name]);
+console.log(JSON.stringify(verdicts));
+"""
+    verdicts = _run_node(source, driver)
+    assert verdicts == {
+        # Only these two are evidence about this preview — and the first one is how an
+        # empty preview is legitimately recognised.
+        "complete_and_empty": True,
+        "complete_with_work": True,
+        # The shape the reviewed endpoint returned on a database error.
+        "the_old_empty_snapshot": False,
+        "no_marker": False,
+        "marker_false": False,
+        "another_preview": False,
+        "no_scope": False,
+        "operations_missing": False,
+        "not_an_object": False,
+        "an_array": False,
+        "nothing": False,
+    }, verdicts
