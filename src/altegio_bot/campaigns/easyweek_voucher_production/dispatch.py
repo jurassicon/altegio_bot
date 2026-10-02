@@ -348,6 +348,12 @@ class CompositionView:
     total_exposure_minor: int
     unit_price_minor: int
     lines: tuple[RecipientLine, ...] = ()
+    # WHICH audience this is, as the freeze would sign it. Reported so the page can
+    # tell "the list I am showing" from "the list a plan just re-proved" (review F1):
+    # one member swapped for another leaves the count and the money identical, so a
+    # screen comparing only numbers would present a stale list as the confirmed one.
+    # It is a digest over slots and preview rows — no name, number or secret.
+    composition_digest: str | None = None
 
     def as_ui_dict(self) -> dict[str, Any]:
         return {
@@ -357,6 +363,7 @@ class CompositionView:
             "recipient_count": self.recipient_count,
             "total_exposure_minor": self.total_exposure_minor,
             "unit_price_minor": self.unit_price_minor,
+            "composition_digest": self.composition_digest,
             "recipients": [line.as_ui_dict() for line in self.lines],
             "issuer_display_name": APPROVED_ISSUER_DISPLAY_NAME,
         }
@@ -456,6 +463,10 @@ async def inspect_composition(
         recipient_count=composition.recipient_count,
         total_exposure_minor=composition.total_exposure_minor,
         unit_price_minor=UNIT_PRICE_MINOR,
+        # The same digest a freeze plan carries in its signed snapshot, so the two
+        # are comparable at all. Only for a proven audience: there is no identity to
+        # report for a composition that could not be established.
+        composition_digest=composition.composition_digest() if composition.proven else None,
         lines=lines,
     )
 

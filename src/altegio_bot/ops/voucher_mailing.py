@@ -720,13 +720,15 @@ let TRACKED_OPERATION = null;
 
 {_PAGE_SCRIPT}
 
-/* An operation confirmed earlier and still unfinished (review R5). Picked up on
-   load, so a refresh or a fresh login resumes watching it rather than looking like
-   a mailing nobody started. */
-TRACKED_OPERATION = recallTrackedOperation();
-if (TRACKED_OPERATION !== null) {{
-  trackOperation();
-}}
+/* The composition panel says what it knows before anything is pressed: "not checked
+   yet", which is not the same statement as an empty mailing (review F1). */
+renderComposition();
+
+/* Whatever this preview already has, read from the SERVER (review F2): a queued or
+   finished operation, or the mailing a freeze already produced. A fresh login, a new
+   tab and a browser with nothing stored all land on the same state, because none of
+   them is the thing being asked. */
+resumeFromServer();
 
 function loadComposition() {{
   /* A READ of the real audience (review R3). It used to ask for a freeze plan,
@@ -737,6 +739,12 @@ function loadComposition() {{
 }}
 
 function planFreeze() {{
+  if (COMPOSITION === null || COMPOSITION_STALE) {{
+    /* Review F1: the numbers are only meaningful against a list that was actually
+       proven. Nothing on screen may stand in for that check. */
+    setAlert("warning", "Сначала проверьте состав — показанные данные не подтверждены.");
+    return;
+  }}
   const count = parseInt(document.getElementById("f-count").value, 10);
   const euro = document.getElementById("f-euro").value;
   const minor = euroToMinor(euro);
@@ -1022,41 +1030,123 @@ function mayRefund(item) {
   return actions.indexOf("refund") !== -1;
 }
 
+/* Every POST this page makes. A transport failure is reported as a RESULT rather
+   than thrown, because the callers have to tell three states apart (review F1/F2):
+   the server refused, the server answered, and the answer never arrived. The third
+   one is the dangerous one — it says nothing about whether the request was carried
+   out — and the reviewed code could not express it at all. */
 async function postJson(path, payload) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "X-Ops-CSRF": CSRF},
-    credentials: "same-origin",
-    body: JSON.stringify(payload)
-  });
+  let response = null;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Ops-CSRF": CSRF},
+      credentials: "same-origin",
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    return {status: 0, transport: true, data: {}};
+  }
   let data = {};
   try { data = await response.json(); } catch (err) { data = {}; }
-  return {status: response.status, data: data};
+  return {status: response.status, transport: false, data: data};
 }
 
-/* Review R3. Proves and shows the audience; authorises nothing. */
+/* ===========================================================================
+   The composition READ and the stage OFFER are two different payloads
+   ===========================================================================
+
+   Review F1. ``/api/composition`` answers with a composition: ``campaign_period``,
+   ``recipient_count``, ``total_exposure_minor``, ``composition_digest``,
+   ``recipients``. ``/api/plan`` answers with an offer for one stage: ``ready``,
+   ``reasons``, ``approval``, ``targets`` and a PII-free ``plan``. The two shapes
+   have not one field in common.
+
+   The reviewed page handed the OFFER to the composition renderer. Every lookup
+   missed, so pressing "Проверить и зафиксировать" repainted the list the operator
+   had just read as 0 recipients, 0,00 € and "Состав пуст" — while the confirmation
+   dialog beside it still said two recipients and 30 €. One of the two was false and
+   the screen offered no way to tell which, immediately before the irreversible part
+   of the workflow.
+
+   So the composition panel is painted from ONE source: the stored composition read.
+   ``renderComposition`` takes no argument, which is what makes the defect
+   unrepeatable rather than merely fixed — there is no parameter left to pass the
+   wrong payload into. A plan answer can still make the shown list STALE, and then
+   the panel says exactly that instead of inventing an empty one. */
+
+/* Why there is no table, when there is none: "not checked yet" and "checked, and
+   the audience is empty or unusable" are different facts, and a zeroed table cannot
+   say which. */
+let COMPOSITION_NOTE = null;
+
+/* The shown composition may no longer hold — a plan refused, or its answer never
+   arrived. Said on the panel, and the freeze waits for a fresh check. */
+let COMPOSITION_STALE = false;
+
+function compositionDigest() {
+  return (COMPOSITION && COMPOSITION.composition_digest) || null;
+}
+
+/* Review R3, and now F1: this proves and SHOWS the audience, authorises nothing,
+   and is the only thing that may fill the composition panel. */
 async function inspectComposition() {
   const result = await postJson("/ops/voucher-mailings/api/composition",
     {preview_run_id: PREVIEW_RUN_ID});
-  const data = result.data || {};
-  COMPOSITION = data;
-  renderComposition(data);
   /* Checking the list must never arm the confirmation. */
   OFFER = null;
   hideConfirm();
   const panel = document.getElementById("freeze-panel");
-  if (data.composition_proven) {
-    if (panel) panel.classList.remove("d-none");
-    prefillApprovalFields(data);
-    setAlert("info", "Состав проверен. "
-      + "Подтвердите количество и сумму.");
+  if (result.transport) {
+    /* No answer is not an empty audience. What was read earlier stays on screen,
+       marked: overwriting it with zeros would turn a lost connection into a mailing
+       that looks like it has nobody in it. */
+    if (panel) panel.classList.add("d-none");
+    COMPOSITION_STALE = COMPOSITION !== null;
+    renderComposition();
+    setAlert("danger", "Ответ сервера не получен: состав не прочитан. Повторите проверку.");
     return;
   }
-  if (panel) panel.classList.add("d-none");
-  const reasons = (data.reasons || []).join(", ");
-  setAlert("warning", reasons
-    ? "Состав нельзя зафиксировать: " + reasons
-    : "Состав пуст.");
+  const data = result.data || {};
+  if (!data.composition_proven) {
+    if (panel) panel.classList.add("d-none");
+    const reasons = (data.reasons || []).join(", ");
+    const note = reasons
+      ? "Состав нельзя зафиксировать: " + reasons
+      : "Состав пуст.";
+    /* A refusal is not a composition, so it does not become one. */
+    COMPOSITION_STALE = COMPOSITION !== null;
+    COMPOSITION_NOTE = COMPOSITION === null ? note : null;
+    renderComposition();
+    setAlert("warning", note);
+    return;
+  }
+  COMPOSITION = data;
+  COMPOSITION_NOTE = null;
+  COMPOSITION_STALE = false;
+  renderComposition();
+  if (panel) panel.classList.remove("d-none");
+  prefillApprovalFields(data);
+  setAlert("info", "Состав проверен. Подтвердите количество и сумму.");
+}
+
+/* The plan's own view of the audience: PII-free, and authoritative about its SIZE
+   and IDENTITY. Used to decide whether the screen is stale — never to paint it,
+   precisely because it carries no names. */
+function plannedComposition(offer) {
+  const plan = (offer && offer.plan) || null;
+  const snapshot = (plan && plan.snapshot) || null;
+  return (snapshot && snapshot.composition) || null;
+}
+
+/* The composition on screen is no longer known to hold. Says so where the numbers
+   are, not only in the alert area, because the numbers are what gets believed. */
+function markCompositionStale(text) {
+  COMPOSITION_STALE = true;
+  renderComposition();
+  const hint = document.getElementById("approval-hint");
+  if (hint) hint.textContent = "";
+  setAlert("warning", text);
 }
 
 /* The numbers are SHOWN, never submitted for the operator: the fields stay empty
@@ -1084,25 +1174,51 @@ async function planStage(stage, options) {
 
 function renderOffer(stage, result, options) {
   const data = result.data || {};
-  if (stage === "freeze") renderComposition(data);
+  if (result.transport) {
+    /* The plan answer never arrived, so nothing is armed — and for a freeze the
+       list on screen is no longer known to be current. */
+    OFFER = null;
+    hideConfirm();
+    if (stage === "freeze") {
+      markCompositionStale("Ответ сервера не получен. Проверьте состав заново.");
+    } else {
+      setAlert("danger", "Ответ сервера не получен. Подготовьте шаг заново.");
+    }
+    return;
+  }
   if (!data.ready) {
     OFFER = null;
     hideConfirm();
     const reasons = (data.reasons || []).join(", ");
-    setAlert("warning", reasons
+    const text = reasons
       ? "Действие недоступно: " + reasons
-      : "Действие недоступно.");
+      : "Действие недоступно.";
+    if (stage === "freeze") {
+      /* A refused freeze plan says the audience was not re-proved as the operator
+         stated it — a miscount, an edited preview, an opt-out or an unreachable
+         EasyWeek. Which of those it was cannot be read off a reason code, so the
+         shown list stops counting as current and one press re-proves it. The
+         reviewed page instead ZEROED the list here, which looked like an answer. */
+      markCompositionStale(text + " Проверьте состав заново.");
+    } else {
+      setAlert("warning", text);
+    }
     return;
   }
-  if (options.preview) {
-    /* Loading the composition is not an offer to act on: it refuses to arm the
-       confirm button, so "check the list" can never be one click from a freeze. */
-    OFFER = null;
-    hideConfirm();
-    const panel = document.getElementById("freeze-panel");
-    if (panel) panel.classList.remove("d-none");
-    setAlert("info", "Состав проверен. Подтвердите количество и сумму.");
-    return;
+  if (stage === "freeze") {
+    /* The plan re-proved the audience while building itself. If what it proved is
+       not what this screen is showing, the screen is stale and nothing is armed
+       from a list the operator has not seen: one member exchanged for another
+       leaves both the count and the money identical, so the digest is what decides
+       and the numbers cannot. */
+    const planned = plannedComposition(data);
+    const shown = compositionDigest();
+    if (planned && shown && planned.frozen_digest && planned.frozen_digest !== shown) {
+      OFFER = null;
+      hideConfirm();
+      markCompositionStale("Состав изменился после проверки. Проверьте список заново.");
+      return;
+    }
   }
   OFFER = data;
   const summary = document.getElementById("confirm-summary");
@@ -1114,10 +1230,30 @@ function renderOffer(stage, result, options) {
   if (panel) panel.classList.remove("d-none");
 }
 
-function renderComposition(data) {
+/* Takes no argument ON PURPOSE (review F1): the only composition it can show is
+   the one that was read, so no caller can hand it a plan answer and silently zero
+   the audience. */
+function renderComposition() {
+  const data = COMPOSITION;
   const summary = document.getElementById("composition-summary");
+  const slotsArea = document.getElementById("composition-slots");
+  if (!data) {
+    /* Nothing proven in this page load. Said in words, because an empty table reads
+       as "this mailing has nobody in it", which is a different statement. */
+    if (summary) {
+      summary.innerHTML = '<p class="text-muted" id="c-unchecked">' +
+        escapeHtml(COMPOSITION_NOTE || "Состав ещё не проверен.") + "</p>";
+    }
+    if (slotsArea) slotsArea.innerHTML = "";
+    return;
+  }
+  const stale = COMPOSITION_STALE
+    ? '<div class="alert alert-warning py-2" id="composition-stale">' +
+      "Эти данные могли измениться после проверки. Нажмите «Проверить состав» заново." +
+      "</div>"
+    : "";
   if (summary) {
-    summary.innerHTML =
+    summary.innerHTML = stale +
       "<table class=\"table table-sm w-auto\">" +
       "<tr><th>Период кампании</th><td id=\"c-period\">" +
       escapeHtml(data.campaign_period || "—") + "</td></tr>" +
@@ -1129,7 +1265,6 @@ function renderComposition(data) {
       escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>" +
       "</table>";
   }
-  const slotsArea = document.getElementById("composition-slots");
   if (slotsArea) {
     const people = data.recipients || [];
     let rows = "";
@@ -1178,6 +1313,17 @@ async function confirmStage() {
   OFFER = null;
   hideConfirm();
   if (button) button.disabled = false;
+  if (result.transport) {
+    /* The answer never came back, and the operation may well have been committed
+       before the connection broke (review F2). The one thing that must not happen
+       now is a second confirmation, so none is sent: the page asks the server what
+       exists. A duplicate would be refused by the spent approval anyway — this is
+       about not asking, and about not telling the operator that nothing happened. */
+    setAlert("warning", "Ответ не получен. Повторное подтверждение не отправляется —"
+      + " состояние уточняется на сервере.");
+    await resumeFromServer();
+    return;
+  }
   const data = result.data || {};
   if (data.accepted && data.operation) {
     const where = data.operation.batch_id;
@@ -1255,9 +1401,21 @@ function refundSubject(slot) {
   return who.display_name + " (№" + slot + ", строка preview #" + who.campaign_recipient_id + ")";
 }
 
-/* Review R5. Survives a refresh and a fresh login: the id is kept per preview in
-   sessionStorage, so reopening the page resumes watching instead of looking like a
-   mailing that was never started. Wrapped because a private window can throw. */
+/* ===========================================================================
+   A CACHE, not the source of truth (review F2)
+   ===========================================================================
+
+   The reviewed page resumed only from this store. Everything else therefore looked
+   like a mailing nobody had started: a second tab, another browser, a private
+   window, a fresh login, a cleared store — and the tab whose confirm response was
+   lost on the way back, which had no id to remember in the first place even though
+   its operation existed on the server.
+
+   The durable state is in PostgreSQL and the status endpoint is already scoped to
+   one preview, so that is what the page asks on load. This store is kept for what
+   it is good for: showing something immediately, and having a last known id when
+   the server cannot be reached at all. It is never the reason a state is believed.
+   Wrapped in try/catch because a private window can throw on access. */
 function rememberTrackedOperation(id) {
   try {
     window.sessionStorage.setItem("ew-voucher-op-" + PREVIEW_RUN_ID, String(id));
@@ -1293,21 +1451,43 @@ function operationSettled(operation) {
   return ["completed", "refused", "expired", "interrupted"].indexOf(operation.status) !== -1;
 }
 
+/* How long between polls, and how many failed reads in a row are tried before the
+   page stops and asks for a refresh. Bounded: an unreachable server must not be
+   polled forever by a tab somebody left open. */
+const TRACK_INTERVAL_MS = 1500;
+const TRACK_MAX_FAILURES = 5;
+let TRACK_FAILURES = 0;
+
 async function trackOperation() {
   if (TRACKED_OPERATION === null) return;
-  const response = await fetch("/ops/voucher-mailings/api/operation?operation_id=" +
-    encodeURIComponent(TRACKED_OPERATION) + "&preview_run_id=" + encodeURIComponent(PREVIEW_RUN_ID),
-    {credentials: "same-origin"});
+  let response = null;
+  try {
+    response = await fetch("/ops/voucher-mailings/api/operation?operation_id=" +
+      encodeURIComponent(TRACKED_OPERATION) + "&preview_run_id=" + encodeURIComponent(PREVIEW_RUN_ID),
+      {credentials: "same-origin"});
+  } catch (err) {
+    trackAgainAfterFailure();
+    return;
+  }
   if (response.status === 404) {
-    /* Not this preview's operation. Never shown as if it were. */
+    /* Authoritative, and not a failure in disguise: this endpoint answers 404 only
+       for an operation that does not exist or belongs to another preview, while a
+       database that cannot answer raises a 500. Another preview's work is never
+       shown here, so the id goes. */
     TRACKED_OPERATION = null;
     forgetTrackedOperation();
     return;
   }
-  let data = {};
-  try { data = await response.json(); } catch (err) { return; }
-  const operation = data.operation;
-  if (!operation) return;
+  if (!response.ok) {
+    trackAgainAfterFailure();
+    return;
+  }
+  let data = null;
+  try { data = await response.json(); } catch (err) { trackAgainAfterFailure(); return; }
+  const operation = data && data.operation;
+  if (!operation) { trackAgainAfterFailure(); return; }
+  /* A read landed, so the connection notice — if there was one — is over. */
+  TRACK_FAILURES = 0;
   renderTrackedOperation(operation);
   if (operation.batch_id) {
     /* The freeze produced a batch. Go to it. */
@@ -1321,7 +1501,110 @@ async function trackOperation() {
     forgetTrackedOperation();
     return;
   }
-  setTimeout(trackOperation, 1500);
+  setTimeout(trackOperation, TRACK_INTERVAL_MS);
+}
+
+/* A read that did not land is a LOST CONNECTION and is never "there is no
+   operation" (review F2). The reviewed version returned silently on a network error
+   or an unparseable body, which ended the polling for good and left the screen
+   looking like a mailing that was never started — while a confirmed stage was in
+   fact running on the server.
+
+   So the page says what happened and tries again on a widening delay. The id stays
+   in memory and in the cache, so even once the attempts are spent, a reload resumes
+   watching the same operation; nothing here re-sends a confirmation or starts
+   anything. */
+function trackAgainAfterFailure() {
+  TRACK_FAILURES += 1;
+  if (TRACK_FAILURES >= TRACK_MAX_FAILURES) {
+    renderConnectionLost("Связь с сервером потеряна. Шаг продолжает выполняться на сервере"
+      + " — обновите страницу, чтобы снова увидеть его состояние.");
+    return;
+  }
+  renderConnectionLost("Связь с сервером потеряна. Повторная попытка…");
+  setTimeout(trackOperation, TRACK_INTERVAL_MS * TRACK_FAILURES);
+}
+
+/* Not knowing is its own state, and it is not "nothing is happening". */
+function renderConnectionLost(text) {
+  const area = document.getElementById("operation-panel") || document.getElementById("alert-area");
+  if (!area) return;
+  area.innerHTML = '<div class="alert alert-warning" id="operation-unreachable">' +
+    escapeHtml(text) + "</div>";
+}
+
+/* ===========================================================================
+   What this page shows comes from the SERVER (review F2)
+   ===========================================================================
+
+   Called on load, and after any confirmation whose answer was lost. It reads the
+   state of THIS preview from the scoped status endpoint — the one the mailing page
+   already polls, rather than a second, narrower cousin that could disagree with it —
+   and shows whichever of the three things is true: the mailing already exists, an
+   operation is queued or running or has settled, or this preview genuinely has
+   nothing. */
+async function resumeFromServer() {
+  if (BATCH_ID !== null) {
+    /* A mailing page already has its scope and its own poll; that IS its resume. */
+    await refreshStatus();
+    return;
+  }
+  const read = await readPreviewState();
+  if (!read.ok) {
+    const cached = recallTrackedOperation();
+    if (cached !== null) {
+      /* The server is unreachable and this browser has a last known id: watch that,
+         while saying plainly that the connection — not the mailing — is the
+         problem. */
+      TRACKED_OPERATION = cached;
+      renderConnectionLost("Связь с сервером потеряна. Повторная попытка…");
+      await trackOperation();
+      return;
+    }
+    renderConnectionLost("Состояние на сервере прочитать не удалось."
+      + " Это не значит, что шаг не выполняется — обновите страницу.");
+    return;
+  }
+  const state = read.state || {};
+  const batch = state.batch || {};
+  if (batch.batch_id) {
+    /* The freeze finished while nobody was watching, so this is the wrong screen to
+       be on: the mailing has its own. */
+    forgetTrackedOperation();
+    window.location.href = "/ops/voucher-mailings/" + batch.batch_id;
+    return;
+  }
+  const history = state.operations || [];
+  const operation = state.active_operation || (history.length ? history[0] : null);
+  if (!operation) {
+    /* The server says this preview has no operation at all. THAT is when a cached id
+       is wrong, and the only time the cache is cleared on a successful read. */
+    TRACKED_OPERATION = null;
+    forgetTrackedOperation();
+    return;
+  }
+  TRACKED_OPERATION = operation.operation_id;
+  rememberTrackedOperation(TRACKED_OPERATION);
+  renderTrackedOperation(operation);
+  if (!operationSettled(operation)) await trackOperation();
+}
+
+/* This preview's durable state, or an honest failure. Scoped by preview, so one
+   preview can never be shown another's work. */
+async function readPreviewState() {
+  let response = null;
+  try {
+    response = await fetch("/ops/voucher-mailings/api/status?preview_run_id=" +
+      encodeURIComponent(PREVIEW_RUN_ID), {credentials: "same-origin"});
+  } catch (err) {
+    return {ok: false};
+  }
+  if (!response.ok) return {ok: false};
+  try {
+    return {ok: true, state: await response.json()};
+  } catch (err) {
+    return {ok: false};
+  }
 }
 
 function renderTrackedOperation(operation) {

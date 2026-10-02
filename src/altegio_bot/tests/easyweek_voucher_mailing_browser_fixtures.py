@@ -165,16 +165,7 @@ async def page(ops_server: str) -> AsyncIterator[Any]:
                 }
             ]
         )
-        opened = await context.new_page()
-        # Surface page errors: a silent JavaScript exception is exactly the class of
-        # defect this suite exists to catch, and it must not read as a passing test.
-        errors: list[str] = []
-        opened.on("pageerror", lambda exc: errors.append(str(exc)))
-        opened.on(
-            "console",
-            lambda message: errors.append(message.text) if message.type == "error" else None,
-        )
-        opened.page_errors = errors  # type: ignore[attr-defined]
+        opened = watch_for_errors(await context.new_page())
         yield opened
     finally:
         if browser is not None:
@@ -200,13 +191,48 @@ _THIRD_PARTY_NOISE = (
 )
 
 
+def watch_for_errors(opened: Any) -> Any:
+    """Collect this page's JavaScript errors, for :func:`assert_no_page_errors`.
+
+    Applied to every page a test drives, not only the first one: a silent exception
+    is exactly the class of defect this suite exists to catch, and a second tab is
+    where several of the review findings actually showed up.
+    """
+    errors: list[str] = []
+    opened.on("pageerror", lambda exc: errors.append(str(exc)))
+    opened.on(
+        "console",
+        lambda message: errors.append(message.text) if message.type == "error" else None,
+    )
+    opened.collected_page_errors = errors
+    return opened
+
+
+async def tab_with_no_cache(opened: Any, ops_server: str) -> Any:
+    """A page in a context that provably has nothing of this browser's own state.
+
+    The point of review F2 is that the page restores itself from the SERVER, so a test
+    of it must be able to say that the browser had nothing to restore from.
+    ``storage_state`` carries the session cookie and deliberately not sessionStorage,
+    and the init script empties it before any page script runs — so if the operation
+    still appears, the server is the only place it can have come from.
+    """
+    state = await opened.context.storage_state()
+    context = await opened.context.browser.new_context(base_url=ops_server, storage_state=state)
+    context.set_default_timeout(WAIT_MS)
+    await context.route(
+        lambda url: not url.startswith(ops_server),
+        lambda route: asyncio.ensure_future(route.abort()),
+    )
+    await context.add_init_script("try { window.sessionStorage.clear(); } catch (err) {}")
+    return watch_for_errors(await context.new_page())
+
+
 def assert_no_page_errors(opened: Any) -> None:
     """No uncaught JavaScript and no console error of the page's own making."""
-    errors = [
-        message
-        for message in getattr(opened, "page_errors", [])
-        if not any(noise in message.lower() for noise in _THIRD_PARTY_NOISE)
-    ]
+    collected = getattr(opened, "collected_page_errors", None)
+    assert collected is not None, "this page was not watched for errors: use watch_for_errors / tab_with_no_cache"
+    errors = [message for message in collected if not any(noise in message.lower() for noise in _THIRD_PARTY_NOISE)]
     assert errors == [], f"the page reported JavaScript errors: {errors}"
 
 
@@ -216,4 +242,6 @@ __all__ = [
     "assert_no_page_errors",
     "ops_server",
     "page",
+    "tab_with_no_cache",
+    "watch_for_errors",
 ]

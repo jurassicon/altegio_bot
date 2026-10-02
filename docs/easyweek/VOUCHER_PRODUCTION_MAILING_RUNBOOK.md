@@ -683,25 +683,140 @@ the mailing state stays readable afterwards.
 
 ### 12.2 Rollback
 
-Rolling back §43 leaves §42's storage and every historical ledger untouched.
+Two different operations get called "the rollback", and they remove different
+things. Decide which one is wanted before running anything.
 
-1. Close the fence (§11) and stop the executor service.
-2. Downgrade one revision:
+The §43 chain is three revisions, in this order:
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run alembic downgrade -1
+```
+e2c7b4f16a83  →  a4f1c9d26b70  →  c7e3b8a14f29
 ```
 
-This drops the four §43 tables and nothing else: no §35–§42 table, row,
-constraint or HMAC binding is referenced by them, and the foreign keys all point
-the other way. What a downgrade **does** lose is the record of who authorised
-what, so it belongs to a rollback of this PR and not to routine operation.
+* `a4f1c9d26b70` created the four §43 tables.
+* `c7e3b8a14f29` added `stop_generation_at_plan` to the approvals table, with its
+  `>= 0` CHECK constraint.
 
-3. Confirm one head again with `alembic heads` and `alembic current`.
+| | **Scope A — the stop-generation fix** | **Scope B — all of §43** |
+|---|---|---|
+| Target revision | `a4f1c9d26b70` | `e2c7b4f16a83` |
+| Schema change | drops `stop_generation_at_plan` and its CHECK | drops all four §43 tables |
+| What is lost | which stop each stored plan was built under | every approval, operation, stop request and audit row |
+| Mailing still possible afterwards | yes, on the matching older application | **no** |
+
+**`alembic downgrade -1` is scope A, and this runbook used to describe it as scope
+B.** One step back from the current head `c7e3b8a14f29` lands on `a4f1c9d26b70`: the
+four tables stay exactly where they are, and only the stop-generation column and its
+constraint go. Counting steps is how that sentence became wrong — the count was
+right when there was one §43 revision and silently meant something else as soon as
+there were two — so every command below names its target revision instead. The chain
+is deliberately **not** re-pointed to make `-1` mean something tidier: rewriting
+published revisions is a far worse problem than a longer command.
+
+#### The order matters
+
+The schema and the application version have to move together, and the application
+must not be serving across the gap: this version's code reads
+`stop_generation_at_plan` on every plan and every confirmation, so it cannot run on
+a database where that column has already been removed.
+
+1. Close the fence (§11), so nothing new can be confirmed.
+2. Let any operation in flight finish, or stop the executor and treat what it was
+   doing as `interrupted` and in need of a readback (§10).
+3. Stop **both** application containers. Nothing serves while the schema moves.
+4. Back the database up.
+5. Run the downgrade **from the image that is deployed right now**. It is the only
+   one that contains the revision scripts the database is currently stamped with; an
+   older image cannot walk down from a revision it has never heard of.
+6. Only then deploy the older application version.
+7. Verify, before anything is opened again.
+
+#### Steps
+
+```bash
+cd /opt/altegio_bot
+```
+
+Stop the two application containers (PostgreSQL stays up — the migration needs it):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml stop altegio-api altegio-easyweek-voucher-executor
+```
+
+Back up. This is not optional for either scope, and for scope B it is the only copy
+of the authorisation history that will exist afterwards:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc -f /tmp/voucher-rollback.dump'
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml cp postgres:/tmp/voucher-rollback.dump ./voucher-rollback.dump
+```
+
+Then **one** of the two downgrades.
+
+Scope A — undo the stop-generation fix only:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps altegio-api uv run alembic downgrade a4f1c9d26b70
+```
+
+Scope B — undo all of §43:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps altegio-api uv run alembic downgrade e2c7b4f16a83
+```
+
+Now deploy the application version that matches the schema just restored — for
+scope A the commit before this fix, for scope B the commit before PR-20 — and bring
+the stack back up with the fence still closed.
+
+#### Verify before opening anything
+
+The stamped revision must be the target, not the head:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps altegio-api uv run alembic current
+```
+
+The four §43 tables: four of them after scope A, none after scope B.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec postgres sh -c "psql -U \$POSTGRES_USER -d \$POSTGRES_DB -t -c \"SELECT count(*) FROM information_schema.tables WHERE table_name IN ('easyweek_voucher_production_approvals', 'easyweek_voucher_production_operations', 'easyweek_voucher_production_stop_requests', 'easyweek_voucher_production_audit')\""
+```
+
+The stop-generation column: `0` after either scope.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec postgres sh -c "psql -U \$POSTGRES_USER -d \$POSTGRES_DB -t -c \"SELECT count(*) FROM information_schema.columns WHERE table_name = 'easyweek_voucher_production_approvals' AND column_name = 'stop_generation_at_plan'\""
+```
+
+The historical ledgers, which neither scope touches. Expected: `5`, in both.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec postgres sh -c "psql -U \$POSTGRES_USER -d \$POSTGRES_DB -t -c \"SELECT count(*) FROM information_schema.tables WHERE table_name IN ('easyweek_voucher_production_batches', 'easyweek_voucher_production_batch_items', 'easyweek_voucher_production_batch_attempts', 'easyweek_voucher_snapshot_batches', 'easyweek_voucher_canary_ledger')\""
+```
+
+Going forward again is `alembic upgrade head`, after the application version that
+matches it is deployed, in that order for the same reason.
+
+#### What a rollback costs
+
+No §35–§42 table, row, constraint or HMAC binding is referenced by the §43 tables
+and every foreign key points the other way, so the historical ledgers and the frozen
+production batches survive both scopes intact. That is the part that is safe.
+
+What scope B destroys is the record of **who authorised what**: the approvals, the
+operations, the stop requests and the audit rows all go, and a `pg_dump` file is
+then the only evidence that a mailing was ever authorised by anybody. It is a
+decision to abandon that history, not a maintenance step, and it belongs to backing
+out this PR rather than to operating it. Scope A costs much less — the stop
+generation each stored plan was built under — and that is still a fact an
+investigation of a stop might want, so the backup is taken either way.
 
 With §43 rolled back there is **no supported way to run a mailing**: the CLI
-mutations stay closed. A rollback is a decision to stop mailing, not a way back to
-the terminal process.
+mutations stay closed and no flag reopens them. A rollback is a decision to stop
+mailing, not a way back to the terminal process.
 
 ---
 

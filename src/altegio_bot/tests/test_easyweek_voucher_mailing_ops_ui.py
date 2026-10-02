@@ -976,56 +976,148 @@ console.log(JSON.stringify({
     assert answer["nothing"] is False
 
 
-@needs_node
-async def test_checking_the_list_is_not_one_click_from_a_freeze(ui_client, ops_credentials) -> None:
-    """ "Проверить состав" must not arm the confirm button.
+_COMPOSITION_FUNCTIONS = (
+    "renderOffer",
+    "renderComposition",
+    "plannedComposition",
+    "compositionDigest",
+    "markCompositionStale",
+    "hideConfirm",
+    "moneyLabel",
+    "escapeHtml",
+    "confirmSummary",
+    "stageLabel",
+    "setAlert",
+)
 
-    Executed against the shipped ``renderOffer``, because this is the one place
-    where a careless refactor would turn a read into an action.
-    """
-    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=1")
-    script = _page_script(page.text)
-    source = "\n".join(
-        _function_source(script, name)
-        for name in (
-            "renderOffer",
-            "renderComposition",
-            "hideConfirm",
-            "moneyLabel",
-            "escapeHtml",
-            "confirmSummary",
-            "stageLabel",
-            "setAlert",
-        )
-    )
-    driver = """
-let OFFER = {sentinel: true};
+# A composition READ, as ``/api/composition`` answers it, and a ready freeze OFFER
+# for the same audience, as ``/api/plan`` answers it. Review F1 is the difference
+# between these two shapes: the fields the panel needs exist only in the first.
+_NODE_PRELUDE = """
+let OFFER = null;
+let COMPOSITION = null;
+let COMPOSITION_NOTE = null;
+let COMPOSITION_STALE = false;
 const PANELS = {};
 globalThis.document = {
   getElementById: (id) => (PANELS[id] = PANELS[id] || {
-    innerHTML: "", value: "",
+    innerHTML: "", value: "", textContent: "",
     classList: {_s: new Set(), add(c){this._s.add(c);}, remove(c){this._s.delete(c);},
                 contains(c){return this._s.has(c);}}
   })
 };
 const UNIT_PRICE_MINOR = 1500;
-const ready = {ready: true, stage: "freeze", approval: {approval_id: 7},
-               targets: {stage_target_count: 2, stage_amount_minor: 3000,
-                         batch_recipient_count: 2, batch_exposure_minor: 3000},
-               plan: {snapshot: {composition: {recipient_count: 2, total_exposure_minor: 3000, slots: []}}}};
-renderOffer("freeze", {status: 200, data: ready}, {preview: true});
-const afterPreview = {offer: OFFER, hidden: PANELS["confirm-panel"].classList.contains("d-none")};
-renderOffer("freeze", {status: 200, data: ready}, {});
-const afterPlan = {armed: OFFER !== null, hidden: PANELS["confirm-panel"].classList.contains("d-none")};
-console.log(JSON.stringify({afterPreview: afterPreview, afterPlan: afterPlan}));
+const read = {composition_proven: true, campaign_period: "2026-08-01..2026-08-31",
+              recipient_count: 2, total_exposure_minor: 3000, unit_price_minor: 1500,
+              composition_digest: "digest-of-these-two-people",
+              recipients: [{slot: 1, display_name: "Anna", campaign_recipient_id: 11, preview_run_id: 5},
+                           {slot: 2, display_name: "Bea", campaign_recipient_id: 12, preview_run_id: 5}]};
+function offerFor(digest) {
+  return {ready: true, stage: "freeze", approval: {approval_id: 7},
+          targets: {stage_target_count: 2, stage_amount_minor: 3000,
+                    batch_recipient_count: 2, batch_exposure_minor: 3000},
+          plan: {snapshot: {composition: {recipient_count: 2, total_exposure_minor: 3000,
+                                          frozen_digest: digest, slots: []}}}};
+}
+function shown() {
+  return {summary: PANELS["composition-summary"].innerHTML,
+          slots: PANELS["composition-slots"].innerHTML};
+}
 """
+
+
+@needs_node
+async def test_a_plan_answer_cannot_repaint_the_composition_panel(ui_client, ops_credentials) -> None:
+    """Review F1, against the shipped functions.
+
+    ``renderOffer`` used to hand the ``/api/plan`` answer to ``renderComposition``.
+    The two payloads share no field, so every lookup missed and the panel was
+    repainted as 0 recipients, 0,00 € and "Состав пуст" — while the confirmation
+    dialog beside it still said two recipients and 30 €.
+
+    Checked here as well as in the browser because this is the exact seam a careless
+    refactor would re-break, and because the assertion can be made byte-for-byte: the
+    panel's HTML after a plan is rendered must be the HTML the composition read
+    produced, unchanged.
+    """
+    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=1")
+    script = _page_script(page.text)
+    source = "\n".join(_function_source(script, name) for name in _COMPOSITION_FUNCTIONS)
+    driver = (
+        _NODE_PRELUDE
+        + """
+COMPOSITION = read;
+renderComposition();
+const painted = shown();
+renderOffer("freeze", {status: 200, data: offerFor(read.composition_digest)}, {});
+console.log(JSON.stringify({
+  painted: painted,
+  after: shown(),
+  armed: OFFER !== null,
+  hidden: PANELS["confirm-panel"].classList.contains("d-none"),
+  stale: COMPOSITION_STALE
+}));
+"""
+    )
     answer = _run_node(source, driver)
-    # Checking the list clears any armed offer and keeps the confirmation hidden.
-    assert answer["afterPreview"]["offer"] is None
-    assert answer["afterPreview"]["hidden"] is True
-    # Only an explicit plan arms it.
-    assert answer["afterPlan"]["armed"] is True
-    assert answer["afterPlan"]["hidden"] is False
+    # The real numbers were there to begin with...
+    assert "2026-08-01..2026-08-31" in answer["painted"]["summary"]
+    assert "30.00" in answer["painted"]["summary"]
+    assert "Anna" in answer["painted"]["slots"] and "Bea" in answer["painted"]["slots"]
+    # ...and preparing the confirmation did not touch them.
+    assert answer["after"] == answer["painted"], "the plan answer repainted the composition"
+    assert answer["stale"] is False
+    # Only an explicit plan arms the confirmation, and this one did.
+    assert answer["armed"] is True
+    assert answer["hidden"] is False
+
+
+@needs_node
+async def test_a_refused_or_changed_plan_marks_the_composition_rather_than_emptying_it(
+    ui_client, ops_credentials
+) -> None:
+    """Three answers, none of which may invent an empty audience.
+
+    A refusal, a transport failure and a ready plan that proved a DIFFERENT audience
+    all leave the numbers on screen and all refuse to arm the confirmation. The third
+    one is why the comparison is a digest and not a count: one recipient exchanged for
+    another keeps "2 people, 30 €" true.
+    """
+    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=1")
+    script = _page_script(page.text)
+    source = "\n".join(_function_source(script, name) for name in _COMPOSITION_FUNCTIONS)
+    driver = (
+        _NODE_PRELUDE
+        + """
+const cases = {};
+for (const [name, result] of [
+  ["refused", {status: 409, data: {ready: false, reasons: ["voucher_production_approval_count_mismatch"]}}],
+  ["lost", {status: 0, transport: true, data: {}}],
+  ["swapped", {status: 200, data: offerFor("a-digest-of-two-OTHER-people")}]
+]) {
+  COMPOSITION = read;
+  COMPOSITION_NOTE = null;
+  COMPOSITION_STALE = false;
+  OFFER = {sentinel: true};
+  renderComposition();
+  const before = shown();
+  renderOffer("freeze", result, {});
+  cases[name] = {kept: shown().summary.includes("30.00") && shown().slots === before.slots,
+                 stale: COMPOSITION_STALE,
+                 armed: OFFER !== null,
+                 hidden: PANELS["confirm-panel"].classList.contains("d-none"),
+                 marked: shown().summary.includes("composition-stale")};
+}
+console.log(JSON.stringify(cases));
+"""
+    )
+    answer = _run_node(source, driver)
+    for name, case in answer.items():
+        assert case["kept"] is True, f"{name}: the composition was emptied"
+        assert case["stale"] is True, f"{name}: the composition was left looking current"
+        assert case["marked"] is True, f"{name}: nothing on the panel said so"
+        assert case["armed"] is False, f"{name}: the confirmation was armed anyway"
+        assert case["hidden"] is True, f"{name}: the confirmation panel stayed open"
 
 
 # ===========================================================================

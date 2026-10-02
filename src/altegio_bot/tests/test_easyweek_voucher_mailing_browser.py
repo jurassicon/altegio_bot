@@ -23,7 +23,11 @@ import re
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
-from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import assert_no_page_errors
+from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (
+    assert_no_page_errors,
+    tab_with_no_cache,
+    watch_for_errors,
+)
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     VOUCHER_CODE_SENTINELS,
@@ -248,8 +252,13 @@ async def test_wrong_numbers_do_not_create_a_batch(
     )
     assert await page.is_hidden("#confirm-panel")
     assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    # The refusal also says the shown list is no longer known to be current, because
+    # a reason code cannot distinguish a miscount from an edited preview (review F1).
+    await page.wait_for_selector("#composition-stale")
 
-    # The right numbers then open a confirmation.
+    # The right numbers alone are not enough now: the audience is proven again first.
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-stale", state="hidden")
     await page.fill("#f-count", str(count))
     await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
     await page.click("#btn-plan-freeze")
@@ -755,3 +764,431 @@ async def test_the_executor_runs_the_work_without_any_manual_exec(
 
     assert mutator.calls.count("create") == count
     assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F1 — the composition and the plan answer are different payloads
+# ===========================================================================
+
+
+async def _composition_on_screen(page) -> dict[str, object]:
+    """What the composition panel is telling the operator, right now."""
+    return {
+        "period": (await page.inner_text("#c-period")).strip(),
+        "count": (await page.inner_text("#c-count")).strip(),
+        "total": (await page.inner_text("#c-total")).strip(),
+        "rows": await page.locator("#composition-table tbody tr").count(),
+    }
+
+
+async def test_the_composition_survives_preparing_the_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Review F1, exactly as reported.
+
+    The reviewed page passed the ``/api/plan`` answer — a stage offer — to the
+    composition renderer, which reads top-level fields that payload does not have. So
+    the moment the operator pressed "Проверить и зафиксировать", the list they had
+    just read was repainted as 0 recipients, 0,00 €, "—" and "Состав пуст", while the
+    confirmation dialog beside it still said two recipients and 30 €.
+
+    The composition is therefore read BEFORE and AFTER the dialog appears and has to
+    be the same both times, which is the assertion the earlier browser tests were
+    missing: they checked the panel before pressing and never looked again.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    before = await _composition_on_screen(page)
+    assert before["rows"] == count
+    assert before["count"] == str(count)
+    assert "30.00" in str(before["total"]), before
+    assert "2026-08-01..2026-08-31" in str(before["period"]), before
+
+    euro = f"{count * 1500 / 100:.2f}"
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", euro)
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    after = await _composition_on_screen(page)
+    assert after == before, f"the composition changed while the confirmation was prepared: {before} -> {after}"
+    # And the two panels agree, which is the whole point: the dialog's numbers are
+    # the plan's, the table's are the composition's, and they are the same numbers.
+    summary = await page.inner_text("#confirm-summary")
+    assert str(count) in summary and euro in summary, summary
+    assert await page.is_hidden("#composition-stale")
+    assert_no_page_errors(page)
+
+
+async def test_a_refused_plan_marks_the_composition_instead_of_zeroing_it(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A refusal does not become an empty audience, and does not become a freeze.
+
+    Two things have to be true at once: the list stays on screen with its real
+    numbers, and it stops counting as current — because a refused freeze plan cannot
+    say whether the operator miscounted or the preview changed underneath them.
+    """
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    before = await _composition_on_screen(page)
+
+    # One recipient too many.
+    await page.fill("#f-count", str(count + 1))
+    await page.fill("#f-euro", f"{(count + 1) * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#composition-stale")
+
+    assert await _composition_on_screen(page) == before, "a refusal repainted the composition"
+    assert await page.is_hidden("#confirm-panel")
+
+    # And the stale list cannot be frozen on: the numbers mean nothing until the
+    # audience is proven again.
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Сначала проверьте состав'); }"
+    )
+    assert await page.is_hidden("#confirm-panel")
+
+    # Nothing was created by any of it.
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+
+    # Re-checking the list clears the mark and the right numbers then arm the step.
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-stale", state="hidden")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    assert_no_page_errors(page)
+
+
+async def test_a_composition_that_changed_after_the_check_is_not_confirmable(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A swap keeps the count and the money identical, so the digest decides.
+
+    One recipient excluded and another admitted leaves "3 people, 45 €" true, the
+    operator's typed numbers correct and the plan ready — while the list on screen
+    names somebody who is no longer in it. Numbers cannot catch that; the composition
+    digest the plan re-proved can.
+    """
+    count = 3
+    run_id, recipient_ids = await seed_production_preview(session_maker, count=count + 1)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(indices=list(range(count + 1)))
+    transports.use(reader=reader)
+
+    async def include(ids: list[int], *, status: str) -> None:
+        async with session_maker() as session:
+            from sqlalchemy import update
+
+            from altegio_bot.models.models import CampaignRecipient
+
+            await session.execute(update(CampaignRecipient).where(CampaignRecipient.id.in_(ids)).values(status=status))
+            await session.commit()
+
+    # Three of the four are in the mailing when the operator looks.
+    await include([recipient_ids[-1]], status="excluded")
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    shown = await _composition_on_screen(page)
+    assert shown["rows"] == count and shown["count"] == str(count), shown
+
+    # Now the first is dropped and the fourth admitted: three people and 45 € are
+    # still both true, so the operator's typed numbers will match a ready plan.
+    await include([recipient_ids[0]], status="excluded")
+    await include([recipient_ids[-1]], status="candidate")
+
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#composition-stale")
+
+    assert await page.is_hidden("#confirm-panel")
+    assert await _composition_on_screen(page) == shown, "the stale list was repainted as the new one"
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F2 — the page restores itself from the server
+# ===========================================================================
+
+
+async def _confirm_a_freeze(page, session_maker, *, run_id: int, count: int) -> None:
+    """Everything up to and including the confirmation, with nothing drained."""
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+    await page.wait_for_selector("#tracked-operation")
+
+
+async def test_a_queued_freeze_is_found_by_a_tab_that_stored_nothing(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, ops_server
+):
+    """Review F2, cases 1 and 2.
+
+    A new tab has its own empty sessionStorage, and so does a fresh login. The
+    reviewed page resumed only from that store, so both of them showed a preview with
+    a confirmed, queued FREEZE as a mailing nobody had started — and would have
+    offered a second freeze.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await _confirm_a_freeze(page, session_maker, run_id=run_id, count=count)
+    queued = await operations_module.list_operations(session_maker, campaign_run_id=run_id)
+    assert len(queued) == 1 and queued[0].batch_id is None
+
+    # Case 1: a tab whose sessionStorage is emptied before any page script runs, so
+    # the only possible source of what it shows is the server.
+    other = await tab_with_no_cache(page, ops_server)
+    try:
+        await other.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+        await other.wait_for_selector("#tracked-operation")
+        shown = await other.inner_text("#tracked-operation")
+        assert "очереди" in shown or "выполняется" in shown, shown
+        assert_no_page_errors(other)
+    finally:
+        await other.context.close()
+
+    # Case 2: a fresh login, in a context that was never on this page at all.
+    relogged = await tab_with_no_cache(page, ops_server)
+    try:
+        await relogged.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+        await relogged.wait_for_selector("#tracked-operation")
+        assert "очереди" in await relogged.inner_text("#tracked-operation")
+        # Still one operation: watching is a read.
+        assert len(await operations_module.list_operations(session_maker, campaign_run_id=run_id)) == 1
+
+        # The executor runs, and the tab that stored nothing follows to the batch.
+        await _drain(session_maker)
+        await relogged.wait_for_url(_MAILING_URL, timeout=20_000)
+        batch_id = int(relogged.url.rstrip("/").rsplit("/", 1)[-1])
+        snapshot = await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)
+        assert snapshot.batch_id == batch_id
+        assert len(await operations_module.list_operations(session_maker, batch_id=batch_id)) == 1
+        assert_no_page_errors(relogged)
+    finally:
+        await relogged.context.close()
+
+
+async def test_a_lost_confirm_answer_is_resolved_from_the_server(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Review F2, case 3: the request is carried out, the answer never arrives.
+
+    The route lets the POST reach the server and then drops the response, so the
+    operation really is committed while the browser sees a failed fetch. The page must
+    not press again, must not report that nothing happened, and must find the
+    operation that exists.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    async def swallow_the_answer(route):
+        await route.fetch()
+        await route.abort()
+
+    await page.route("**/api/confirm", swallow_the_answer)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+
+    # It says the answer was lost, and that it is not confirming again.
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ не получен'); }"
+    )
+    # ...and then shows the operation the server actually has.
+    await page.wait_for_selector("#tracked-operation")
+    committed = await operations_module.list_operations(session_maker, campaign_run_id=run_id)
+    assert len(committed) == 1, committed
+
+    # Reopening is the same answer, not a second freeze.
+    await page.unroute("**/api/confirm")
+    await page.reload()
+    await page.wait_for_selector("#tracked-operation")
+    assert len(await operations_module.list_operations(session_maker, campaign_run_id=run_id)) == 1
+
+    await _drain(session_maker)
+    await page.wait_for_url(_MAILING_URL, timeout=20_000)
+    batch_id = int(page.url.rstrip("/").rsplit("/", 1)[-1])
+    assert len(await operations_module.list_operations(session_maker, batch_id=batch_id)) == 1
+    assert await _drain(session_maker) is None, "a second freeze was queued"
+    assert (await ledger_module.load(session_maker, batch_id=batch_id)).recipient_count == count
+    assert_no_page_errors(page)
+
+
+async def test_a_failing_read_is_shown_as_a_lost_connection_and_recovers(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Review F2, case 4: a temporary read failure must not end the watch.
+
+    The reviewed code returned silently when the fetch threw or the body would not
+    parse, which stopped the polling for good — the screen then looked like a mailing
+    nobody had started while a confirmed stage was running on the server.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    failures = {"left": 2}
+
+    async def flaky(route):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            await route.abort()
+            return
+        await route.continue_()
+
+    await page.route("**/api/operation*", flaky)
+    # Deliberately NOT _confirm_a_freeze: that helper waits for the operation to be
+    # on screen, which would swallow the very phase under test.
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1500 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+
+    # Not knowing is its own state, and it is not "nothing is happening".
+    await page.wait_for_selector("#operation-unreachable")
+    assert "Связь" in await page.inner_text("#operation-unreachable")
+    assert len(await operations_module.list_operations(session_maker, campaign_run_id=run_id)) == 1
+
+    # The reads start working again and the watch picks the operation back up.
+    await page.wait_for_selector("#tracked-operation")
+    assert failures["left"] == 0
+    await _drain(session_maker)
+    await page.wait_for_url(_MAILING_URL, timeout=20_000)
+    batch_id = int(page.url.rstrip("/").rsplit("/", 1)[-1])
+    assert len(await operations_module.list_operations(session_maker, batch_id=batch_id)) == 1
+    assert_no_page_errors(page)
+
+
+async def test_a_refusal_is_still_there_when_the_operator_comes_back(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, ops_server
+):
+    """Review F2, case 5: a refused freeze is visible from a tab that stored nothing."""
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await _confirm_a_freeze(page, session_maker, run_id=run_id, count=count)
+
+    # The audience changes under the confirmed plan, so the executor refuses it.
+    async with session_maker() as session:
+        from sqlalchemy import update
+
+        from altegio_bot.models.models import CampaignRecipient
+
+        await session.execute(
+            update(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run_id).values(status="excluded")
+        )
+        await session.commit()
+    finished = await _drain(session_maker)
+    assert finished is not None and finished.status == "refused"
+
+    other = await tab_with_no_cache(page, ops_server)
+    try:
+        await other.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+        await other.wait_for_function(
+            "() => { const el = document.querySelector('#tracked-operation');"
+            " return el && el.innerText.includes('отказано'); }"
+        )
+        assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+        assert_no_page_errors(other)
+    finally:
+        await other.context.close()
+
+
+async def test_a_batch_created_while_nobody_watched_opens_its_own_page(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, ops_server
+):
+    """Review F2, case 7: the freeze finished before the operator came back."""
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await _confirm_a_freeze(page, session_maker, run_id=run_id, count=count)
+    await _drain(session_maker)
+    snapshot = await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)
+    assert snapshot.exists and snapshot.batch_id is not None
+
+    other = await tab_with_no_cache(page, ops_server)
+    try:
+        await other.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+        await other.wait_for_url(_MAILING_URL, timeout=20_000)
+        assert other.url.rstrip("/").endswith(f"/{snapshot.batch_id}")
+        # Arriving at the mailing is not a new freeze.
+        assert len(await operations_module.list_operations(session_maker, batch_id=snapshot.batch_id)) == 1
+        assert_no_page_errors(other)
+    finally:
+        await other.context.close()
+
+
+async def test_another_previews_page_never_shows_this_operation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Review F2, case 6, now that the restore comes from the server.
+
+    The resume is scoped by preview, so the preview next door stays empty — and a
+    cached id belonging to another preview is dropped rather than displayed.
+    """
+    count = 1
+    run_a, reader_a = await _seed(session_maker, count=count)
+    run_b, _reader_b = await _seed(session_maker, count=count, offset=10)
+    transports.use(reader=reader_a)
+    await _confirm_a_freeze(page, session_maker, run_id=run_a, count=count)
+    mine = await operations_module.list_operations(session_maker, campaign_run_id=run_a)
+    assert len(mine) == 1
+
+    other = watch_for_errors(await page.context.new_page())
+    try:
+        # Plant preview A's operation id in preview B's cache slot — the only way a
+        # cache could ever cross previews — and then open preview B.
+        await other.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_b}")
+        await other.evaluate(
+            "(args) => window.sessionStorage.setItem('ew-voucher-op-' + args.run, String(args.id))",
+            {"run": run_b, "id": mine[0].id},
+        )
+        await other.reload()
+        # The planted id is DROPPED rather than displayed, because the server — not the
+        # store — decides what this preview has.
+        await other.wait_for_function(
+            "(run) => window.sessionStorage.getItem('ew-voucher-op-' + run) === null",
+            arg=run_b,
+        )
+        assert await other.is_hidden("#tracked-operation")
+        assert await other.is_hidden("#operation-unreachable")
+        assert_no_page_errors(other)
+    finally:
+        await other.close()

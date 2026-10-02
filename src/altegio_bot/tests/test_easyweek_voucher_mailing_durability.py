@@ -670,10 +670,9 @@ async def test_an_approval_expiry_must_be_after_its_issue(session_maker):
 
 # Set this to "1" to turn "this environment cannot create a disposable database"
 # from a skip into a failure, exactly as ALTEGIO_REQUIRE_MIGTEST does for the §42
-# migration suite. It is deliberately NOT wired into the workflow by this PR:
-# adding a dedicated required step is a one-line change the owner can make, and
-# inventing a new required gate here would change the CI contract that
-# docs/ops/test_suite_tiers.md describes.
+# migration suite. The required workflow sets it: this module is one of the dedicated
+# gates in docs/ops/test_suite_tiers.md, so a machine without a usable PostgreSQL
+# fails the gate rather than reporting a green skip for the migration cycle.
 #
 # The invariant that must never be able to skip — exactly one Alembic head — does
 # not use this fixture at all and runs unconditionally in the rest shard.
@@ -920,6 +919,221 @@ async def _tables(database_url: str, names: tuple[str, ...]) -> set[str]:
                 await conn.execute(
                     text("SELECT tablename FROM pg_tables WHERE tablename = ANY(:names)"),
                     {"names": list(names)},
+                )
+            ).all()
+        return {row[0] for row in rows}
+    finally:
+        await engine.dispose()
+
+
+# ===========================================================================
+# The rollback the runbook actually documents (review F3)
+# ===========================================================================
+
+RUNBOOK = os.path.join(_repo_root(), "docs", "easyweek", "VOUCHER_PRODUCTION_MAILING_RUNBOOK.md")
+
+# The revision the stop-generation fix was added ON TOP OF: one step back from the
+# head, and the target of a rollback of the FIX alone.
+STOP_GENERATION_PARENT_REVISION = "a4f1c9d26b70"
+STOP_GENERATION_COLUMN = "stop_generation_at_plan"
+STOP_GENERATION_CHECK = "ck_ew_voucher_production_approval_stop_gen"
+
+PHASE_TABLES = (
+    "easyweek_voucher_production_approvals",
+    "easyweek_voucher_production_operations",
+    "easyweek_voucher_production_stop_requests",
+    "easyweek_voucher_production_audit",
+)
+HISTORICAL_TABLES = (
+    "easyweek_voucher_production_batches",
+    "easyweek_voucher_production_batch_items",
+    "easyweek_voucher_production_batch_attempts",
+    "easyweek_voucher_snapshot_batches",
+    "easyweek_voucher_canary_ledger",
+)
+
+
+def _rollback_section() -> str:
+    text_body = open(RUNBOOK, encoding="utf-8").read()
+    assert "### 12.2 Rollback" in text_body, "the runbook has no rollback section"
+    return text_body.split("### 12.2 Rollback", 1)[1].split("\n## ", 1)[0]
+
+
+def _rollback_commands() -> list[str]:
+    """The COMMANDS of the rollback section, without the prose that explains them.
+
+    The prose names ``alembic downgrade -1`` on purpose — to say that it is not what
+    the section used to claim it was — so a scan of the whole text would flag the very
+    sentence that fixes the defect.
+    """
+    inside = False
+    commands: list[str] = []
+    for line in _rollback_section().splitlines():
+        if line.startswith("```"):
+            inside = line.startswith("```bash")
+            continue
+        if inside and line.strip():
+            commands.append(line.strip())
+    return commands
+
+
+def _documented_downgrade_targets() -> dict[str, str]:
+    """The revisions the runbook tells an administrator to downgrade TO.
+
+    Read out of the document rather than written here, because the point of these
+    tests is that the documented command does what the document says it does. A test
+    with its own hard-coded revision would stay green while the runbook drifted — and
+    that drift is exactly the defect under repair.
+    """
+    import re as re_module
+
+    scope = None
+    found: dict[str, str] = {}
+    for line in _rollback_section().splitlines():
+        if line.startswith("Scope A"):
+            scope = "A"
+        elif line.startswith("Scope B"):
+            scope = "B"
+        match = re_module.search(r"alembic downgrade (\S+)", line)
+        if match and scope is not None:
+            found.setdefault(scope, match.group(1))
+    return found
+
+
+def test_the_runbook_names_explicit_rollback_revisions():
+    """Review F3: ``downgrade -1`` was documented as dropping the four tables.
+
+    It never did once a second §43 revision existed. One step back from the head
+    removes the stop-generation column and leaves every table in place, so an
+    administrator following the old instruction would have reported a rollback that
+    had not happened and left the new application over a schema missing a column it
+    reads.
+
+    No database is needed for this one, and that is deliberate: a wrong instruction
+    is caught by the required gate even on a machine with no PostgreSQL at all.
+    """
+    section = _rollback_section()
+    commands = _rollback_commands()
+    assert commands, "the rollback section has no commands at all"
+    assert not [line for line in commands if "downgrade -1" in line], (
+        f"the runbook still tells an operator to step back one revision: {commands}"
+    )
+    # And it says so in words, so the next reader does not reintroduce it.
+    assert "`alembic downgrade -1` is scope A" in section
+
+    targets = _documented_downgrade_targets()
+    assert targets == {"A": STOP_GENERATION_PARENT_REVISION, "B": OPERATIONS_PARENT_REVISION}, targets
+
+    # The two scopes are named and distinguished, with what each one costs.
+    assert "Scope A" in section and "Scope B" in section
+    assert STOP_GENERATION_COLUMN in section
+    assert "pg_dump" in section, "a rollback without a backup is not documented as needing one"
+    # The ordering rule the defect would otherwise invite: new code, old schema.
+    assert "stop altegio-api altegio-easyweek-voucher-executor" in section
+    # And it does not read as routine maintenance.
+    assert "not a maintenance step" in section
+    # The CLI stays shut either way.
+    assert "no supported way to run a mailing" in section
+
+
+async def test_the_documented_fix_rollback_keeps_the_four_tables(disposable_database: str):
+    """Scope A, run exactly as the runbook spells it.
+
+    The column and its CHECK go; the four tables, the historical ledgers and every
+    other revision stay. Then forward again, because a rollback nobody can come back
+    from is not one.
+    """
+    target = _documented_downgrade_targets()["A"]
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, PHASE_TABLES) == set(PHASE_TABLES)
+    assert STOP_GENERATION_COLUMN in await _columns(disposable_database, PHASE_TABLES[0])
+
+    assert _alembic(disposable_database, "downgrade", target).returncode == 0
+
+    current = _alembic(disposable_database, "current")
+    assert current.returncode == 0
+    assert target in current.stdout, current.stdout
+    # The documented outcome: the tables are still there.
+    assert await _tables(disposable_database, PHASE_TABLES) == set(PHASE_TABLES)
+    assert STOP_GENERATION_COLUMN not in await _columns(disposable_database, PHASE_TABLES[0])
+    assert STOP_GENERATION_CHECK not in await _check_constraints(disposable_database, PHASE_TABLES[0])
+    assert await _tables(disposable_database, HISTORICAL_TABLES) == set(HISTORICAL_TABLES)
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert STOP_GENERATION_COLUMN in await _columns(disposable_database, PHASE_TABLES[0])
+    assert STOP_GENERATION_CHECK in await _check_constraints(disposable_database, PHASE_TABLES[0])
+    back = _alembic(disposable_database, "current")
+    assert back.returncode == 0 and "(head)" in back.stdout
+
+
+async def test_the_documented_phase_rollback_drops_the_four_tables(disposable_database: str):
+    """Scope B, run exactly as the runbook spells it.
+
+    This is the transition the old instruction CLAIMED to perform, so it is checked
+    under the revision the document now names — including the historical ledgers it
+    promises not to touch, with a real row in one of them.
+    """
+    target = _documented_downgrade_targets()["B"]
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    marker = "historical-" + uuid_module.uuid4().hex[:10]
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO easyweek_voucher_canary_ledger ("
+                    " canary_scope, request_schema_version, template_config_digest,"
+                    " create_plan_digest, customer_fingerprint, staffer_fingerprint,"
+                    " account_fingerprint, reconciliation_marker, status,"
+                    " create_claimed_at, create_attempted_at,"
+                    " create_window_start, create_window_end"
+                    ") VALUES ("
+                    " 'historical_canary_v1', '1', :digest, :digest, :fp, :fp, :fp, :marker,"
+                    " 'create_claimed', now(), now(), now() - interval '1 hour', now() + interval '1 hour')"
+                ),
+                {"digest": "c" * 64, "fp": "d" * 64, "marker": marker},
+            )
+
+        assert _alembic(disposable_database, "downgrade", target).returncode == 0
+
+        current = _alembic(disposable_database, "current")
+        assert current.returncode == 0 and target in current.stdout, current.stdout
+        assert await _tables(disposable_database, PHASE_TABLES) == set()
+        assert await _tables(disposable_database, HISTORICAL_TABLES) == set(HISTORICAL_TABLES)
+        async with engine.connect() as conn:
+            kept = (
+                await conn.execute(
+                    text("SELECT count(*) FROM easyweek_voucher_canary_ledger WHERE reconciliation_marker = :m"),
+                    {"m": marker},
+                )
+            ).scalar_one()
+        assert kept == 1, "the rollback took a historical ledger row with it"
+
+        assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+        assert await _tables(disposable_database, PHASE_TABLES) == set(PHASE_TABLES)
+        assert STOP_GENERATION_COLUMN in await _columns(disposable_database, PHASE_TABLES[0])
+        heads = _alembic(_repo_root(), "heads")
+        assert len([line for line in heads.stdout.splitlines() if "(head)" in line]) == 1, heads.stdout
+    finally:
+        await engine.dispose()
+
+
+async def _check_constraints(database_url: str, table: str) -> set[str]:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT c.conname FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid"
+                        " WHERE t.relname = :t AND c.contype = 'c'"
+                    ),
+                    {"t": table},
                 )
             ).all()
         return {row[0] for row in rows}
