@@ -94,16 +94,36 @@ def test_no_extra_flag_reopens_a_mutating_command(configured, capsys, stage: str
 
 
 @pytest.mark.parametrize("stage", MUTATING)
-def test_a_mutating_command_refuses_before_it_reads_the_fence_state(configured, capsys, stage: str, monkeypatch):
-    """Closed whether the fence is open or shut: this is not a fence question."""
+def test_a_mutating_command_names_the_closure_even_with_the_fence_shut(configured, capsys, stage: str, monkeypatch):
+    """The closure is a property of the command, not of the deployment (review R4).
+
+    A post-deploy smoke runs with the fence CLOSED. While the fence answered first,
+    that smoke got `voucher_production_disabled` — which proves the fence works and
+    says nothing about whether the CLI mutation path is shut, so the administrator
+    checking the closure was reading the wrong refusal. Now the answer is the same
+    either way, which is what makes the check in the runbook meaningful.
+    """
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
     code, report = _run(_args_for(stage), capsys)
     assert code == cli.EXIT_CONTRACT_MISMATCH
-    # With the fence shut the fence answers first, which is also a refusal.
-    assert report["reasons"] in (
-        ["voucher_production_cli_mutation_closed"],
-        ["voucher_production_disabled"],
-    )
+    assert report["reasons"] == ["voucher_production_cli_mutation_closed"]
+    assert report["external_effect_attempted"] is False
+    assert report["external_send_attempted"] is False
+
+
+@pytest.mark.parametrize("stage", MUTATING)
+def test_the_closure_answer_does_not_depend_on_any_configuration(capsys, stage: str, monkeypatch):
+    """Not configured at all, fence shut, no staffer, no account: still the closure.
+
+    The refusal an administrator relies on must not be reachable only on a
+    fully-configured machine.
+    """
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_staffer_uuid", "", raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_account_uuid", "", raising=False)
+    code, report = _run(_args_for(stage), capsys)
+    assert code == cli.EXIT_CONTRACT_MISMATCH
+    assert report["reasons"] == ["voucher_production_cli_mutation_closed"]
     assert report["external_effect_attempted"] is False
 
 

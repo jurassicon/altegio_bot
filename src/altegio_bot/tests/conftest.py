@@ -179,6 +179,15 @@ from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: E402
     configuration,
 )
 
+# The browser acceptance fixtures (review R8). Re-exported for the same reason, and
+# deliberately importing nothing heavy at module scope: `ops_server` imports uvicorn
+# and the app lazily, inside the fixture, so a suite that never opens a browser pays
+# nothing for these being here.
+from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (  # noqa: E402,F401
+    ops_server,
+    page,
+)
+
 # §43 operator UI (PR-20). Re-exported here for the same reason as the fixtures
 # above: a test module that imported them would shadow its own parameter names.
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (  # noqa: E402,F401

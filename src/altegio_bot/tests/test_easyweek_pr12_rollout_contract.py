@@ -260,6 +260,26 @@ def test_no_new_service_and_no_new_secret_distribution() -> None:
         # container, and the apply authorisation is passed per invocation
         # rather than declared in Compose.
         "easyweek-failed-cancellation-recovery",
+        # Plan §43 (PR-20). The voucher-mailing executor performs the stages an
+        # operator confirms in Ops, so it reaches EasyWeek and Meta and needs the
+        # same key.
+        #
+        # Admitted deliberately, and it is the first STANDING service besides the API
+        # and the two workers to hold it — every entry above is an ops-profile
+        # `restart: "no"` one-off. That difference is the reason it is admitted
+        # separately rather than folded into one of them, and the reason its power is
+        # worth stating precisely: it can create, pay and refund a voucher and send
+        # one WhatsApp template, and it can do so ONLY for a stage a named operator
+        # confirmed through the CSRF-protected UI, stored as an immutable approval
+        # whose exact target slots it may not widen. It accepts no command and no
+        # argument; the work it does is whatever the approval row says. With
+        # EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED false — the default — it
+        # refuses every stage it picks up.
+        #
+        # It cannot create a customer, a booking, a message job or an outbox row, it
+        # has no retry path, and it is not reachable from the network: no ports, no
+        # Docker socket.
+        "altegio-easyweek-voucher-executor",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

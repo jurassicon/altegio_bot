@@ -894,31 +894,86 @@ console.log(JSON.stringify({rows: facts.length, values: facts.map(p => p[1])}));
     assert answer["values"] == ["да", "4 из 4", "1 из 4", "0 из 4"]
 
 
+def test_the_server_action_table_is_the_ledgers_own_contract():
+    """``available_item_actions`` is derived from the claim sets, not re-typed (R6).
+
+    The UI used to keep its own list of refundable statuses and it had drifted both
+    ways: it hid ``pay_unknown`` and ``refund_rejected``, where a refund is allowed,
+    and offered ``send_rejected``, where it is forbidden because the one attempt was
+    already spent. This pins the single table against the ledger's own sets, so the
+    two cannot drift again.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production.ledger import (
+        CREATE_CLAIMABLE_FROM,
+        PAY_CLAIMABLE_FROM,
+        REFUND_CLAIMABLE_FROM,
+        SEND_CLAIMABLE_FROM,
+        SENT_ITEM_STATUSES,
+        ItemSnapshot,
+    )
+    from altegio_bot.campaigns.easyweek_voucher_production.runner import available_item_actions
+
+    def snapshot(status: str, attempts: int = 0) -> ItemSnapshot:
+        return ItemSnapshot(
+            slot=1,
+            campaign_recipient_id=1,
+            campaign_run_id=1,
+            easyweek_customer_uuid="synthetic",
+            reconciliation_marker="marker",
+            status=status,
+            send_attempt_count=attempts,
+        )
+
+    for status in CREATE_CLAIMABLE_FROM:
+        assert "create" in available_item_actions(snapshot(status)), status
+    for status in PAY_CLAIMABLE_FROM:
+        assert "pay" in available_item_actions(snapshot(status)), status
+    for status in SEND_CLAIMABLE_FROM:
+        assert "deliver" in available_item_actions(snapshot(status)), status
+    for status in REFUND_CLAIMABLE_FROM:
+        assert "refund" in available_item_actions(snapshot(status)), status
+
+    # And never after a send, by either test: the state, or a spent attempt.
+    for status in SENT_ITEM_STATUSES:
+        assert "refund" not in available_item_actions(snapshot(status, attempts=1)), status
+    assert "refund" not in available_item_actions(snapshot("paid", attempts=1))
+
+
 @needs_node
-async def test_the_ui_offers_a_refund_only_before_a_send(
+async def test_the_ui_offers_a_refund_from_the_servers_list_not_a_status_name(
     ui_client, session_maker, production_configuration, binding_key, executor_enabled, transports
 ) -> None:
-    """A slot Meta has already been asked about is never offered a refund button."""
+    """``mayRefund`` reads ``available_actions`` and ignores the status entirely (R6).
+
+    Asserted by giving it contradictory inputs: a status that sounds refundable with
+    no action offered, and one that sounds final with the action present. The server's
+    list wins both times, which is what makes it the only copy of the rule.
+    """
     source = await _decisions(ui_client, session_maker, transports)
     driver = """
 console.log(JSON.stringify({
-  paid: mayRefund({status: "paid", send_attempt_count: 0}),
-  sendRejected: mayRefund({status: "send_rejected", send_attempt_count: 0}),
-  attempted: mayRefund({status: "paid", send_attempt_count: 1}),
-  accepted: mayRefund({status: "provider_accepted", send_attempt_count: 1, provider_accepted: true}),
-  delivered: mayRefund({status: "delivered", send_attempt_count: 1, webhook_delivered: true}),
-  planned: mayRefund({status: "planned", send_attempt_count: 0}),
-  created: mayRefund({status: "created", send_attempt_count: 0})
+  offered: mayRefund({status: "paid", available_actions: ["deliver", "refund"]}),
+  notOffered: mayRefund({status: "paid", available_actions: ["deliver"]}),
+  payUnknownOffered: mayRefund({status: "pay_unknown", available_actions: ["refund"]}),
+  refundRejectedOffered: mayRefund({status: "refund_rejected", available_actions: ["refund"]}),
+  sendRejectedNotOffered: mayRefund({status: "send_rejected", available_actions: []}),
+  soundsFinalButOffered: mayRefund({status: "refund_rejected", available_actions: ["refund"]}),
+  missingField: mayRefund({status: "paid"}),
+  nothing: mayRefund(null)
 }));
 """
     answer = _run_node(source, driver)
-    assert answer["paid"] is True
-    assert answer["sendRejected"] is True
-    assert answer["attempted"] is False
-    assert answer["accepted"] is False
-    assert answer["delivered"] is False
-    assert answer["planned"] is False
-    assert answer["created"] is False
+    assert answer["offered"] is True
+    assert answer["notOffered"] is False
+    # The two states the old UI list wrongly hid.
+    assert answer["payUnknownOffered"] is True
+    assert answer["refundRejectedOffered"] is True
+    # The state the old UI list wrongly offered.
+    assert answer["sendRejectedNotOffered"] is False
+    assert answer["soundsFinalButOffered"] is True
+    # No list means no offer: a missing field is never read as permission.
+    assert answer["missingField"] is False
+    assert answer["nothing"] is False
 
 
 @needs_node

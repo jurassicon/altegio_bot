@@ -4539,6 +4539,7 @@ class EasyWeekVoucherProductionApproval(Base):
         # An approval that covers no slot authorises nothing, and storing one
         # would invite an executor to read "no restriction" out of an empty list.
         CheckConstraint("target_slot_count >= 1", name="ck_ew_voucher_production_approval_slots"),
+        CheckConstraint("stop_generation_at_plan >= 0", name="ck_ew_voucher_production_approval_stop_gen"),
         # What THIS stage is about to do, which is not the same as what the batch
         # costs in total. A freeze and a deliver move no money; a create and a pay
         # move €15 per slot they are about to touch.
@@ -4596,6 +4597,15 @@ class EasyWeekVoucherProductionApproval(Base):
     batch_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     campaign_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Which operator stop this plan was built in knowledge of (review R1).
+    #
+    # 0 means "no stop had ever been pressed for this batch". A confirmation is
+    # admitted while a stop is ACTIVE only when this equals the batch's current
+    # generation — that is, only when the plan was built after that stop, by an
+    # operator who could see it. A plan from before the stop carries the older
+    # number and is refused, so a second tab cannot lift somebody else's stop.
+    stop_generation_at_plan: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # -- the authorisation itself -------------------------------------------
     plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)

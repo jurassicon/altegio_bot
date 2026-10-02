@@ -98,6 +98,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ISSUER_MEMBERSHIP_INCOMPLETE,
     KARLSRUHE_COMPANY_ID,
     LEDGER_STATE_UNEXPECTED,
+    LEDGER_WRITE_LOST,
     MARKER_SEARCH_AMBIGUOUS,
     MARKER_SEARCH_INCOMPLETE,
     MARKER_SEARCH_UNRESOLVED,
@@ -110,6 +111,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ORDER_UNPROVEN,
     PREVIEW_ALREADY_FROZEN,
     PRODUCTION_SCOPE,
+    RECONCILE_BUSY,
     RECONCILE_UNRESOLVED,
     REFUND_FORBIDDEN_AFTER_SEND,
     SLOT_UNKNOWN,
@@ -719,6 +721,33 @@ async def _stop_reached(
     if not honour_stop:
         return False
     return await ledger_module.stop_is_active(session_maker, batch_id=batch_id)
+
+
+def available_item_actions(item: ledger_module.ItemSnapshot) -> tuple[str, ...]:
+    """Which per-item stages this slot is in a state to be planned for.
+
+    The ONE place that answers it (review R6). The UI used to decide for itself
+    which rows could be refunded, and its list had drifted from the ledger's in both
+    directions: it hid two states a refund is genuinely allowed from, and offered one
+    — ``send_rejected`` — where a refund is forbidden because an attempt was already
+    spent. Both are the same bug, which is a second copy of a rule.
+
+    Derived from ``STAGE_ITEM_SOURCE_STATUSES``, so the buttons and the plan cannot
+    disagree: this says what may be PLANNED, never what is authorised. Every real
+    refusal still happens in the plan, in the claim and in a CHECK constraint, and a
+    slot named here still needs a fresh plan, a live proof and its own confirmation.
+    """
+    actions: list[str] = []
+    for stage in (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND):
+        if item.status in STAGE_ITEM_SOURCE_STATUSES.get(stage, frozenset()):
+            actions.append(stage)
+    if STAGE_REFUND in actions and (
+        item.status in ledger_module.SENT_ITEM_STATUSES or int(item.send_attempt_count or 0) > 0
+    ):
+        # Belt and braces for the rule that costs the most to get wrong: once an
+        # attempt is spent, the code may already be in somebody's hands.
+        actions.remove(STAGE_REFUND)
+    return tuple(actions)
 
 
 async def build_stage_plan(
@@ -2009,12 +2038,24 @@ async def run_deliver(
         del params
 
         if outcome_meta.accepted and outcome_meta.provider_message_id:
-            await ledger_module.record_item_outcome(
+            recorded = await ledger_module.record_item_outcome(
                 session_maker,
                 batch_id=batch_id,
                 slot=slot,
                 status=VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
-                expected_statuses=frozenset({VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED}),
+                # Both source states, deliberately (review R2). `send_claimed` is
+                # the ordinary one. `send_unknown` is the row a reconcile parked
+                # while this very request was in flight: the readback could not
+                # know the answer was still coming, and the answer is now here.
+                #
+                # Accepting it is sound rather than lenient — `provider_accepted`
+                # outranks `send_unknown`, so this is a forward move the
+                # monotonicity guard already permits, and the alternative is
+                # throwing away a PROVEN success and the only identifier by which
+                # a later delivered/read callback could find this slot.
+                expected_statuses=frozenset(
+                    {VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED, VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN}
+                ),
                 provider_message_id=outcome_meta.provider_message_id,
                 # Stamped by the very compare-and-set that records the
                 # acceptance, not left for a webhook to invent afterwards.
@@ -2022,6 +2063,22 @@ async def run_deliver(
                 reconciliation_required=False,
                 attempt_outcome="provider_accepted",
             )
+            if not recorded.applied:
+                # Meta accepted and the ledger does not say so. Never reported as
+                # success: the message is real, the record is not, and the honest
+                # state is one a human has to resolve. Deliberately NOT retried —
+                # a second send is the one thing this outcome must not cause.
+                results.append(
+                    SlotResult(
+                        slot=slot,
+                        outcome="unknown",
+                        reasons=[LEDGER_WRITE_LOST],
+                        external_effect_attempted=True,
+                        external_send_attempted=True,
+                    )
+                )
+                halted = True
+                continue
             results.append(
                 SlotResult(
                     slot=slot,
@@ -2370,8 +2427,12 @@ async def _park_unresolved(
     batch_id: int,
     item: ledger_module.ItemSnapshot,
     reason: str,
-) -> None:
+) -> ledger_module.RecordOutcome:
     """Record that a reconcile looked at a crashed claim and still cannot say.
+
+    Returns the outcome rather than discarding it, because one of its refusals is
+    load bearing: ``record_refused_busy`` means an executor is using that claim and
+    the reconcile must say so instead of implying it reinterpreted anything.
 
     Moves ``*_claimed`` to the matching ``*_unknown`` and does nothing else. The
     destination is deliberately another unresolved state: it is not in any
@@ -2382,8 +2443,8 @@ async def _park_unresolved(
     """
     parked = _RECONCILED_UNKNOWN.get(item.status)
     if parked is None:
-        return
-    await ledger_module.record_item_outcome(
+        return ledger_module.RecordOutcome(False, ledger_module.RECORD_STALE_STATE)
+    return await ledger_module.record_item_outcome(
         session_maker,
         batch_id=batch_id,
         slot=item.slot,
@@ -2395,6 +2456,9 @@ async def _park_unresolved(
         # a reconcile that found nothing has not proved otherwise.
         manual_cleanup_required=True if item.status == VOUCHER_PRODUCTION_ITEM_CREATE_CLAIMED else None,
         attempt_outcome="unknown" if item.status == VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED else None,
+        # The guard that makes a readback safe to run at all (review R2): a claim an
+        # executor is using is not an abandoned one.
+        require_idle=True,
     )
 
 
@@ -2464,7 +2528,9 @@ async def run_reconcile(
                 # Nothing was proven. Absence is NOT proof the POST never left:
                 # the walk may simply not have seen the order, so the slot stays
                 # unresolved and nobody gets to send a second CREATE.
-                await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=slot_reasons[0])
+                parked = await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=slot_reasons[0])
+                if parked.reason == ledger_module.RECORD_REFUSED_BUSY:
+                    slot_reasons = [RECONCILE_BUSY]
         elif item.target_order_uuid is not None:
             payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
             if order_reason is not None:
@@ -2571,8 +2637,14 @@ async def run_reconcile(
         # identifier to ask Meta about. It may not be retried, it may not be
         # declared unsent, and it may not be refunded. It waits for a human.
         if item.status in SEND_UNRESOLVED:
-            slot_reasons.append(MUTATION_UNKNOWN)
-            await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=MUTATION_UNKNOWN)
+            parked = await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=MUTATION_UNKNOWN)
+            if parked.reason == ledger_module.RECORD_REFUSED_BUSY:
+                # An executor is holding this claim. The readback has reinterpreted
+                # nothing, and saying "unknown" here would be a claim about a slot
+                # whose answer is still on its way.
+                slot_reasons.append(RECONCILE_BUSY)
+            else:
+                slot_reasons.append(MUTATION_UNKNOWN)
 
         reasons.extend(slot_reasons)
         results.append(
@@ -2660,6 +2732,7 @@ __all__ = [
     "StageReport",
     "VoucherMutator",
     "VoucherSender",
+    "available_item_actions",
     "build_stage_plan",
     "run_create",
     "run_deliver",

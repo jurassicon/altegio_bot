@@ -248,15 +248,42 @@ nothing about deploying them starts a mailing.
 ### 3.2 The dedicated executor
 
 A confirmed stage is **not** executed inside the HTTP request that confirmed it.
-It is stored in PostgreSQL first, and a separate worker runs it:
+It is stored in PostgreSQL first, and a separate **supervised service** runs it:
+`altegio-easyweek-voucher-executor`, defined in `docker-compose.yml` next to the
+other workers.
+
+It is not something anybody runs by hand. A stage over a real list takes minutes
+and must survive the request that confirmed it, the tab that was closed and the
+process that was restarted — and an interactive `docker compose exec` gives it none
+of that: the work dies with the terminal, and nobody can tell "still running" from
+"died silently".
+
+Start it with the rest of the stack:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.run_easyweek_voucher_production_worker
+cd /opt/altegio_bot
 ```
 
-In the deployment it is a service of its own, started and stopped by the existing
-stack, with `EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED=true` set for the API so
-the UI knows a confirmation can be picked up.
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d altegio-easyweek-voucher-executor
+```
+
+Check it is up, and read its log:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps altegio-easyweek-voucher-executor
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml logs --tail 50 altegio-easyweek-voucher-executor
+```
+
+Set `EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED=true` for the API as well, so the
+UI knows a confirmation can be picked up. **That flag is a statement about the
+deployment, not a health check**: it means "this deployment runs an executor", never
+"one is alive this second". An executor that is down shows up as an operation
+sitting in `queued` on the mailing page — that, and the service's own status, are
+the real evidence.
 
 **Supported topology: one API container and ONE executor, with no rolling
 deploy.** The executor relies on that: a `running` operation it finds at start-up
@@ -272,8 +299,25 @@ twice. This executor has **no retry path at all** — no backoff, no attempt
 ceiling, no requeue. There is no transition from `running` or `interrupted` back
 to `queued` anywhere in the schema or the code.
 
-Stopping the executor is safe: a SIGTERM is checked **between** operations, never
-during one, so a stage that is mid-flight finishes and records its outcome.
+#### Stopping and draining it
+
+A SIGTERM is checked **between** operations, never during one, so a stage that is
+mid-flight finishes and records its outcome. The service declares
+`stop_grace_period: 120s` for that reason.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml stop altegio-easyweek-voucher-executor
+```
+
+**If a stage outlasts the grace period** Docker kills it. That is not a lost
+mailing and it is not a silent one: whatever each slot reached is already in the
+per-item ledger, and the operation reads `interrupted` on the mailing page. It is
+never retried — resolve it with «Сверить с EasyWeek» and then a fresh confirmation
+for what is provably untouched (§9.4).
+
+To stop a mailing **without** stopping the service, use the operator's own control:
+«Остановить после текущего запроса» (§8). That is the ordinary way, and the only one
+that leaves no operation in doubt.
 
 ---
 
@@ -300,8 +344,34 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 Expected: `"reasons": ["voucher_production_cli_mutation_closed"]`,
 `"external_effect_attempted": false`, exit code 4.
 
-6. Confirm the executor is running and idle in its own logs. An empty queue is
-   the expected state.
+This is the answer **whether the fence is open or shut**. Whether the CLI may
+mutate is a property of the command, not of the deployment, so the closure is
+checked before the fence — otherwise this smoke would come back
+`voucher_production_disabled`, which proves the fence works and says nothing about
+the closure you were checking.
+
+6. Confirm the executor service is up and idle:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps altegio-easyweek-voucher-executor
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml logs --tail 30 altegio-easyweek-voucher-executor
+```
+
+Expect exactly one container, `running`, with an idle log and no queued operations.
+Its own status is the evidence that it is alive — the `..._EXECUTOR_ENABLED` flag only
+says this deployment runs one.
+
+7. Confirm exactly one executor is supervised, not several:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps --format '{{.Service}}' | sort | uniq -c | grep voucher-executor
+```
+
+Expect the count to be `1`. Two overlapping executors are not a supported topology:
+each interrupts the other's running operations at start-up.
 
 **Then, and only then:** open the fence as a separate, deliberate administrative
 step. Opening it creates nothing by itself — every stage still requires its own
@@ -341,8 +411,9 @@ copied anywhere.
 On the preparation page:
 
 1. Press **«Проверить состав»**. The page shows the campaign period, the exact
-   number of recipients, €15 each and the total. Checking the list never arms the
-   confirmation — it is a read.
+   number of recipients, €15 each, the total, and **who each recipient is** — name
+   and the preview row they came from. Checking the list is a read: it never arms
+   the confirmation and never creates anything.
 2. Read the period. It is the wave the vouchers are **earned for**, not the month
    of sending.
 3. Read the message and the voucher's terms, shown lower on the page. The voucher
@@ -356,7 +427,13 @@ On the preparation page:
 6. A confirmation panel states what will happen. Press **«Подтвердить»**.
 
 The freeze writes the batch locally. **No money moves and no message is sent.**
-The browser is taken to the new mailing's page.
+
+The freeze runs on the executor like every other step, so for a moment there is a
+confirmed operation and no batch yet. The page says so and waits; when the batch
+exists it takes you to it. **Refreshing or logging in again resumes watching the
+same operation** rather than offering a second freeze — if the page shows a step in
+progress, that step is yours and it is already running. A freeze the executor
+refuses is reported as refused, with its reason, and creates nothing.
 
 ---
 
@@ -428,6 +505,17 @@ authorises. That confirmation is what lifts the stop — there is no separate
 "resume" button, because continuing must be a decision rather than a toggle.
 Successful and attempted actions are never repeated.
 
+Two refusals you may meet, and both are the system protecting the stop:
+
+| Reason | What it means |
+| --- | --- |
+| `voucher_production_stop_active` | the step you are confirming was prepared **before** the stop. A plan from before a stop cannot be the decision to carry on past it — prepare the step again and confirm that |
+| `voucher_production_operation_in_flight` | another step of this mailing is still running. Wait for it to finish, then prepare the next one |
+
+So a second browser tab holding a step prepared earlier cannot lift your stop, and
+confirming something in one tab cannot resume a step that is already running in
+another.
+
 ---
 
 ## 9. Operator: unknown outcomes, reconciliation and refunds
@@ -441,6 +529,12 @@ unknown may mean the customer is already holding the code.
 
 1. Press **«Сверить с EasyWeek»**. It performs reads only and records what it
    read.
+
+   If it answers `voucher_production_reconcile_busy`, a step of this mailing is
+   executing right now. That is not a failure: a readback exists to reinterpret
+   claims left behind by a process that died, and doing it to a live one would move
+   the row out from under a request whose answer is still on its way. Wait for the
+   step to finish — the page shows when it has — and press it again.
 2. If reconciliation resolves the slot, the mailing continues from a fresh,
    confirmed plan for the slots that are provably untouched.
 3. If it does not resolve, stop and escalate. Creating a second batch to get
@@ -463,7 +557,13 @@ the same rule independently — a refund after any send claim or attempt is refu
 by the plan, by the claim and by a CHECK constraint, because returning the money
 for a code somebody is already holding is worse than losing the €15.
 
-A refund is one named recipient of one named mailing, with its own confirmation.
+A refund is one named recipient of one named mailing, with its own confirmation —
+and the confirmation **names the client**, not only the slot number, so there is no
+way to return the wrong person's money by misreading a row.
+
+Which rows offer the button comes from the server's own rule rather than from the
+page's idea of it, so what you can press and what the server will accept are the
+same list.
 It stays available when the batch is halted — a halt is exactly when an untouched
 paid slot most needs its money back — and when the issuer configuration has
 changed or disappeared.
@@ -508,37 +608,49 @@ this: it runs a stored, authorised UI action, never a command somebody typed.
 Set `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED=false` in the environment file
 first.
 
-Then recreate the API service. **A plain `docker compose restart` is not enough
-and must not be used here:** `restart` stops and starts the existing container,
-which keeps the environment it was created with, so the fence would still read
-`true` inside it while the file on disk says `false`. The environment is only
-re-read when the container is created again.
+Then recreate **both** the API and the executor. Two things matter here.
+
+**A plain `docker compose restart` is not enough and must not be used:** `restart`
+stops and starts the existing container, which keeps the environment it was created
+with, so the fence would still read `true` inside it while the file on disk says
+`false`. The environment is only re-read when the container is created again.
+
+**Recreating only the API is not enough either.** The executor is a separate
+container with its own copy of the environment, and it is the process that actually
+performs a stage. An API recreated with the fence shut would refuse new
+confirmations while an executor still holding `true` went on executing anything
+already queued.
 
 ```bash
 cd /opt/altegio_bot
 ```
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --no-deps --force-recreate altegio-api
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml up -d --no-deps --force-recreate altegio-api altegio-easyweek-voucher-executor
 ```
 
-`--no-deps` keeps this to the one service; `--force-recreate` is what makes the
+`--no-deps` keeps this to those two services; `--force-recreate` is what makes the
 new environment take effect.
 
-Then verify the value **inside the container**, not in the file:
+Then verify the value **inside each container**, not in the file:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api printenv EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED
 ```
 
-Expected output, exactly:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-easyweek-voucher-executor printenv EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED
+```
+
+Expected output from both, exactly:
 
 ```
 false
 ```
 
-Anything else — `true`, or no output at all — means the fence is still open or the
-variable is not set as intended. Do not stop here; fix it and verify again.
+Anything else — `true`, or no output at all — means the fence is still open in that
+container or the variable is not set as intended. Do not stop here; fix it and
+verify again.
 
 Pages, `status` and the delivery webhooks keep working with the fence closed, so
 the mailing state stays readable afterwards.
@@ -549,12 +661,15 @@ the mailing state stays readable afterwards.
 
 ### 12.1 Limits worth knowing
 
-- **The executor is a single point of execution.** If it is not running,
+- **The executor is a single point of execution.** If the service is not running,
   confirmations stay `queued` and nothing happens. The confirmation refuses up
   front when `EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED` is false, but that
   flag means "this deployment runs one", never "it is alive this second". An
   executor that died shows up as an operation sitting in `queued` on the mailing
-  page.
+  page, and as a stopped container in `docker compose ps`.
+- **A fence change must reach the executor too.** It is a separate container with
+  its own copy of the environment; recreating only the API leaves it running on the
+  old settings. See §11.
 - **A rolling deploy is not supported.** The executor interrupts every `running`
   operation it finds at start-up, which is correct for one executor and wrong for
   two overlapping ones.

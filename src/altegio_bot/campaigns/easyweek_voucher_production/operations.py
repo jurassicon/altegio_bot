@@ -53,11 +53,13 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPROVAL_UNKNOWN,
     EXECUTION_INTERRUPTED,
     KARLSRUHE_COMPANY_ID,
+    OPERATION_IN_FLIGHT,
     PLAN_EXPIRED,
     PRODUCTION_SCHEMA_VERSION,
     PRODUCTION_SCOPE,
     STAGE_FREEZE,
     STAGE_REFUND,
+    STOP_ACTIVE,
 )
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
@@ -156,6 +158,7 @@ class StoredApproval:
     expires_at: datetime
     status: str
     frozen_digest: str | None
+    stop_generation_at_plan: int = 0
 
     @property
     def pending(self) -> bool:
@@ -253,6 +256,7 @@ def _approval(row: EasyWeekVoucherProductionApproval) -> StoredApproval:
         expires_at=row.expires_at,
         status=str(row.status),
         frozen_digest=row.frozen_digest,
+        stop_generation_at_plan=int(row.stop_generation_at_plan or 0),
     )
 
 
@@ -335,6 +339,7 @@ async def store_approval(
     runtime_identity_bound: bool,
     baseline_version: str,
     frozen_digest: str | None,
+    stop_generation_at_plan: int = 0,
 ) -> StoredApproval:
     """Write the immutable offer. Only ever called for a plan that was READY.
 
@@ -371,6 +376,7 @@ async def store_approval(
                 runtime_identity_bound=runtime_identity_bound,
                 baseline_version=baseline_version,
                 frozen_digest=frozen_digest,
+                stop_generation_at_plan=stop_generation_at_plan,
                 status=VOUCHER_PRODUCTION_APPROVAL_PENDING,
             )
             session.add(row)
@@ -457,10 +463,23 @@ async def confirm_approval(
       never used; what they prove is that the human agreed to this count and this
       amount and not to whatever the page last rendered.
 
-    A confirmation for an acting stage also lifts an operator stop on that batch,
-    in this same transaction. That is the only thing that lifts one: continuing
-    after a stop is exactly "a fresh plan, confirmed", and doing it here means
-    there is no instant in which a stopped batch is resumable without a decision.
+    Two admission rules keep a batch doing one thing at a time (review R1), and
+    both are checked here, under the batch header's row lock — the same lock
+    ``request_stop`` and every per-item claim take, which is what makes them
+    atomic rather than almost atomic:
+
+    *One operation at a time.* A batch with a queued or running operation admits no
+    second one. Without this, confirming a plan prepared earlier would clear the
+    running operation's stop and let it carry on through the slots behind a request
+    that was still in flight.
+
+    *A stop is lifted only by a plan that saw it.* The approval records the batch's
+    stop generation at plan time. While a stop is active, a confirmation is admitted
+    only when that number still matches, so a plan from before the stop — the one
+    sitting in the operator's other tab — is refused rather than becoming a resume
+    nobody asked for. A matching generation means the plan was built in full
+    knowledge of the stop, which is precisely the "fresh plan, confirmed" that §43.6
+    requires for continuing, and it is still the only thing that lifts one.
     """
     moment = now or utcnow()
     async with session_maker() as session:
@@ -495,6 +514,22 @@ async def confirm_approval(
 
             if stored.expired_at(moment):
                 return ConfirmOutcome(operation=None, reasons=(PLAN_EXPIRED,))
+
+            # The batch's own gate. Taken AFTER the approval's row lock and always
+            # in this order — approval, then header — so two confirmations racing
+            # on one batch cannot deadlock by taking them the other way round.
+            if stored.batch_id is not None:
+                admission = await ledger_module.admission_locked(session, batch_id=stored.batch_id)
+                if not admission.exists:
+                    return ConfirmOutcome(operation=None, reasons=(APPROVAL_UNKNOWN,))
+                if admission.busy:
+                    # Somebody else's turn. Reported rather than queued: a second
+                    # concurrent operation is not a thing this phase has.
+                    return ConfirmOutcome(operation=None, reasons=(OPERATION_IN_FLIGHT,))
+                if admission.stop_active and stored.stop_generation_at_plan != admission.stop_generation:
+                    # A plan from before this stop. It cannot be the decision to
+                    # carry on, because its author had not seen the stop.
+                    return ConfirmOutcome(operation=None, reasons=(STOP_ACTIVE,))
 
             if confirmed_count != stored.stage_target_count:
                 return ConfirmOutcome(operation=None, reasons=(APPROVAL_COUNT_UNCONFIRMED,))

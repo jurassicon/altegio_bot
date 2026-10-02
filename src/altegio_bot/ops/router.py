@@ -382,6 +382,16 @@ def _page(title: str, body: str) -> str:
     integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
     crossorigin="anonymous">
   <style>
+    /* Bootstrap's own definition, repeated locally on purpose.
+     *
+     * Every page here shows and hides panels by toggling `d-none`, and that rule
+     * arrives from a CDN. On a restricted network, or whenever the pinned bundle is
+     * blocked, the class would do nothing and a confirmation dialog meant to be
+     * hidden would sit permanently open — which is the worst possible thing for it
+     * to do. Identical to the upstream rule, so it changes nothing when the CDN is
+     * reachable.
+     */
+    .d-none {{ display: none !important; }}
     pre {{ white-space: pre-wrap; word-break: break-all; font-size: .8rem; }}
     .table-sm td, .table-sm th {{ font-size: .85rem; }}
     .warn {{ background-color: #fff3cd !important; }}

@@ -26,6 +26,15 @@ dev = [
   'pytest>=8.3',
   'respx>=0.21',
   "ruff>=0.15.4",
+  # A real browser for the §43 operator UI acceptance tests. The Ops pages are the
+  # product of that phase, and API calls cannot show that a click reaches the right
+  # handler, that a value typed into a field arrives, that polling repaints or that
+  # navigation lands — all of which are the operator path itself.
+  #
+  # Chromium is installed in CI by `playwright install --with-deps chromium`, and the
+  # browser suite FAILS rather than skips when it is missing: see
+  # ALTEGIO_REQUIRE_BROWSER_TESTS in the required gate.
+  'playwright>=1.47',
 ]
 
 [tool.setuptools]

@@ -417,6 +417,26 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if args.command == COMMAND_STATUS:
         return await _run_status(args.batch_id, args.preview_run_id)
 
+    # §43.6: the mutating stages are not things this command does any more, and
+    # that is answered BEFORE the fence.
+    #
+    # The order matters for one practical reason (review R4): a post-deploy smoke
+    # runs with the fence CLOSED, and with the fence checked first the answer was
+    # `voucher_production_disabled` — which proves the fence works and says nothing
+    # about whether the CLI mutation path is shut. An administrator checking the
+    # closure would have been reading the wrong refusal. Whether the CLI may mutate
+    # is a property of the command, not of the deployment's fence, so it is the
+    # answer regardless of either.
+    #
+    # Both are refusals with zero external effects, so nothing is weakened by
+    # choosing which one speaks first.
+    if args.command in _CLOSED_CLI_STAGES:
+        # There is deliberately no flag that reopens this. `--apply` does not, and
+        # adding a second one would simply recreate what §43 closed. The internal
+        # executor is not a counter-example: it runs a stored, authorised UI action,
+        # never a command somebody typed.
+        return _refusal_report(args.command, [CLI_MUTATION_CLOSED]), EXIT_CONTRACT_MISMATCH
+
     # Everything else is behind the fence, before anything opens a socket or a
     # session — the read-only plan included. A closed fence means the command
     # does nothing at all, not "nothing that writes".
@@ -432,26 +452,10 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if args.command == COMMAND_RECONCILE:
         return await _run_reconcile(request)
 
-    # §43.6: FREEZE, CREATE, PAY, DELIVER and REFUND are no longer things this
-    # command does. The owner's decision of 28.09.2026 is that the real mailing
-    # happens from the interface, and a supported terminal path alongside it would
-    # not be a convenience — it would be a way to spend real money without the
-    # server-held approval, the CSRF-protected session, the recorded operator and
-    # the audit row that the UI contract is made of.
-    #
-    # Closed here, at the dispatch, rather than by deleting the subcommands: the
-    # refusal has to be something an operator READS, naming the reason and where
-    # the action now lives. A removed subcommand would print an argparse error
-    # about an unknown command, which teaches nobody anything.
-    #
-    # There is deliberately no flag that reopens this. `--apply` does not, and
-    # adding a second one would simply recreate what §43 closed. The internal
-    # executor is not a counter-example: it runs a stored, authorised UI action,
-    # never a command somebody typed.
-    #
-    # `status`, `plan` and `reconcile` are above and stay: they read, they
-    # diagnose, and a closed fence or a halted batch is exactly when somebody
-    # needs them.
+    # Unreachable: every mutating command was answered above, and `status`, `plan`
+    # and `reconcile` all returned. Kept as a fail-closed floor rather than an
+    # assertion — a future subcommand that forgets to classify itself refuses
+    # instead of falling through to something that acts.
     return (
         _refusal_report(args.command, [CLI_MUTATION_CLOSED]),
         EXIT_CONTRACT_MISMATCH,
@@ -465,6 +469,10 @@ async def _dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 # reads or writes locally; none of them constructs a mutation transport at all,
 # so their failure provably started no external effect.
 _EFFECTFUL_COMMANDS: Final = frozenset({STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND})
+
+# The five §42 stage commands §43 closed. Named as a set so the dispatch answers
+# them in one place, before the fence — see `_dispatch`.
+_CLOSED_CLI_STAGES: Final = frozenset({STAGE_FREEZE, STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND})
 
 # Everything that writes durable state, which is the set worth taking a
 # before-snapshot of. `freeze` reaches nobody, but it does create the batch,

@@ -213,6 +213,27 @@ OPS_SESSION_REQUIRED: Final = "voucher_production_ops_session_required"
 OPS_CSRF_INVALID: Final = "voucher_production_ops_csrf_invalid"
 OPS_ORIGIN_REJECTED: Final = "voucher_production_ops_origin_rejected"
 
+# -- serialising a batch's own activity (review R1, R2) ----------------------
+# A batch does one thing at a time, and the two ways that was not true were both
+# ways to lose money or a message.
+#
+# A plan built BEFORE a stop cannot authorise carrying on after it: the operator
+# who pressed stop had not seen that plan, and a second tab confirming it would
+# have lifted their stop. Continuing is a plan built in full knowledge of the
+# stop, which is what the generation comparison establishes.
+STOP_ACTIVE: Final = "voucher_production_stop_active"
+# Another operation for this batch is queued or running. Admitting a second one
+# would let it clear the first one's stop and resume the slots behind a request
+# that is still in flight.
+OPERATION_IN_FLIGHT: Final = "voucher_production_operation_in_flight"
+# A readback was asked for while a stage of the same batch is executing.
+# Reconciling then would reinterpret a LIVE claim as abandoned, and the success
+# that is about to come back would have nowhere to land.
+RECONCILE_BUSY: Final = "voucher_production_reconcile_busy"
+# An external effect happened and its durable record did not land. Never
+# reported as success: the effect is real and the ledger does not say so.
+LEDGER_WRITE_LOST: Final = "voucher_production_ledger_write_lost"
+
 # -- the closed CLI mutation surface (§43.6) ---------------------------------
 # FREEZE/CREATE/PAY/DELIVER/REFUND are UI actions now. The command still exists,
 # still reads and still diagnoses; what it no longer does is act.

@@ -55,6 +55,7 @@ from altegio_bot.campaigns.easyweek_voucher_production import operations as oper
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     API_UNAVAILABLE,
+    OPERATION_UNKNOWN,
     OPS_CSRF_INVALID,
     OPS_ORIGIN_REJECTED,
     OPS_SESSION_REQUIRED,
@@ -122,6 +123,10 @@ class ConfirmRequest(BaseModel):
     # amount, and they cannot widen anything.
     confirmed_count: int = Field(ge=0)
     confirmed_amount_minor: int = Field(ge=0)
+
+
+class CompositionRequest(BaseModel):
+    preview_run_id: int
 
 
 class StopRequest(BaseModel):
@@ -328,18 +333,20 @@ async def api_reconcile(request: Request, payload: ReconcileRequest) -> JSONResp
     principal, refusal = _principal_or_error(request)
     if refusal is not None or principal is None:
         return refusal or _session_error(OpsSessionError("ops_session_invalid"))
-    report = await dispatch_module.reconcile_batch(
+    outcome = await dispatch_module.reconcile_batch(
         SessionLocal,
         preview_run_id=payload.preview_run_id,
         batch_id=payload.batch_id,
         principal=principal,
     )
-    if report is None:
+    if outcome.report is None:
+        # Named, so an operator can tell "a stage is running, look again shortly"
+        # from "EasyWeek is unreachable" (review R2).
         return JSONResponse(
             status_code=409,
-            content={"accepted": False, "reasons": [API_UNAVAILABLE]},
+            content={"accepted": False, "reasons": list(outcome.reasons) or [API_UNAVAILABLE]},
         )
-    return JSONResponse(status_code=200, content={"accepted": True, "report": report.as_safe_dict()})
+    return JSONResponse(status_code=200, content={"accepted": True, "report": outcome.report.as_safe_dict()})
 
 
 @router.get("/api/status")
@@ -349,15 +356,30 @@ async def api_status(batch_id: int | None = None, preview_run_id: int | None = N
     Available with the fence closed and after a stop, deliberately: the moment an
     operator most needs to know what a halted mailing left behind is exactly when
     everything else is blocked.
+
+    Always scoped (review R5). Before a freeze there is no batch to scope by, and the
+    earlier version fell back to listing operations with ``batch_id=None`` — which
+    means "every operation of every mailing". A page watching one preview would then
+    have shown another preview's work as its own. When there is no batch yet the
+    scope is the PREVIEW, and never nothing.
     """
+    if batch_id is None and preview_run_id is None:
+        return JSONResponse(
+            status_code=400,
+            content={"reasons": ["voucher_production_unscoped_status"]},
+        )
     try:
         report = await production_runner.run_status(SessionLocal, batch_id=batch_id, preview_run_id=preview_run_id)
         state = report.as_safe_dict()
     except SQLAlchemyError:
         return JSONResponse(status_code=200, content={"batch": {}, "batches": [], "operations": []})
     resolved = batch_id if batch_id is not None else (state.get("batch") or {}).get("batch_id")
-    operations = await operations_module.list_operations(SessionLocal, batch_id=resolved, limit=20)
-    active = await operations_module.active_operation(SessionLocal, batch_id=resolved)
+    # One of the two is always set, so the listing is never global.
+    scope: dict[str, Any] = (
+        {"batch_id": int(resolved)} if resolved is not None else {"campaign_run_id": int(preview_run_id or 0)}
+    )
+    operations = await operations_module.list_operations(SessionLocal, limit=20, **scope)
+    active = await operations_module.active_operation(SessionLocal, **scope)
     stop = (
         (await ledger_module.stop_state(SessionLocal, batch_id=int(resolved))).as_safe_dict()
         if resolved is not None
@@ -367,7 +389,69 @@ async def api_status(batch_id: int | None = None, preview_run_id: int | None = N
     state["active_operation"] = active.as_safe_dict() if active is not None else None
     state.update(stop)
     state["readiness"] = await _readiness()
+    # Which per-item stages each slot is in a state to be planned for, derived from
+    # the ledger's own contract rather than re-decided in JavaScript (review R6).
+    if resolved is not None:
+        snapshot = await ledger_module.load(SessionLocal, batch_id=int(resolved))
+        actions = {entry.slot: list(production_runner.available_item_actions(entry)) for entry in snapshot.items}
+        for item in state.get("batch", {}).get("items", []):
+            item["available_actions"] = actions.get(item.get("slot"), [])
     return JSONResponse(status_code=200, content=state)
+
+
+@router.get("/api/operation")
+async def api_operation(operation_id: int, preview_run_id: int) -> JSONResponse:
+    """One operation, for watching a stage that has no batch yet (review R5).
+
+    A FREEZE is confirmed before its batch exists, so the confirmation answers with
+    ``batch_id: null`` and the page has nothing to poll by. This is what it polls
+    instead: the operation it was given, until the freeze produces a batch.
+
+    Scoped by preview and checked against it, so an id guessed or carried over from
+    another mailing answers 404 rather than another preview's progress.
+    """
+    operation = await operations_module.load_operation(SessionLocal, operation_id=operation_id)
+    if operation is None or operation.campaign_run_id != preview_run_id:
+        return JSONResponse(status_code=404, content={"reasons": [OPERATION_UNKNOWN]})
+    return JSONResponse(status_code=200, content={"operation": operation.as_safe_dict()})
+
+
+@router.post("/api/composition")
+async def api_composition(request: Request, payload: CompositionRequest) -> JSONResponse:
+    """The audience of one preview. A READ — it authorises nothing (review R3).
+
+    Separate from the freeze plan on purpose. "Check the list" used to ask for a
+    freeze plan, which cannot be ready without the count and the exposure — the very
+    numbers the operator was about to read off the list — so the screen dead-ended
+    before showing them. This proves the composition and reports it; the operator
+    then states the numbers, and the freeze plan still demands them exactly.
+
+    A POST rather than a GET because it reaches EasyWeek to re-prove every member,
+    and because it goes through the same authenticated, CSRF-protected door as every
+    other action here. It stores no approval, writes no batch and sends nothing.
+    """
+    principal, refusal = _principal_or_error(request)
+    if refusal is not None or principal is None:
+        return refusal or _session_error(OpsSessionError("ops_session_invalid"))
+    view = await dispatch_module.inspect_composition(SessionLocal, preview_run_id=payload.preview_run_id)
+    return JSONResponse(status_code=200, content=view.as_ui_dict())
+
+
+@router.get("/api/recipients")
+async def api_recipients(batch_id: int) -> JSONResponse:
+    """Slot → recipient for one mailing, for the authorised operator (review R7).
+
+    Its own endpoint, deliberately. A slot number is the right thing for a ledger and
+    useless to somebody deciding whether to return a particular person's €15 — but a
+    name is exactly what must never enter an operation payload, an audit row or a
+    diagnostic report. So the name is served here, to a logged-in operator, and
+    nowhere else.
+    """
+    lines = await dispatch_module.recipient_lines(SessionLocal, batch_id=batch_id)
+    return JSONResponse(
+        status_code=200,
+        content={"batch_id": batch_id, "recipients": [line.as_ui_dict() for line in lines]},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +673,9 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
         <input id="f-count" type="number" min="1" class="form-control form-control-sm">
       </div>
       <div class="col-auto">
+        <div class="small text-muted" id="approval-hint"></div>
+      </div>
+      <div class="col-auto">
         <label class="form-label small mb-1" for="f-euro">Общая сумма, €</label>
         <input id="f-euro" type="text" class="form-control form-control-sm" placeholder="например 45.00">
       </div>
@@ -619,6 +706,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
     <pre class="border rounded p-2 bg-white">{_esc(message["body"])}</pre>
   </div>
 </div>
+<div id="operation-panel"></div>
 <div id="alert-area"></div>
 <script>
 const CSRF = {json.dumps(csrf)};
@@ -626,11 +714,26 @@ const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
 const UNIT_PRICE_MINOR = {int(UNIT_PRICE_MINOR)};
 let OFFER = null;
+let COMPOSITION = null;
+let RECIPIENTS = {{}};
+let TRACKED_OPERATION = null;
 
 {_PAGE_SCRIPT}
 
+/* An operation confirmed earlier and still unfinished (review R5). Picked up on
+   load, so a refresh or a fresh login resumes watching it rather than looking like
+   a mailing nobody started. */
+TRACKED_OPERATION = recallTrackedOperation();
+if (TRACKED_OPERATION !== null) {{
+  trackOperation();
+}}
+
 function loadComposition() {{
-  planStage("freeze", {{preview: true}});
+  /* A READ of the real audience (review R3). It used to ask for a freeze plan,
+     which can never be ready without the count and the exposure — the numbers the
+     operator is about to read off this very list — so the screen dead-ended before
+     revealing the fields. */
+  inspectComposition();
 }}
 
 function planFreeze() {{
@@ -752,10 +855,15 @@ const PREVIEW_RUN_ID = {preview_run_id};
 const BATCH_ID = {batch_id};
 const UNIT_PRICE_MINOR = {int(UNIT_PRICE_MINOR)};
 let OFFER = null;
+let COMPOSITION = null;
+let RECIPIENTS = {{}};
+let TRACKED_OPERATION = null;
 
 {_PAGE_SCRIPT}
 
-refreshStatus();
+/* Names first, so the very first render of the slots table can already say whose
+   money each row is about (review R7). */
+loadRecipients().then(refreshStatus);
 setInterval(refreshStatus, 5000);
 </script>
 """
@@ -824,7 +932,9 @@ function confirmSummary(offer) {
     lines.push("Будет отправлено сообщений: " + t.stage_target_count + ".");
     lines.push("Одна попытка на получателя, повторной не будет.");
   } else if (stage === "refund") {
-    lines.push("Возврат " + moneyLabel(t.stage_amount_minor) + " по одному получателю.");
+    const slot = (t.target_slots && t.target_slots.length === 1) ? t.target_slots[0] : null;
+    lines.push("Возврат " + moneyLabel(t.stage_amount_minor) + " — " +
+      (slot === null ? "по одному получателю." : refundSubject(slot) + "."));
   }
   if (stage !== "freeze") {
     lines.push("Вся рассылка: " + t.batch_recipient_count +
@@ -894,13 +1004,22 @@ function deliveryFacts(state) {
   ];
 }
 
-/* May this slot's payment be returned? Pre-send only, and the UI mirrors what the
-   server enforces rather than deciding it. */
+/* May a refund be PREPARED for this slot? Read off the server's own list (review
+   R6), never re-derived here.
+
+   The old version kept its own status list and it had drifted both ways: it hid
+   `pay_unknown` and `refund_rejected`, where a refund is genuinely allowed, and it
+   offered `send_rejected`, where a refund is forbidden because the one attempt was
+   already spent. A second copy of a rule is how that happens, so there is no longer
+   a second copy — `available_actions` comes from `available_item_actions` in the
+   runner, which is derived from the same table the claim enforces.
+
+   Still only about OFFERING the step. The plan, the claim and a CHECK constraint
+   remain the things that decide. */
 function mayRefund(item) {
   if (!item) return false;
-  if (Number(item.send_attempt_count || 0) > 0) return false;
-  if (item.provider_accepted || item.webhook_delivered || item.webhook_read) return false;
-  return item.status === "paid" || item.status === "send_rejected";
+  const actions = item.available_actions || [];
+  return actions.indexOf("refund") !== -1;
 }
 
 async function postJson(path, payload) {
@@ -913,6 +1032,42 @@ async function postJson(path, payload) {
   let data = {};
   try { data = await response.json(); } catch (err) { data = {}; }
   return {status: response.status, data: data};
+}
+
+/* Review R3. Proves and shows the audience; authorises nothing. */
+async function inspectComposition() {
+  const result = await postJson("/ops/voucher-mailings/api/composition",
+    {preview_run_id: PREVIEW_RUN_ID});
+  const data = result.data || {};
+  COMPOSITION = data;
+  renderComposition(data);
+  /* Checking the list must never arm the confirmation. */
+  OFFER = null;
+  hideConfirm();
+  const panel = document.getElementById("freeze-panel");
+  if (data.composition_proven) {
+    if (panel) panel.classList.remove("d-none");
+    prefillApprovalFields(data);
+    setAlert("info", "Состав проверен. "
+      + "Подтвердите количество и сумму.");
+    return;
+  }
+  if (panel) panel.classList.add("d-none");
+  const reasons = (data.reasons || []).join(", ");
+  setAlert("warning", reasons
+    ? "Состав нельзя зафиксировать: " + reasons
+    : "Состав пуст.");
+}
+
+/* The numbers are SHOWN, never submitted for the operator: the fields stay empty
+   and they type what they read. Auto-filling them would make the confirmation a
+   formality instead of a statement. */
+function prefillApprovalFields(data) {
+  const hint = document.getElementById("approval-hint");
+  if (hint) {
+    hint.textContent = "Ожидается: "
+      + Number(data.recipient_count || 0) + " / " + moneyLabel(data.total_exposure_minor);
+  }
 }
 
 async function planStage(stage, options) {
@@ -960,36 +1115,37 @@ function renderOffer(stage, result, options) {
 }
 
 function renderComposition(data) {
-  const plan = data.plan || {};
-  const snapshot = plan.snapshot || {};
-  const composition = snapshot.composition || {};
   const summary = document.getElementById("composition-summary");
   if (summary) {
-    const count = Number(composition.recipient_count || 0);
     summary.innerHTML =
       "<table class=\"table table-sm w-auto\">" +
-      "<tr><th>Период кампании</th><td>" +
-      escapeHtml(composition.campaign_period || "—") + "</td></tr>" +
-      "<tr><th>Получателей</th><td>" + count + "</td></tr>" +
-      "<tr><th>Общая сумма</th><td>" +
-      escapeHtml(moneyLabel(composition.total_exposure_minor)) + "</td></tr>" +
+      "<tr><th>Период кампании</th><td id=\"c-period\">" +
+      escapeHtml(data.campaign_period || "—") + "</td></tr>" +
+      "<tr><th>Получателей</th><td id=\"c-count\">" +
+      Number(data.recipient_count || 0) + "</td></tr>" +
+      "<tr><th>Общая сумма</th><td id=\"c-total\">" +
+      escapeHtml(moneyLabel(data.total_exposure_minor)) + "</td></tr>" +
       "<tr><th>На одного</th><td>" +
-      escapeHtml(moneyLabel(UNIT_PRICE_MINOR)) + "</td></tr>" +
+      escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>" +
       "</table>";
   }
   const slotsArea = document.getElementById("composition-slots");
   if (slotsArea) {
-    const slots = composition.slots || [];
+    const people = data.recipients || [];
     let rows = "";
-    for (const slot of slots) {
-      rows += "<tr><td>" + escapeHtml(slot.slot) + "</td><td>" +
-        escapeHtml(slot.campaign_recipient_id) + "</td><td>" +
-        escapeHtml(moneyLabel(UNIT_PRICE_MINOR)) + "</td></tr>";
+    for (const person of people) {
+      /* The ordinal and the preview row are different things and both are shown:
+         confusing them would point an action at the wrong person (review R7). */
+      rows += "<tr><td>" + escapeHtml(person.slot) + "</td><td>" +
+        escapeHtml(person.display_name) + "</td><td>" +
+        "<a href=\"/ops/campaigns/" + encodeURIComponent(person.preview_run_id) +
+        "/recipients\" target=\"_blank\">#" + escapeHtml(person.campaign_recipient_id) + "</a></td><td>" +
+        escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>";
     }
     slotsArea.innerHTML = rows
-      ? "<table class=\"table table-sm w-auto\"><thead><tr><th>№</th>" +
-        "<th>Строка preview</th><th>Сумма</th></tr></thead><tbody>" +
-        rows + "</tbody></table>"
+      ? "<table class=\"table table-sm w-auto\" id=\"composition-table\"><thead><tr><th>№</th>" +
+        "<th>Клиент</th><th>Строка preview</th>" +
+        "<th>Сумма</th></tr></thead><tbody>" + rows + "</tbody></table>"
       : "<p class=\"text-muted\">Состав пуст.</p>";
   }
 }
@@ -1025,14 +1181,27 @@ async function confirmStage() {
   const data = result.data || {};
   if (data.accepted && data.operation) {
     const where = data.operation.batch_id;
-    if (BATCH_ID === null && where) {
-      window.location.href = "/ops/voucher-mailings/" + where;
+    if (where) {
+      if (BATCH_ID === null) {
+        window.location.href = "/ops/voucher-mailings/" + where;
+        return;
+      }
+      setAlert("info", data.created
+        ? "Шаг принят в работу."
+        : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
+      refreshStatus();
       return;
     }
+    /* A FREEZE is confirmed before its batch exists, so the answer carries no
+       batch id (review R5). The page watches the OPERATION until one appears
+       instead of giving up — and remembers it, so a refresh resumes watching the
+       same operation rather than offering a second freeze. */
+    TRACKED_OPERATION = data.operation.operation_id;
+    rememberTrackedOperation(TRACKED_OPERATION);
     setAlert("info", data.created
-      ? "Шаг принят в работу."
+      ? "Шаг принят в работу. Можно закрыть страницу — работа продолжится на сервере."
       : "Этот шаг уже был принят раньше — повторно ничего не выполняется.");
-    refreshStatus();
+    trackOperation();
     return;
   }
   setAlert("warning", "Отказ: " + ((data.reasons || []).join(", ") || "неизвестно"));
@@ -1061,8 +1230,111 @@ async function reconcile() {
   refreshStatus();
 }
 
+async function loadRecipients() {
+  if (BATCH_ID === null) return;
+  const response = await fetch("/ops/voucher-mailings/api/recipients?batch_id=" +
+    encodeURIComponent(BATCH_ID), {credentials: "same-origin"});
+  let data = {};
+  try { data = await response.json(); } catch (err) { return; }
+  RECIPIENTS = {};
+  for (const person of (data.recipients || [])) {
+    RECIPIENTS[person.slot] = person;
+  }
+}
+
 function refundSlot(slot) {
+  /* The slot the button carries, and nothing derived from its position in the
+     table: re-sorting or re-rendering must not change whose money comes back. */
   planStage("refund", {slot: slot});
+}
+
+/* Review R7: the individual refund confirmation names the same person. */
+function refundSubject(slot) {
+  const who = RECIPIENTS[slot] || null;
+  if (!who) return "получатель №" + slot;
+  return who.display_name + " (№" + slot + ", строка preview #" + who.campaign_recipient_id + ")";
+}
+
+/* Review R5. Survives a refresh and a fresh login: the id is kept per preview in
+   sessionStorage, so reopening the page resumes watching instead of looking like a
+   mailing that was never started. Wrapped because a private window can throw. */
+function rememberTrackedOperation(id) {
+  try {
+    window.sessionStorage.setItem("ew-voucher-op-" + PREVIEW_RUN_ID, String(id));
+  } catch (err) { /* storage unavailable: tracking still works for this page load */ }
+}
+
+function forgetTrackedOperation() {
+  try {
+    window.sessionStorage.removeItem("ew-voucher-op-" + PREVIEW_RUN_ID);
+  } catch (err) { /* nothing to clean up */ }
+}
+
+function recallTrackedOperation() {
+  try {
+    const raw = window.sessionStorage.getItem("ew-voucher-op-" + PREVIEW_RUN_ID);
+    return raw ? parseInt(raw, 10) : null;
+  } catch (err) { return null; }
+}
+
+function operationLabel(status) {
+  if (status === "queued") return "в очереди";
+  if (status === "running") return "выполняется";
+  if (status === "completed") return "исполнение завершено";
+  if (status === "refused") return "отказано";
+  if (status === "expired") return "план истёк";
+  if (status === "interrupted") return "прервано — нужна сверка";
+  return status;
+}
+
+/* Does this operation still need watching, or has it settled? */
+function operationSettled(operation) {
+  if (!operation) return false;
+  return ["completed", "refused", "expired", "interrupted"].indexOf(operation.status) !== -1;
+}
+
+async function trackOperation() {
+  if (TRACKED_OPERATION === null) return;
+  const response = await fetch("/ops/voucher-mailings/api/operation?operation_id=" +
+    encodeURIComponent(TRACKED_OPERATION) + "&preview_run_id=" + encodeURIComponent(PREVIEW_RUN_ID),
+    {credentials: "same-origin"});
+  if (response.status === 404) {
+    /* Not this preview's operation. Never shown as if it were. */
+    TRACKED_OPERATION = null;
+    forgetTrackedOperation();
+    return;
+  }
+  let data = {};
+  try { data = await response.json(); } catch (err) { return; }
+  const operation = data.operation;
+  if (!operation) return;
+  renderTrackedOperation(operation);
+  if (operation.batch_id) {
+    /* The freeze produced a batch. Go to it. */
+    TRACKED_OPERATION = null;
+    forgetTrackedOperation();
+    window.location.href = "/ops/voucher-mailings/" + operation.batch_id;
+    return;
+  }
+  if (operationSettled(operation)) {
+    TRACKED_OPERATION = null;
+    forgetTrackedOperation();
+    return;
+  }
+  setTimeout(trackOperation, 1500);
+}
+
+function renderTrackedOperation(operation) {
+  const area = document.getElementById("operation-panel") || document.getElementById("alert-area");
+  if (!area) return;
+  const settled = operationSettled(operation);
+  const kind = operation.status === "completed" ? "info"
+    : (settled ? "warning" : "primary");
+  let text = stageLabel(operation.stage) + ": " + operationLabel(operation.status);
+  if (operation.outcome_code) text += " (" + operation.outcome_code + ")";
+  if (!settled) text += ". Можно закрыть страницу — работа продолжится на сервере.";
+  area.innerHTML = '<div class="alert alert-' + kind + '" id="tracked-operation">' +
+    escapeHtml(text) + "</div>";
 }
 
 async function refreshStatus() {
@@ -1116,11 +1388,21 @@ function renderStatus(state) {
     const items = (state.batch && state.batch.items) || [];
     let rows = "";
     for (const item of items) {
+      /* Review R7: a slot number does not tell an operator whose €15 this is. The
+         name comes from the authorised recipients endpoint and is escaped like
+         every other value here. */
+      const who = RECIPIENTS[item.slot] || null;
       const action = mayRefund(item)
-        ? '<button class="btn btn-sm btn-outline-danger" onclick="refundSlot(' + item.slot + ')">' +
-          "Вернуть оплату</button>"
+        ? '<button class="btn btn-sm btn-outline-danger" data-slot="' + item.slot +
+          '" onclick="refundSlot(' + item.slot + ')">Вернуть оплату</button>'
         : "";
-      rows += "<tr><td>" + escapeHtml(item.slot) + "</td><td><code>" + escapeHtml(item.status) +
+      rows += '<tr data-slot="' + escapeHtml(item.slot) + '"><td>' + escapeHtml(item.slot) + "</td><td>" +
+        (who ? escapeHtml(who.display_name) : "<span class=\"text-muted\">…</span>") + "</td><td>" +
+        (who
+          ? '<a href="/ops/campaigns/' + encodeURIComponent(who.preview_run_id) +
+            '/recipients" target="_blank">#' + escapeHtml(who.campaign_recipient_id) + "</a>"
+          : "—") +
+        "</td><td><code>" + escapeHtml(item.status) +
         "</code></td><td><code>" + escapeHtml(item.reason_code || "—") + "</code></td><td>" +
         escapeHtml(item.send_attempt_count || 0) + "</td><td>" +
         escapeHtml(item.provider_accepted ? "да" : "нет") + "</td><td>" +
@@ -1130,7 +1412,8 @@ function renderStatus(state) {
         action + "</td></tr>";
     }
     slotsArea.innerHTML = rows
-      ? "<table class=\"table table-sm align-middle\"><thead><tr><th>№</th><th>Статус</th>" +
+      ? "<table class=\"table table-sm align-middle\" id=\"slots-table\"><thead><tr><th>№</th>" +
+        "<th>Клиент</th><th>Строка preview</th><th>Статус</th>" +
         "<th>Причина</th><th>Попыток</th><th>Meta приняла</th>" +
         "<th>Доставлено</th><th>Прочитано</th><th>Сверка</th><th></th>" +
         "</tr></thead><tbody>" + rows + "</tbody></table>"

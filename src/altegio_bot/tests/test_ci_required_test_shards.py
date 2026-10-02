@@ -50,10 +50,14 @@ from altegio_bot.tests.test_ci_legacy_altegio_quarantine import (
 )
 from altegio_bot.tests.test_ci_workflow_nginx_gate import (
     AGGREGATOR_JOB,
+    BROWSER_GATE_ENV,
+    BROWSER_JOB,
+    BROWSER_SUITE,
     DEDICATED_JOB,
     EXECUTION_JOBS,
     HEAVY_JOB,
     REST_JOB,
+    VOUCHER_MIGRATION_GATE_ENV,
     _condition_source,
     _jobs,
     _pytest_invocations,
@@ -189,11 +193,17 @@ def test_invocation_parser_ignores_comments_and_echoes() -> None:
 # ===========================================================================
 
 
-def test_all_four_jobs_exist() -> None:
+def test_every_required_job_exists() -> None:
+    """The execution jobs plus the aggregator that branch protection names.
+
+    Four executors now: heavy, rest, dedicated, and the browser acceptance runner
+    §43's interface is judged on. The tuple is asserted as a whole so adding a job
+    without telling this contract about it fails here rather than silently.
+    """
     jobs = _workflow()["jobs"]
     for job_name in (*EXECUTION_JOBS, AGGREGATOR_JOB):
         assert job_name in jobs, f"missing job {job_name}"
-    assert (HEAVY_JOB, REST_JOB, DEDICATED_JOB) == EXECUTION_JOBS
+    assert (HEAVY_JOB, REST_JOB, DEDICATED_JOB, BROWSER_JOB) == EXECUTION_JOBS
 
 
 @pytest.mark.parametrize("job_name", EXECUTION_JOBS)
@@ -308,13 +318,23 @@ def test_rest_invocation_ignores_exactly_the_dedicated_and_heavy_modules() -> No
     assert ignored == expected, (
         f"unexpected --ignore set; missing={sorted(expected - ignored)} extra={sorted(ignored - expected)}"
     )
-    assert len(ignored) == 5 + 16
+    # Derived, for the same reason as the count below: a literal here is an edit
+    # waiting to be got wrong.
+    assert len(ignored) == len(EXPECTED_IGNORED_SUITES) + len(EXPECTED_HEAVY_MODULES)
 
 
 def test_rest_invocation_ignores_each_path_once() -> None:
+    """No duplicate --ignore, and the count is DERIVED rather than typed.
+
+    A hardcoded number has to be edited every time a suite moves to its own runner,
+    and the edit is exactly where a typo hides. The expected count is the two sets
+    that are subtracted: the mandatory suites run elsewhere and the heavy modules.
+    """
     arguments = _rest_invocation()[3:]
     ignores = [argument for argument in arguments if argument.startswith("--ignore")]
-    assert len(ignores) == len(set(ignores)) == 21, "a duplicated --ignore hides a typo in one of them"
+    expected = len(EXPECTED_IGNORED_SUITES) + len(EXPECTED_HEAVY_MODULES)
+    assert len(ignores) == len(set(ignores)), "a duplicated --ignore hides a typo in one of them"
+    assert len(ignores) == expected, f"expected {expected} ignores, found {len(ignores)}"
 
 
 # ===========================================================================
@@ -322,9 +342,10 @@ def test_rest_invocation_ignores_each_path_once() -> None:
 # ===========================================================================
 
 
-def test_dedicated_job_runs_the_three_gates() -> None:
+def test_dedicated_job_runs_every_gate_once() -> None:
+    """One invocation per gate, and §43's migration cycle is one of them now."""
     invocations = _invocations(DEDICATED_JOB)
-    assert len(invocations) == 3, f"expected three gate invocations, found {len(invocations)}"
+    assert len(invocations) == 4, f"expected four gate invocations, found {len(invocations)}"
 
 
 @pytest.mark.parametrize("suite", DEDICATED_GATE_SUITES)
@@ -338,7 +359,31 @@ def test_dedicated_gates_keep_their_mandatory_env_flags() -> None:
     flags = {name: str(value) for step in _steps(DEDICATED_JOB) for name, value in (step.get("env") or {}).items()}
     assert flags.get("ALTEGIO_REQUIRE_MIGTEST") == "1"
     assert flags.get("ALTEGIO_REQUIRE_NGINX_LOGTEST") == "1"
+    # Without this one, a runner whose database user cannot create a disposable
+    # database would SKIP §43's migration cycle and the gate would stay green.
+    assert flags.get(VOUCHER_MIGRATION_GATE_ENV) == "1"
     assert flags.get("REQUIRE_PG_CONCURRENCY") == "1"
+
+
+def test_the_browser_job_cannot_degrade_into_a_green_skip() -> None:
+    """The flag that turns a missing browser into a failure is set on the job.
+
+    This is the whole reason the browser suite is a gate rather than a nicety: with
+    the flag unset, a runner without Chromium reports success for the one layer §43
+    is judged on.
+    """
+    job = _workflow()["jobs"][BROWSER_JOB]
+    env = {name: str(value) for name, value in (job.get("env") or {}).items()}
+    assert env.get(BROWSER_GATE_ENV) == "1"
+    invocations = _invocations(BROWSER_JOB)
+    assert len(invocations) == 1, f"expected one invocation, found {len(invocations)}"
+    assert _pytest_targets(invocations[0]) == [BROWSER_SUITE]
+    # Never marker-filtered: a gate that could be narrowed is not a gate.
+    assert _marker_selections(invocations[0]) == []
+    # And the browser is actually installed before it runs.
+    assert any("playwright install" in str(step.get("run", "")) for step in _steps(BROWSER_JOB)), (
+        "the browser job does not install a browser"
+    )
 
 
 def test_dedicated_gate_steps_cannot_be_skipped_or_softened() -> None:
@@ -374,9 +419,11 @@ def test_the_union_is_total_by_construction() -> None:
     exist yet.
     """
     subtracted = _ignored_suites(_rest_invocation())
-    executed_elsewhere = set(_pytest_targets(_heavy_invocation())) | {
-        suite for invocation in _invocations(DEDICATED_JOB) for suite in _pytest_targets(invocation)
-    }
+    executed_elsewhere = (
+        set(_pytest_targets(_heavy_invocation()))
+        | {suite for invocation in _invocations(DEDICATED_JOB) for suite in _pytest_targets(invocation)}
+        | {suite for invocation in _invocations(BROWSER_JOB) for suite in _pytest_targets(invocation)}
+    )
     orphaned = subtracted - executed_elsewhere
     assert not orphaned, f"these paths are ignored by rest and run by nobody: {sorted(orphaned)}"
 

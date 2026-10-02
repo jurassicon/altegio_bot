@@ -679,6 +679,10 @@ async def test_an_approval_expiry_must_be_after_its_issue(session_maker):
 # not use this fixture at all and runs unconditionally in the rest shard.
 REQUIRE_MIGRATION = os.getenv("ALTEGIO_REQUIRE_VOUCHER_MAILING_MIGTEST") == "1"
 
+# The revision these four tables were created ON TOP OF. Named, so "undo the
+# migration that created them" keeps meaning that however many revisions follow.
+OPERATIONS_PARENT_REVISION = "e2c7b4f16a83"
+
 
 def _alembic(database_url: str, *args: str) -> subprocess.CompletedProcess[str]:
     """Run alembic against one database.
@@ -756,7 +760,13 @@ def test_the_chain_has_exactly_one_head():
 
 
 async def test_upgrade_downgrade_and_re_upgrade_on_an_empty_database(disposable_database: str):
-    """The new tables appear, disappear and reappear, and the head stays single."""
+    """The new tables appear, disappear and reappear, and the head stays single.
+
+    Addressed by REVISION rather than by "head" and "-1", for the reason §42's own
+    migration tests had to learn the hard way: a later revision — including this
+    PR's own follow-up — makes "one step back" mean something else, and a test that
+    said "-1" would then be checking a different migration than the one it names.
+    """
     assert _alembic(disposable_database, "upgrade", "head").returncode == 0
 
     new_tables = (
@@ -767,7 +777,8 @@ async def test_upgrade_downgrade_and_re_upgrade_on_an_empty_database(disposable_
     )
     assert await _tables(disposable_database, new_tables) == set(new_tables)
 
-    assert _alembic(disposable_database, "downgrade", "-1").returncode == 0
+    # Back past the revision that created them, by name.
+    assert _alembic(disposable_database, "downgrade", OPERATIONS_PARENT_REVISION).returncode == 0
     assert await _tables(disposable_database, new_tables) == set()
     # The §42 tables are untouched by the downgrade.
     historical = (
@@ -784,6 +795,8 @@ async def test_upgrade_downgrade_and_re_upgrade_on_an_empty_database(disposable_
     current = _alembic(disposable_database, "current")
     assert current.returncode == 0
     assert "(head)" in current.stdout
+    # The stop generation the review's R1 fix added is part of the upgraded schema.
+    assert await _columns(disposable_database, "easyweek_voucher_production_approvals") >= {"stop_generation_at_plan"}
 
 
 async def test_a_downgrade_keeps_historical_ledger_rows(disposable_database: str):
@@ -830,7 +843,7 @@ async def test_a_downgrade_keeps_historical_ledger_rows(disposable_database: str
 
         # Down and back up again. The historical row is not the new migration's to
         # touch, in either direction.
-        assert _alembic(disposable_database, "downgrade", "-1").returncode == 0
+        assert _alembic(disposable_database, "downgrade", OPERATIONS_PARENT_REVISION).returncode == 0
         async with engine.connect() as conn:
             midway = (await conn.execute(text("SELECT count(*) FROM easyweek_voucher_canary_ledger"))).scalar_one()
         assert midway == 1
@@ -868,7 +881,7 @@ async def test_upgrading_a_database_that_already_holds_a_production_batch(
     assert snapshot.exists and snapshot.recipient_count == 2
 
     assert _alembic(disposable_database, "upgrade", "head").returncode == 0
-    assert _alembic(disposable_database, "downgrade", "-1").returncode == 0
+    assert _alembic(disposable_database, "downgrade", OPERATIONS_PARENT_REVISION).returncode == 0
     assert _alembic(disposable_database, "upgrade", "head").returncode == 0
     current = _alembic(disposable_database, "current")
     assert current.returncode == 0 and "(head)" in current.stdout
@@ -878,6 +891,23 @@ async def test_upgrading_a_database_that_already_holds_a_production_batch(
     assert after.recipient_count == snapshot.recipient_count
     assert after.frozen_digest == snapshot.frozen_digest
     assert after.staffer_uuid == snapshot.staffer_uuid
+
+
+async def _columns(database_url: str, table: str) -> set[str]:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name = :t"),
+                    {"t": table},
+                )
+            ).all()
+        return {row[0] for row in rows}
+    finally:
+        await engine.dispose()
 
 
 async def _tables(database_url: str, names: tuple[str, ...]) -> set[str]:

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,10 +46,17 @@ from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_m
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as runner_module
 from altegio_bot.campaigns.easyweek_voucher_production.authorisation import PLAN_MAX_AGE, phrase_for_digest
-from altegio_bot.campaigns.easyweek_voucher_production.composition import BatchApproval
+from altegio_bot.campaigns.easyweek_voucher_production.composition import (
+    BatchApproval,
+    prove_production_composition,
+)
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ACCOUNT_UNCONFIGURED,
     API_UNAVAILABLE,
+    APPROVAL_COUNT_MISMATCH,
+    APPROVAL_COUNT_MISSING,
+    APPROVAL_EXPOSURE_MISMATCH,
+    APPROVAL_EXPOSURE_MISSING,
     APPROVAL_NOT_READY,
     DATABASE_UNAVAILABLE,
     EXECUTION_INTERRUPTED,
@@ -59,6 +67,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     PLAN_EXPIRED,
     PRODUCTION_DISABLED,
     PRODUCTION_STAGES,
+    RECONCILE_BUSY,
     RUNTIME_IDENTITY_UNUSABLE,
     SLOT_UNKNOWN,
     STAGE_CREATE,
@@ -237,6 +246,220 @@ def _refused_offer(stage: str, reasons: tuple[str, ...]) -> StageOffer:
     return StageOffer(stage=stage, ready=False, reasons=reasons, approval=None)
 
 
+@dataclass(frozen=True)
+class RecipientLine:
+    """One slot and the person it addresses — for the authorised UI only.
+
+    Why this exists at all (review R7): every other surface of this phase speaks in
+    slot numbers, which is right for a ledger and useless to an operator deciding
+    whether to return somebody's €15. A slot is an ordinal inside one frozen
+    composition and nothing else; it is deliberately NOT the preview row id, and
+    confusing the two would point an action at the wrong person.
+
+    Why it is its own type rather than a field on the report: this carries a customer
+    name, and the report goes into operation payloads, audit rows and diagnostics.
+    Those must stay PII-free, so this is built per request, returned to an
+    authenticated operator, and never passed to ``store_approval``, ``record_audit``
+    or any ``as_safe_dict``. There is no path from here into a stored row.
+    """
+
+    slot: int
+    campaign_recipient_id: int
+    display_name: str
+    preview_run_id: int
+
+    def as_ui_dict(self) -> dict[str, Any]:
+        # Named `as_ui_dict`, not `as_safe_dict`, on purpose: the name is the
+        # warning. Nothing that serialises reports may call this.
+        return {
+            "slot": self.slot,
+            "campaign_recipient_id": self.campaign_recipient_id,
+            "display_name": self.display_name,
+            "preview_run_id": self.preview_run_id,
+        }
+
+
+async def recipient_lines(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    batch_id: int,
+) -> tuple[RecipientLine, ...]:
+    """Slot → recipient for one frozen batch, in slot order.
+
+    Read from the preview row each slot was frozen from, which is the same source
+    the preview editor shows, so the operator sees the name they curated. An empty
+    display name is answered as a readable placeholder rather than a blank cell: a
+    blank would be indistinguishable from a bug.
+    """
+    from altegio_bot.models.models import (
+        CampaignRecipient,
+        EasyWeekVoucherProductionBatchItem,
+    )
+
+    async with session_maker() as session:
+        rows = (
+            await session.execute(
+                select(
+                    EasyWeekVoucherProductionBatchItem.slot,
+                    EasyWeekVoucherProductionBatchItem.campaign_recipient_id,
+                    EasyWeekVoucherProductionBatchItem.campaign_run_id,
+                    CampaignRecipient.display_name,
+                )
+                .join(
+                    CampaignRecipient,
+                    CampaignRecipient.id == EasyWeekVoucherProductionBatchItem.campaign_recipient_id,
+                )
+                .where(EasyWeekVoucherProductionBatchItem.batch_id == batch_id)
+                .order_by(EasyWeekVoucherProductionBatchItem.slot.asc())
+            )
+        ).all()
+    return tuple(
+        RecipientLine(
+            slot=int(row[0]),
+            campaign_recipient_id=int(row[1]),
+            display_name=(row[3] or "").strip() or f"без имени (строка preview {int(row[1])})",
+            preview_run_id=int(row[2]),
+        )
+        for row in rows
+    )
+
+
+@dataclass(frozen=True)
+class CompositionView:
+    """The audience an operator is about to approve. A READ, never an authorisation.
+
+    Separating this from the freeze plan is review R3, and the defect it fixes made
+    the feature unusable: "check the list" asked for a freeze plan, a freeze plan
+    needs the count and the exposure, and those are the very numbers the operator was
+    about to read off the list. The plan came back unready, the page stopped before
+    revealing the fields, and there was no way forward.
+
+    So the two jobs are now two things. This one proves the composition live and
+    reports the real period, the real members, the real N and the real total. It
+    stores no approval, signs no digest and reaches no customer, so it cannot
+    authorise a freeze — and the operator then states the numbers for a plan that
+    still demands them exactly.
+    """
+
+    proven: bool
+    reasons: tuple[str, ...]
+    campaign_period: str | None
+    recipient_count: int
+    total_exposure_minor: int
+    unit_price_minor: int
+    lines: tuple[RecipientLine, ...] = ()
+
+    def as_ui_dict(self) -> dict[str, Any]:
+        return {
+            "composition_proven": self.proven,
+            "reasons": list(self.reasons),
+            "campaign_period": self.campaign_period,
+            "recipient_count": self.recipient_count,
+            "total_exposure_minor": self.total_exposure_minor,
+            "unit_price_minor": self.unit_price_minor,
+            "recipients": [line.as_ui_dict() for line in self.lines],
+            "issuer_display_name": APPROVED_ISSUER_DISPLAY_NAME,
+        }
+
+
+# The refusals that mean only "you have not stated the numbers yet". They are the
+# whole point of the freeze plan and have no business in a composition READ.
+_APPROVAL_NUMBER_REASONS = frozenset(
+    {
+        APPROVAL_COUNT_MISSING,
+        APPROVAL_EXPOSURE_MISSING,
+        APPROVAL_COUNT_MISMATCH,
+        APPROVAL_EXPOSURE_MISMATCH,
+    }
+)
+
+
+async def inspect_composition(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    preview_run_id: int,
+    transports: Transports | None = None,
+) -> CompositionView:
+    """Prove this preview's audience and report it. Writes nothing, sends nothing.
+
+    Uses the same live proof the freeze plan uses, so what the operator reads is what
+    a freeze would act on — not a second, friendlier derivation that could disagree.
+    The reasons about the missing count and exposure are filtered out, because asking
+    for them is this screen's next step rather than a problem with the audience.
+    """
+    if not settings.easyweek_voucher_production_mailing_enabled:
+        return CompositionView(
+            proven=False,
+            reasons=(PRODUCTION_DISABLED,),
+            campaign_period=None,
+            recipient_count=0,
+            total_exposure_minor=0,
+            unit_price_minor=UNIT_PRICE_MINOR,
+        )
+    carrier = transports or Transports()
+    try:
+        async with carrier.reader() as reader:
+            async with session_maker() as session:
+                composition = await prove_production_composition(
+                    session,
+                    preview_run_id=preview_run_id,
+                    client_reader=reader,
+                    now=utcnow(),
+                    approval=None,
+                )
+    except EasyWeekConfigError:
+        return CompositionView(
+            proven=False,
+            reasons=(RUNTIME_IDENTITY_UNUSABLE,),
+            campaign_period=None,
+            recipient_count=0,
+            total_exposure_minor=0,
+            unit_price_minor=UNIT_PRICE_MINOR,
+        )
+    except EasyWeekError:
+        return CompositionView(
+            proven=False,
+            reasons=(API_UNAVAILABLE,),
+            campaign_period=None,
+            recipient_count=0,
+            total_exposure_minor=0,
+            unit_price_minor=UNIT_PRICE_MINOR,
+        )
+    except SQLAlchemyError:
+        return CompositionView(
+            proven=False,
+            reasons=(DATABASE_UNAVAILABLE,),
+            campaign_period=None,
+            recipient_count=0,
+            total_exposure_minor=0,
+            unit_price_minor=UNIT_PRICE_MINOR,
+        )
+
+    reasons = tuple(reason for reason in composition.reasons if reason not in _APPROVAL_NUMBER_REASONS)
+    lines = tuple(
+        RecipientLine(
+            slot=member.slot,
+            campaign_recipient_id=member.campaign_recipient_id,
+            display_name=(member.proof.client_display_name or "").strip()
+            or f"без имени (строка preview {member.campaign_recipient_id})",
+            preview_run_id=preview_run_id,
+        )
+        for member in composition.members
+    )
+    return CompositionView(
+        # Proven for the purpose of this screen: a real audience the operator may
+        # now put numbers to. The freeze still proves everything again, including
+        # those numbers.
+        proven=not reasons and bool(composition.members),
+        reasons=reasons,
+        campaign_period=composition.period_label,
+        recipient_count=composition.recipient_count,
+        total_exposure_minor=composition.total_exposure_minor,
+        unit_price_minor=UNIT_PRICE_MINOR,
+        lines=lines,
+    )
+
+
 async def offer_stage(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -337,6 +560,14 @@ async def offer_stage(
     if not targets.slots:
         return StageOffer(stage=stage, ready=False, reasons=(APPROVAL_NOT_READY,), approval=None, plan=safe_plan)
 
+    # Which stop this plan is built in knowledge of (review R1). Read now, so a
+    # confirmation can tell a continuation an operator decided on from a plan that
+    # predates the stop they are currently looking at.
+    generation = (
+        await ledger_module.stop_generation(session_maker, batch_id=snapshot.batch_id)
+        if snapshot.exists and snapshot.batch_id is not None
+        else 0
+    )
     stored = await operations_module.store_approval(
         session_maker,
         principal=principal,
@@ -355,6 +586,7 @@ async def offer_stage(
         runtime_identity_bound=bool(safe_plan.get("snapshot", {}).get("runtime_identity_matches_frozen")),
         baseline_version=str((safe_plan.get("snapshot", {}).get("baseline") or {}).get("baseline_version") or ""),
         frozen_digest=snapshot.frozen_digest if snapshot.exists else composition.composition_digest(),
+        stop_generation_at_plan=generation,
     )
     await operations_module.record_audit(
         session_maker,
@@ -463,6 +695,23 @@ async def request_stop(
     return state
 
 
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    """What a readback did, or the named reason it did not run.
+
+    A report-or-``None`` would collapse "a stage is executing right now" into the
+    same answer as "EasyWeek is unreachable", and those need different things from
+    an operator: one is "wait and look again", the other is "something is wrong".
+    """
+
+    report: runner_module.StageReport | None
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def ran(self) -> bool:
+        return self.report is not None
+
+
 async def reconcile_batch(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -470,14 +719,33 @@ async def reconcile_batch(
     batch_id: int,
     principal: operations_module.OpsPrincipal,
     transports: Transports | None = None,
-) -> runner_module.StageReport | None:
+) -> ReconcileOutcome:
     """Read the outside world back and resolve what can be resolved.
 
     GET-only against EasyWeek plus local writes that record what was READ. It
     needs no approval and no confirmation because it buys nothing and sends
     nothing — and it must stay available exactly when the rest is blocked: after a
     stop, after an unknown, and with the fence closed.
+
+    What it must NOT run against is a stage that is executing right now (review R2).
+    A readback's job is to reinterpret claims left behind by a process that died;
+    done to a live claim it moves the row out from under the request in flight, and
+    the success coming back has nowhere to land. Refused here with a readable
+    reason, and refused again inside each write under the batch header's lock — this
+    check is the courtesy, that one is the guarantee.
     """
+    busy = await ledger_module.live_execution(session_maker, batch_id=batch_id)
+    if busy is not None:
+        await operations_module.record_audit(
+            session_maker,
+            principal=principal,
+            action="reconcile",
+            outcome=RECONCILE_BUSY,
+            batch_id=batch_id,
+            campaign_run_id=preview_run_id,
+            detail={"blocking_operation_id": busy},
+        )
+        return ReconcileOutcome(report=None, reasons=(RECONCILE_BUSY,))
     frozen_staffer = await _frozen_staffer(session_maker, batch_id=batch_id)
     request, _reasons = _request_for(
         stage=NON_ISSUING,
@@ -486,13 +754,17 @@ async def reconcile_batch(
         frozen_staffer_uuid=frozen_staffer,
     )
     if request is None:
-        return None
+        return ReconcileOutcome(report=None, reasons=(RUNTIME_IDENTITY_UNUSABLE,))
     carrier = transports or Transports()
     try:
         async with carrier.reader() as reader:
             report = await runner_module.run_reconcile(session_maker, request=request, order_reader=reader)
-    except (EasyWeekConfigError, EasyWeekError, SQLAlchemyError):
-        return None
+    except EasyWeekConfigError:
+        return ReconcileOutcome(report=None, reasons=(RUNTIME_IDENTITY_UNUSABLE,))
+    except EasyWeekError:
+        return ReconcileOutcome(report=None, reasons=(API_UNAVAILABLE,))
+    except SQLAlchemyError:
+        return ReconcileOutcome(report=None, reasons=(DATABASE_UNAVAILABLE,))
     await operations_module.record_audit(
         session_maker,
         principal=principal,
@@ -505,7 +777,7 @@ async def reconcile_batch(
             "manual_cleanup_required": report.manual_cleanup_required,
         },
     )
-    return report
+    return ReconcileOutcome(report=report)
 
 
 async def execute_operation(
@@ -684,11 +956,16 @@ async def execute_operation(
 __all__ = [
     "SENDER_CODE",
     "UI_STAGES",
+    "CompositionView",
+    "ReconcileOutcome",
+    "RecipientLine",
     "StageOffer",
     "Transports",
     "confirm_stage",
     "execute_operation",
+    "inspect_composition",
     "offer_stage",
+    "recipient_lines",
     "reconcile_batch",
     "request_stop",
 ]
