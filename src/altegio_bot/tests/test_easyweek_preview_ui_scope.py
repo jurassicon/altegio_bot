@@ -1212,7 +1212,7 @@ globalThis.OUTSTANDING = {
 
 globalThis.defaultRoutes = async function (url) {
   if (url.indexOf("/outstanding-cards") !== -1) {
-    const company = (url.match(/company_id=(\d+)/) || [])[1] || "";
+    const company = (url.match(/company_id=(\\d+)/) || [])[1] || "";
     return {ok: true, body: {cards: OUTSTANDING[company] || []}};
   }
   if (url.indexOf("/bulk-delete-cards") !== -1) {
@@ -2062,7 +2062,8 @@ late.resolve({ok: true, body: {id: 101, provider: "altegio", company_ids: [75828
                                candidates_count: 9}});
 await running;
 await settle();
-emit({busy: busy, cancelled: cancelled, after: state(), alerts: ALERTS});
+emit({busy: busy, cancelled: cancelled, after: state(), alerts: ALERTS,
+      premise: (typeof PREMISE === "undefined" ? null : PREMISE)});
 """
 
 
@@ -2113,21 +2114,39 @@ await fireEvent("f-company", "change");
     _assert_cancelled_to_idle(_run_node(source, driver))
 
 
+# What to put in each snapshot field, as a JavaScript expression evaluated with
+# ``target`` bound to the field.
+#
+# Every one of these must produce a value DIFFERENT from the one the server rendered,
+# because an edit that changes nothing is correctly not treated as an edit: the
+# preview still describes the form on screen, so it is not revoked and the page stays
+# busy. The two dates are therefore expressed RELATIVE to what was rendered. The page
+# defaults them to the previous calendar month, so any literal date here coincides
+# with the default for one month in every year — and this test duly failed every
+# October, on a product that was behaving correctly.
+_SNAPSHOT_EDITS = {
+    "f-period-start": "shiftYears(el(target).value, -1)",
+    # Forward, so the period stays in order however the start was rendered.
+    "f-period-end": "shiftYears(el(target).value, 1)",
+    "f-attribution": '"60"',
+    "f-card-type": '"2002"',
+    "f-followup-enabled": "true",
+    "f-followup-delay": '"7"',  # the server renders 3, so 3 is not a change
+    # A real other option, read off the select the server rendered. The literal
+    # this used to carry (`skip_if_booked`) is not one of them, so the harness's
+    # select refused it and the field changed to "" — a change, so the test passed,
+    # but it was proving that an INVALID value revokes a preview rather than that
+    # a different policy does.
+    "f-followup-policy": "otherOption(target)",
+    "f-followup-template": '"some_template"',
+}
+
+
 @needs_node
 @pytest.mark.asyncio
 async def test_editing_any_snapshot_field_during_a_preview_revokes_it(http_client) -> None:
     """With no context on screen yet — which is where the old check gave up."""
-    edits = {
-        "f-period-start": '"2026-07-01"',
-        "f-period-end": '"2026-09-30"',
-        "f-attribution": '"60"',
-        "f-card-type": '"2002"',
-        "f-followup-enabled": "true",
-        "f-followup-delay": '"7"',  # the server renders 3, so 3 is not a change
-        "f-followup-policy": '"skip_if_booked"',
-        "f-followup-template": '"some_template"',
-    }
-    for field, value in edits.items():
+    for field, expression in _SNAPSHOT_EDITS.items():
         source = await _browser(http_client)
         if field.startswith("f-followup-") and field != "f-followup-enabled":
             # Those three only mean anything while follow-up is on.
@@ -2139,13 +2158,39 @@ async def test_editing_any_snapshot_field_during_a_preview_revokes_it(http_clien
             + PREVIEW_DRIVER_PRELUDE
             + """
 const target = %s;
-if (typeof %s === "boolean") el(target).checked = %s; else el(target).value = %s;
+globalThis.shiftYears = function (value, years) {
+  const parts = String(value).split("-");
+  return [String(Number(parts[0]) + years).padStart(4, "0"), parts[1], parts[2]].join("-");
+};
+globalThis.otherOption = function (id) {
+  const element = el(id);
+  const current = String(element.value);
+  const option = (element.options || []).find((o) => String(o.value) !== current);
+  return option ? option.value : current;
+};
+const wasChecked = typeof (%s) === "boolean";
+const before = wasChecked ? el(target).checked : el(target).value;
+const wanted = %s;
+if (wasChecked) el(target).checked = wanted; else el(target).value = wanted;
+const taken = wasChecked ? el(target).checked : el(target).value;
+globalThis.PREMISE = {before: before, wanted: wanted, taken: taken};
 await fireEvent(target, "change");
 """
-            % (json.dumps(field), value, value, value)
+            % (json.dumps(field), expression, expression)
             + PREVIEW_DRIVER_CODA
         )
         answer = _run_node(source, driver)
+        premise = answer["premise"]
+        # Said out loud, because the alternative is this test failing as though the
+        # page had stopped revoking previews. The field has to actually change.
+        assert premise["taken"] == premise["wanted"], (
+            f"{field}: the field would not take {premise['wanted']!r} (it holds {premise['taken']!r}), "
+            "so this edit proves nothing about revoking a preview"
+        )
+        assert premise["taken"] != premise["before"], (
+            f"{field}: the test set the value the server already rendered ({premise['before']!r}), "
+            "so nothing was edited and the preview was rightly left alone"
+        )
         try:
             _assert_cancelled_to_idle(answer)
         except AssertionError as failure:  # pragma: no cover - only on a regression

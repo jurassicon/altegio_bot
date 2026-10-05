@@ -78,6 +78,29 @@ def _digest_over(material: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
+def phrase_for_digest(stage: str, digest: str) -> str:
+    """The exact phrase that authorises *stage* at *digest*. One definition.
+
+    Named the phase, not only the stage: an operator reading it should be able to
+    see which phase they are authorising, and a §41 phrase must not look like a
+    §42 one.
+
+    Worth being precise about what this adds, because the browser path (§43.4)
+    derives it rather than asking a human to type it. The phrase is a pure
+    function of the digest, so it carries no strength the digest does not already
+    have — anyone holding the digest can compute it. What it bought in §42 was
+    CEREMONY: a human typing the phase name out loud, in a terminal, as the last
+    act before money moved.
+
+    In the browser that ceremony is the confirmation screen and the stored
+    approval: a named operator agreeing to this stage, this count and this amount,
+    recorded in a row with its own expiry. So the UI path computes the phrase from
+    the digest its approval stored, and the digest comparison — which is the real
+    check — is unchanged and unweakened.
+    """
+    return f"{stage}-voucher-production-{digest[:12]}"
+
+
 def stage_digest(
     *,
     stage: str,
@@ -134,10 +157,7 @@ class StagePlan:
         )
 
     def phrase_for(self, digest: str) -> str:
-        # Names the phase, not only the stage: an operator typing this should be
-        # able to see from the phrase alone which one they are authorising, and
-        # a §41 phrase must not look like a §42 one.
-        return f"{self.stage}-voucher-production-{digest[:12]}"
+        return phrase_for_digest(self.stage, digest)
 
     @property
     def confirmation_phrase(self) -> str:
@@ -221,6 +241,7 @@ def verify_plan_authorisation(
 __all__ = [
     "PLAN_MAX_AGE",
     "StagePlan",
+    "phrase_for_digest",
     "stage_digest",
     "verify_plan_authorisation",
 ]

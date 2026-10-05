@@ -4406,6 +4406,438 @@ class EasyWeekVoucherProductionBatchAttempt(Base):
 
 
 # ---------------------------------------------------------------------------
+# §43 — browser-authorised operation of the production voucher mailing (PR-20)
+# ---------------------------------------------------------------------------
+# §42 proved the stages; it drove them from a terminal, where the operator
+# carried the digest and the timestamp by hand. The owner's decision of
+# 28.09.2026 is that the real mailing happens from the interface, which moves
+# exactly one thing: WHERE the authorisation lives.
+#
+# It cannot live in the browser. A request body is not an approval — it is
+# whatever the last page happened to post, twice if the operator double-clicked,
+# and again if a tab was left open. So the server builds the plan, stores it
+# immutably with its own expiry, and hands the browser nothing but its id. The
+# browser confirms THAT plan; it never assembles permission out of fields.
+#
+# Three tables, for three different jobs:
+#
+# * ``..._approvals`` — one immutable plan per offer: who, which batch, which
+#   stage, which exact slots, how many and how much. Signed by the same digest
+#   §42 already used, so every drift check it earned still applies.
+# * ``..._operations`` — the durable record that an approval was spent. UNIQUE on
+#   ``approval_id``, which is what makes a double POST, a refresh, two tabs and
+#   two operators converge on ONE operation instead of two mailings.
+# * ``..._stop_requests`` — the operator's "stop after the current request",
+#   durable and per batch, checked inside the same transaction as the next claim.
+
+VOUCHER_PRODUCTION_APPROVAL_PENDING = "pending"
+VOUCHER_PRODUCTION_APPROVAL_CONSUMED = "consumed"
+
+VOUCHER_PRODUCTION_APPROVAL_STATUSES = (
+    VOUCHER_PRODUCTION_APPROVAL_PENDING,
+    VOUCHER_PRODUCTION_APPROVAL_CONSUMED,
+)
+
+_VOUCHER_PRODUCTION_APPROVAL_STATUS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_PRODUCTION_APPROVAL_STATUSES)
+
+VOUCHER_PRODUCTION_OPERATION_QUEUED = "queued"
+VOUCHER_PRODUCTION_OPERATION_RUNNING = "running"
+VOUCHER_PRODUCTION_OPERATION_COMPLETED = "completed"
+VOUCHER_PRODUCTION_OPERATION_REFUSED = "refused"
+VOUCHER_PRODUCTION_OPERATION_EXPIRED = "expired"
+# The executor died while this operation held the lease. NOT a retryable state
+# and deliberately never returned to ``queued``: something may already have
+# reached EasyWeek or Meta, and the only safe next step is a readback and a
+# fresh human decision.
+VOUCHER_PRODUCTION_OPERATION_INTERRUPTED = "interrupted"
+
+VOUCHER_PRODUCTION_OPERATION_STATUSES = (
+    VOUCHER_PRODUCTION_OPERATION_QUEUED,
+    VOUCHER_PRODUCTION_OPERATION_RUNNING,
+    VOUCHER_PRODUCTION_OPERATION_COMPLETED,
+    VOUCHER_PRODUCTION_OPERATION_REFUSED,
+    VOUCHER_PRODUCTION_OPERATION_EXPIRED,
+    VOUCHER_PRODUCTION_OPERATION_INTERRUPTED,
+)
+
+_VOUCHER_PRODUCTION_OPERATION_STATUS_SQL = ", ".join(f"'{value}'" for value in VOUCHER_PRODUCTION_OPERATION_STATUSES)
+
+VOUCHER_PRODUCTION_OPERATION_TERMINAL = (
+    VOUCHER_PRODUCTION_OPERATION_COMPLETED,
+    VOUCHER_PRODUCTION_OPERATION_REFUSED,
+    VOUCHER_PRODUCTION_OPERATION_EXPIRED,
+    VOUCHER_PRODUCTION_OPERATION_INTERRUPTED,
+)
+
+_VOUCHER_PRODUCTION_OPERATION_TERMINAL_SQL = ", ".join(f"'{value}'" for value in VOUCHER_PRODUCTION_OPERATION_TERMINAL)
+
+
+class EasyWeekVoucherProductionApproval(Base):
+    """One immutable server-side plan an operator may confirm, once (§43.4).
+
+    What makes it an approval rather than a form submission
+    ------------------------------------------------------
+    Everything that decides what may happen is written HERE, by the server, at
+    the moment the plan was built: the authenticated principal, the branch, the
+    preview, the batch, the stage, the exact ``target_slots``, the count and the
+    money, and the verdicts about the pinned issuer and the frozen identity. The
+    browser receives an id.
+
+    So the confirm request cannot widen anything. There is no field in it that
+    names a slot, a staffer, an amount nobody computed or a batch the plan is not
+    about; the two numbers it does carry are compared against this row and a
+    mismatch refuses. An operator who edits the preview between reading a plan
+    and confirming it changes the digest, and the stage refuses before anything
+    leaves the process.
+
+    ``target_slots`` is the PR-19 fix, stored
+    -----------------------------------------
+    §42.7 requires that execution act on exactly the slots the approval covered —
+    a CREATE that lands between the plan and the act makes its slot eligible for
+    the NEXT plan, not for this one's payment. That list is signed into
+    ``plan_digest`` and kept here verbatim, so the executor reads the approved
+    set rather than re-deriving a larger one.
+
+    It expires, and the queue does not extend it
+    --------------------------------------------
+    ``expires_at`` is 30 minutes after the plan was issued, exactly as §42's TTL.
+    Waiting in the executor's queue is not reading time: an operation picked up
+    after this moment is refused with zero external effects and needs a new plan
+    and a new confirmation. No worker re-approves anything.
+
+    PII-free, like every other row of this phase: slots, ids, counts, booleans
+    and reason codes. No phone, no name, no customer UUID, no voucher code, no
+    staffer UUID and no session token.
+    """
+
+    __tablename__ = "easyweek_voucher_production_approvals"
+
+    __table_args__ = (
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_approval_provider"),
+        CheckConstraint(
+            f"batch_scope = '{VOUCHER_PRODUCTION_SCOPE}'",
+            name="ck_ew_voucher_production_approval_scope",
+        ),
+        CheckConstraint(
+            f"company_id = {VOUCHER_PRODUCTION_COMPANY_ID}",
+            name="ck_ew_voucher_production_approval_company",
+        ),
+        CheckConstraint(
+            "stage IN ('freeze', 'create', 'pay', 'deliver', 'refund')",
+            name="ck_ew_voucher_production_approval_stage",
+        ),
+        CheckConstraint(
+            f"status IN ({_VOUCHER_PRODUCTION_APPROVAL_STATUS_SQL})",
+            name="ck_ew_voucher_production_approval_status",
+        ),
+        # Consumed exactly when there is a moment it was consumed at. The two
+        # cannot drift, so "spent" is one fact rather than two that might disagree.
+        CheckConstraint(
+            f"(status = '{VOUCHER_PRODUCTION_APPROVAL_CONSUMED}') = (consumed_at IS NOT NULL)",
+            name="ck_ew_voucher_production_approval_consumed",
+        ),
+        # An approval that covers no slot authorises nothing, and storing one
+        # would invite an executor to read "no restriction" out of an empty list.
+        CheckConstraint("target_slot_count >= 1", name="ck_ew_voucher_production_approval_slots"),
+        CheckConstraint("stop_generation_at_plan >= 0", name="ck_ew_voucher_production_approval_stop_gen"),
+        # What THIS stage is about to do, which is not the same as what the batch
+        # costs in total. A freeze and a deliver move no money; a create and a pay
+        # move €15 per slot they are about to touch.
+        CheckConstraint("stage_target_count >= 1", name="ck_ew_voucher_production_approval_targets"),
+        CheckConstraint("stage_amount_minor >= 0", name="ck_ew_voucher_production_approval_amount"),
+        CheckConstraint("expires_at > plan_issued_at", name="ck_ew_voucher_production_approval_ttl"),
+        # Every stage after the freeze is about one existing batch, by id. A row
+        # without one could only be a freeze, which is the stage that creates it.
+        CheckConstraint(
+            "(stage = 'freeze') OR (batch_id IS NOT NULL)",
+            name="ck_ew_voucher_production_approval_batch",
+        ),
+        ForeignKeyConstraint(
+            ["campaign_run_id", "provider"],
+            ["campaign_runs.id", "campaign_runs.provider"],
+            name="fk_ew_voucher_production_approval_run_provider",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["batch_id"],
+            ["easyweek_voucher_production_batches.id"],
+            name="fk_ew_voucher_production_approval_batch",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_ew_voucher_production_approval_batch_stage", "batch_id", "stage"),
+        Index("ix_ew_voucher_production_approval_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    batch_scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # -- who ---------------------------------------------------------------
+    # The server-resolved Ops account, never an actor named in a payload.
+    principal: Mapped[str] = mapped_column(String(128), nullable=False)
+    # A keyed digest of the session that created it. Enough to tell two sessions
+    # of the same account apart in an audit; never the token itself.
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Said out loud rather than left to be assumed: with one shared Ops account,
+    # an audit row identifies the account and the session, not a human being.
+    identification_limit: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # -- what ---------------------------------------------------------------
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    target_slots: Mapped[list] = mapped_column(JSONB, nullable=False)
+    target_slot_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage_target_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage_amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    campaign_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Which operator stop this plan was built in knowledge of (review R1).
+    #
+    # 0 means "no stop had ever been pressed for this batch". A confirmation is
+    # admitted while a stop is ACTIVE only when this equals the batch's current
+    # generation — that is, only when the plan was built after that stop, by an
+    # operator who could see it. A plan from before the stop carries the older
+    # number and is refused, so a second tab cannot lift somebody else's stop.
+    stop_generation_at_plan: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    # -- the authorisation itself -------------------------------------------
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- the bindings this plan was proven against --------------------------
+    issuer_pinned: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    issuer_membership_proven: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    runtime_identity_bound: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    baseline_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    frozen_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekVoucherProductionOperation(Base):
+    """One durable, confirmed stage of one mailing (§43.5).
+
+    Written and COMMITTED before the browser gets its answer, which is what makes
+    the work independent of the tab that started it. A refresh, a second login or
+    a closed laptop changes nothing: the operation is in PostgreSQL and the
+    dedicated executor is what runs it.
+
+    One approval, one operation
+    ---------------------------
+    ``approval_id`` is UNIQUE. That single constraint is what a double-click, a
+    retried POST whose response was lost, two open tabs and two operators all
+    collide on — in the database, not in a disabled button. The loser of the race
+    is handed the operation the winner created, so the answer to "did my click
+    work?" is always the same operation rather than a second payment.
+
+    A crash is not a retry
+    ----------------------
+    There is no path from ``running`` back to ``queued``. An operation whose
+    executor died becomes ``interrupted``, which is terminal: the per-item ledger
+    already distinguishes "never claimed" from "may have reached the outside
+    world", and continuing means a readback and a NEW approval for whatever is
+    provably still untouched. Nothing here re-authorises itself.
+
+    ``result`` holds the stage's own PII-free report — the same dictionary the CLI
+    printed in §42. No voucher code, no phone, no name, no provider payload and no
+    raw Meta id has ever been in it.
+    """
+
+    __tablename__ = "easyweek_voucher_production_operations"
+
+    __table_args__ = (
+        # The idempotency key of the whole phase.
+        UniqueConstraint("approval_id", name="uq_ew_voucher_production_operation_approval"),
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_operation_provider"),
+        CheckConstraint(
+            f"batch_scope = '{VOUCHER_PRODUCTION_SCOPE}'",
+            name="ck_ew_voucher_production_operation_scope",
+        ),
+        CheckConstraint(
+            "stage IN ('freeze', 'create', 'pay', 'deliver', 'refund')",
+            name="ck_ew_voucher_production_operation_stage",
+        ),
+        CheckConstraint(
+            f"status IN ({_VOUCHER_PRODUCTION_OPERATION_STATUS_SQL})",
+            name="ck_ew_voucher_production_operation_status",
+        ),
+        # Finished exactly when it reached a terminal state.
+        CheckConstraint(
+            f"(status IN ({_VOUCHER_PRODUCTION_OPERATION_TERMINAL_SQL})) = (finished_at IS NOT NULL)",
+            name="ck_ew_voucher_production_operation_finished",
+        ),
+        # A queued operation has not started and holds no lease. Anything else
+        # would let a sweep mistake a waiting row for an abandoned one.
+        CheckConstraint(
+            f"status <> '{VOUCHER_PRODUCTION_OPERATION_QUEUED}'"
+            " OR (started_at IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="ck_ew_voucher_production_operation_queued_idle",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_ew_voucher_production_operation_attempts"),
+        ForeignKeyConstraint(
+            ["approval_id"],
+            ["easyweek_voucher_production_approvals.id"],
+            name="fk_ew_voucher_production_operation_approval",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["batch_id"],
+            ["easyweek_voucher_production_batches.id"],
+            name="fk_ew_voucher_production_operation_batch",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_ew_voucher_production_operation_status", "status"),
+        Index("ix_ew_voucher_production_operation_batch", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    approval_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    batch_scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Only ever set for a refund, which is the one stage about a single slot.
+    slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    principal: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    identification_limit: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    outcome_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason_codes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekVoucherProductionStopRequest(Base):
+    """ "Stop after the current request", durable, for ONE batch (§43.6).
+
+    One row per batch, ever — ``batch_id`` is UNIQUE — so pressing stop twice is
+    the same request rather than a second one, and a continuation clears it
+    instead of deleting history.
+
+    What it is NOT: a cancellation. A request already on the wire cannot be
+    un-sent, so a stop never claims one did not happen; the per-item ledger
+    records whatever that request turned out to be, including unknown. What the
+    stop does is refuse the NEXT per-item claim, inside the very transaction that
+    would have granted it — see ``ledger._claim``. Both this writer and that
+    claim take the batch header's row lock first, so they serialise and there is
+    no window in which one more slot slips through.
+
+    It does not refund anything, it does not halt the batch, and it blocks
+    neither status, nor delivery webhooks, nor reconciliation, nor an allowed
+    pre-send refund. Stopping is how an operator stops spending, not how they
+    lose access to what already happened.
+    """
+
+    __tablename__ = "easyweek_voucher_production_stop_requests"
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", name="uq_ew_voucher_production_stop_batch"),
+        ForeignKeyConstraint(
+            ["batch_id"],
+            ["easyweek_voucher_production_batches.id"],
+            name="fk_ew_voucher_production_stop_batch",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_ew_voucher_production_stop_active", "batch_id", "cleared_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Set when an operator confirmed a fresh plan for this batch, which is the
+    # only thing that lifts a stop. Keeping the row makes "it was stopped once"
+    # a readable fact rather than an absence.
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cleared_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    stop_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EasyWeekVoucherProductionAudit(Base):
+    """Who did what, when, to which plan and operation — and what came back.
+
+    Separate from the EasyWeek staffer on the voucher, deliberately (§43.9): the
+    issuer is fixed and says nothing about who authorised anything, so the Ops
+    account that confirmed an action is recorded here and nowhere else.
+
+    ``identification_limit`` is the honest part. One shared Ops credential cannot
+    distinguish two people, and a log that implied otherwise would be worse than
+    one that says so: the row names the account and a digest of the session, and
+    states what that does and does not prove.
+
+    Never stored: a cookie, a session token, a CSRF token, a voucher code, a raw
+    provider payload or a raw Meta id. ``detail`` carries counts, slots, booleans
+    and reason codes.
+    """
+
+    __tablename__ = "easyweek_voucher_production_audit"
+
+    __table_args__ = (
+        CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_audit_provider"),
+        Index("ix_ew_voucher_production_audit_at", "at"),
+        Index("ix_ew_voucher_production_audit_batch", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    provider: Mapped[str] = _provider_column()
+
+    principal: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    identification_limit: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    campaign_run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    approval_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    operation_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    outcome: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # Chatwoot outbound mirror registry
 # ---------------------------------------------------------------------------
 # Durable WAMID → Chatwoot Message.id link for the private mirror note of an

@@ -179,6 +179,66 @@ SLOT_UNKNOWN: Final = "voucher_production_slot_unknown"
 # and it is one for a human with a fresh plan.
 EXECUTION_INTERRUPTED: Final = "voucher_production_execution_interrupted"
 
+# -- the pinned issuer (§43.9) ------------------------------------------------
+# Every production voucher is sold by ONE approved EasyWeek staffer, whoever the
+# client is, whoever served them and whoever is logged into Ops. These are the
+# four ways that can fail, kept apart because they need four different answers:
+# a wrong configuration is an administrator's job, an unproven membership may be
+# EasyWeek being slow, and a browser that tried to name a staffer is an attempt.
+ISSUER_NOT_APPROVED: Final = "voucher_production_issuer_not_approved"
+ISSUER_MEMBERSHIP_MISSING: Final = "voucher_production_issuer_membership_missing"
+ISSUER_MEMBERSHIP_AMBIGUOUS: Final = "voucher_production_issuer_membership_ambiguous"
+ISSUER_MEMBERSHIP_INCOMPLETE: Final = "voucher_production_issuer_membership_incomplete"
+ISSUER_SUPPLIED_BY_CLIENT: Final = "voucher_production_issuer_supplied_by_client"
+
+# -- the operator's stop (§43.6) ---------------------------------------------
+# Not a halt and not an unknown. The operator asked for the stage to stop after
+# the request that was already in flight, so the slots behind it were never
+# claimed and nothing about them is in doubt.
+STOPPED_BY_OPERATOR: Final = "voucher_production_stopped_by_operator"
+
+# -- browser authorisation of one stage (§43.4) ------------------------------
+APPROVAL_UNKNOWN: Final = "voucher_production_approval_unknown"
+APPROVAL_NOT_READY: Final = "voucher_production_approval_not_ready"
+APPROVAL_ALREADY_CONSUMED: Final = "voucher_production_approval_already_consumed"
+APPROVAL_PRINCIPAL_MISMATCH: Final = "voucher_production_approval_principal_mismatch"
+APPROVAL_COUNT_UNCONFIRMED: Final = "voucher_production_approval_count_unconfirmed"
+APPROVAL_EXPOSURE_UNCONFIRMED: Final = "voucher_production_approval_exposure_unconfirmed"
+OPERATION_UNKNOWN: Final = "voucher_production_operation_unknown"
+# The single dedicated executor is not running, so a confirmation would sit in a
+# queue nobody drains. Said out loud rather than shown as a stuck spinner.
+EXECUTOR_UNAVAILABLE: Final = "voucher_production_executor_unavailable"
+# The operator session is missing, unconfigured or not a browser session.
+OPS_SESSION_REQUIRED: Final = "voucher_production_ops_session_required"
+OPS_CSRF_INVALID: Final = "voucher_production_ops_csrf_invalid"
+OPS_ORIGIN_REJECTED: Final = "voucher_production_ops_origin_rejected"
+
+# -- serialising a batch's own activity (review R1, R2) ----------------------
+# A batch does one thing at a time, and the two ways that was not true were both
+# ways to lose money or a message.
+#
+# A plan built BEFORE a stop cannot authorise carrying on after it: the operator
+# who pressed stop had not seen that plan, and a second tab confirming it would
+# have lifted their stop. Continuing is a plan built in full knowledge of the
+# stop, which is what the generation comparison establishes.
+STOP_ACTIVE: Final = "voucher_production_stop_active"
+# Another operation for this batch is queued or running. Admitting a second one
+# would let it clear the first one's stop and resume the slots behind a request
+# that is still in flight.
+OPERATION_IN_FLIGHT: Final = "voucher_production_operation_in_flight"
+# A readback was asked for while a stage of the same batch is executing.
+# Reconciling then would reinterpret a LIVE claim as abandoned, and the success
+# that is about to come back would have nowhere to land.
+RECONCILE_BUSY: Final = "voucher_production_reconcile_busy"
+# An external effect happened and its durable record did not land. Never
+# reported as success: the effect is real and the ledger does not say so.
+LEDGER_WRITE_LOST: Final = "voucher_production_ledger_write_lost"
+
+# -- the closed CLI mutation surface (§43.6) ---------------------------------
+# FREEZE/CREATE/PAY/DELIVER/REFUND are UI actions now. The command still exists,
+# still reads and still diagnoses; what it no longer does is act.
+CLI_MUTATION_CLOSED: Final = "voucher_production_cli_mutation_closed"
+
 # -- the halt ----------------------------------------------------------------
 # The first unknown stops the whole remaining suffix OF THIS BATCH. Its own
 # code, because "this slot was never attempted" is a different fact from any

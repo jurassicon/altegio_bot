@@ -274,6 +274,15 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # container, and the apply authorisation is passed per invocation
         # rather than declared in Compose.
         "easyweek-failed-cancellation-recovery",
+        # Plan §43 (PR-20). The voucher-mailing executor performs the stages an
+        # operator confirms in Ops, so it reaches EasyWeek and Meta and needs the same
+        # key. It is the first STANDING carrier besides the API and the two workers —
+        # see the fuller justification beside the same entry in
+        # `test_easyweek_pr12_rollout_contract.py`. It accepts no command and no
+        # argument: what it does is whatever an immutable, operator-confirmed approval
+        # row says, within target slots it may not widen, and with the production fence
+        # false by default it refuses every stage it picks up.
+        "altegio-easyweek-voucher-executor",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

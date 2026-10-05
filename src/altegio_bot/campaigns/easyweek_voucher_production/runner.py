@@ -95,8 +95,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     FROZEN_DIGEST_MISMATCH,
     HALTED_BY_PREDECESSOR,
     IDENTITY_BINDING_MISMATCH,
+    ISSUER_MEMBERSHIP_INCOMPLETE,
     KARLSRUHE_COMPANY_ID,
     LEDGER_STATE_UNEXPECTED,
+    LEDGER_WRITE_LOST,
     MARKER_SEARCH_AMBIGUOUS,
     MARKER_SEARCH_INCOMPLETE,
     MARKER_SEARCH_UNRESOLVED,
@@ -109,6 +111,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ORDER_UNPROVEN,
     PREVIEW_ALREADY_FROZEN,
     PRODUCTION_SCOPE,
+    RECONCILE_BUSY,
     RECONCILE_UNRESOLVED,
     REFUND_FORBIDDEN_AFTER_SEND,
     SLOT_UNKNOWN,
@@ -118,11 +121,17 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_FREEZE,
     STAGE_PAY,
     STAGE_REFUND,
+    STOPPED_BY_OPERATOR,
     TEMPLATE_PARAMETERS_UNPROVEN,
     UNIT_PRICE_MINOR,
     UNKNOWN_STAGE,
     VOUCHER_TEMPLATE_CODE,
     binding_material,
+)
+from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
+    IssuerMembership,
+    pinned_issuer,
+    prove_issuer_membership,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.readiness import (
     ProductionPrerequisites,
@@ -167,6 +176,7 @@ from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
     VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN,
 )
+from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
 # How long after a claim a created order may have been opened. Bounded locally,
@@ -292,6 +302,9 @@ class StageReport:
     reconciliation_required: bool = False
     manual_cleanup_required: bool = False
     halted: bool = False
+    # The operator stopped this stage. Distinct from ``halted``, which means a
+    # slot's outcome could not be proven.
+    stopped: bool = False
     batch: dict[str, Any] = field(default_factory=dict)
     slots: list[SlotResult] = field(default_factory=list)
     observations: list[dict[str, Any]] = field(default_factory=list)
@@ -321,6 +334,9 @@ class StageReport:
             "reconciliation_required": self.reconciliation_required,
             "manual_cleanup_required": self.manual_cleanup_required,
             "halted": self.halted,
+            # Two different facts, never merged: an operator stopped this stage,
+            # versus a slot's outcome could not be proven.
+            "stopped_by_operator": self.stopped,
             "baseline": dict(self.baseline) if self.baseline is not None else None,
             "observations": list(self.observations),
             "slots": [entry.as_safe_dict() for entry in self.slots],
@@ -494,7 +510,12 @@ def _identity_from_snapshot(
     )
 
 
-def _runtime_identity_matches(request: ProductionRequest, snapshot: ledger_module.BatchSnapshot) -> bool:
+def _runtime_identity_matches(
+    request: ProductionRequest,
+    snapshot: ledger_module.BatchSnapshot,
+    *,
+    stage: str,
+) -> bool:
     """Is the environment this process runs in the one the batch was frozen with?
 
     Four UUIDs decide where real money goes: which branch, which staffer sells,
@@ -509,12 +530,24 @@ def _runtime_identity_matches(request: ProductionRequest, snapshot: ledger_modul
     """
     if not snapshot.exists:
         return True
-    return (
+    bound = (
         snapshot.location_uuid == request.location_uuid
-        and snapshot.staffer_uuid == request.staffer_uuid
         and snapshot.payment_account_uuid == request.payment_account_uuid
         and snapshot.voucher_template_uuid == request.voucher_template_uuid
     )
+    if stage == STAGE_REFUND:
+        # The staffer is who SOLD the voucher, and a refund sells nothing. §43.9
+        # is explicit that the issuer rule must not reach into a refund: a
+        # pre-send slot whose money should come back must not be stranded
+        # because the server's staffer setting was emptied, corrected or pointed
+        # at somebody new since the freeze. The frozen order, the payment
+        # account, the fence, the binding and the absence of a send claim are
+        # what protect it, and none of them moved.
+        #
+        # Nothing is re-attributed either: the batch keeps the staffer it was
+        # frozen with, and this comparison simply does not ask about it.
+        return bound
+    return bound and snapshot.staffer_uuid == request.staffer_uuid
 
 
 def _refusal(
@@ -667,6 +700,56 @@ def _stage_slots(
     return [slot for slot in slots if slot in permitted]
 
 
+async def _stop_reached(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    honour_stop: bool,
+    batch_id: int,
+) -> bool:
+    """A cheap pre-claim read of the operator's stop. An optimisation only.
+
+    The GUARANTEE lives in :func:`ledger._claim`, which re-reads the stop inside
+    the very transaction that would grant the claim, after the header lock. This
+    read exists so a stopped stage does not spend an EasyWeek GET per remaining
+    slot on its way to finding out — a deliver, in particular, reads the paid
+    order before it claims.
+
+    It is therefore allowed to be stale in exactly one harmless direction: a stop
+    pressed after this read is still caught by the claim. A stop pressed before it
+    is caught here, one GET earlier.
+    """
+    if not honour_stop:
+        return False
+    return await ledger_module.stop_is_active(session_maker, batch_id=batch_id)
+
+
+def available_item_actions(item: ledger_module.ItemSnapshot) -> tuple[str, ...]:
+    """Which per-item stages this slot is in a state to be planned for.
+
+    The ONE place that answers it (review R6). The UI used to decide for itself
+    which rows could be refunded, and its list had drifted from the ledger's in both
+    directions: it hid two states a refund is genuinely allowed from, and offered one
+    — ``send_rejected`` — where a refund is forbidden because an attempt was already
+    spent. Both are the same bug, which is a second copy of a rule.
+
+    Derived from ``STAGE_ITEM_SOURCE_STATUSES``, so the buttons and the plan cannot
+    disagree: this says what may be PLANNED, never what is authorised. Every real
+    refusal still happens in the plan, in the claim and in a CHECK constraint, and a
+    slot named here still needs a fresh plan, a live proof and its own confirmation.
+    """
+    actions: list[str] = []
+    for stage in (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER, STAGE_REFUND):
+        if item.status in STAGE_ITEM_SOURCE_STATUSES.get(stage, frozenset()):
+            actions.append(stage)
+    if STAGE_REFUND in actions and (
+        item.status in ledger_module.SENT_ITEM_STATUSES or int(item.send_attempt_count or 0) > 0
+    ):
+        # Belt and braces for the rule that costs the most to get wrong: once an
+        # attempt is spent, the code may already be in somebody's hands.
+        actions.remove(STAGE_REFUND)
+    return tuple(actions)
+
+
 async def build_stage_plan(
     session: AsyncSession,
     session_maker: async_sessionmaker[AsyncSession],
@@ -710,12 +793,32 @@ async def build_stage_plan(
     if stage not in STAGE_ITEM_SOURCE_STATUSES and stage != STAGE_FREEZE:
         reasons.append(UNKNOWN_STAGE)
 
+    # §43.9: the approved issuer, and whether they still provably belong to this
+    # location — asked ONCE here, per stage, and never per recipient. The walk is
+    # skipped for a refund, which neither sells nor sends and must not be held
+    # hostage by a staffer catalogue it has no use for.
+    issuer = pinned_issuer(settings.easyweek_voucher_production_mailing_staffer_uuid)
+    issuer_membership: IssuerMembership | None = None
+    if stage != STAGE_REFUND:
+        if issuer.pinned and issuer.uuid is not None:
+            issuer_membership = await prove_issuer_membership(
+                order_reader,
+                location_uuid=request.location_uuid,
+                issuer_uuid=issuer.uuid,
+            )
+        else:
+            # Nothing to look for. Reported as an unproven membership rather than
+            # as a pass, so the refusal set names both facts an administrator has
+            # to fix in order.
+            issuer_membership = IssuerMembership(reason=ISSUER_MEMBERSHIP_INCOMPLETE)
+
     prerequisites = await prove_prerequisites(
         session,
         stage=stage,
         company_id=request.company_id,
         sender_code=request.sender_code,
         enabled=enabled,
+        issuer_membership=issuer_membership,
     )
     reasons.extend(prerequisites.reasons)
 
@@ -751,7 +854,7 @@ async def build_stage_plan(
     # otherwise charge an account nobody approved. Checked for every stage that
     # comes after a freeze, the refund included, and the drift costs zero
     # external calls because the plan simply is not ready.
-    runtime_identity_bound = _runtime_identity_matches(request, snapshot)
+    runtime_identity_bound = _runtime_identity_matches(request, snapshot, stage=stage)
     if not runtime_identity_bound:
         reasons.append(IDENTITY_BINDING_MISMATCH)
 
@@ -910,6 +1013,27 @@ async def build_stage_plan(
         # binds is the VERDICT about them: an approval taken while the
         # environment matched cannot be replayed once it no longer does.
         "runtime_identity_matches_frozen": runtime_identity_bound,
+        # §43.9, signed as booleans for the same reason — and sound as booleans
+        # BECAUSE the pin admits exactly one UUID. An approval taken while the
+        # approved issuer was configured and provably present cannot be replayed
+        # after the configuration drifts or the staffer leaves the branch.
+        #
+        # Deliberately absent from a REFUND's signed material. A refund sells
+        # nothing, so these facts are not conditions of it — and signing them
+        # would make the staffer setting changing after the plan invalidate the
+        # digest, which is precisely the stranding §43.9 forbids: the money would
+        # become unreturnable because of a setting that has nothing to do with
+        # returning it. ``issuer_check_applied`` says which of the two shapes this
+        # snapshot is, so one cannot be mistaken for the other.
+        "issuer_check_applied": stage != STAGE_REFUND,
+        **(
+            {
+                "issuer_pinned": issuer.pinned,
+                "issuer_membership_proven": (issuer_membership.proven if issuer_membership is not None else None),
+            }
+            if stage != STAGE_REFUND
+            else {}
+        ),
         "baseline": baseline.as_safe_dict(),
         "batch": snapshot.as_safe_dict(),
     }
@@ -1092,6 +1216,7 @@ async def run_create(
     order_reader: Any,
     mutator: VoucherMutator,
     apply: bool,
+    honour_stop: bool = False,
     supplied_digest: str,
     supplied_issued_at: datetime | None,
     supplied_phrase: str,
@@ -1129,6 +1254,7 @@ async def run_create(
     results: list[SlotResult] = []
     calls = 0
     halted = False
+    stopped = False
 
     # Bounded by what the operator's approval actually covers. The
     # intersection can only narrow this stage's work, never widen it.
@@ -1137,6 +1263,10 @@ async def run_create(
             # The suffix. Not attempted, and said so in the report rather than
             # left to be inferred from a missing entry.
             results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]))
+            continue
+        if stopped or await _stop_reached(session_maker, honour_stop=honour_stop, batch_id=batch_id):
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
             continue
 
         item = snapshot.item(slot)
@@ -1159,7 +1289,14 @@ async def run_create(
             plan_digest=plan.digest,
             create_window_start=window_start - CREATE_WINDOW,
             create_window_end=window_start + CREATE_WINDOW,
+            honour_stop=honour_stop,
         )
+        if claim.reason == ledger_module.CLAIM_REFUSED_STOPPED:
+            # The authoritative stop: read under the header lock, so nothing was
+            # stamped and nothing about this slot is in doubt.
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
+            continue
         if not claim.granted:
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[claim.reason]))
             halted = True
@@ -1260,6 +1397,7 @@ async def run_create(
         final,
         baseline,
         external_calls={"create": calls, "pay": 0, "refund": 0, "meta": 0},
+        stopped=stopped,
     )
 
 
@@ -1400,17 +1538,30 @@ def _stage_report(
     baseline: ProductionBaselineProof,
     *,
     external_calls: dict[str, int],
+    stopped: bool = False,
 ) -> StageReport:
     """One report over however many slots the stage touched.
 
     The outcome is the worst thing that happened, never the best: a batch in
     which thirty-nine slots succeeded and one is unknown is an unknown batch.
+
+    ``stopped`` is its own outcome rather than a flavour of success or of
+    failure. A stage in which nine slots were paid and eleven were never claimed
+    because the operator pressed stop is neither ``applied`` — eleven people have
+    no voucher — nor ``refused``, because nine payments are real. An operator
+    reading either of those words would act on the wrong belief, and "unknown"
+    would be worse still: a stopped slot was never claimed, so there is nothing
+    uncertain about it.
     """
     outcomes = {entry.outcome for entry in results}
     if not results:
         outcome = "nothing_to_do"
     elif "unknown" in outcomes:
+        # An unknown outranks a stop: the stop explains the tail, the unknown is
+        # still a question about one person.
         outcome = "unknown"
+    elif stopped:
+        outcome = "stopped"
     elif outcomes <= {"refused", "not_attempted"}:
         # Nothing was attempted at all. "Partial" would read as though some of
         # it had worked, which is the one thing an operator must not conclude.
@@ -1430,6 +1581,7 @@ def _stage_report(
     return StageReport(
         stage=stage,
         outcome=outcome,
+        stopped=stopped,
         reasons=list(dict.fromkeys(reasons)),
         external_effect_attempted=any(entry.external_effect_attempted for entry in results),
         external_send_attempted=any(entry.external_send_attempted for entry in results),
@@ -1453,6 +1605,7 @@ async def run_pay(
     order_reader: Any,
     mutator: VoucherMutator,
     apply: bool,
+    honour_stop: bool = False,
     supplied_digest: str,
     supplied_issued_at: datetime | None,
     supplied_phrase: str,
@@ -1484,12 +1637,17 @@ async def run_pay(
     results: list[SlotResult] = []
     calls = 0
     halted = False
+    stopped = False
 
     # Bounded by what the operator's approval actually covers. The
     # intersection can only narrow this stage's work, never widen it.
     for slot in _stage_slots(snapshot, STAGE_PAY, authorised=plan.authorised_slots):
         if halted:
             results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]))
+            continue
+        if stopped or await _stop_reached(session_maker, honour_stop=honour_stop, batch_id=batch_id):
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
             continue
         item = snapshot.item(slot)
         if item is None or item.target_order_uuid is None:
@@ -1525,7 +1683,12 @@ async def run_pay(
             batch_id=batch_id,
             slot=slot,
             plan_digest=plan.digest,
+            honour_stop=honour_stop,
         )
+        if claim.reason == ledger_module.CLAIM_REFUSED_STOPPED:
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
+            continue
         if not claim.granted:
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[claim.reason]))
             halted = True
@@ -1589,6 +1752,7 @@ async def run_pay(
         final,
         baseline,
         external_calls={"create": 0, "pay": calls, "refund": 0, "meta": 0},
+        stopped=stopped,
     )
 
 
@@ -1707,6 +1871,7 @@ async def run_deliver(
     order_reader: Any,
     sender: VoucherSender,
     apply: bool,
+    honour_stop: bool = False,
     supplied_digest: str,
     supplied_issued_at: datetime | None,
     supplied_phrase: str,
@@ -1745,12 +1910,19 @@ async def run_deliver(
     results: list[SlotResult] = []
     calls = 0
     halted = False
+    stopped = False
 
     # Bounded by what the operator's approval actually covers. The
     # intersection can only narrow this stage's work, never widen it.
     for slot in _stage_slots(snapshot, STAGE_DELIVER, authorised=plan.authorised_slots):
         if halted:
             results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[HALTED_BY_PREDECESSOR]))
+            continue
+        # Before the paid order is read, not only before the claim: a stopped
+        # deliver should not spend one GET per remaining recipient either.
+        if stopped or await _stop_reached(session_maker, honour_stop=honour_stop, batch_id=batch_id):
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
             continue
         item = snapshot.item(slot)
         member = members.get(slot)
@@ -1806,7 +1978,13 @@ async def run_deliver(
             meta_template_name=prerequisites.meta_template_name or "",
             template_language=prerequisites.template_language or "",
             sender_id=prerequisites.sender_id,
+            honour_stop=honour_stop,
         )
+        if claim.reason == ledger_module.CLAIM_REFUSED_STOPPED:
+            del code
+            stopped = True
+            results.append(SlotResult(slot=slot, outcome="not_attempted", reasons=[STOPPED_BY_OPERATOR]))
+            continue
         if not claim.granted:
             del code
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[claim.reason]))
@@ -1860,12 +2038,24 @@ async def run_deliver(
         del params
 
         if outcome_meta.accepted and outcome_meta.provider_message_id:
-            await ledger_module.record_item_outcome(
+            recorded = await ledger_module.record_item_outcome(
                 session_maker,
                 batch_id=batch_id,
                 slot=slot,
                 status=VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
-                expected_statuses=frozenset({VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED}),
+                # Both source states, deliberately (review R2). `send_claimed` is
+                # the ordinary one. `send_unknown` is the row a reconcile parked
+                # while this very request was in flight: the readback could not
+                # know the answer was still coming, and the answer is now here.
+                #
+                # Accepting it is sound rather than lenient — `provider_accepted`
+                # outranks `send_unknown`, so this is a forward move the
+                # monotonicity guard already permits, and the alternative is
+                # throwing away a PROVEN success and the only identifier by which
+                # a later delivered/read callback could find this slot.
+                expected_statuses=frozenset(
+                    {VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED, VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN}
+                ),
                 provider_message_id=outcome_meta.provider_message_id,
                 # Stamped by the very compare-and-set that records the
                 # acceptance, not left for a webhook to invent afterwards.
@@ -1873,6 +2063,22 @@ async def run_deliver(
                 reconciliation_required=False,
                 attempt_outcome="provider_accepted",
             )
+            if not recorded.applied:
+                # Meta accepted and the ledger does not say so. Never reported as
+                # success: the message is real, the record is not, and the honest
+                # state is one a human has to resolve. Deliberately NOT retried —
+                # a second send is the one thing this outcome must not cause.
+                results.append(
+                    SlotResult(
+                        slot=slot,
+                        outcome="unknown",
+                        reasons=[LEDGER_WRITE_LOST],
+                        external_effect_attempted=True,
+                        external_send_attempted=True,
+                    )
+                )
+                halted = True
+                continue
             results.append(
                 SlotResult(
                     slot=slot,
@@ -1939,6 +2145,7 @@ async def run_deliver(
         final,
         baseline,
         external_calls={"create": 0, "pay": 0, "refund": 0, "meta": calls},
+        stopped=stopped,
     )
 
 
@@ -2220,8 +2427,12 @@ async def _park_unresolved(
     batch_id: int,
     item: ledger_module.ItemSnapshot,
     reason: str,
-) -> None:
+) -> ledger_module.RecordOutcome:
     """Record that a reconcile looked at a crashed claim and still cannot say.
+
+    Returns the outcome rather than discarding it, because one of its refusals is
+    load bearing: ``record_refused_busy`` means an executor is using that claim and
+    the reconcile must say so instead of implying it reinterpreted anything.
 
     Moves ``*_claimed`` to the matching ``*_unknown`` and does nothing else. The
     destination is deliberately another unresolved state: it is not in any
@@ -2232,8 +2443,8 @@ async def _park_unresolved(
     """
     parked = _RECONCILED_UNKNOWN.get(item.status)
     if parked is None:
-        return
-    await ledger_module.record_item_outcome(
+        return ledger_module.RecordOutcome(False, ledger_module.RECORD_STALE_STATE)
+    return await ledger_module.record_item_outcome(
         session_maker,
         batch_id=batch_id,
         slot=item.slot,
@@ -2245,6 +2456,9 @@ async def _park_unresolved(
         # a reconcile that found nothing has not proved otherwise.
         manual_cleanup_required=True if item.status == VOUCHER_PRODUCTION_ITEM_CREATE_CLAIMED else None,
         attempt_outcome="unknown" if item.status == VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED else None,
+        # The guard that makes a readback safe to run at all (review R2): a claim an
+        # executor is using is not an abandoned one.
+        require_idle=True,
     )
 
 
@@ -2314,7 +2528,9 @@ async def run_reconcile(
                 # Nothing was proven. Absence is NOT proof the POST never left:
                 # the walk may simply not have seen the order, so the slot stays
                 # unresolved and nobody gets to send a second CREATE.
-                await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=slot_reasons[0])
+                parked = await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=slot_reasons[0])
+                if parked.reason == ledger_module.RECORD_REFUSED_BUSY:
+                    slot_reasons = [RECONCILE_BUSY]
         elif item.target_order_uuid is not None:
             payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
             if order_reason is not None:
@@ -2421,8 +2637,14 @@ async def run_reconcile(
         # identifier to ask Meta about. It may not be retried, it may not be
         # declared unsent, and it may not be refunded. It waits for a human.
         if item.status in SEND_UNRESOLVED:
-            slot_reasons.append(MUTATION_UNKNOWN)
-            await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=MUTATION_UNKNOWN)
+            parked = await _park_unresolved(session_maker, batch_id=batch_id, item=item, reason=MUTATION_UNKNOWN)
+            if parked.reason == ledger_module.RECORD_REFUSED_BUSY:
+                # An executor is holding this claim. The readback has reinterpreted
+                # nothing, and saying "unknown" here would be a claim about a slot
+                # whose answer is still on its way.
+                slot_reasons.append(RECONCILE_BUSY)
+            else:
+                slot_reasons.append(MUTATION_UNKNOWN)
 
         reasons.extend(slot_reasons)
         results.append(
@@ -2510,6 +2732,7 @@ __all__ = [
     "StageReport",
     "VoucherMutator",
     "VoucherSender",
+    "available_item_actions",
     "build_stage_plan",
     "run_create",
     "run_deliver",

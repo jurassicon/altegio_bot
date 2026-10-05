@@ -50,7 +50,18 @@ MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_migration_integration.py"
 HEAVY_JOB = "required-tests-heavy"
 REST_JOB = "required-tests-rest"
 DEDICATED_JOB = "required-tests-dedicated"
-EXECUTION_JOBS = (HEAVY_JOB, REST_JOB, DEDICATED_JOB)
+# §43's operator UI is judged on its interface, so the browser acceptance suite is a
+# required job of its own. Its own runner because it is the only suite that needs a
+# browser installed, and because the rest shard subtracts it to avoid collecting it
+# twice. ALTEGIO_REQUIRE_BROWSER_TESTS=1 makes a missing browser a failure rather
+# than a skip, which is what keeps it a gate.
+BROWSER_JOB = "required-tests-browser"
+BROWSER_GATE_ENV = "ALTEGIO_REQUIRE_BROWSER_TESTS"
+BROWSER_SUITE = "src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py"
+# §43's migration cycle, under its own mandatory flag in the dedicated job.
+VOUCHER_MIGRATION_GATE_ENV = "ALTEGIO_REQUIRE_VOUCHER_MAILING_MIGTEST"
+VOUCHER_MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_voucher_mailing_durability.py"
+EXECUTION_JOBS = (HEAVY_JOB, REST_JOB, DEDICATED_JOB, BROWSER_JOB)
 AGGREGATOR_JOB = "tests"
 
 
@@ -636,6 +647,11 @@ _EXPECTED_CRITICAL_SERVICES = frozenset(
         # PR-4: the EasyWeek normalizer is a standing service and must be
         # verified after every deploy like any other worker.
         "altegio-easyweek-inbox-worker",
+        # §43 (PR-20): the voucher-mailing executor. A standing service, so it is
+        # verified after every deploy like any other worker — and it matters more than
+        # most, because a confirmed stage with no executor running does not fail
+        # loudly: it sits in `queued` until somebody notices.
+        "altegio-easyweek-voucher-executor",
     }
 )
 

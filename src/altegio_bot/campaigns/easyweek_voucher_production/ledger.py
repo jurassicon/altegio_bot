@@ -122,6 +122,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
+    EasyWeekVoucherProductionStopRequest,
 )
 from altegio_bot.utils import utcnow
 
@@ -223,11 +224,18 @@ CLAIM_REFUSED_MISSING_ROW: Final = "claim_refused_missing_row"
 CLAIM_REFUSED_STATE: Final = "claim_refused_state"
 CLAIM_REFUSED_IDENTITY: Final = "claim_refused_identity"
 CLAIM_REFUSED_HALTED: Final = "claim_refused_halted"
+# The operator asked this batch to stop, and the request was durable before this
+# transaction took the header lock. Not a refusal about the slot: nothing was
+# attempted for it at all.
+CLAIM_REFUSED_STOPPED: Final = "claim_refused_stopped"
 
 RECORD_APPLIED: Final = "record_applied"
 RECORD_MISSING_ROW: Final = "record_missing_row"
 RECORD_STALE_STATE: Final = "record_stale_state"
 RECORD_WOULD_REGRESS: Final = "record_would_regress"
+# A reconcile tried to park a claim while an executor was using it. Not a failure
+# of the reconcile: an answer about that slot is still on its way.
+RECORD_REFUSED_BUSY: Final = "record_refused_busy"
 
 FREEZE_APPLIED: Final = "freeze_applied"
 FREEZE_REFUSED_EXISTS: Final = "freeze_refused_exists"
@@ -1089,6 +1097,273 @@ async def _settle_header(session: AsyncSession, header: EasyWeekVoucherProductio
         header.status = VOUCHER_PRODUCTION_IN_PROGRESS
 
 
+# ---------------------------------------------------------------------------
+# The operator's stop (§43.6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StopState:
+    """Whether this batch is under an operator stop, and since when."""
+
+    active: bool
+    requested_at: datetime | None = None
+    requested_by: str | None = None
+    cleared_at: datetime | None = None
+    stop_count: int = 0
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "stop_active": self.active,
+            "stop_requested_at": _iso(self.requested_at),
+            "stop_cleared_at": _iso(self.cleared_at),
+            "stop_count": self.stop_count,
+        }
+
+
+async def _stop_row(
+    session: AsyncSession,
+    *,
+    batch_id: int,
+    for_update: bool = False,
+) -> EasyWeekVoucherProductionStopRequest | None:
+    stmt = select(EasyWeekVoucherProductionStopRequest).where(EasyWeekVoucherProductionStopRequest.batch_id == batch_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _stop_is_active_locked(session: AsyncSession, *, batch_id: int) -> bool:
+    """Is a stop in force, read inside a transaction that already holds the header?
+
+    Called from a claim, after the header lock. It does not take its own lock:
+    the header lock is what serialises it against :func:`request_stop`, and a
+    second lock here would only widen the ordering surface a deadlock needs.
+    """
+    row = await _stop_row(session, batch_id=batch_id)
+    return row is not None and row.cleared_at is None
+
+
+async def _stop_facts_locked(session: AsyncSession, *, batch_id: int) -> tuple[bool, int]:
+    """``(active, generation)`` for this batch, read inside a transaction.
+
+    The generation is the stop COUNTER, not a boolean, and that is the whole point
+    of it (review R1). A plan has to be able to say *which* stop it was built in
+    knowledge of: "there was no stop" (0), "the first stop" (1), "the stop pressed
+    again after a resume" (2). An approval carrying the wrong generation is a plan
+    from before the stop the operator is looking at, and resuming on it would lift
+    a stop its author never saw.
+
+    Callers hold the batch header's row lock, which is what serialises this against
+    :func:`request_stop` and against every per-item claim.
+    """
+    row = await _stop_row(session, batch_id=batch_id)
+    if row is None:
+        return False, 0
+    return row.cleared_at is None, int(row.stop_count or 0)
+
+
+async def stop_generation(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> int:
+    """This batch's stop generation, for stamping onto a plan."""
+    async with session_maker() as session:
+        _active, generation = await _stop_facts_locked(session, batch_id=batch_id)
+        return generation
+
+
+async def live_execution_locked(session: AsyncSession, *, batch_id: int) -> int | None:
+    """The id of a non-terminal operation of this batch, or ``None``.
+
+    "Non-terminal" is queued or running, which is exactly "somebody else's turn".
+    Read inside a transaction that already holds the batch header's row lock, so
+    the answer cannot change under the caller: an executor publishes ``running``
+    before it starts a stage, and it takes that same lock for every claim.
+
+    Two callers, two different disasters avoided (reviews R1 and R2). Admitting a
+    second operation would let its confirmation clear the first one's stop and
+    resume the slots behind a request still in flight. Admitting a reconcile would
+    reinterpret the live claim as abandoned, and the provider's success would come
+    back to a row that had moved.
+
+    Deliberately imported from the operations table rather than tracked twice: one
+    place says whether a batch is busy.
+    """
+    from altegio_bot.models.models import (
+        VOUCHER_PRODUCTION_OPERATION_QUEUED,
+        VOUCHER_PRODUCTION_OPERATION_RUNNING,
+        EasyWeekVoucherProductionOperation,
+    )
+
+    row = (
+        await session.execute(
+            select(EasyWeekVoucherProductionOperation.id)
+            .where(
+                EasyWeekVoucherProductionOperation.batch_id == batch_id,
+                EasyWeekVoucherProductionOperation.status.in_(
+                    [VOUCHER_PRODUCTION_OPERATION_QUEUED, VOUCHER_PRODUCTION_OPERATION_RUNNING]
+                ),
+            )
+            .order_by(EasyWeekVoucherProductionOperation.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return int(row) if row is not None else None
+
+
+@dataclass(frozen=True)
+class BatchAdmission:
+    """Everything a decision to start something on this batch has to know.
+
+    One lock, one read, one answer — so an admission cannot be made out of two
+    facts observed at different moments.
+    """
+
+    exists: bool
+    in_flight_operation_id: int | None = None
+    stop_active: bool = False
+    stop_generation: int = 0
+
+    @property
+    def busy(self) -> bool:
+        return self.in_flight_operation_id is not None
+
+
+async def admission_locked(session: AsyncSession, *, batch_id: int) -> BatchAdmission:
+    """Take the batch header's row lock and report what may start.
+
+    The header lock is the batch's one serialisation point: ``request_stop`` takes
+    it, every per-item claim takes it, and so do the two admission decisions this
+    answers (reviews R1 and R2). Holding it while reading both the in-flight
+    operation and the stop facts is what makes those two facts a single consistent
+    observation rather than a pair that could have changed in between.
+    """
+    header = await _header_by_id(session, batch_id, for_update=True)
+    if header is None:
+        return BatchAdmission(exists=False)
+    in_flight = await live_execution_locked(session, batch_id=batch_id)
+    active, generation = await _stop_facts_locked(session, batch_id=batch_id)
+    return BatchAdmission(
+        exists=True,
+        in_flight_operation_id=in_flight,
+        stop_active=active,
+        stop_generation=generation,
+    )
+
+
+async def live_execution(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> int | None:
+    """The same question, standalone, under the header lock."""
+    async with session_maker() as session:
+        header = await _header_by_id(session, batch_id, for_update=True)
+        if header is None:
+            return None
+        return await live_execution_locked(session, batch_id=batch_id)
+
+
+async def stop_is_active(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> bool:
+    """Is a stop in force? A standalone read, for the pre-claim shortcut.
+
+    Deliberately NOT the thing that makes the stop safe — that is the identical
+    read inside :func:`_claim`, under the header lock. This one saves a stopped
+    stage from spending one EasyWeek GET per remaining slot before it finds out.
+    """
+    async with session_maker() as session:
+        return await _stop_is_active_locked(session, batch_id=batch_id)
+
+
+async def stop_state(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> StopState:
+    """The stop a page shows. A read; it changes nothing."""
+    async with session_maker() as session:
+        row = await _stop_row(session, batch_id=batch_id)
+        if row is None:
+            return StopState(active=False)
+        return StopState(
+            active=row.cleared_at is None,
+            requested_at=row.requested_at,
+            requested_by=row.requested_by,
+            cleared_at=row.cleared_at,
+            stop_count=int(row.stop_count or 0),
+        )
+
+
+async def request_stop(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    batch_id: int,
+    requested_by: str,
+) -> StopState:
+    """Persist "stop after the current request" for ONE batch. Idempotent.
+
+    Takes the batch header's row lock FIRST — the same lock, in the same order,
+    that every per-item claim takes — so a stop and a claim cannot interleave.
+    That is what makes the guarantee atomic rather than best effort: once this
+    returns, no further claim can be granted for this batch, and the request that
+    was already on the wire when it was pressed is the last one.
+
+    Pressing stop a second time is the same stop. The counter moves so an
+    operator can see they were not ignored, and nothing else does: there is no
+    second, stronger stop to escalate to, and in particular no automatic refund.
+
+    A stop that had been cleared by a continuation becomes active again, which is
+    what an operator pressing it after resuming means.
+    """
+    now = utcnow()
+    async with session_maker() as session:
+        async with session.begin():
+            header = await _header_by_id(session, batch_id, for_update=True)
+            if header is None:
+                return StopState(active=False)
+            row = await _stop_row(session, batch_id=batch_id, for_update=True)
+            if row is None:
+                row = EasyWeekVoucherProductionStopRequest(
+                    batch_id=batch_id,
+                    requested_by=requested_by,
+                    requested_at=now,
+                    stop_count=1,
+                )
+                session.add(row)
+                await session.flush()
+                return StopState(active=True, requested_at=now, requested_by=requested_by, stop_count=1)
+            row.stop_count = int(row.stop_count or 0) + 1
+            row.requested_at = now
+            row.requested_by = requested_by
+            row.cleared_at = None
+            row.cleared_by = None
+            row.updated_at = now
+            await session.flush()
+            return StopState(
+                active=True,
+                requested_at=now,
+                requested_by=requested_by,
+                stop_count=int(row.stop_count),
+            )
+
+
+async def clear_stop_locked(
+    session: AsyncSession,
+    *,
+    batch_id: int,
+    cleared_by: str,
+    now: datetime,
+) -> bool:
+    """Lift a stop because an operator confirmed a fresh plan for this batch.
+
+    Deliberately not its own endpoint and not a "resume" button. The ONLY thing
+    that lifts a stop is the act §43.9 and §43.6 require for continuing at all: a
+    freshly built plan, re-proven live, confirmed by an authenticated operator for
+    the slots that plan authorises. Clearing it in that same transaction means
+    there is no moment in which a batch is resumable without a decision.
+
+    Runs inside the confirm transaction, which already holds its locks.
+    """
+    row = await _stop_row(session, batch_id=batch_id, for_update=True)
+    if row is None or row.cleared_at is not None:
+        return False
+    row.cleared_at = now
+    row.cleared_by = cleared_by
+    row.updated_at = now
+    await session.flush()
+    return True
+
+
 async def _claim(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -1103,6 +1378,7 @@ async def _claim(
     attempted_field: str,
     extra: dict[str, Any] | None = None,
     allow_halted: bool = False,
+    honour_stop: bool = False,
 ) -> ClaimOutcome:
     """Lock the header and the one slot, check everything, stamp, commit.
 
@@ -1150,6 +1426,20 @@ async def _claim(
             if header.status == VOUCHER_PRODUCTION_HALTED and not allow_halted:
                 return ClaimOutcome(False, CLAIM_REFUSED_HALTED, header.status)
 
+            # The operator's stop, read INSIDE this transaction and after the
+            # header lock (§43.6). That ordering is the whole guarantee:
+            # ``request_stop`` locks the same header row before it writes, so a
+            # stop and a claim can never overlap, and there is no window in which
+            # one more slot is claimed because the check happened a moment too
+            # early. A pre-loop read would have exactly that window.
+            #
+            # Checked before anything is stamped, so a stopped slot carries no
+            # claim, no attempt and no doubt. The refund deliberately does not
+            # pass ``honour_stop``: a stop is a reason to want the money back,
+            # not a reason to be unable to ask for it.
+            if honour_stop and await _stop_is_active_locked(session, batch_id=batch_id):
+                return ClaimOutcome(False, CLAIM_REFUSED_STOPPED, header.status)
+
             row = await _one_item(session, batch_id=batch_id, slot=slot, for_update=True)
             if row is None:
                 return ClaimOutcome(False, CLAIM_REFUSED_MISSING_ROW, None)
@@ -1191,6 +1481,7 @@ async def claim_create(
     plan_digest: str,
     create_window_start: datetime,
     create_window_end: datetime,
+    honour_stop: bool = False,
 ) -> ClaimOutcome:
     """Reserve the right to send the ONE create POST for this slot."""
     return await _claim(
@@ -1212,6 +1503,7 @@ async def claim_create(
             # proven manual closure — never by a search that found nothing.
             "manual_cleanup_required": True,
         },
+        honour_stop=honour_stop,
     )
 
 
@@ -1222,6 +1514,7 @@ async def claim_pay(
     batch_id: int,
     slot: int,
     plan_digest: str,
+    honour_stop: bool = False,
 ) -> ClaimOutcome:
     """Reserve the right to send the ONE payment POST for this slot."""
     return await _claim(
@@ -1235,6 +1528,7 @@ async def claim_pay(
         digest_field="pay_plan_digest",
         claimed_field="pay_claimed_at",
         attempted_field="pay_attempted_at",
+        honour_stop=honour_stop,
     )
 
 
@@ -1283,6 +1577,7 @@ async def claim_send(
     meta_template_name: str,
     template_language: str,
     sender_id: int | None,
+    honour_stop: bool = False,
 ) -> ClaimOutcome:
     """Reserve the ONE delivery of this slot, and write its intent, before sending.
 
@@ -1303,6 +1598,12 @@ async def claim_send(
                 return ClaimOutcome(False, CLAIM_REFUSED_IDENTITY, header.status)
             if header.status == VOUCHER_PRODUCTION_HALTED:
                 return ClaimOutcome(False, CLAIM_REFUSED_HALTED, header.status)
+
+            # The same in-transaction stop check as every other claim, and here
+            # it matters most: this is the claim after which a real person's
+            # phone is the next thing that happens.
+            if honour_stop and await _stop_is_active_locked(session, batch_id=batch_id):
+                return ClaimOutcome(False, CLAIM_REFUSED_STOPPED, header.status)
 
             row = await _one_item(session, batch_id=batch_id, slot=slot, for_update=True)
             if row is None:
@@ -1382,6 +1683,7 @@ async def record_item_outcome(
     reconciliation_required: bool | None = None,
     manual_cleanup_observed: bool = False,
     attempt_outcome: str | None = None,
+    require_idle: bool = False,
 ) -> RecordOutcome:
     """Write what one slot's stage turned out to be — as a compare-and-set.
 
@@ -1406,6 +1708,31 @@ async def record_item_outcome(
             header = await _header_by_id(session, batch_id, for_update=True)
             if header is None:
                 return RecordOutcome(False, RECORD_MISSING_ROW)
+
+            # Only a reconcile passes this (review R2). A reconcile exists to say
+            # "a process died and left this claim behind", and while an executor is
+            # actually RUNNING that statement is false: the claim is live, its
+            # request is in flight, and moving the row out from under it leaves the
+            # success about to come back with nowhere to land.
+            #
+            # Checked here, inside the transaction that already holds the header
+            # lock, because an executor publishes `running` before it starts a stage
+            # and takes the same lock for every claim. The two therefore cannot
+            # interleave: either this sees the operation and refuses, or it commits
+            # first and the stage's own live plan rebuild refuses on the changed
+            # ledger. Neither order loses a result.
+            #
+            # An operation that really died is terminal, so a reconcile after a
+            # genuine crash passes straight through — which is when it is needed.
+            if require_idle and await live_execution_locked(session, batch_id=batch_id) is not None:
+                return RecordOutcome(
+                    False,
+                    RECORD_REFUSED_BUSY,
+                    header.status,
+                    header.status == VOUCHER_PRODUCTION_HALTED,
+                    bool(header.reconciliation_required),
+                )
+
             row = await _one_item(session, batch_id=batch_id, slot=slot, for_update=True)
             if row is None:
                 return RecordOutcome(
@@ -1730,10 +2057,13 @@ __all__ = [
     "BatchIdentity",
     "BatchItemIdentity",
     "BatchSnapshot",
+    "CLAIM_REFUSED_STOPPED",
+    "BatchAdmission",
     "ClaimOutcome",
     "FreezeOutcome",
     "ItemSnapshot",
     "RecordOutcome",
+    "StopState",
     "apply_webhook_transition",
     "binding_matches",
     "claim_create",
@@ -1747,6 +2077,15 @@ __all__ = [
     "preview_is_locked_by_voucher_production",
     "production_batch_id_for_preview",
     "record_item_outcome",
+    "RECORD_REFUSED_BUSY",
+    "admission_locked",
+    "clear_stop_locked",
+    "live_execution",
+    "live_execution_locked",
     "record_webhook_transition",
+    "request_stop",
     "resettle",
+    "stop_generation",
+    "stop_is_active",
+    "stop_state",
 ]

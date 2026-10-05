@@ -36,12 +36,14 @@ import pytest
 import yaml
 
 from altegio_bot.tests.test_ci_workflow_nginx_gate import (
+    BROWSER_SUITE,
     DEDICATED_JOB,
     EXECUTION_JOBS,
     MIGRATION_GATE_ENV,
     MIGRATION_SUITE,
     NGINX_GATE_ENV,
     NGINX_SUITE,
+    VOUCHER_MIGRATION_SUITE,
     _execution_steps,
     _pytest_invocations,
     _steps,
@@ -74,11 +76,22 @@ HANDOVER_SUITES = (
     "src/altegio_bot/tests/test_easyweek_reminder_handover_db.py",
     "src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py",
 )
-DEDICATED_GATE_SUITES = (MIGRATION_SUITE, NGINX_SUITE, *HANDOVER_SUITES)
+# §43's migration cycle joined the dedicated job under its own mandatory flag, and
+# the browser acceptance suite runs on its own runner — both are subtracted from the
+# rest shard so nothing is collected twice.
+DEDICATED_GATE_SUITES = (
+    MIGRATION_SUITE,
+    NGINX_SUITE,
+    *HANDOVER_SUITES,
+    VOUCHER_MIGRATION_SUITE,
+)
 
-# The five --ignore entries that keep the heavy mandatory suites from running a
-# second time inside the general invocation.
-EXPECTED_IGNORED_SUITES = frozenset({MIGRATION_SUITE, NGINX_SUITE, *HANDOVER_SUITES})
+# The --ignore entries that keep the mandatory suites from running a second time
+# inside the general invocation. Every one of them is executed somewhere else: the
+# dedicated job runs these, and `required-tests-browser` runs the browser suite.
+EXPECTED_IGNORED_SUITES = frozenset(
+    {MIGRATION_SUITE, NGINX_SUITE, *HANDOVER_SUITES, VOUCHER_MIGRATION_SUITE, BROWSER_SUITE}
+)
 
 
 # ===========================================================================

@@ -43,6 +43,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import (
     DELIVERY_UNKNOWN,
     DeliveryOutcome,
 )
+from altegio_bot.campaigns.easyweek_voucher_production import issuer as issuer_module
 from altegio_bot.campaigns.easyweek_voucher_production.composition import BatchApproval
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     KARLSRUHE_COMPANY_ID,
@@ -71,9 +72,52 @@ from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 
 COMPANY_ID = KARLSRUHE_COMPANY_ID
+# The ONE approved issuer of every production voucher, synthetically (§43.9).
+# Obviously fabricated, like every other identity here: the real staffer UUID is
+# deployment configuration and the owner's local evidence, and putting it in a
+# fixture would publish it in the repository forever.
 STAFFER_UUID = "dddddddd-4444-4444-8444-dddddddddddd"
+# A second perfectly valid staffer of the same branch, for the case the pin
+# exists to catch: seven of the eight people at Karlsruhe have a UUID that passes
+# every other check in this phase and is still the wrong answer.
+OTHER_STAFFER_UUID = "dddddddd-4444-4444-8444-dddddddddd99"
 ACCOUNT_UUID = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
 SENDER_PHONE_NUMBER_ID = "SYNTHETIC_PRODUCTION_PHONE_NUMBER_ID"
+
+# The fingerprint the synthetic issuer above has, computed the same way runtime
+# computes it. Tests replace what `expected_issuer_fingerprint()` ANSWERS, which
+# is the single narrow seam the issuer module exposes — never a bypass flag and
+# never an environment variable. There is no value this can be set to that lets
+# an arbitrary UUID through: the comparison stays exact, it is only told which
+# fingerprint is the approved one in this synthetic world.
+SYNTHETIC_ISSUER_FINGERPRINT = issuer_module.issuer_fingerprint(STAFFER_UUID)
+
+
+def pin_synthetic_issuer(monkeypatch: pytest.MonkeyPatch, *, fingerprint: str | None = None) -> None:
+    """Make `STAFFER_UUID` the approved issuer for the duration of one test."""
+    monkeypatch.setattr(
+        issuer_module,
+        "expected_issuer_fingerprint",
+        lambda: fingerprint if fingerprint is not None else SYNTHETIC_ISSUER_FINGERPRINT,
+    )
+
+
+def staffers_page(
+    uuids: list[str],
+    *,
+    current: int = 1,
+    last: int = 1,
+) -> dict[str, Any]:
+    """One page of ``GET /locations/{uuid}/staffers`` as the strict walk expects.
+
+    The walk proves completeness from ``meta.last_page``, so a fixture that wants
+    an INCOMPLETE walk simply omits or contradicts the metadata.
+    """
+    return {
+        "data": [{"uuid": value} for value in uuids],
+        "meta": {"current_page": current, "last_page": last, "per_page": 100},
+    }
+
 
 # Big enough for the sizes these tests actually exercise: 1, 2, 6 (the number
 # §41 could not hold), 12 (a mailing where a per-item quadratic would bite), and
@@ -134,11 +178,17 @@ def location_map(*, booking_link: str = BOOKING_LINK) -> str:
 
 @pytest.fixture
 def production_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fence open and every identity configured — the acting case."""
+    """The fence open and every identity configured — the acting case.
+
+    Includes the §43.9 issuer pin, because a correctly configured deployment has
+    one: the configured staffer IS the approved issuer. Tests about the pin
+    failing re-point the seam or the setting themselves.
+    """
     monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_staffer_uuid", STAFFER_UUID, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_account_uuid", ACCOUNT_UUID, raising=False)
+    pin_synthetic_issuer(monkeypatch)
 
 
 def production_request(*, run_id: int, batch_id: int | None = None) -> ProductionRequest:
@@ -293,6 +343,7 @@ class FakeReader:
         orders: dict[str, Any] | None = None,
         template: dict[str, Any] | Exception | None = None,
         order_pages: list[dict[str, Any]] | Exception | None = None,
+        staffer_pages: list[dict[str, Any]] | Exception | None = None,
     ) -> None:
         known = list(range(count)) if indices is None else list(indices)
         # One card per person, addressable by UUID.
@@ -308,9 +359,17 @@ class FakeReader:
         self.orders: dict[str, Any] = orders or {}
         self.template = template if template is not None else template_payload()
         self.order_pages = order_pages if order_pages is not None else [orders_page()]
+        # The location's staffer catalogue, for the §43.9 membership proof. By
+        # default the branch holds the approved issuer plus one other employee,
+        # which is the shape production actually has: one right answer among
+        # several valid UUIDs.
+        self.staffer_pages = (
+            staffer_pages if staffer_pages is not None else [staffers_page([OTHER_STAFFER_UUID, STAFFER_UUID])]
+        )
         self.customer_calls: list[str] = []
         self.order_calls: list[str] = []
         self.listing_calls: list[tuple[str, int]] = []
+        self.staffer_calls: list[tuple[str, int]] = []
         self.template_calls = 0
 
     def teach(self, indices: list[int]) -> None:
@@ -358,6 +417,19 @@ class FakeReader:
         if answer is None:
             raise KeyError(order_uuid)
         return answer
+
+    async def list_location_staffers(self, location_uuid: str, *, page: int) -> dict[str, Any]:
+        """One page of the location's staffer catalogue.
+
+        Recorded per call, so a test can prove the walk happens ONCE per stage
+        plan rather than once per recipient.
+        """
+        self.staffer_calls.append((location_uuid, page))
+        if isinstance(self.staffer_pages, Exception):
+            raise self.staffer_pages
+        if page > len(self.staffer_pages):
+            raise AssertionError(f"the staffer walk asked for page {page} beyond the fixture")
+        return self.staffer_pages[page - 1]
 
     async def get_voucher_template(self, template_uuid: str) -> dict[str, Any]:
         self.template_calls += 1

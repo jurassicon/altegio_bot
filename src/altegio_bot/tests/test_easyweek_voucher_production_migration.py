@@ -237,14 +237,24 @@ def test_the_orm_and_the_migration_describe_the_same_tables() -> None:
 
 
 @pytest.mark.asyncio
-async def test_head_upgrade_on_an_empty_database_creates_the_three_tables(temp_db_url: str) -> None:
-    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
-    (head,) = script.get_heads()
+async def test_upgrading_to_the_pr19_revision_creates_the_three_tables(temp_db_url: str) -> None:
+    """§42's own migration, addressed by its own revision rather than by "head".
 
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    It used to upgrade to ``head`` and assert that §42's three tables were the only
+    ``easyweek_voucher_production%`` ones. That was true while §42 WAS the head and
+    stopped being true the moment a later phase added a revision — which is exactly
+    the trap §42's runbook warns about for operators. Naming the revision keeps this
+    test about the migration it is about, for every phase after it.
+
+    The chain still has to have exactly one head; that is asserted separately.
+    """
+    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    assert len(script.get_heads()) == 1
+
+    _alembic_ok("upgrade", PR19_REVISION, db_url=temp_db_url)
     current = _alembic_ok("current", db_url=temp_db_url)
 
-    assert head in current
+    assert PR19_REVISION in current
     assert await _tables(temp_db_url, "easyweek_voucher_production%") == set(PR19_TABLES)
 
 
@@ -317,8 +327,13 @@ async def test_the_migration_matches_the_orm_exactly(temp_db_url: str) -> None:
 
 @pytest.mark.asyncio
 async def test_downgrade_removes_only_the_new_objects(temp_db_url: str) -> None:
-    """Exactly the three new tables go, and every historical ledger stays."""
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    """Exactly the three new tables go, and every historical ledger stays.
+
+    Bounded to §42's revision rather than to ``head``: a later phase's tables are
+    not this migration's to remove, and upgrading past it would make "before minus
+    after" describe two migrations at once.
+    """
+    _alembic_ok("upgrade", PR19_REVISION, db_url=temp_db_url)
     before = await _tables(temp_db_url, "easyweek_%voucher%")
 
     _alembic_ok("downgrade", PR19_PARENT_REVISION, db_url=temp_db_url)
@@ -330,9 +345,9 @@ async def test_downgrade_removes_only_the_new_objects(temp_db_url: str) -> None:
         assert table in after
 
     # And it goes back up cleanly, so a rollback is not a one-way door.
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    _alembic_ok("upgrade", PR19_REVISION, db_url=temp_db_url)
     assert await _tables(temp_db_url, "easyweek_voucher_production%") == set(PR19_TABLES)
-    assert _alembic_ok("heads", db_url=temp_db_url).count(PR19_REVISION) == 1
+    assert _alembic_ok("current", db_url=temp_db_url).count(PR19_REVISION) == 1
 
 
 async def _seed_run_and_recipients(db_url: str, *, count: int, phone_offset: int = 0) -> tuple[int, list[int]]:
@@ -1146,15 +1161,21 @@ async def test_historical_canary_and_batch_rows_survive_the_round_trip(temp_db_u
 
 @pytest.mark.asyncio
 async def test_an_upgrade_over_a_populated_production_table_is_a_no_op(temp_db_url: str) -> None:
-    """Re-running the upgrade on an already-migrated database changes nothing."""
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    """Re-running the upgrade on an already-migrated database changes nothing.
+
+    Pinned to §42's revision, so what is proven idempotent is §42's migration and
+    not whatever the chain happens to end with.
+    """
+    _alembic_ok("upgrade", PR19_REVISION, db_url=temp_db_url)
     _run_id, _recipients, batch_id = await _seed_batch(temp_db_url, recipient_count=3)
 
-    _alembic_ok("upgrade", "head", db_url=temp_db_url)
+    _alembic_ok("upgrade", PR19_REVISION, db_url=temp_db_url)
 
     rows = await _fetch(
         temp_db_url,
         "SELECT id, recipient_count, approved_recipient_count FROM easyweek_voucher_production_batches",
     )
     assert rows == [(batch_id, 3, 3)]
-    assert _alembic_ok("heads", db_url=temp_db_url).count(PR19_REVISION) == 1
+    assert _alembic_ok("current", db_url=temp_db_url).count(PR19_REVISION) == 1
+    # One head overall, whichever revision that is now.
+    assert len(ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_heads()) == 1

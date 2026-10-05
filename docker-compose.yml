@@ -237,6 +237,50 @@ services:
         condition: service_started
     command: ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_easyweek_inbox_worker"]
 
+  # §43: the dedicated executor of confirmed voucher-mailing stages (PR-20).
+  #
+  # A supervised service rather than something a human runs with `exec`. A stage
+  # over a real list takes minutes and must survive the request that confirmed it,
+  # the tab that was closed and the process that was restarted — and `exec` gives
+  # it none of that: the work would die with the terminal, and nobody would be able
+  # to tell "still running" from "died silently".
+  #
+  # ONE of these, and no rolling deploy. The executor interrupts every `running`
+  # operation it finds at start-up, which is correct for a single executor (such a
+  # row can only belong to a dead process) and wrong for two overlapping ones.
+  # `deploy.replicas: 1` states that for the orchestrators that read it; the
+  # database enforces it regardless, via `FOR UPDATE SKIP LOCKED` on the claim.
+  #
+  # Deliberately NOT the generic campaign worker. That worker's purpose is to retry
+  # what it finds, which is right for an idempotent job and catastrophically wrong
+  # here: EasyWeek publishes no write idempotency key and Meta will deliver twice.
+  # This one has no retry path at all.
+  #
+  # Starting the container authorises NOTHING. With
+  # EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED false — the default — every stage it
+  # picks up still refuses, and each stage needs its own confirmation in the UI.
+  #
+  # `stop_grace_period` is generous on purpose: SIGTERM is checked BETWEEN
+  # operations, never during one, so a stage that is mid-flight finishes and records
+  # its outcome instead of being cut in half. A stage that outlasts the grace period
+  # is killed, which reads as `interrupted` and is resolved by a readback — see the
+  # runbook's drain section.
+  altegio-easyweek-voucher-executor:
+    build: .
+    restart: always
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    stop_grace_period: 120s
+    command:
+      ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_easyweek_voucher_production_worker"]
+
   # Migration runner — not started by default `docker compose up -d`.
   # Run explicitly: docker compose --profile ops run --rm migrate
   migrate:
