@@ -30,6 +30,7 @@ scratch.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Final
 
 from altegio_bot.models.models import (
@@ -101,9 +102,8 @@ RUN_UNPROVEN: Final = "voucher_production_run_unproven"
 # The preview holds no active manually selected candidate at all. An empty batch
 # is not a small batch: there is nothing to approve.
 COMPOSITION_EMPTY: Final = "voucher_production_composition_empty"
-# An earned or owner-test candidate sits in the same snapshot. This phase serves
-# one basis, and a mixed snapshot is an operator's decision to make again, not
-# one for a tool to resolve by filtering.
+# Retained stable refusal for a snapshot containing unsupported owner-test or
+# unknown bases, or any earned row in a historical v1 manual-only batch.
 COMPOSITION_MIXED_BASIS: Final = "voucher_production_composition_mixed_basis"
 # Two active rows resolve to one EasyWeek customer.
 COMPOSITION_DUPLICATE_CUSTOMER: Final = "voucher_production_composition_duplicate_customer"
@@ -281,7 +281,17 @@ def production_marker(*, preview_run_id: int, campaign_recipient_id: int, slot: 
     return "ewvp1-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
-def binding_material(*, batch_id: int, slot: int) -> str:
+def binding_material(
+    *,
+    batch_id: int,
+    slot: int,
+    schema_version: str = "1",
+    frozen_digest: str | None = None,
+    recipient_basis: str | None = None,
+    manual_policy: str | None = None,
+    source_proof_digest: str | None = None,
+    customer_uuid: str | None = None,
+) -> str:
     """What a slot's voucher MAC is bound to, besides the order and the product.
 
     Both halves matter and neither is enough alone. The slot alone repeats
@@ -290,7 +300,20 @@ def binding_material(*, batch_id: int, slot: int) -> str:
     ignores which of its recipients the code belongs to. Together they name
     exactly one row, table-wide, for the lifetime of the phase.
     """
-    return f"{PRODUCTION_SCOPE}:{batch_id}:{slot}"
+    legacy = f"{PRODUCTION_SCOPE}:{batch_id}:{slot}"
+    if schema_version == "1":
+        return legacy
+    if schema_version != "2" or not frozen_digest or not recipient_basis or not customer_uuid:
+        raise ValueError("voucher_production_binding_identity_unproven")
+    material = {
+        "schema_version": schema_version,
+        "frozen_digest": frozen_digest,
+        "recipient_basis": recipient_basis,
+        "manual_policy": manual_policy,
+        "source_proof_digest": source_proof_digest,
+        "customer_uuid": customer_uuid,
+    }
+    return legacy + ":v2:" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
 __all__ = [

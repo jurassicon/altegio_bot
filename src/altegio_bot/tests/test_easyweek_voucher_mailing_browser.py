@@ -1502,3 +1502,88 @@ async def test_a_status_error_does_not_blank_a_mailings_progress(
     assert await page.locator("#slots-table tbody tr").count() == rows_before
     assert mutator.calls.count("create") == count
     assert_no_page_errors(page)
+
+
+async def test_operator_adds_checked_subset_to_earned_preview_and_delivers_mixed_mailing(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """Paste → read results → explicit subset → four stage confirmations, all in UI."""
+    from sqlalchemy import func, select
+
+    import altegio_bot.ops.voucher_mailing as voucher_ops
+    from altegio_bot.models.models import CampaignRecipient, Client
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_mixed_ui_fixtures import MixedReader, seed_mixed_editor
+    from altegio_bot.tests.easyweek_voucher_production_fixtures import CUSTOMER_UUIDS, PHONES
+
+    monkeypatch.setattr(settings, "easyweek_allowed_service_categories", '["Wimpernverlängerung"]')
+    run_id, earned_id = await seed_mixed_editor(session_maker)
+    reader = MixedReader(count=3)
+    # Third contact's malformed history is never interpreted as empty.
+    reader.history[CUSTOMER_UUIDS[2]] = {"data": [], "meta": {"total": 0}}
+    transports.use(reader=reader)
+    monkeypatch.setattr(voucher_ops, "EasyWeekClient", lambda: reader)
+    await page.goto(f"/ops/campaigns/{run_id}")
+    assert "Automatic: 1" in await page.inner_text("#preview-basis-counts")
+    async with session_maker() as session:
+        initial_client_count = await session.scalar(select(func.count()).select_from(Client))
+    await page.fill("#bulk-phones", "\n".join([PHONES[0], PHONES[1], PHONES[1], PHONES[2]]))
+    await page.check("#bulk-altegio")
+    await page.check("#bulk-karlsruhe")
+    await page.click("#bulk-check")
+    await page.wait_for_selector("#bulk-result-table")
+    results = await page.inner_text("#bulk-result-table")
+    assert "Можно добавить" in results and "Уже присутствует" in results and "Повтор строки" in results
+    assert "Историю EasyWeek не удалось доказать" in results
+    assert await page.is_disabled("#bulk-confirm")
+    async with session_maker() as session:
+        assert await session.scalar(select(func.count()).select_from(Client)) == initial_client_count
+        assert await session.scalar(select(func.count()).select_from(CampaignRecipient)) == 1
+    await page.check("#bulk-subset-confirmed")
+    await page.click("#bulk-confirm")
+    await page.wait_for_function("document.querySelector('#bulk-status').innerText.includes('Состав добавлен: 1')")
+    await page.reload()
+    assert await page.is_hidden("#bulk-confirm-panel")
+    assert "manual: 1" in await page.inner_text("#preview-basis-counts")
+    async with session_maker() as session:
+        earned = await session.get(CampaignRecipient, earned_id)
+        assert earned.recipient_basis == "earned_first_visit"
+        assert earned.source_booking_uuid is not None
+        assert await session.scalar(select(func.count()).select_from(CampaignRecipient)) == 2
+
+    # Navigate by the page's actual action; do not hand-copy ids into the mailing URL.
+    await page.click("#preview-vouchers-link")
+    await page.wait_for_url(re.compile(r"/ops/voucher-mailings/prepare\?preview_run_id=\d+$"))
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    assert (await page.inner_text("#c-count")).strip() == "2"
+    composition_text = await page.inner_text("#composition-table")
+    assert "доказанный первый визит" in composition_text and "заявление о визите Altegio" in composition_text
+    await page.fill("#f-count", "2")
+    await page.fill("#f-euro", "30.00")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+    await page.wait_for_selector("#tracked-operation")
+    await _drain(session_maker)
+    await page.wait_for_url(_MAILING_URL, timeout=20_000)
+    batch_id = int(page.url.rstrip("/").rsplit("/", 1)[-1])
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(0), _ok(1)]))
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-create")
+    await _wait_for_slots_text(page, "created")
+    settles = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    transports.use(reader=reader, mutator=FakeMutator(pay_sequence=[_ok(0), _ok(1)], reader=reader, settles=settles))
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-pay")
+    await _wait_for_slots_text(page, "paid")
+    sender = FakeSender()
+    transports.use(reader=reader, sender=sender)
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-deliver")
+    await _wait_for_slots_text(page, "provider_accepted")
+    assert sender.calls == 2
+    await page.reload()
+    await _wait_for_slots_text(page, "provider_accepted")
+    assert sender.calls == 2
+    delivery = await page.inner_text("#delivery-panel")
+    assert "Meta приняла" in delivery and "Прочитано" in delivery and "0 из" in delivery
+    assert_no_page_errors(page)

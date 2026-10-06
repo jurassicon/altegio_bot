@@ -1286,7 +1286,7 @@ async def test_one_batch_cannot_hold_the_same_customer_twice(session_maker):
 
 
 async def test_a_mixed_basis_snapshot_refuses_whole(session_maker, production_configuration, binding_key):
-    """An earned or test row in the same preview cancels the composition."""
+    """An owner-test row in the same preview cancels the composition."""
     run_id, _ = await seed_production_preview(
         session_maker, count=2, bases=["operator_manual_selection", RECIPIENT_BASIS_TEST]
     )
@@ -2154,7 +2154,7 @@ async def test_a_pr18_mac_does_not_verify_here(session_maker, production_configu
     )
     _own_key, own_mac = voucher_code_mac(
         voucher_code=VOUCHER_CODE_SENTINELS[0],
-        ledger_uuid=binding_material(batch_id=batch_id, slot=1),
+        ledger_uuid=await ledger_module.load_binding_material(session_maker, batch_id=batch_id, slot=1),
         target_order_uuid=ORDER_UUIDS[0],
         voucher_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
         domain=ledger_module.VOUCHER_PRODUCTION_DOMAIN,

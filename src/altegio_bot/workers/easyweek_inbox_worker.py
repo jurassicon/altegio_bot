@@ -120,6 +120,12 @@ from ..easyweek_service_category import (
     record_raw_with_services_count,
     services_count_from_record_raw,
 )
+from ..easyweek_uuid_identity import (
+    UUIDIdentityResolutionRequired,
+    lock_customer_phone,
+    needs_uuid_resolution,
+    resolve_webhook_identity,
+)
 from ..message_planner import MAX_VISITS_FOR_REVIEW
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
@@ -588,6 +594,7 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     if booking.customer_id is None:
         return None
 
+    await lock_customer_phone(session, booking.phone_e164)
     existing = (
         (
             await session.execute(
@@ -603,6 +610,8 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     )
 
     if existing is None:
+        if await needs_uuid_resolution(session, booking):
+            raise UUIDIdentityResolutionRequired(booking)
         client = Client(
             provider=PROVIDER,
             company_id=booking.company_id,
@@ -614,6 +623,26 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
         session.add(client)
         await session.flush()
         return client
+
+    # A numeric hit does not override an independently proven UUID identity.
+    # Re-prove outside this transaction before adopting a competing phone, and
+    # never silently change the phone of a UUID-bound card.
+    if booking.carries("phone_e164") and booking.phone_e164 != existing.phone_e164:
+        if existing.easyweek_customer_uuid is not None:
+            raise UUIDIdentityResolutionRequired(booking)
+    if booking.phone_e164 is not None:
+        conflict = await session.scalar(
+            select(Client.id)
+            .where(
+                Client.provider == PROVIDER,
+                Client.easyweek_customer_uuid.is_not(None),
+                Client.phone_e164 == booking.phone_e164,
+                Client.id != existing.id,
+            )
+            .limit(1)
+        )
+        if conflict is not None:
+            raise UUIDIdentityResolutionRequired(booking)
 
     # Patch, never blanket overwrite: a cancel delivery that omits the e-mail
     # must not erase the address the create delivery proved.
@@ -1147,7 +1176,7 @@ async def record_visit_counter(
             record.id,
         )
         return
-    if int(client.altegio_client_id) != visit.customer_id:
+    if client.altegio_client_id != visit.customer_id:
         # The Record points at a client the payload does not name. Never
         # resolved by phone, name or a bare customer id — that is how one
         # person's visit count lands on another person's row.
@@ -1292,7 +1321,7 @@ async def plan_review_job(
     if client is None:
         logger.info("easyweek review skipped event=%s record_id=%s reason=no_client", event.id, record.id)
         return
-    if expected_customer_id is not None and int(client.altegio_client_id) != expected_customer_id:
+    if expected_customer_id is not None and client.altegio_client_id != expected_customer_id:
         # The booking was reassigned after this delivery was captured. The review
         # belongs to the customer who actually had the visit, and sending it to
         # whoever holds the booking now is a cross-client message — the one thing
@@ -1350,7 +1379,7 @@ async def plan_review_job(
         )
         return
 
-    if int(client.altegio_client_id) != visit.customer_id:
+    if client.altegio_client_id != visit.customer_id:
         # The counter attached this visit to a customer; the review must go to
         # the same one, proven the same way, or not at all.
         logger.warning(
@@ -1596,7 +1625,7 @@ async def plan_repeat_job(
     if client is None:
         logger.info("easyweek repeat skipped event=%s record_id=%s reason=no_client", event.id, record.id)
         return
-    if int(client.altegio_client_id) != visit.customer_id:
+    if client.altegio_client_id != visit.customer_id:
         # The Record points at a client this delivery does not name. Never
         # resolved by phone or name — that is how one person's invitation lands
         # on another person's number.
@@ -1607,7 +1636,7 @@ async def plan_repeat_job(
             client.id,
         )
         return
-    if expected_customer_id is not None and int(client.altegio_client_id) != expected_customer_id:
+    if expected_customer_id is not None and client.altegio_client_id != expected_customer_id:
         logger.warning(
             "easyweek repeat refused event=%s record_id=%s client_id=%s reason=client_reassigned",
             event.id,
@@ -2709,6 +2738,13 @@ async def process_one() -> bool:
         # Safe metadata only: never str(exc), never a traceback. A SQLAlchemy
         # error renders the statement WITH its bound parameters, which here
         # means the customer's phone, e-mail, name and comment.
+        if isinstance(exc, UUIDIdentityResolutionRequired):
+            # The claim and all domain writes have rolled back. GETs must not
+            # hold that transaction while proving the new UUID/numeric bridge.
+            if await resolve_webhook_identity(SessionLocal, event_id=transient_event_id, booking=exc.booking):
+                return True
+            await schedule_retry(transient_event_id)
+            return False
         if isinstance(exc, RecoverableCategoryConfigurationError):
             # The outer transaction already rolled the claim and all domain
             # writes back, so the row is `captured` again. Give it a short,

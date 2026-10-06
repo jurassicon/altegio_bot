@@ -681,7 +681,8 @@ async def test_the_easyweek_ui_offers_no_run_from_preview_and_no_altegio_field(
     # §37.1 renamed the control: one "Add recipient" button, whose contract
     # depends on the provider rather than on the label.
     assert "Add recipient" in page
-    assert "обычный send-real" in page.lower()
+    assert "Generic campaign send-real, MessageJob/Outbox" in page
+    assert "и follow-up для EasyWeek закрыты." in page
 
 
 @pytest.mark.asyncio

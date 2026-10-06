@@ -169,6 +169,7 @@ async def test_duplicate_manual_add_uses_a_warning_not_a_success_alert(
     driver = """
 let IS_EASYWEEK = true;
 let ADD_RECIPIENT_MODE = "manual";
+const EDITOR_CSRF = "synthetic-session-csrf";
 const MANUAL_ADD_REASONS = {};
 const elements = {
   "add-phone": {value: "+4915100000042"},
@@ -2358,7 +2359,8 @@ emit(Object.assign(state(), {alertText: el("preview-alert").innerHTML}));
     answer = _run_node(source, driver)
 
     assert "EasyWeek" in answer["alertText"]
-    assert "§37.1" in answer["alertText"]
+    assert "Ваучеры" in answer["alertText"]
+    assert "редактирование snapshot" in answer["alertText"]
     assert answer["context"] is None
     assert answer["runDisabled"] is True
     assert answer["spinnerHidden"] is True

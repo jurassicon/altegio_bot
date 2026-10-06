@@ -39,15 +39,17 @@ as configuration.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
+from altegio_bot.campaigns import easyweek_manual_batch
 from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
 from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
@@ -69,9 +71,12 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     APPROVED_ISSUER_DISPLAY_NAME_GENITIVE,
 )
 from altegio_bot.db import SessionLocal
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     CampaignRecipient,
     CampaignRun,
@@ -128,6 +133,23 @@ class ConfirmRequest(BaseModel):
 
 class CompositionRequest(BaseModel):
     preview_run_id: int
+
+
+class RecipientCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_run_id: int = Field(gt=0)
+    phones: str = Field(min_length=1, max_length=16384)
+    prior_altegio_visit_confirmed: bool
+    assign_karlsruhe_confirmed: bool
+
+
+class RecipientConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_run_id: int = Field(gt=0)
+    plan_id: str = Field(min_length=1, max_length=128)
+    confirmed_count: int = Field(gt=0, le=100)
 
 
 class StopRequest(BaseModel):
@@ -483,6 +505,86 @@ async def api_composition(request: Request, payload: CompositionRequest) -> JSON
     return JSONResponse(status_code=200, content=view.as_ui_dict())
 
 
+async def _recipient_request(request: Request, schema: type[BaseModel]) -> BaseModel | None:
+    """Bound the actual streamed body, including chunked requests, before parsing."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 24576:
+            return None
+    try:
+        return schema.model_validate_json(body)
+    except (ValidationError, ValueError):
+        return None
+
+
+_MANUAL_BATCH_IN_FLIGHT: set[str] = set()
+
+
+async def _manual_batch_action(request: Request, *, confirm: bool) -> JSONResponse:
+    principal, refusal = _principal_or_error(request)
+    if refusal is not None or principal is None:
+        return refusal or _session_error(OpsSessionError("ops_session_invalid"))
+    # One API process is the supported topology. Reject overlap before any API
+    # reads, so concurrent requests cannot evade the durable per-minute budget.
+    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
+    try:
+        async with asyncio.timeout(10):
+            payload = await _recipient_request(request, RecipientConfirmRequest if confirm else RecipientCheckRequest)
+    except TimeoutError:
+        payload = None
+    if payload is None:
+        return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
+    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
+    _MANUAL_BATCH_IN_FLIGHT.add(principal.account)
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as reader:
+            common = {
+                "run_id": payload.preview_run_id,
+                "reader": reader,
+                "operator": principal.account,
+                "session_fingerprint": principal.session_fingerprint,
+            }
+            if isinstance(payload, RecipientConfirmRequest):
+                result = await easyweek_manual_batch.confirm_manual_recipients(
+                    SessionLocal, plan_id=payload.plan_id, confirmed_count=payload.confirmed_count, **common
+                )
+            else:
+                result = await easyweek_manual_batch.check_manual_recipients(
+                    SessionLocal,
+                    phones=payload.phones,
+                    prior_altegio_visit_confirmed=payload.prior_altegio_visit_confirmed,
+                    assign_karlsruhe_confirmed=payload.assign_karlsruhe_confirmed,
+                    **common,
+                )
+    except (EasyWeekError, TimeoutError):
+        result = {"ok": False, "reason": "manual_batch_provider_unavailable"}
+    except SQLAlchemyError:
+        result = {"ok": False, "reason": "manual_batch_database_unavailable"}
+    finally:
+        _MANUAL_BATCH_IN_FLIGHT.discard(principal.account)
+    return JSONResponse(
+        status_code=200 if result.get("ok") else 409,
+        content=result,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/api/recipients/check")
+async def api_check_recipients(request: Request) -> JSONResponse:
+    """Read provider facts and store an expiring plan; never change the audience."""
+    return await _manual_batch_action(request, confirm=False)
+
+
+@router.post("/api/recipients/confirm")
+async def api_confirm_recipients(request: Request) -> JSONResponse:
+    """Apply the exact server-owned subset after live revalidation, atomically."""
+    return await _manual_batch_action(request, confirm=True)
+
+
 @router.get("/api/recipients")
 async def api_recipients(batch_id: int) -> JSONResponse:
     """Slot → recipient for one mailing, for the authorised operator (review R7).
@@ -599,12 +701,21 @@ async def page_index(request: Request) -> str:
                 )
                 if not active:
                     continue
-                manual_only = all(row.recipient_basis == RECIPIENT_BASIS_MANUAL for row in active)
+                scope_supported = (
+                    run.company_ids == [production_runner.KARLSRUHE_COMPANY_ID]
+                    and run.campaign_code == "new_clients_monthly"
+                )
+                supported_basis = all(
+                    row.recipient_basis in {RECIPIENT_BASIS_MANUAL, RECIPIENT_BASIS_EARNED} for row in active
+                )
                 candidates.append(
                     {
                         "run_id": int(run.id),
                         "count": len(active),
-                        "manual_only": manual_only,
+                        "supported_basis": supported_basis,
+                        "scope_supported": scope_supported,
+                        "automatic": sum(row.recipient_basis == RECIPIENT_BASIS_EARNED for row in active),
+                        "manual": sum(row.recipient_basis == RECIPIENT_BASIS_MANUAL for row in active),
                         "period": (
                             f"{run.period_start.date().isoformat()}..{run.period_end.date().isoformat()}"
                             if run.period_start and run.period_end
@@ -642,13 +753,17 @@ async def page_index(request: Request) -> str:
         "<tr>"
         f"<td><a href='/ops/campaigns/{entry['run_id']}'>Preview #{entry['run_id']}</a></td>"
         f"<td>{_esc(entry['period'])}</td>"
-        f"<td>{entry['count']}</td>"
+        f"<td>{entry['count']} (automatic: {entry['automatic']}, manual: {entry['manual']})</td>"
         + (
             "<td><a class='btn btn-sm btn-primary' "
             f"href='/ops/voucher-mailings/prepare?preview_run_id={entry['run_id']}'>"
             "Подготовить рассылку</a></td>"
-            if entry["manual_only"]
-            else "<td><span class='text-muted small'>в списке есть не-ручные получатели</span></td>"
+            if entry["supported_basis"] and entry["scope_supported"]
+            else (
+                "<td><span class='text-muted small'>Только Karlsruhe / new_clients_monthly</span></td>"
+                if not entry["scope_supported"]
+                else "<td><span class='text-muted small'>Есть неподдерживаемое основание (например, test)</span></td>"
+            )
         )
         + "</tr>"
         for entry in candidates
@@ -658,7 +773,7 @@ async def page_index(request: Request) -> str:
         "<thead><tr><th>Preview</th><th>Период</th><th>Активных получателей</th><th></th></tr></thead>"
         f"<tbody>{candidate_rows}</tbody></table>"
         if candidate_rows
-        else "<p class='text-muted'>Нет готовых preview с ручным составом.</p>"
+        else "<p class='text-muted'>Нет завершённых preview с активными получателями.</p>"
     )
 
     body = f"""
@@ -1372,14 +1487,25 @@ function renderComposition() {
         escapeHtml(person.display_name) + "</td><td>" +
         "<a href=\"/ops/campaigns/" + encodeURIComponent(person.preview_run_id) +
         "/recipients\" target=\"_blank\">#" + escapeHtml(person.campaign_recipient_id) + "</a></td><td>" +
+        escapeHtml(basisLabel(person)) + "</td><td>" +
         escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>";
     }
     slotsArea.innerHTML = rows
       ? "<table class=\"table table-sm w-auto\" id=\"composition-table\"><thead><tr><th>№</th>" +
-        "<th>Клиент</th><th>Строка preview</th>" +
+        "<th>Клиент</th><th>Строка preview</th><th>Основание / политика</th>" +
         "<th>Сумма</th></tr></thead><tbody>" + rows + "</tbody></table>"
       : "<p class=\"text-muted\">Состав пуст.</p>";
   }
+}
+
+function basisLabel(person) {
+  if (person.recipient_basis === "earned_first_visit") return "Automatic — доказанный первый визит";
+  if (person.recipient_basis === "operator_manual_selection") {
+    return person.manual_policy === "altegio_visit_zero_easyweek_bookings"
+      ? "Manual — заявление о визите Altegio; проверено 0 записей EasyWeek"
+      : "Manual — решение оператора; first-visit proof не применяется";
+  }
+  return person.recipient_basis || "Основание не получено";
 }
 
 function hideConfirm() {
@@ -1886,7 +2012,7 @@ function renderStatus(state) {
           ? '<a href="/ops/campaigns/' + encodeURIComponent(who.preview_run_id) +
             '/recipients" target="_blank">#' + escapeHtml(who.campaign_recipient_id) + "</a>"
           : "—") +
-        "</td><td><code>" + escapeHtml(item.status) +
+        "</td><td>" + escapeHtml(basisLabel(item)) + "</td><td><code>" + escapeHtml(item.status) +
         "</code></td><td><code>" + escapeHtml(item.reason_code || "—") + "</code></td><td>" +
         escapeHtml(item.send_attempt_count || 0) + "</td><td>" +
         escapeHtml(item.provider_accepted ? "да" : "нет") + "</td><td>" +
@@ -1897,7 +2023,7 @@ function renderStatus(state) {
     }
     slotsArea.innerHTML = rows
       ? "<table class=\"table table-sm align-middle\" id=\"slots-table\"><thead><tr><th>№</th>" +
-        "<th>Клиент</th><th>Строка preview</th><th>Статус</th>" +
+        "<th>Клиент</th><th>Строка preview</th><th>Основание / политика</th><th>Статус</th>" +
         "<th>Причина</th><th>Попыток</th><th>Meta приняла</th>" +
         "<th>Доставлено</th><th>Прочитано</th><th>Сверка</th><th></th>" +
         "</tr></thead><tbody>" + rows + "</tbody></table>"

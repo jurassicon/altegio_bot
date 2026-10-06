@@ -52,7 +52,7 @@ line and no exception here carries any of the three.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -110,6 +110,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ORDER_NOT_PAYABLE,
     ORDER_UNPROVEN,
     PREVIEW_ALREADY_FROZEN,
+    PRODUCTION_SCHEMA_VERSION,
     PRODUCTION_SCOPE,
     RECONCILE_BUSY,
     RECONCILE_UNRESOLVED,
@@ -126,13 +127,13 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     UNIT_PRICE_MINOR,
     UNKNOWN_STAGE,
     VOUCHER_TEMPLATE_CODE,
-    binding_material,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     IssuerMembership,
     pinned_issuer,
     prove_issuer_membership,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.read_sessions import release_reads_before_http
 from altegio_bot.campaigns.easyweek_voucher_production.readiness import (
     ProductionPrerequisites,
     prove_prerequisites,
@@ -358,8 +359,8 @@ class StageReport:
             "provider_accepted_count": batch.get("provider_accepted_count", 0),
             "webhook_delivered_count": batch.get("webhook_delivered_count", 0),
             "webhook_read_count": batch.get("webhook_read_count", 0),
-            "recipient_basis": "operator_manual_selection",
-            "first_visit_proof": "not_applicable",
+            "recipient_basis": batch.get("recipient_basis"),
+            "first_visit_proof": batch.get("first_visit_proof"),
             "voucher_unit_price_minor": UNIT_PRICE_MINOR,
             "approval_arithmetic": APPROVAL_ARITHMETIC,
             # Repeated verbatim on every stage, success included. A mailing of
@@ -435,6 +436,14 @@ def _identity_from_composition(
                 campaign_recipient_id=member.campaign_recipient_id,
                 easyweek_customer_uuid=customer,
                 reconciliation_marker=member.marker(preview_run_id=composition.preview_run_id),
+                recipient_basis=member.recipient_basis,
+                client_id=member.client_id,
+                destination_phone=member.proof.destination_phone,
+                manual_policy=member.manual_policy,
+                source_booking_uuid=member.source_booking_uuid,
+                source_proof_digest=member.source_proof_digest,
+                manual_policy_checked_at=member.manual_policy_checked_at,
+                manual_operator_attested_at=member.manual_operator_attested_at,
             )
         )
     return ledger_module.BatchIdentity(
@@ -451,6 +460,8 @@ def _identity_from_composition(
         frozen_digest=composition.composition_digest(),
         items=tuple(items),
         batch_id=None,
+        schema_version=composition.schema_version,
+        recipient_basis=composition.recipient_basis,
     )
 
 
@@ -491,6 +502,10 @@ def _identity_from_snapshot(
                 campaign_recipient_id=entry.campaign_recipient_id,
                 easyweek_customer_uuid=entry.easyweek_customer_uuid,
                 reconciliation_marker=entry.reconciliation_marker,
+                recipient_basis=entry.recipient_basis,
+                manual_policy=entry.manual_policy,
+                source_booking_uuid=entry.source_booking_uuid,
+                source_proof_digest=entry.source_proof_digest,
             )
         )
     return ledger_module.BatchIdentity(
@@ -507,6 +522,8 @@ def _identity_from_snapshot(
         frozen_digest=str(snapshot.frozen_digest),
         items=tuple(items),
         batch_id=int(snapshot.batch_id or 0),
+        schema_version=snapshot.schema_version,
+        recipient_basis=snapshot.recipient_basis,
     )
 
 
@@ -750,6 +767,7 @@ def available_item_actions(item: ledger_module.ItemSnapshot) -> tuple[str, ...]:
     return tuple(actions)
 
 
+@release_reads_before_http("reader", "order_reader")
 async def build_stage_plan(
     session: AsyncSession,
     session_maker: async_sessionmaker[AsyncSession],
@@ -887,6 +905,7 @@ async def build_stage_plan(
             # entitlements. Counting them would make every later stage report
             # the batch as a conflict with itself.
             exclude_batch_id=batch_id,
+            schema_version=snapshot.schema_version if snapshot.exists else PRODUCTION_SCHEMA_VERSION,
         )
         reasons.extend(composition.reasons)
 
@@ -945,7 +964,12 @@ async def build_stage_plan(
         # who opted out or changed their number, changes it, and the stage
         # refuses before anything leaves this process.
         if snapshot.exists and stage != STAGE_REFUND:
-            if composition.proven and composition.composition_digest() != snapshot.frozen_digest:
+            live_identity = _identity_from_composition(request, composition) if composition.proven else None
+            if composition.proven and (
+                composition.composition_digest() != snapshot.frozen_digest
+                or live_identity is None
+                or not live_identity.matches(snapshot)
+            ):
                 reasons.append(FROZEN_DIGEST_MISMATCH)
             elif not composition.proven:
                 reasons.append(COMPOSITION_DRIFTED)
@@ -1245,7 +1269,9 @@ async def run_create(
         return refused
     assert plan is not None and composition is not None and baseline is not None and snapshot is not None
 
-    identity = _identity_from_snapshot(snapshot)
+    identity = _identity_from_composition(request, composition)
+    if identity is not None:
+        identity = replace(identity, batch_id=snapshot.batch_id)
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_CREATE, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
@@ -1474,7 +1500,7 @@ async def _verify_created(
         try:
             mac = voucher_code_mac(
                 voucher_code=code,
-                ledger_uuid=binding_material(batch_id=batch_id, slot=slot),
+                ledger_uuid=await ledger_module.load_binding_material(session_maker, batch_id=batch_id, slot=slot),
                 target_order_uuid=candidate,
                 voucher_template_uuid=voucher_template_uuid,
                 domain=ledger_module.VOUCHER_PRODUCTION_DOMAIN,
@@ -1629,7 +1655,9 @@ async def run_pay(
         return refused
     assert plan is not None and composition is not None and baseline is not None and snapshot is not None
 
-    identity = _identity_from_snapshot(snapshot)
+    identity = _identity_from_composition(request, composition)
+    if identity is not None:
+        identity = replace(identity, batch_id=snapshot.batch_id)
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_PAY, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
@@ -1901,7 +1929,9 @@ async def run_deliver(
         and snapshot is not None
     )
 
-    identity = _identity_from_snapshot(snapshot)
+    identity = _identity_from_composition(request, composition)
+    if identity is not None:
+        identity = replace(identity, batch_id=snapshot.batch_id)
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_DELIVER, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
@@ -2374,7 +2404,7 @@ async def _recover_unknown_create(
         try:
             mac = voucher_code_mac(
                 voucher_code=code,
-                ledger_uuid=binding_material(batch_id=batch_id, slot=item.slot),
+                ledger_uuid=await ledger_module.load_binding_material(session_maker, batch_id=batch_id, slot=item.slot),
                 target_order_uuid=candidate,
                 voucher_template_uuid=voucher_template_uuid,
                 domain=ledger_module.VOUCHER_PRODUCTION_DOMAIN,
