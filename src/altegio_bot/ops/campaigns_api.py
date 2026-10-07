@@ -55,6 +55,7 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.identity import (
     TEST_RECIPIENT_DISABLED,
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.test_recipient import add_test_recipient_to_preview
+from altegio_bot.campaigns.easyweek_voucher_production import template_contract as production_template_contract
 from altegio_bot.campaigns.followup import execute_followup, followup_run_at, plan_followup
 from altegio_bot.campaigns.gift_card_readiness import probe_gift_card_readiness
 from altegio_bot.campaigns.loyalty_cleanup import (
@@ -1125,7 +1126,10 @@ def normalize_meta_template_name(template_name: str) -> str:
 
 
 @router.get("/new-clients/easyweek-template-status")
-async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, Any]:
+async def easyweek_template_status(
+    company_id: int = Query(...),
+    contract: Literal["legacy-15eur", "production-10eur-v2"] = Query(default="legacy-15eur"),
+) -> dict[str, Any]:
     """Is THIS branch's voucher template row proven? (§37.1)
 
     Narrow, read-only and deliberately branch-specific. The approved Meta
@@ -1143,6 +1147,7 @@ async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, An
     No Meta request is made: this answers what the database holds, and the live
     read belongs to the separate reconciler that maintains it.
     """
+    message = production_template_contract if contract == "production-10eur-v2" else template_contract
     registry = configured_easyweek_locations()
     location = registry.locations.get(company_id) if registry.ready else None
     if location is None:
@@ -1152,7 +1157,7 @@ async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, An
             "configured": False,
             "reason": "branch_contract_not_approved",
             "company_id": company_id,
-            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+            "template_code": message.VOUCHER_TEMPLATE_CODE,
         }
 
     async with SessionLocal() as session:
@@ -1162,8 +1167,8 @@ async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, An
                     select(MessageTemplate)
                     .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
                     .where(MessageTemplate.company_id == company_id)
-                    .where(MessageTemplate.code == template_contract.VOUCHER_TEMPLATE_CODE)
-                    .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                    .where(MessageTemplate.code == message.VOUCHER_TEMPLATE_CODE)
+                    .where(MessageTemplate.language == message.VOUCHER_TEMPLATE_LANGUAGE)
                 )
             )
             .scalars()
@@ -1178,16 +1183,16 @@ async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, An
             "configured": False,
             "reason": "template_row_missing" if not active else "template_rows_ambiguous",
             "company_id": company_id,
-            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+            "template_code": message.VOUCHER_TEMPLATE_CODE,
         }
 
-    blocker = template_contract.db_row_blocker(active[0], company_id=company_id)
+    blocker = message.db_row_blocker(active[0], company_id=company_id)
     if blocker is not None:
         return {
             "configured": False,
             "reason": blocker,
             "company_id": company_id,
-            "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
+            "template_code": message.VOUCHER_TEMPLATE_CODE,
         }
 
     return {
@@ -1195,9 +1200,9 @@ async def easyweek_template_status(company_id: int = Query(...)) -> dict[str, An
         "reason": None,
         "company_id": company_id,
         "provider": PROVIDER_EASYWEEK,
-        "template_code": template_contract.VOUCHER_TEMPLATE_CODE,
-        "language": template_contract.VOUCHER_TEMPLATE_LANGUAGE,
-        "meta_template_name": template_contract.VOUCHER_META_TEMPLATE_NAME,
+        "template_code": message.VOUCHER_TEMPLATE_CODE,
+        "language": message.VOUCHER_TEMPLATE_LANGUAGE,
+        "meta_template_name": message.VOUCHER_META_TEMPLATE_NAME,
     }
 
 
@@ -1220,7 +1225,14 @@ async def get_template_text(
 
     Если шаблон не найден — возвращает 404.
     """
-    code = normalize_meta_template_name(template_name)
+    production_message = (
+        provider == PROVIDER_EASYWEEK and template_name == production_template_contract.VOUCHER_META_TEMPLATE_NAME
+    )
+    code = (
+        production_template_contract.VOUCHER_TEMPLATE_CODE
+        if production_message
+        else normalize_meta_template_name(template_name)
+    )
 
     async with SessionLocal() as session:
         base_stmt = (
@@ -1237,12 +1249,19 @@ async def get_template_text(
         # Сначала ищем шаблон для конкретной компании
         if company_id is not None:
             company_stmt = base_stmt.where(MessageTemplate.company_id == company_id)
-            match = (await session.execute(company_stmt)).scalar_one_or_none()
+            if production_message:
+                rows = list((await session.execute(company_stmt.limit(None))).scalars())
+                match = rows[0] if len(rows) == 1 else None
+            else:
+                match = (await session.execute(company_stmt)).scalar_one_or_none()
 
         # Fallback: берём первый активный шаблон с таким кодом (детерминированно по id ASC)
         if match is None and provider == PROVIDER_ALTEGIO:
             match = (await session.execute(base_stmt)).scalar_one_or_none()
 
+    if production_message and match is not None:
+        if company_id != 322579 or production_template_contract.db_row_blocker(match, company_id=company_id):
+            match = None
     if match is None:
         raise HTTPException(
             status_code=404,

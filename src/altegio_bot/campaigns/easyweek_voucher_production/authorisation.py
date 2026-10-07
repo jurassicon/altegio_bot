@@ -116,7 +116,7 @@ def stage_digest(
     return _digest_over(
         {
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": PRODUCTION_SCHEMA_VERSION,
+            "schema_version": "3" if snapshot.get("product_contract") is not None else PRODUCTION_SCHEMA_VERSION,
             "stage": stage,
             "snapshot": snapshot,
             "ledger_state": ledger_state,
@@ -186,7 +186,7 @@ class StagePlan:
         return {
             "mode": "voucher_production_stage_plan",
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": PRODUCTION_SCHEMA_VERSION,
+            "schema_version": "3" if self.snapshot.get("product_contract") is not None else PRODUCTION_SCHEMA_VERSION,
             "stage": self.stage,
             "ready": self.ready,
             "reasons": list(self.reasons),
@@ -199,7 +199,11 @@ class StagePlan:
             "observations": [dict(entry) for entry in self.observations],
             # Repeated on every plan, ready or not. A green stage of one
             # mailing is never a campaign permission, however large the mailing.
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "approval_arithmetic": (
+                "approved_exposure_minor = expected_recipient_count * 1000"
+                if self.snapshot.get("product_contract") is not None
+                else APPROVAL_ARITHMETIC
+            ),
             "campaign_send_authorized": False,
             "bulk_delivery_authorized": False,
             "global_ready_for_send": False,

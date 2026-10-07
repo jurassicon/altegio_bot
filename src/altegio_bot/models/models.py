@@ -3943,7 +3943,7 @@ class EasyWeekVoucherProductionBatch(Base):
       ``total_exposure_minor``;
     * ``total_exposure_minor`` must itself equal
       ``voucher_unit_price_minor * recipient_count``, with the unit price pinned
-      to €15.
+      to the versioned product (€15 historically, €10 for schema 3).
 
     Storing the approved values rather than merely validating them is the point.
     A batch that has been frozen carries, forever, the two numbers a human
@@ -3974,6 +3974,7 @@ class EasyWeekVoucherProductionBatch(Base):
         # own declared size. Redundant next to the primary key, and load
         # bearing: without it the composite foreign key on items cannot exist.
         UniqueConstraint("id", "recipient_count", name="uq_ew_voucher_production_batch_id_count"),
+        UniqueConstraint("id", "voucher_unit_price_minor", name="uq_ew_voucher_production_batch_id_price"),
         # 3. The preview this batch was frozen from, under the same provider.
         ForeignKeyConstraint(
             ["campaign_run_id", "provider"],
@@ -3998,18 +3999,26 @@ class EasyWeekVoucherProductionBatch(Base):
         ),
         CheckConstraint(
             "(request_schema_version = '1' AND recipient_basis = 'operator_manual_selection') OR "
-            "(request_schema_version = '2' AND recipient_basis IN "
+            "(request_schema_version IN ('2', '3') AND recipient_basis IN "
             "('earned_first_visit', 'operator_manual_selection', 'mixed'))",
             name="ck_ew_voucher_production_batch_basis",
         ),
         # 9. At least one recipient. An empty batch is not a small batch: there
         # is nothing to approve. Deliberately no upper bound — see the docstring.
         CheckConstraint("recipient_count >= 1", name="ck_ew_voucher_production_batch_recipient_count"),
-        # 10-13. §42.5, as arithmetic the database will not let drift: €15 each,
+        # 10-13. Product version and arithmetic the database will not let drift:
         # a total that is exactly the product, and the two numbers the operator
         # approved equal to the two the freeze computed.
         CheckConstraint(
-            f"voucher_unit_price_minor = {VOUCHER_PRODUCTION_UNIT_PRICE_MINOR}",
+            "(request_schema_version IN ('1', '2') "
+            "AND product_contract_version = 'easyweek-production-15eur-v1' "
+            "AND message_contract_code = 'new_client_voucher' "
+            "AND voucher_unit_price_minor = 1500) OR "
+            "(request_schema_version = '3' "
+            "AND product_contract_version = 'easyweek-production-10eur-v1' "
+            "AND message_contract_code = 'new_client_voucher_10eur_v2' "
+            "AND voucher_template_uuid = '0ffb0346-57b8-475e-9c22-152dd23e25ca'::uuid "
+            "AND voucher_unit_price_minor = 1000)",
             name="ck_ew_voucher_production_batch_unit_price",
         ),
         CheckConstraint(
@@ -4048,6 +4057,12 @@ class EasyWeekVoucherProductionBatch(Base):
     # -- identity ----------------------------------------------------------
     batch_scope: Mapped[str] = mapped_column(String(128), nullable=False)
     request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    product_contract_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("'easyweek-production-15eur-v1'")
+    )
+    message_contract_code: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("'new_client_voucher'")
+    )
     baseline_version: Mapped[str] = mapped_column(String(32), nullable=False)
     provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -4099,7 +4114,7 @@ class EasyWeekVoucherProductionBatch(Base):
 
 
 class EasyWeekVoucherProductionBatchItem(Base):
-    """One slot of a production batch: one person, one €15 voucher, one message.
+    """One slot of a production batch: one person, one fixed voucher, one message.
 
     Its slot cannot escape its batch
     --------------------------------
@@ -4145,6 +4160,12 @@ class EasyWeekVoucherProductionBatchItem(Base):
                 "easyweek_voucher_production_batches.recipient_count",
             ],
             name="fk_ew_voucher_production_item_batch_size",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["batch_id", "voucher_value_minor"],
+            ["easyweek_voucher_production_batches.id", "easyweek_voucher_production_batches.voucher_unit_price_minor"],
+            name="fk_ew_voucher_production_item_batch_price",
             ondelete="RESTRICT",
         ),
         # 2. 1 <= slot <= the batch's own declared size. No global ceiling.
@@ -4218,10 +4239,10 @@ class EasyWeekVoucherProductionBatchItem(Base):
             "AND manual_policy = 'altegio_visit_zero_easyweek_bookings')",
             name="ck_ew_voucher_production_item_policy",
         ),
-        # 17. Exactly one voucher of exactly €15. Not a default and not a
-        # maximum: the two numbers this slot is allowed to be worth.
+        # 17. One fixed voucher, with its amount additionally bound to the
+        # header product through fk_ew_voucher_production_item_batch_price.
         CheckConstraint(
-            f"voucher_value_minor = {VOUCHER_PRODUCTION_UNIT_PRICE_MINOR} AND voucher_quantity = 1",
+            "voucher_value_minor IN (1500, 1000) AND voucher_quantity = 1",
             name="ck_ew_voucher_production_item_exact_voucher",
         ),
         CheckConstraint(
@@ -4565,6 +4586,18 @@ class EasyWeekVoucherProductionApproval(Base):
     __tablename__ = "easyweek_voucher_production_approvals"
 
     __table_args__ = (
+        CheckConstraint(
+            "(request_schema_version IN ('1', '2') AND product_contract_version = 'easyweek-production-15eur-v1') "
+            "OR (request_schema_version = '3' AND product_contract_version = 'easyweek-production-10eur-v1')",
+            name="ck_ew_voucher_production_approval_product",
+        ),
+        CheckConstraint(
+            "request_schema_version <> '3' OR (batch_recipient_count >= 1 "
+            "AND batch_exposure_minor = batch_recipient_count * 1000 "
+            "AND stage_amount_minor = CASE WHEN stage = 'freeze' THEN batch_exposure_minor "
+            "WHEN stage IN ('create', 'pay', 'refund') THEN stage_target_count * 1000 ELSE 0 END)",
+            name="ck_ew_voucher_production_approval_product_amount",
+        ),
         CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_approval_provider"),
         CheckConstraint(
             f"batch_scope = '{VOUCHER_PRODUCTION_SCOPE}'",
@@ -4624,6 +4657,9 @@ class EasyWeekVoucherProductionApproval(Base):
 
     batch_scope: Mapped[str] = mapped_column(String(128), nullable=False)
     request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    product_contract_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=text("'easyweek-production-15eur-v1'")
+    )
     provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, nullable=False)
     stage: Mapped[str] = mapped_column(String(32), nullable=False)

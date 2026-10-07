@@ -753,10 +753,16 @@ class MetaTemplateClient:
         graph_url: str,
         api_version: str,
         timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._url = f"{normalize_graph_url(graph_url)}/{api_version}/{waba_id}/message_templates"
         self._headers = {"Authorization": f"Bearer {token}"}
-        self._client = httpx.AsyncClient(timeout=timeout_seconds, headers=self._headers)
+        # ``transport`` is the one seam, and it is the same one
+        # ``EasyWeekVoucherMutationClient`` already offers: a test can put an
+        # ``httpx.MockTransport`` under the REAL client and so exercise this
+        # class's own paging, error mapping and exception types rather than a
+        # stand-in that raises whatever the test chose.
+        self._client = httpx.AsyncClient(timeout=timeout_seconds, headers=self._headers, transport=transport)
 
     async def __aenter__(self) -> "MetaTemplateClient":
         return self

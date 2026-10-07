@@ -8,7 +8,9 @@ that list honestly is.
 What is pinned, and what is not
 -------------------------------
 Pinned here as literals, because they are the topology the owner approved: the
-branch, the campaign, the basis, €15 per recipient, the internal template code.
+branch and campaign. The exported €15/schema-2 primitives below retain the
+historical contract; §45 selects its fixed €10/schema-3 product explicitly through
+``easyweek_voucher_production_contract``.
 
 **Not** pinned, deliberately: how many people. §41's ceiling of five was right
 for a controlled experiment, and carrying it into production would be wrong.
@@ -33,6 +35,7 @@ import hashlib
 import json
 from typing import Final
 
+from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_CAMPAIGN_CODE,
     VOUCHER_PRODUCTION_COMPANY_ID,
@@ -291,6 +294,8 @@ def binding_material(
     manual_policy: str | None = None,
     source_proof_digest: str | None = None,
     customer_uuid: str | None = None,
+    product_contract_version: str | None = None,
+    message_contract_code: str | None = None,
 ) -> str:
     """What a slot's voucher MAC is bound to, besides the order and the product.
 
@@ -300,10 +305,13 @@ def binding_material(
     ignores which of its recipients the code belongs to. Together they name
     exactly one row, table-wide, for the lifetime of the phase.
     """
+    contract = production_contract(schema_version, contract_version=product_contract_version)
+    if message_contract_code is not None and message_contract_code != contract.message_code:
+        raise ValueError("voucher_production_binding_identity_unproven")
     legacy = f"{PRODUCTION_SCOPE}:{batch_id}:{slot}"
     if schema_version == "1":
         return legacy
-    if schema_version != "2" or not frozen_digest or not recipient_basis or not customer_uuid:
+    if schema_version not in ("2", "3") or not frozen_digest or not recipient_basis or not customer_uuid:
         raise ValueError("voucher_production_binding_identity_unproven")
     material = {
         "schema_version": schema_version,
@@ -313,7 +321,9 @@ def binding_material(
         "source_proof_digest": source_proof_digest,
         "customer_uuid": customer_uuid,
     }
-    return legacy + ":v2:" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+    if schema_version == "3":
+        material["product_contract"] = contract.digest_material()
+    return legacy + f":v{schema_version}:" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
 __all__ = [

@@ -61,6 +61,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_REFUND,
     STOP_ACTIVE,
 )
+from altegio_bot.easyweek_voucher_production_contract import LEGACY_PRODUCTION_CONTRACT, production_contract
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     VOUCHER_PRODUCTION_APPROVAL_CONSUMED,
@@ -159,6 +160,8 @@ class StoredApproval:
     status: str
     frozen_digest: str | None
     stop_generation_at_plan: int = 0
+    request_schema_version: str = PRODUCTION_SCHEMA_VERSION
+    product_contract_version: str = LEGACY_PRODUCTION_CONTRACT.version
 
     @property
     def pending(self) -> bool:
@@ -240,6 +243,8 @@ def _approval(row: EasyWeekVoucherProductionApproval) -> StoredApproval:
     slots = tuple(sorted(int(value) for value in (row.target_slots or [])))
     return StoredApproval(
         id=int(row.id),
+        request_schema_version=row.request_schema_version,
+        product_contract_version=row.product_contract_version,
         stage=str(row.stage),
         principal=str(row.principal),
         session_fingerprint=str(row.session_fingerprint),
@@ -340,6 +345,8 @@ async def store_approval(
     baseline_version: str,
     frozen_digest: str | None,
     stop_generation_at_plan: int = 0,
+    request_schema_version: str = PRODUCTION_SCHEMA_VERSION,
+    product_contract_version: str | None = None,
 ) -> StoredApproval:
     """Write the immutable offer. Only ever called for a plan that was READY.
 
@@ -351,7 +358,10 @@ async def store_approval(
         async with session.begin():
             row = EasyWeekVoucherProductionApproval(
                 batch_scope=PRODUCTION_SCOPE,
-                request_schema_version=PRODUCTION_SCHEMA_VERSION,
+                request_schema_version=request_schema_version,
+                product_contract_version=production_contract(
+                    request_schema_version, contract_version=product_contract_version
+                ).version,
                 provider=PROVIDER_EASYWEEK,
                 company_id=KARLSRUHE_COMPANY_ID,
                 stage=stage,

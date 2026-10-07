@@ -1,10 +1,34 @@
-# Production EasyWeek voucher mailing — runbook (§44 mixed audience, §43 operation)
+# Production EasyWeek voucher mailing — runbook (§45 fixed €10 product)
 
-The working mode: a real operator-curated list, **one €15 voucher per
+The working mode for new mailings: a real operator-curated list, **one €10 voucher per
 recipient**, one WhatsApp message each. Every stage is confirmed separately, in
 the browser. There is no control that runs two stages, and there will not be one.
 
-Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–44 before the first action.
+The voucher is single use, valid for one month **from activation**, with any
+unused balance forfeited. Receiving the WhatsApp message does not start or
+restart the term. Approval TTL remains a separate 30-minute authorization rule.
+
+**Rollout is blocked pending issued-voucher validity evidence, and the block now
+lands before the money.** Two different questions are kept apart:
+
+* **(a) Can this application prove the term of any issued voucher at all?** No.
+  There is no implemented, evidenced way to read a voucher's activation instant
+  and expiry boundary. So a schema 3 contract refuses **CREATE and PAY**, with
+  `voucher_production_validity_capability_unproven`, before the first order
+  exists. A FREEZE is still allowed — it is local and buys nothing — and its
+  report and the readiness panel both name the blocker, so a frozen composition
+  is never presented as a mailing that is ready to go out.
+* **(b) Is one particular issued voucher still valid?** Only askable once a
+  voucher exists. That guard is unchanged and still returns
+  `voucher_production_validity_unproven`, with `voucher_production_voucher_expired`
+  for an observed expired signal.
+
+Future-looking dates alone prove neither. Answering (a) is a reviewed
+implementation change against read-only provider evidence, not a setting: there
+is no environment variable, no flag and no UI bypass. See the scoped rollout
+section below.
+
+Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–45 before the first action.
 §44 adds UUID-first customers, a checked phone list and mixed earned/manual batches.
 
 > **This runbook does not authorise anything.** Each real payment and each real
@@ -30,8 +54,8 @@ Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–44 before the first action.
 
 | | |
 | --- | --- |
-| Value per recipient | €15 (1500 minor units), exactly — a CHECK constraint, not a default |
-| Total exposure | `recipient_count × €15`, equal to what the operator confirmed |
+| Value per recipient | New schema 3: €10 (1000 minor units); historical schema 1/2: €15 (1500) |
+| Total exposure | Actual eligible `recipient_count × contract unit price`, equal to what the operator confirmed |
 | Maximum Meta messages | one per slot, one attempt each, for the lifetime of the row |
 
 **There is no recipient ceiling, and the operator states the size.** A ceiling
@@ -40,7 +64,7 @@ one an environment variable could raise would not be a ceiling at all. What
 replaces it is an arithmetic identity confirmed before the freeze:
 
 ```
-approved_exposure_minor = expected_recipient_count * 1500
+approved_exposure_minor = expected_recipient_count * 1000
 ```
 
 Both numbers must describe the full active snapshot exactly. A wrong count or a
@@ -114,7 +138,7 @@ require a real browser session:
 With `OPS_USER` or the signing key unset, every voucher-mailing action refuses
 with `voucher_production_ops_session_required`. That is deliberate: the Ops
 cabinet's historical door allows an unconfigured deployment through for read-only
-pages, and a machine nobody finished setting up is the last place a €15 purchase
+pages, and a machine nobody finished setting up is the last place a voucher purchase
 should be possible.
 
 `EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED=true` is **not** a second fence and
@@ -433,7 +457,7 @@ copied anywhere.
 On the preparation page:
 
 1. Press **«Проверить состав»**. The page shows the campaign period, the exact
-   number of recipients, €15 each, the total, and **who each recipient is** — name
+   number of recipients, €10 each for a new mailing, the total, and **who each recipient is** — name
    and the preview row they came from. Checking the list is a read: it never arms
    the confirmation and never creates anything.
 2. Read the period. It is the campaign wave, not the month of sending. Manual additions
@@ -577,7 +601,7 @@ A **«Вернуть оплату»** button appears next to a recipient only wh
 allowed: the slot is paid and **nothing was ever sent for it**. The server enforces
 the same rule independently — a refund after any send claim or attempt is refused
 by the plan, by the claim and by a CHECK constraint, because returning the money
-for a code somebody is already holding is worse than losing the €15.
+for a code somebody is already holding is worse than losing the voucher amount.
 
 A refund is one named recipient of one named mailing, with its own confirmation —
 and the confirmation **names the client**, not only the slot number, so there is no
@@ -596,6 +620,20 @@ If the executor died mid-stage, the operation reads **«прервано — н�
 This is terminal and is never retried: a slot may hold a committed claim whose
 request went out. Reconcile, then confirm a fresh plan for what is provably
 untouched.
+
+**«Прервано» means a possible external effect, and nothing else means it.** A
+failure that happens while the stage is still being re-proven — Meta unreachable
+while the exact approved template is read back, for instance — is a plain
+refusal: the operation finishes, it names its reason, and there is nothing to
+reconcile. If a pre-send failure ever shows as «прервано», or an operation sits
+in «выполняется» for ten minutes and then turns into it, that is a defect to
+report rather than a mailing to reconcile.
+
+A Meta read that times out, is refused or is cut short therefore reads as
+`voucher_production_template_unproven` — the same answer as a template that is
+not approved, because in both cases this evaluation did not prove the approval.
+Press the stage button again to build a fresh plan; nothing retries by itself,
+and no token, URL or provider message appears in the answer.
 
 ---
 
@@ -618,6 +656,22 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 `status` reads the durable ledger with no HTTP at all, and works with the fence
 closed. `plan --stage ...` performs reads only and writes nothing. `reconcile`
 reads the outside world back and records what it read.
+
+**How to read the amounts in a `status` report.** The report distinguishes what
+it is ABOUT from the default:
+
+| Field | What it means |
+| --- | --- |
+| `voucher_unit_price_minor`, `approval_arithmetic` | the subject of this report: a named batch's own frozen amount, or, with no batch named, the current contract |
+| `default_voucher_unit_price_minor`, `default_product_contract_version` | what a **new** mailing costs — always the €10 contract, whatever this report is about |
+| each row of `batches[]` | that batch's own `voucher_unit_price_minor` and `total_exposure_minor` |
+
+So a named historical batch reads €15 in the subject and €10 in the default; a
+named new batch reads €10 in both; an empty ledger and the mixed list of every
+batch read €10, with each listed row carrying its own amount. A report has never
+been the place to look up a batch's money — the batch's own row is — but it must
+not state last contract's nominal as this one's, which is what an earlier build
+did whenever no batch was named.
 
 `freeze`, `create`, `pay`, `deliver` and `refund` refuse. There is no flag that
 reopens them, `--apply` included. The internal executor is not an exception to
@@ -876,7 +930,8 @@ saying `campaign_send_authorized=false`, `bulk_delivery_authorized=false` and
 ## 14. §44 identity, migration and closed-fence smoke
 
 No new environment setting or HMAC rotation is needed. `f6a8d2c91b47` follows
-`c7e3b8a14f29`; its successor `d8b4e6a29c13` is the current head. Together they provide:
+`c7e3b8a14f29`; its successor `d8b4e6a29c13` was the §44 head (see §14 for the
+new product migration). Together they provide:
 
 - typed EasyWeek customer UUID, unique per provider and branch on Client, nullable numeric ID only for
   such a UUID identity, and time of operator branch assignment;
@@ -963,3 +1018,158 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run
 Deploy the matching older application only after successful schema rollback.
 Historical §43 rollback scopes in §12.2 remain documentation of that phase;
 they do not override the §44 data-preservation guard.
+
+## 14. Scoped §45 rollout: new €10 single-use monthly product
+
+This section supersedes the €15 product examples above **only for new schema 3
+production mailings**. Historical schema 1/2 remain €15, with their original
+message and byte-for-byte HMAC material. Product version
+`easyweek-production-10eur-v1` is distinct from request schema `3`. Existing
+preview IDs, rows and campaign code `new_clients_monthly` are reused unchanged.
+Do not create a replacement preview to get the new amount or evade a conflict.
+
+The new product is API UUID `0ffb0346-57b8-475e-9c22-152dd23e25ca` in the existing
+Kitilash workspace, EUR, Karlsruhe. Required settings: cost/value integer1000,
+quantity1, enabled, offline, **single charge true**, validity integer1,
+forced activation, activate_after0, activate_at null, all3 branches/all43
+services, goods0. Counters must be valid and advance consistently; they need
+not stay zero. The last supplied reading had single charge **false**, so this
+prerequisite is not yet met. An administrator must change it in EasyWeek and
+then verify it; the application performs no settings mutation. The old €15
+product being disabled with counters3/3 is historical evidence, not a blocker
+for the new product and not permission to re-enable it.
+
+The approved issuer, Card payment account and sender remain unchanged. No new
+secret, amount override or HMAC key rotation is required. Never print `.env`,
+tokens, voucher codes, customer details or raw API responses into a ticket.
+
+### 14.1 Required evidence before opening the fence
+
+1. EasyWeek new product meets the exact settings above. This is not established
+   merely by deploying code. The read-only command below compares every pinned
+   field and prints mismatch **names** and counters only.
+2. Meta `kitilash_ka_new_client_voucher_10eur_v2` is live **APPROVED**, German,
+   MARKETING, POSITIONAL, three BODY parameters and no other components. BODY
+   must exactly match the new local contract, including one month **from
+   activation**, single use and forfeited balance. PENDING/REJECTED/other text
+   block. No fallback to `10eur_v1` or the historical €15 template exists.
+3. **Issued-voucher activation/expiry remains unproven, and new issuing is
+   closed because of it.** Existing evidence confirms code/template/value/price
+   only. The official [Get POS order
+   documentation](https://developers.easyweek.io/docs/api-reference/endpoints/orders/get-order/)
+   provides no populated voucher date example; the [template documentation](https://developers.easyweek.io/docs/api-reference/endpoints/voucher-templates/list-voucher-templates/)
+   distinguishes product definitions from issued vouchers. Neither establishes
+   the actual activation instant, timezone, expiry boundary or expiry semantics
+   of a particular code.
+
+   Because the capability itself does not exist, the application refuses a new
+   **CREATE and PAY** with `voucher_production_validity_capability_unproven` —
+   before any order, any payment and any external call. This is enforced in the
+   plan the backend rebuilds, so it also refuses an approval that was stored
+   while an earlier build allowed one; disabled buttons are a consequence of it,
+   never the mechanism. A FREEZE still succeeds and names the blocker in its own
+   report, which is what makes the composition checkable while it is free.
+
+   DELIVER additionally refuses with `voucher_production_validity_unproven`, and
+   an observed expired signal returns `voucher_production_voucher_expired`;
+   future-looking candidate fields still do not authorize delivery. An API
+   evidence review and an implemented positive proof are required before real
+   sending is released. There is no flag bypass.
+
+   **Delivery readiness may not be claimed until that positive proof is
+   implemented and proven.** Reading this runbook, a green readiness panel or a
+   successful freeze is not that proof.
+
+   Already existing objects are unaffected: read-only `status`, the diagnostics
+   commands, `reconcile` and an allowed pre-send `refund` all keep working while
+   this blocker stands, which is what keeps real money recoverable. Historical
+   schema 1/2 batches are **not** moved under this blocker and keep issuing,
+   paying and delivering under their own €15 contract.
+
+Use an **already existing**, separately authorized order for evidence; do not
+create/pay a production voucher just to test the deployment. Obtain provider
+documentation or support confirmation of the exact artifact path, activation
+trigger, timezone, calendar-month semantics and expiry boundary, then compare
+read-only evidence with the EasyWeek UI. If no eligible existing artifact is
+available, the blocker remains. Do not invent dates or substitute a 30-day TTL.
+
+Commands below are for the administrator to run with specific approval. They
+were not run against production during development:
+
+```bash
+# GET only: fixed new product, field-name mismatches and counters; no personal data.
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_10eur_diagnostics
+```
+
+```bash
+# Optional existing new-contract batch/slot: GET exact recorded order.
+# B and S are local ledger identifiers, not a customer ID or voucher code.
+# Outputs only candidate date-field types, never code, dates or customer values.
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_10eur_diagnostics --batch-id B --slot S
+```
+
+The second command cannot produce positive validity proof. Its purpose is to
+identify the missing evidence safely; a successful process exit means product
+baseline read succeeded, not that DELIVER is ready. Never paste a raw order GET.
+
+### 14.2 Migration and local template reconciliation
+
+Keep the mailing fence **false**. Stop/drain API and executor together, take the
+normal backup, deploy matching application images, migrate, and restart one API
+plus one executor. Do not perform a rolling deployment. Use the maintenance
+sequence in §3 with head `e7c2a4f19b86` (parent `d8b4e6a29c13`); verify exactly
+one head and `alembic current` equals it. The migration does not open the fence,
+change configuration, create recipients, freeze a batch or queue an operation.
+
+Create/approve the exact Meta template administratively if necessary. The
+following explicit new selector preserves the historical command default and
+the old `new_client_voucher` row:
+
+```bash
+# Read-only dry run; live Meta contract must prove out.
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.reconcile_easyweek_voucher_template --company-id 322579 --contract production-10eur-v2
+```
+
+```bash
+# Explicit local DB template write after another successful live Meta check.
+# Does not create/edit a Meta template and does not issue/send a voucher.
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.reconcile_easyweek_voucher_template --company-id 322579 --contract production-10eur-v2 --apply
+```
+
+Inspect the existing preview in authenticated Ops before/after upgrade. Verify
+period, counts, earned/manual basis, manual policy, original exclusions and
+operator attestations. The supplied preview #44 had16 earned and18 manual
+recipients for September2026, hence34000 minor units if all34 remain eligible.
+That is an example only: live checks may refuse changed eligibility. Do not edit
+recipients or period to make the example sum match. New Ops must show €10,
+single use, one month from activation, the exact new message and computed
+exposure. Historical batches must still show their €15 amounts and old message.
+
+Status inspection does not need provider HTTP and is safe with the fence closed:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_production_mailing status
+```
+
+Confirm no unexpected queued operations; closed fence and executor availability
+are separate indicators. Do not click real FREEZE/CREATE/PAY/DELIVER as a smoke
+test. After **all** blockers are resolved, opening the fence is an administrator
+decision; every financial/send stage still needs its own fresh Ops confirmation.
+Loss of eligibility, opt-out, product/Meta drift or expiry stops the appropriate
+new effect. Reconciliation and proven pre-send refund remain possible; send
+claim still forbids refund. STOP, unknown outcomes and replay retain §43 rules.
+
+### 14.3 Rollback boundary
+
+With API/executor stopped and backup secured, downgrade to d8 is safe only if
+there are no schema3 batches or approvals. Otherwise it refuses **before any
+DDL**, preserving all new data. Close the fence and use a reviewed forward fix;
+never delete rows or convert1000 to1500 to force a downgrade. Existing previews,
+historical ledgers, HMACs and €15 sums are preserved through upgrade/re-upgrade.
+
+Positive full-lifecycle tests use mocked external APIs and two clearly named
+synthetic fixtures, one per question: `issued_validity_capability` models (a),
+the capability existing at all, and `synthetic_validity_proven` models (b), one
+voucher's term being proven. They verify wiring for the day evidence exists;
+they do not establish real issued-voucher validity or production readiness, and
+the regressions that cover the real refusals deliberately use neither.

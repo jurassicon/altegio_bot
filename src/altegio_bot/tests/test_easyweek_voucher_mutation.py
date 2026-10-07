@@ -175,6 +175,7 @@ def test_the_create_signature_offers_no_line_item_parameters() -> None:
         "voucher_template_uuid",
         "price_minor",
         "marker",
+        "product_contract_version",
     }
 
 

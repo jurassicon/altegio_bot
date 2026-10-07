@@ -44,29 +44,32 @@ import uuid as uuid_module
 from dataclasses import dataclass
 from typing import Any, Final
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import binding_key_reason
+from altegio_bot.campaigns.easyweek_voucher_production import template_contract
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ACCOUNT_UNCONFIGURED,
-    APPROVAL_ARITHMETIC,
     BOOKING_LINK_UNPROVEN,
     ISSUER_MEMBERSHIP_INCOMPLETE,
     PRODUCTION_DISABLED,
     SENDER_UNPROVEN,
+    STAGE_CREATE,
+    STAGE_DELIVER,
+    STAGE_PAY,
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
-    UNIT_PRICE_MINOR,
-    VOUCHER_TEMPLATE_CODE,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     IssuerMembership,
     PinnedIssuer,
     pinned_issuer,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.validity import issued_validity_capability_reason
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
 
@@ -74,6 +77,18 @@ from altegio_bot.settings import settings
 # ``false`` — that would read as "we checked and it failed" — and not ``true``,
 # which would be a lie about a check nobody ran.
 NOT_REQUIRED_FOR_REFUND: Final = "not_required_for_refund"
+
+# What a report prints where the issued-validity capability does not apply at
+# all: the historical contracts, whose terms are not governed by §45.2, and the
+# refund, which sends nothing.
+NOT_APPLICABLE: Final = "not_applicable"
+
+# The stages whose work only makes sense if the voucher it produces can
+# eventually be delivered. A FREEZE is deliberately absent: it is local, it buys
+# nothing, and finding out while it is still free that the batch could not have
+# been delivered is exactly what freezing before buying is for — so a freeze
+# REPORTS this blocker instead of refusing over it.
+DELIVERABLE_STAGES: Final = (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER)
 
 
 def _canonical(value: str | None) -> str | None:
@@ -97,6 +112,7 @@ class ProductionPrerequisites:
 
     stage: str
     fence_open: bool
+    schema_version: str = "2"
     # ``None`` means proven; a string is the blocker.
     staffer_reason: str | None = None
     account_reason: str | None = None
@@ -107,6 +123,13 @@ class ProductionPrerequisites:
     issuer_membership: IssuerMembership | None = None
     key_reason: str | None = None
     template_reason: str | None = None
+    live_meta_verified: bool = False
+    # §45.2 question (a): whether ANY issued voucher's term could be proven. Not
+    # a fact about one voucher — nothing has been issued yet when this is asked.
+    # ``None`` means either proven or not applicable to this contract; which of
+    # the two is :attr:`validity_capability_applies`.
+    validity_capability_reason: str | None = None
+    validity_capability_applies: bool = False
     sender_reason: str | None = None
     booking_link_reason: str | None = None
     delivery_checks_applied: bool = True
@@ -130,6 +153,10 @@ class ProductionPrerequisites:
         if self.delivery_checks_applied:
             found.extend(
                 [
+                    # Before the key, the template and the sender: an operator
+                    # whose contract cannot deliver anything needs to read that
+                    # first, and it is the one blocker no configuration fixes.
+                    self.validity_capability_reason if self.stage in DELIVERABLE_STAGES else None,
                     self.staffer_reason,
                     # The pin and the live membership, in that order: "this is
                     # not the approved staffer" is a more useful answer than
@@ -145,12 +172,36 @@ class ProductionPrerequisites:
         return tuple(dict.fromkeys([reason for reason in found if reason is not None]))
 
     @property
+    def delivery_blockers(self) -> tuple[str, ...]:
+        """Known reasons this contract could not DELIVER what a stage would buy.
+
+        Reported even by the stages these blockers do not refuse, which is the
+        whole point: a freeze is allowed to write a composition and must still
+        say, in the same breath, that the composition is not a launch-ready
+        mailing.
+        """
+        return (self.validity_capability_reason,) if self.validity_capability_reason else ()
+
+    @property
     def ready(self) -> bool:
         return not self.reasons
 
     def as_safe_dict(self) -> dict[str, Any]:
+        contract = production_contract(self.schema_version)
+
         def applicable(reason: str | None) -> Any:
             return (reason is None) if self.delivery_checks_applied else NOT_REQUIRED_FOR_REFUND
+
+        def issued_validity_capability() -> Any:
+            """Three answers, because there are three situations."""
+            if not self.delivery_checks_applied:
+                return NOT_REQUIRED_FOR_REFUND
+            if not self.validity_capability_applies:
+                # A historical contract. Its terms are not §45.2's question, and
+                # printing ``false`` here would read as a blocker on a batch this
+                # phase deliberately leaves alone.
+                return NOT_APPLICABLE
+            return self.validity_capability_reason is None
 
         return {
             "stage": self.stage,
@@ -175,12 +226,18 @@ class ProductionPrerequisites:
             ),
             "hmac_key_usable": applicable(self.key_reason),
             "template_proven": applicable(self.template_reason),
+            "live_meta_verified": self.live_meta_verified,
+            # §45.2 (a), as its own fact. A report that only said
+            # `template_proven` would let a green readiness panel read as "this
+            # mailing can be sent" while the send path is closed by construction.
+            "issued_validity_capability_proven": issued_validity_capability(),
+            "delivery_blockers": list(self.delivery_blockers),
             "sender_proven": applicable(self.sender_reason),
             # Presence only: the link is a real public URL, and a report is
             # pasted into tickets.
             "booking_link_proven": applicable(self.booking_link_reason),
             "template_parameter_count": template_contract.VOUCHER_TEMPLATE_ARITY,
-            "template_code": VOUCHER_TEMPLATE_CODE,
+            "template_code": contract.message_code,
             "meta_template_name": self.meta_template_name,
             "template_language": self.template_language,
             # Presence only: a phone-number id identifies a real line.
@@ -188,8 +245,8 @@ class ProductionPrerequisites:
             # Repeated on every report so a green stage can never read as a
             # campaign permission. There is no recipient ceiling in this phase;
             # what bounds the money is the arithmetic the operator approved.
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "voucher_unit_price_minor": contract.unit_price_minor,
+            "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.unit_price_minor}",
             "reasons": list(self.reasons),
         }
 
@@ -203,6 +260,9 @@ async def prove_prerequisites(
     enabled: bool | None = None,
     issuer_membership: IssuerMembership | None = None,
     require_membership: bool = True,
+    schema_version: str = "2",
+    live_meta_proof: template_contract.TemplateProof | None = None,
+    require_live_meta: bool = True,
 ) -> ProductionPrerequisites:
     """The prerequisites THIS stage actually depends on.
 
@@ -213,13 +273,19 @@ async def prove_prerequisites(
     never send. The other checks are not merely skipped — they are not run, so a
     missing key or a deleted template row cannot raise on the way past.
     """
+    message = template_contract.for_schema(schema_version)
     fence_open = settings.easyweek_voucher_production_mailing_enabled if enabled is None else enabled
+    # §45.2 (a), for the fixed €10 contract only. The historical €15 contracts
+    # are NOT moved under this blocker: their terms were settled when they were
+    # frozen and re-deciding them now would strand their own recovery.
+    capability_applies = schema_version == "3"
     account_uuid = _canonical(settings.easyweek_voucher_production_mailing_account_uuid)
     account_reason = None if account_uuid else ACCOUNT_UNCONFIGURED
 
     if stage == STAGE_REFUND:
         return ProductionPrerequisites(
             stage=stage,
+            schema_version=schema_version,
             fence_open=bool(fence_open),
             account_reason=account_reason,
             payment_account_uuid=account_uuid,
@@ -254,8 +320,8 @@ async def prove_prerequisites(
                 select(MessageTemplate)
                 .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
                 .where(MessageTemplate.company_id == company_id)
-                .where(MessageTemplate.code == VOUCHER_TEMPLATE_CODE)
-                .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                .where(MessageTemplate.code == message.VOUCHER_TEMPLATE_CODE)
+                .where(MessageTemplate.language == message.VOUCHER_TEMPLATE_LANGUAGE)
             )
         )
         .scalars()
@@ -271,10 +337,22 @@ async def prove_prerequisites(
         # own closed one, so the answer is mapped rather than echoed: an operator
         # reading a §42 report should never see a §36 reason code.
         template_reason = (
-            TEMPLATE_UNPROVEN
-            if template_contract.db_row_blocker(active[0], company_id=company_id) is not None
-            else None
+            TEMPLATE_UNPROVEN if message.db_row_blocker(active[0], company_id=company_id) is not None else None
         )
+
+    # Asked without a payload, a voucher or a network call, so it costs nothing
+    # to ask it here — before the first CREATE rather than at the first DELIVER.
+    validity_capability_reason = issued_validity_capability_reason() if capability_applies else None
+
+    live_meta_verified = bool(
+        live_meta_proof is not None
+        and live_meta_proof.proven
+        and live_meta_proof.meta_verified
+        and live_meta_proof.meta_template_name == message.VOUCHER_META_TEMPLATE_NAME
+        and live_meta_proof.language == message.VOUCHER_TEMPLATE_LANGUAGE
+    )
+    if schema_version == "3" and require_live_meta and not live_meta_verified:
+        template_reason = TEMPLATE_UNPROVEN
 
     sender = (
         await session.execute(
@@ -288,6 +366,7 @@ async def prove_prerequisites(
 
     return ProductionPrerequisites(
         stage=stage,
+        schema_version=schema_version,
         fence_open=bool(fence_open),
         # The pin answers both "configured?" and "the approved one?", so there is
         # no separate staffer reason left to report: a second code derived from
@@ -314,6 +393,9 @@ async def prove_prerequisites(
         account_reason=account_reason,
         key_reason=key_reason,
         template_reason=template_reason,
+        live_meta_verified=live_meta_verified,
+        validity_capability_reason=validity_capability_reason,
+        validity_capability_applies=capability_applies,
         sender_reason=None if sender_ok else SENDER_UNPROVEN,
         booking_link_reason=booking_link_reason,
         booking_link=booking_link or None,
@@ -322,9 +404,65 @@ async def prove_prerequisites(
         payment_account_uuid=account_uuid,
         sender_id=sender.id if sender_ok and sender is not None else None,
         phone_number_id=(sender.phone_number_id or "").strip() if sender_ok and sender is not None else None,
-        meta_template_name=template_contract.VOUCHER_META_TEMPLATE_NAME,
-        template_language=template_contract.VOUCHER_TEMPLATE_LANGUAGE,
+        meta_template_name=message.VOUCHER_META_TEMPLATE_NAME,
+        template_language=message.VOUCHER_TEMPLATE_LANGUAGE,
     )
 
 
-__all__ = ["NOT_REQUIRED_FOR_REFUND", "ProductionPrerequisites", "prove_prerequisites"]
+async def prove_live_meta_template(*, reader: Any = None) -> template_contract.TemplateProof:
+    """Read the exact v2 approval; API failure is an unproven contract.
+
+    ``reader.list_meta_templates`` is the test/read-adapter seam. A real
+    EasyWeek reader has no such method; production uses the read-only Meta
+    template client, with no template creation or modification capability.
+
+    A transport failure is NOT allowed to leave this boundary as an exception.
+    The reviewed version caught only :class:`ScriptError`, which the client
+    raises for a Meta error body — while the client's own ``httpx`` calls raise
+    ``httpx`` errors for a timeout, a refused connection or a truncated
+    response. Those escaped into stage preparation, where they became an HTTP
+    500 for the Ops API and, on the executor, an operation left ``running``
+    until its lease lapsed ten minutes later and was called `interrupted` — a
+    word reserved for a stage that may have had an external effect, said about
+    a failure that happened before one was possible.
+
+    So the two are normalised to the same answer, because they mean the same
+    thing here: this evaluation did not prove the approval. The caller gets a
+    negative proof and its own stable reason code, and nothing of the exception
+    — no URL, no header, no token, no response text, no message — survives.
+    Deliberately narrow: ``httpx.HTTPError`` is that library's own transport and
+    status base, so a bug in this module still raises, and a cancellation, which
+    is not an ``Exception`` at all, is never swallowed. There is no retry: one
+    read per evaluation, and a fresh plan is how an operator tries again.
+    """
+    from altegio_bot.scripts.clone_meta_templates_for_location import MetaTemplateClient, ScriptError
+
+    try:
+        if reader is not None and callable(getattr(reader, "list_meta_templates", None)):
+            templates = await reader.list_meta_templates()
+        else:
+            token = settings.whatsapp_access_token.strip()
+            waba_id = (settings.meta_waba_id or "").strip()
+            if not token or not waba_id:
+                return template_contract.prove_meta_templates([])
+            async with MetaTemplateClient(
+                token=token,
+                waba_id=waba_id,
+                graph_url=settings.whatsapp_graph_url,
+                api_version=settings.whatsapp_api_version,
+                timeout_seconds=20.0,
+            ) as client:
+                templates = await client.list_templates()
+        return template_contract.prove_meta_templates(templates)
+    except (ScriptError, httpx.HTTPError):
+        return template_contract.prove_meta_templates([])
+
+
+__all__ = [
+    "DELIVERABLE_STAGES",
+    "NOT_APPLICABLE",
+    "NOT_REQUIRED_FOR_REFUND",
+    "ProductionPrerequisites",
+    "prove_live_meta_template",
+    "prove_prerequisites",
+]

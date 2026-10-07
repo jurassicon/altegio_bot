@@ -41,11 +41,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final
 
-from altegio_bot.campaigns.easyweek_voucher_production.identity import UNIT_PRICE_MINOR
 from altegio_bot.easyweek_voucher_canary.plan import (
     frozen_template_mismatches,
     immutable_template_digest,
     template_counters,
+)
+from altegio_bot.easyweek_voucher_production_contract import (
+    LEGACY_PRODUCTION_CONTRACT,
+    ProductionVoucherContract,
 )
 
 # This phase's own baseline label. The VALUE matches §41's because the catalogue
@@ -54,24 +57,7 @@ PRODUCTION_BASELINE_VERSION: Final = "2026-09-27-43"
 
 # Every frozen field of the template, as the owner-approved live configuration
 # reads it on 27.09.2026.
-PRODUCTION_BASELINE_TEMPLATE_FACTS: Final[dict[str, Any]] = {
-    "is_enabled": True,
-    "is_online": False,
-    "is_single_charge": True,
-    "cost": UNIT_PRICE_MINOR,
-    "value": UNIT_PRICE_MINOR,
-    "validity": None,
-    "forces_activation": True,
-    "activate_after": 0,
-    "activate_at": None,
-    "is_connected_all_branches": True,
-    "branches_count": 3,
-    "all_branches_count": 3,
-    "is_connected_all_services": True,
-    "services_count": 43,
-    "all_services_count": 43,
-    "goods_count": 0,
-}
+PRODUCTION_BASELINE_TEMPLATE_FACTS: Final[dict[str, Any]] = LEGACY_PRODUCTION_CONTRACT.template_facts()
 
 # Stated relationships, checked on top of the field-by-field comparison. The
 # names are what a report may print; the observed values stay in EasyWeek's UI.
@@ -102,18 +88,28 @@ class ProductionBaselineProof:
         }
 
 
-def prove_production_baseline(template_payload: object) -> ProductionBaselineProof:
+def prove_production_baseline(
+    template_payload: object, *, contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT
+) -> ProductionBaselineProof:
     """Compare one template response with the approved 43/43 baseline.
 
     Returns names and booleans. Nothing here decides what to do about a drift:
     that is the caller's refusal to make, and the operator's decision to take.
     """
-    mismatched = list(frozen_template_mismatches(template_payload, facts=PRODUCTION_BASELINE_TEMPLATE_FACTS))
+    mismatched = list(
+        frozen_template_mismatches(
+            template_payload, facts=contract.template_facts(), expected_template_uuid=contract.template_uuid
+        )
+    )
 
     # The two service counts must agree with each other, not only with their own
     # literals. A baseline edited on one line and not the other would otherwise
     # pass field-by-field and describe a template nobody approved.
     template = template_payload if isinstance(template_payload, dict) else {}
+    if contract.request_schema_version == "3":
+        # An omitted activation setting is unknown, even when the required
+        # value is null. Historical baselines retain their original semantics.
+        mismatched.extend(name for name in contract.template_facts() if name not in template and name not in mismatched)
     services = template.get("services_count")
     all_services = template.get("all_services_count")
     if type(services) is not int or type(all_services) is not int or services != all_services:
@@ -121,11 +117,11 @@ def prove_production_baseline(template_payload: object) -> ProductionBaselinePro
             mismatched.append(ALL_SERVICES_COUNT_MISMATCH)
 
     counters = template_counters(template_payload)
-    digest = immutable_template_digest(template_payload, facts=PRODUCTION_BASELINE_TEMPLATE_FACTS)
+    digest = immutable_template_digest(template_payload, facts=contract.template_facts())
 
     return ProductionBaselineProof(
         proven=not mismatched and counters is not None,
-        baseline_version=PRODUCTION_BASELINE_VERSION,
+        baseline_version=contract.baseline_version,
         mismatched_fields=tuple(mismatched),
         counters=counters,
         digest=digest,

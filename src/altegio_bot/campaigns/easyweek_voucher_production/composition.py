@@ -27,7 +27,7 @@ must describe the full active snapshot exactly:
 
 * the count must be greater than zero;
 * the count must equal the number of active recipients actually found;
-* the exposure must equal ``count * 1500``.
+* the exposure must equal ``count * contract.unit_price_minor``.
 
 A missing number and a wrong number are different refusals, deliberately: one
 means the operator has not told us, the other means what they told us does not
@@ -72,7 +72,6 @@ from altegio_bot.campaigns.easyweek_manual_voucher.eligibility import (
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import RecipientProof, prove_recipient
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
-    APPROVAL_ARITHMETIC,
     APPROVAL_COUNT_MISMATCH,
     APPROVAL_COUNT_MISSING,
     APPROVAL_EXPOSURE_MISMATCH,
@@ -99,10 +98,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     RECIPIENT_OPTED_OUT,
     RECIPIENT_UNPROVEN,
     RUN_UNPROVEN,
-    UNIT_PRICE_MINOR,
     production_marker,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.read_sessions import release_reads_before_http
+from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -167,11 +166,13 @@ class BatchApproval:
     def supplied(self) -> bool:
         return self.expected_recipient_count is not None and self.approved_exposure_minor is not None
 
-    def reasons_against(self, observed_count: int) -> tuple[str, ...]:
+    def reasons_against(
+        self, observed_count: int, *, schema_version: str = PRODUCTION_SCHEMA_VERSION
+    ) -> tuple[str, ...]:
         """Why these two numbers do NOT describe a snapshot of *observed_count*.
 
         An empty tuple means the operator's count matches what is really there
-        and their money is exactly that count times €15.
+        and their money is exactly that count times the selected product price.
 
         A zero or negative count is reported as *missing* rather than as a
         mismatch: "minus one recipients" is not a claim about a snapshot that
@@ -188,7 +189,7 @@ class BatchApproval:
 
         if exposure is None or exposure <= 0:
             reasons.append(APPROVAL_EXPOSURE_MISSING)
-        elif count is None or count <= 0 or exposure != count * UNIT_PRICE_MINOR:
+        elif count is None or count <= 0 or exposure != count * production_contract(schema_version).unit_price_minor:
             # Compared against what the OPERATOR said, not against what was
             # observed. Two wrong numbers that are consistent with each other
             # are still caught, because the count itself is compared above.
@@ -196,12 +197,15 @@ class BatchApproval:
 
         return tuple(dict.fromkeys(reasons))
 
-    def as_safe_dict(self) -> dict[str, Any]:
+    def as_safe_dict(self, *, schema_version: str = PRODUCTION_SCHEMA_VERSION) -> dict[str, Any]:
         return {
             "expected_recipient_count": self.expected_recipient_count,
             "approved_exposure_minor": self.approved_exposure_minor,
             "approval_supplied": self.supplied,
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "approval_arithmetic": (
+                "approved_exposure_minor = expected_recipient_count * "
+                f"{production_contract(schema_version).unit_price_minor}"
+            ),
         }
 
 
@@ -242,7 +246,7 @@ class ProductionMember:
             slot=self.slot,
         )
 
-    def as_safe_dict(self, *, preview_run_id: int) -> dict[str, Any]:
+    def as_safe_dict(self, *, preview_run_id: int, schema_version: str = PRODUCTION_SCHEMA_VERSION) -> dict[str, Any]:
         """Slot, row id, booleans and reason codes. Never a person."""
         proof = dict(self.proof.as_safe_dict())
         # §37.2's answers, in this phase's vocabulary. See `translate_reason`.
@@ -258,7 +262,7 @@ class ProductionMember:
             "slot": self.slot,
             "campaign_recipient_id": self.campaign_recipient_id,
             "reconciliation_marker": self.marker(preview_run_id=preview_run_id),
-            "voucher_value_minor": UNIT_PRICE_MINOR,
+            "voucher_value_minor": production_contract(schema_version).unit_price_minor,
             "voucher_quantity": 1,
             **proof,
         }
@@ -300,7 +304,7 @@ class ProductionComposition:
 
     @property
     def total_exposure_minor(self) -> int:
-        return UNIT_PRICE_MINOR * self.recipient_count
+        return production_contract(self.schema_version).unit_price_minor * self.recipient_count
 
     def digest(self) -> str:
         """The immutable fingerprint of this exact composition.
@@ -333,7 +337,7 @@ class ProductionComposition:
             if self.campaign_period_end is not None
             else None,
             "recipient_count": self.recipient_count,
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
+            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
             "approved_recipient_count": self.approval.expected_recipient_count,
             "approved_exposure_minor": self.approval.approved_exposure_minor,
@@ -348,6 +352,8 @@ class ProductionComposition:
                 for member in self.members
             ],
         }
+        if self.schema_version == "3":
+            material["product_contract"] = production_contract(self.schema_version).digest_material()
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
     def composition_digest(self) -> str:
@@ -379,7 +385,7 @@ class ProductionComposition:
             if self.campaign_period_end is not None
             else None,
             "recipient_count": self.recipient_count,
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
+            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
             "slots": [
                 {
@@ -392,6 +398,8 @@ class ProductionComposition:
                 for member in self.members
             ],
         }
+        if self.schema_version == "3":
+            material["product_contract"] = production_contract(self.schema_version).digest_material()
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
     @property
@@ -433,16 +441,24 @@ class ProductionComposition:
             "recipient_count": self.recipient_count,
             "earned_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_EARNED for member in self.members),
             "manual_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_MANUAL for member in self.members),
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
+            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
             # Stated rather than implied: this phase has no recipient ceiling,
             # and a report must not leave a reader guessing whether one applied.
             "max_recipients": None,
             "recipient_ceiling_applies": False,
-            **self.approval.as_safe_dict(),
+            **self.approval.as_safe_dict(schema_version=self.schema_version),
+            **(
+                {"product_contract": production_contract(self.schema_version).digest_material()}
+                if self.schema_version == "3"
+                else {}
+            ),
             "frozen_digest": self.composition_digest() if self.proven else None,
             "approval_digest": self.digest() if self.proven else None,
-            "slots": [member.as_safe_dict(preview_run_id=self.preview_run_id) for member in self.members],
+            "slots": [
+                member.as_safe_dict(preview_run_id=self.preview_run_id, schema_version=self.schema_version)
+                for member in self.members
+            ],
         }
 
 
@@ -635,7 +651,9 @@ async def prove_production_composition(
         or run.period_start is None
         or run.period_end is None
     ):
-        return ProductionComposition(False, preview_run_id, (RUN_UNPROVEN,), approval=supplied)
+        return ProductionComposition(
+            False, preview_run_id, (RUN_UNPROVEN,), approval=supplied, schema_version=schema_version
+        )
 
     recipient_ids, bases = await active_recipient_ids(session, preview_run_id=preview_run_id)
     observed = len(recipient_ids)
@@ -648,11 +666,21 @@ async def prove_production_composition(
         # Unknown/test bases refuse the full composition. Legacy batches never
         # acquire earned eligibility merely because a newer app is deployed.
         return ProductionComposition(
-            False, preview_run_id, (COMPOSITION_MIXED_BASIS,), observed_active=observed, approval=supplied
+            False,
+            preview_run_id,
+            (COMPOSITION_MIXED_BASIS,),
+            observed_active=observed,
+            approval=supplied,
+            schema_version=schema_version,
         )
     if observed == 0:
         return ProductionComposition(
-            False, preview_run_id, (COMPOSITION_EMPTY,), observed_active=observed, approval=supplied
+            False,
+            preview_run_id,
+            (COMPOSITION_EMPTY,),
+            observed_active=observed,
+            approval=supplied,
+            schema_version=schema_version,
         )
 
     # The operator's stated size and cost, against what is really there. Checked
@@ -663,10 +691,15 @@ async def prove_production_composition(
     # Only when an approval was asked for at all. Post-freeze stages pass none.
     approval_reasons: tuple[str, ...] = ()
     if approval is not None:
-        approval_reasons = supplied.reasons_against(observed)
+        approval_reasons = supplied.reasons_against(observed, schema_version=schema_version)
         if approval_reasons:
             return ProductionComposition(
-                False, preview_run_id, approval_reasons, observed_active=observed, approval=supplied
+                False,
+                preview_run_id,
+                approval_reasons,
+                observed_active=observed,
+                approval=supplied,
+                schema_version=schema_version,
             )
 
     # -- and only now, the live reads: one per member, in slot order ---------

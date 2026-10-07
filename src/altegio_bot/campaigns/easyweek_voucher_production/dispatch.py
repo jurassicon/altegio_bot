@@ -75,7 +75,6 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_FREEZE,
     STAGE_PAY,
     STAGE_REFUND,
-    UNIT_PRICE_MINOR,
     UNKNOWN_STAGE,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
@@ -84,10 +83,13 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
 )
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError, EasyWeekError
 from altegio_bot.easyweek_voucher_identity import (
-    EASYWEEK_VOUCHER_TEMPLATE_UUID,
     KARLSRUHE_LOCATION_UUID,
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationClient
+from altegio_bot.easyweek_voucher_production_contract import (
+    CURRENT_PRODUCTION_CONTRACT,
+    production_contract,
+)
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_OPERATION_EXPIRED,
     VOUCHER_PRODUCTION_OPERATION_INTERRUPTED,
@@ -171,6 +173,8 @@ def _request_for(
     preview_run_id: int,
     batch_id: int | None,
     frozen_staffer_uuid: str | None,
+    schema_version: str = "3",
+    product_contract_version: str | None = None,
 ) -> tuple[runner_module.ProductionRequest | None, tuple[str, ...]]:
     """The frozen identity for this action, or the reasons it is unusable.
 
@@ -187,6 +191,7 @@ def _request_for(
       not written. The same is true of a readback, which must stay available
       exactly when the acting path is blocked.
     """
+    contract = production_contract(schema_version, contract_version=product_contract_version)
     account = (settings.easyweek_voucher_production_mailing_account_uuid or "").strip()
     reasons: list[str] = []
     if not account:
@@ -215,7 +220,9 @@ def _request_for(
             batch_id=batch_id,
             company_id=KARLSRUHE_COMPANY_ID,
             location_uuid=KARLSRUHE_LOCATION_UUID,
-            voucher_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            voucher_template_uuid=contract.template_uuid,
+            schema_version=schema_version,
+            product_contract_version=contract.version,
         ),
         (),
     )
@@ -411,7 +418,7 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=UNIT_PRICE_MINOR,
+            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
         )
     carrier = transports or Transports()
     try:
@@ -423,6 +430,7 @@ async def inspect_composition(
                     client_reader=reader,
                     now=utcnow(),
                     approval=None,
+                    schema_version=CURRENT_PRODUCTION_CONTRACT.request_schema_version,
                 )
     except EasyWeekConfigError:
         return CompositionView(
@@ -431,7 +439,7 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=UNIT_PRICE_MINOR,
+            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
         )
     except EasyWeekError:
         return CompositionView(
@@ -440,7 +448,7 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=UNIT_PRICE_MINOR,
+            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
         )
     except SQLAlchemyError:
         return CompositionView(
@@ -449,7 +457,7 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=UNIT_PRICE_MINOR,
+            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
         )
 
     reasons = tuple(reason for reason in composition.reasons if reason not in _APPROVAL_NUMBER_REASONS)
@@ -474,7 +482,7 @@ async def inspect_composition(
         campaign_period=composition.period_label,
         recipient_count=composition.recipient_count,
         total_exposure_minor=composition.total_exposure_minor,
-        unit_price_minor=UNIT_PRICE_MINOR,
+        unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
         # The same digest a freeze plan carries in its signed snapshot, so the two
         # are comparable at all. Only for a proven audience: there is no identity to
         # report for a composition that could not be established.
@@ -515,12 +523,15 @@ async def offer_stage(
         # offer does nothing at all, not "nothing that writes".
         return _refused_offer(stage, (PRODUCTION_DISABLED,))
 
-    frozen_staffer = await _frozen_staffer(session_maker, batch_id=batch_id)
+    frozen = await ledger_module.load(session_maker, batch_id=batch_id) if batch_id is not None else None
+    frozen_staffer = frozen.staffer_uuid if frozen is not None and frozen.exists else None
     request, reasons = _request_for(
         stage=stage,
         preview_run_id=preview_run_id,
         batch_id=batch_id,
         frozen_staffer_uuid=frozen_staffer,
+        schema_version=frozen.schema_version if frozen is not None and frozen.exists else "3",
+        product_contract_version=frozen.product_contract_version if frozen is not None and frozen.exists else None,
     )
     if request is None:
         return _refused_offer(stage, reasons)
@@ -576,7 +587,7 @@ async def offer_stage(
     targets = operations_module.stage_targets_for(
         stage=stage,
         slots=plan.authorised_slots,
-        unit_price_minor=UNIT_PRICE_MINOR,
+        unit_price_minor=production_contract(request.schema_version).unit_price_minor,
         batch_recipient_count=batch_count,
         batch_exposure_minor=batch_exposure,
     )
@@ -610,6 +621,8 @@ async def offer_stage(
         baseline_version=str((safe_plan.get("snapshot", {}).get("baseline") or {}).get("baseline_version") or ""),
         frozen_digest=snapshot.frozen_digest if snapshot.exists else composition.composition_digest(),
         stop_generation_at_plan=generation,
+        request_schema_version=request.schema_version,
+        product_contract_version=production_contract(request.schema_version).version,
     )
     await operations_module.record_audit(
         session_maker,
@@ -769,12 +782,15 @@ async def reconcile_batch(
             detail={"blocking_operation_id": busy},
         )
         return ReconcileOutcome(report=None, reasons=(RECONCILE_BUSY,))
-    frozen_staffer = await _frozen_staffer(session_maker, batch_id=batch_id)
+    frozen = await ledger_module.load(session_maker, batch_id=batch_id) if batch_id is not None else None
+    frozen_staffer = frozen.staffer_uuid if frozen is not None and frozen.exists else None
     request, _reasons = _request_for(
         stage=NON_ISSUING,
         preview_run_id=preview_run_id,
         batch_id=batch_id,
         frozen_staffer_uuid=frozen_staffer,
+        schema_version=frozen.schema_version if frozen is not None and frozen.exists else "3",
+        product_contract_version=frozen.product_contract_version if frozen is not None and frozen.exists else None,
     )
     if request is None:
         return ReconcileOutcome(report=None, reasons=(RUNTIME_IDENTITY_UNUSABLE,))
@@ -862,12 +878,17 @@ async def execute_operation(
             reason_codes=[PRODUCTION_DISABLED],
         )
 
-    frozen_staffer = await _frozen_staffer(session_maker, batch_id=approval.batch_id)
+    frozen = (
+        await ledger_module.load(session_maker, batch_id=approval.batch_id) if approval.batch_id is not None else None
+    )
+    frozen_staffer = frozen.staffer_uuid if frozen is not None and frozen.exists else None
     request, reasons = _request_for(
         stage=approval.stage,
         preview_run_id=approval.campaign_run_id,
         batch_id=approval.batch_id,
         frozen_staffer_uuid=frozen_staffer,
+        schema_version=approval.request_schema_version,
+        product_contract_version=approval.product_contract_version,
     )
     if request is None:
         return await operations_module.finish_operation(

@@ -25,6 +25,12 @@ from altegio_bot.campaigns.easyweek_voucher_production import operations as oper
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import EasyWeekVoucherProductionApproval
 from altegio_bot.ops.auth import SESSION_COOKIE, make_session_token
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    model_issued_validity_capability,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (
     OPS_SECRET,
     OPS_USER,
@@ -35,12 +41,24 @@ from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     FakeMutator,
-    FakeReader,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+
+@pytest.fixture
+def issued_validity_capability(monkeypatch):
+    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
+
+    This module's subject is how a browser click becomes permission for one stage.
+    With the real default the fixed €10 contract refuses CREATE and PAY
+    outright, before any order exists. That refusal is proven WITHOUT this
+    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
+    weakens it. This models question (a) only — whether any issued term could
+    be proven at all — and never question (b) about one particular voucher.
+    """
+    model_issued_validity_capability(monkeypatch)
+
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -79,7 +97,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
                 "stage": "freeze",
                 "preview_run_id": run_id,
                 "expected_recipient_count": count,
-                "approved_exposure_minor": count * 1500,
+                "approved_exposure_minor": count * 1000,
             },
         )
     ).json()
@@ -269,7 +287,13 @@ async def test_the_csrf_token_is_not_in_a_url_and_the_page_carries_no_secret(ui_
 
 
 async def test_a_spoofed_actor_in_the_payload_is_ignored(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The audit records the session's account, never one the request named."""
     run_id, batch_id, _reader = await _frozen(ui_client, session_maker, transports, count=1)
@@ -331,6 +355,7 @@ async def test_a_tampered_count_or_amount_gives_zero_external_calls(
     session_maker,
     production_configuration,
     binding_key,
+    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -364,7 +389,13 @@ async def test_a_tampered_count_or_amount_gives_zero_external_calls(
 
 
 async def test_the_browser_cannot_name_the_slots(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """``target_slots`` comes from the server's plan and from nowhere else."""
     count = 3
@@ -394,7 +425,13 @@ async def test_the_browser_cannot_name_the_slots(
 
 
 async def test_one_approval_cannot_become_two_operations_even_concurrently(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Two confirmations racing on one approval. PostgreSQL decides, and it decides once."""
     import asyncio
@@ -422,7 +459,14 @@ async def test_one_approval_cannot_become_two_operations_even_concurrently(
 
 
 async def test_two_operators_cannot_confirm_the_same_offer(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    monkeypatch,
 ):
     """An approval id is not a capability: it belongs to the session that got it."""
     count = 1
@@ -452,7 +496,13 @@ async def test_two_operators_cannot_confirm_the_same_offer(
 
 
 async def test_an_expired_plan_refuses_at_confirmation(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Thirty minutes of reading time, and not a minute of credit afterwards."""
     count = 1
@@ -476,7 +526,13 @@ async def test_an_expired_plan_refuses_at_confirmation(
 
 
 async def test_a_plan_that_expires_while_queued_is_not_executed(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Waiting in the queue is not reading time, and no worker re-approves anything.
 
@@ -528,7 +584,13 @@ async def _age_approval(session_maker, approval_id: int, *, by: timedelta) -> No
 
 
 async def test_an_approval_for_one_stage_cannot_run_another(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The stage is inside the signed plan, so a create approval is useless for a pay."""
     count = 1
@@ -563,7 +625,13 @@ async def test_an_approval_for_one_stage_cannot_run_another(
 
 
 async def test_an_approval_for_one_batch_cannot_run_a_stage_of_another(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Two mailings in one week is the normal case, and their approvals do not mix."""
     count = 1
@@ -579,7 +647,7 @@ async def test_an_approval_for_one_batch_cannot_run_a_stage_of_another(
                 "stage": "freeze",
                 "preview_run_id": run_b,
                 "expected_recipient_count": count,
-                "approved_exposure_minor": count * 1500,
+                "approved_exposure_minor": count * 1000,
             },
         )
     ).json()
@@ -656,7 +724,13 @@ async def test_a_confirmation_for_an_unknown_approval_is_refused(
 
 
 async def test_the_approval_records_exactly_the_slots_the_operator_was_shown(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """§42.7 through the browser: the approved slot set is stored, not re-derived.
 
@@ -707,14 +781,14 @@ async def test_the_approval_records_exactly_the_slots_the_operator_was_shown(
     assert pay_offer["ready"], pay_offer["reasons"]
     assert pay_offer["targets"]["target_slots"] == [1]
     assert pay_offer["targets"]["stage_target_count"] == 1
-    assert pay_offer["targets"]["stage_amount_minor"] == 1500
+    assert pay_offer["targets"]["stage_amount_minor"] == 1000
     # The batch total is shown separately and is NOT what is being approved.
-    assert pay_offer["targets"]["batch_exposure_minor"] == count * 1500
+    assert pay_offer["targets"]["batch_exposure_minor"] == count * 1000
 
     approval = await operations_module.load_approval(session_maker, approval_id=pay_offer["approval"]["approval_id"])
     assert approval is not None
     assert approval.target_slots == (1,)
-    assert approval.stage_amount_minor == 1500
+    assert approval.stage_amount_minor == 1000
 
     # Now slot 2's voucher appears in the window between the plan and the payment.
     await _make_slot_created(session_maker, batch_id=batch_id, slot=2, order_index=1)

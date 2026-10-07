@@ -3924,7 +3924,8 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       <hr class="my-3">
       <div class="alert alert-warning mb-0">
         <b>EasyWeek preview (§37.1).</b> Кампания <code>new_clients_monthly</code>,
-        шаблон доставки <code>new_client_voucher</code>.
+        новая рассылка: <code>new_client_voucher_10eur_v2</code>.
+        Ваучер 10 EUR, одноразовый, один календарный месяц с активации, а не с получения сообщения.
         Здесь можно построить preview и вручную отредактировать список получателей.
         Для Karlsruhe перейдите в <a href="/ops/voucher-mailings">«Ваучеры»</a>:
         проверка состава и отдельные подтверждения FREEZE, CREATE, PAY, DELIVER.
@@ -3981,7 +3982,7 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
       <dt class="col-sm-3">Provider</dt>
       <dd class="col-sm-9"><code>easyweek</code></dd>
       <dt class="col-sm-3">Internal code</dt>
-      <dd class="col-sm-9"><code>new_client_voucher</code></dd>
+      <dd class="col-sm-9"><code>new_client_voucher_10eur_v2</code></dd>
       <dt class="col-sm-3">Meta template</dt>
       <dd class="col-sm-9"><span id="ew-template-name">—</span></dd>
       <dt class="col-sm-3">Язык</dt>
@@ -5300,6 +5301,7 @@ const EW_TEMPLATE_REASONS = {{
   "template_row_missing": "Шаблон для этого филиала не настроен.",
   "template_rows_ambiguous": "Для этого филиала несколько активных шаблонов — неоднозначно.",
   "voucher_delivery_template_unproven": "Шаблон филиала не доказан.",
+  "voucher_production_template_unproven": "Новый шаблон 10 EUR не совпадает с контрактом.",
   "voucher_delivery_template_mismatch": "Строка шаблона не совпадает с контрактом.",
 }};
 
@@ -5326,7 +5328,8 @@ async function loadEasyWeekTemplateStatus() {{
   let data;
   try {{
     const resp = await fetch(
-      "/ops/campaigns/new-clients/easyweek-template-status?company_id=" + encodeURIComponent(companyId)
+      "/ops/campaigns/new-clients/easyweek-template-status?contract=production-10eur-v2&company_id="
+        + encodeURIComponent(companyId)
     );
     data = resp.ok ? await resp.json() : null;
   }} catch (e) {{

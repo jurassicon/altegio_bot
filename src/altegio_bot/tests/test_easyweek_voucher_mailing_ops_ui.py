@@ -44,20 +44,38 @@ from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_PLANNED,
     EasyWeekVoucherProductionBatchItem,
 )
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    model_issued_validity_capability,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import StubTransports, session_cookie
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     VOUCHER_CODE_SENTINELS,
     FakeMutator,
-    FakeReader,
     FakeSender,
     accepted_outcome,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
     unknown_outcome,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+
+@pytest.fixture
+def issued_validity_capability(monkeypatch):
+    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
+
+    This module's subject is the operator's whole path through the browser.
+    With the real default the fixed €10 contract refuses CREATE and PAY
+    outright, before any order exists. That refusal is proven WITHOUT this
+    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
+    weakens it. This models question (a) only — whether any issued term could
+    be proven at all — and never question (b) about one particular voucher.
+    """
+    model_issued_validity_capability(monkeypatch)
+
 
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed; JS execution tests need it")
@@ -67,6 +85,12 @@ CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
 STOP_URL = "/ops/voucher-mailings/api/stop"
 RECONCILE_URL = "/ops/voucher-mailings/api/reconcile"
 STATUS_URL = "/ops/voucher-mailings/api/status"
+
+
+@pytest.fixture
+def synthetic_validity_proven(monkeypatch):
+    """Conditional send acceptance; production expiry evidence is still a rollout blocker."""
+    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
 
 
 # ===========================================================================
@@ -174,7 +198,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
         preview_run_id=run_id,
         reader=reader,
         count=count,
-        minor=count * 1500,
+        minor=count * 1000,
     )
     assert frozen is not None and frozen.status == "completed", frozen
     batch_id = await _batch_id(session_maker, run_id=run_id)
@@ -222,7 +246,14 @@ async def _paid(client, session_maker, transports, *, count: int) -> tuple[int, 
 
 
 async def test_an_operator_runs_the_whole_mailing_from_the_browser(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """One operator, one browser, four confirmations, three recipients paid and sent.
 
@@ -255,10 +286,10 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
         preview_run_id=run_id,
         reader=reader,
         count=count,
-        minor=count * 1500,
+        minor=count * 1000,
     )
     assert freeze_offer["targets"]["stage_target_count"] == count
-    assert freeze_offer["targets"]["stage_amount_minor"] == count * 1500
+    assert freeze_offer["targets"]["stage_amount_minor"] == count * 1000
     assert frozen is not None and frozen.status == "completed"
     batch_id = await _batch_id(session_maker, run_id=run_id)
     assert batch_id is not None
@@ -295,7 +326,7 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
         reader=reader,
         mutator=FakeMutator(pay_sequence=[_ok(i) for i in range(count)], reader=reader, settles=settles),
     )
-    assert pay_offer["targets"]["stage_amount_minor"] == count * 1500
+    assert pay_offer["targets"]["stage_amount_minor"] == count * 1000
     assert paid is not None and paid.status == "completed"
     assert paid.result["external_calls"]["pay"] == count
 
@@ -326,7 +357,13 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
 
 
 async def test_no_single_control_walks_create_pay_and_deliver(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Finishing a stage offers the next one; it never authorises it.
 
@@ -345,7 +382,13 @@ async def test_no_single_control_walks_create_pay_and_deliver(
 
 
 async def test_a_refresh_and_a_second_tab_do_not_create_a_second_effect(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """One offer, two confirmations, one operation, one set of vouchers.
 
@@ -391,7 +434,7 @@ async def test_work_survives_the_tab_that_started_it(
         stage="freeze",
         preview_run_id=run_id,
         expected_recipient_count=count,
-        approved_exposure_minor=count * 1500,
+        approved_exposure_minor=count * 1000,
     )
     status, body = await _confirm(ui_client, offer)
     assert status == 200
@@ -429,6 +472,24 @@ async def test_readiness_explains_a_closed_fence_without_naming_a_secret(
     offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=1)
     assert offer["ready"] is False
     assert "voucher_production_disabled" in offer["reasons"]
+
+
+async def test_the_readiness_panel_names_the_issued_validity_blocker_before_any_batch(
+    session_maker, production_configuration, binding_key, ui_client
+):
+    """F1. The blocker is visible on the way IN, not discovered after a payment.
+
+    An operator opening the entry page of a correctly configured deployment —
+    fence open, every identity in place — must be told that new mailings cannot
+    be issued yet. The panel is rendered from the same prerequisites the backend
+    refuses on, so the page and the refusal cannot disagree.
+    """
+    page = await ui_client.get("/ops/voucher-mailings")
+    assert page.status_code == 200
+    assert "voucher_production_validity_capability_unproven" in page.text
+    assert "выпуск и оплата новых ваучеров закрыты" in page.text
+    # The one thing it must not read as: ready.
+    assert "alert-success" not in page.text
 
 
 async def test_the_status_page_stays_readable_with_the_fence_closed(
@@ -473,7 +534,13 @@ async def test_a_get_never_starts_a_stage(
 
 
 async def test_a_stop_ends_the_stage_after_the_current_request(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """One voucher is created, the stop lands, and the rest are never claimed.
 
@@ -551,7 +618,13 @@ async def test_a_stop_does_not_block_status_or_reconciliation(
 
 
 async def test_continuing_after_a_stop_needs_a_fresh_confirmation_and_repeats_nothing(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A stop blocks the stage it was pressed during; continuing is a new decision.
 
@@ -592,7 +665,14 @@ async def test_continuing_after_a_stop_needs_a_fresh_confirmation_and_repeats_no
 
 
 async def test_an_unknown_send_stops_the_rest_and_the_ui_offers_reconciliation(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """One ambiguous Meta answer halts the suffix, and the browser says so.
 
@@ -634,7 +714,13 @@ async def test_an_unknown_send_stops_the_rest_and_the_ui_offers_reconciliation(
 
 
 async def test_an_allowed_pre_send_refund_runs_from_the_browser(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """One named paid slot, nothing ever sent for it, money back — one confirmation."""
     count = 2
@@ -654,7 +740,7 @@ async def test_an_allowed_pre_send_refund_runs_from_the_browser(
         slot=1,
     )
     assert offer["targets"]["stage_target_count"] == 1
-    assert offer["targets"]["stage_amount_minor"] == 1500
+    assert offer["targets"]["stage_amount_minor"] == 1000
     assert finished is not None and finished.status == "completed", finished.result
     assert mutator.calls.count("refund") == 1
     items = await _items(session_maker, batch_id)
@@ -978,6 +1064,7 @@ console.log(JSON.stringify({
 
 
 _COMPOSITION_FUNCTIONS = (
+    "reasonLabel",
     "basisLabel",
     "renderOffer",
     "renderComposition",
@@ -1128,7 +1215,14 @@ console.log(JSON.stringify(cases));
 
 
 async def test_no_page_or_api_answer_carries_a_code_or_an_identity(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """Every sentinel this suite can leak, hunted across the whole operator surface."""
     from altegio_bot.tests.easyweek_voucher_production_fixtures import (

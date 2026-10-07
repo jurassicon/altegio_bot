@@ -39,6 +39,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
+from altegio_bot.campaigns.easyweek_voucher_production import template_contract as production_template_contract
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate
@@ -65,6 +66,16 @@ REPAIR_NONE: Final = "none"
 # which here means the template body, and its connection context can carry the
 # DSN. A stable reason code is what a runbook can act on anyway.
 REASON_DATABASE_UNAVAILABLE: Final = "voucher_template_database_unavailable"
+LEGACY_CONTRACT: Final = "legacy-15eur"
+PRODUCTION_CONTRACT: Final = "production-10eur-v2"
+
+
+def _contract(selector: str):
+    if selector == LEGACY_CONTRACT:
+        return template_contract
+    if selector == PRODUCTION_CONTRACT:
+        return production_template_contract
+    raise ValueError("unknown voucher message contract")
 
 
 async def audit(
@@ -72,17 +83,19 @@ async def audit(
     *,
     company_id: int,
     templates: list[dict[str, Any]],
+    contract: str = LEGACY_CONTRACT,
 ) -> tuple[template_contract.TemplateProof, MessageTemplate | None, str | None]:
     """Prove Meta, then say what the stored row would have to become."""
-    proof = template_contract.prove_meta_templates(templates)
+    message = _contract(contract)
+    proof = message.prove_meta_templates(templates)
     rows = list(
         (
             await session.execute(
                 select(MessageTemplate)
                 .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
                 .where(MessageTemplate.company_id == company_id)
-                .where(MessageTemplate.code == template_contract.VOUCHER_TEMPLATE_CODE)
-                .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                .where(MessageTemplate.code == message.VOUCHER_TEMPLATE_CODE)
+                .where(MessageTemplate.language == message.VOUCHER_TEMPLATE_LANGUAGE)
             )
         )
         .scalars()
@@ -91,7 +104,7 @@ async def audit(
     if len(rows) > 1:
         return proof, None, "multiple_rows_for_one_code"
     row = rows[0] if rows else None
-    blocker = template_contract.db_row_blocker(row, company_id=company_id) if row is not None else "row_missing"
+    blocker = message.db_row_blocker(row, company_id=company_id) if row is not None else "row_missing"
     return proof, row, blocker
 
 
@@ -116,7 +129,10 @@ def _repair_for(blocker: str, row: MessageTemplate | None) -> str:
     return REPAIR_NONE
 
 
-async def reconcile(*, company_id: int, apply: bool) -> tuple[dict[str, Any], int]:
+async def reconcile(*, company_id: int, apply: bool, contract: str = LEGACY_CONTRACT) -> tuple[dict[str, Any], int]:
+    message = _contract(contract)
+    if contract == PRODUCTION_CONTRACT and company_id != 322579:
+        return {"ok": False, "reason": "unsupported_production_company"}, EXIT_ARGUMENTS
     token = settings.whatsapp_access_token.strip()
     waba_id = (settings.meta_waba_id or "").strip()
     if not token or not waba_id:
@@ -137,9 +153,13 @@ async def reconcile(*, company_id: int, apply: bool) -> tuple[dict[str, Any], in
         # ``session.begin()`` only after ``audit()`` raises
         # InvalidRequestError in production before any row can be written.
         async with session.begin():
-            proof, row, blocker = await audit(session, company_id=company_id, templates=templates)
+            audit_kwargs: dict[str, Any] = {"company_id": company_id, "templates": templates}
+            if contract != LEGACY_CONTRACT:
+                audit_kwargs["contract"] = contract
+            proof, row, blocker = await audit(session, **audit_kwargs)
             report: dict[str, Any] = {
                 "company_id": company_id,
+                "contract": contract,
                 "meta": proof.as_safe_dict(),
                 "db_row_blocker": blocker,
                 "applied": False,
@@ -168,17 +188,17 @@ async def reconcile(*, company_id: int, apply: bool) -> tuple[dict[str, Any], in
                     MessageTemplate(
                         provider=PROVIDER_EASYWEEK,
                         company_id=company_id,
-                        code=template_contract.VOUCHER_TEMPLATE_CODE,
-                        language=template_contract.VOUCHER_TEMPLATE_LANGUAGE,
-                        body=template_contract.VOUCHER_TEMPLATE_BODY,
-                        meta_template_name=template_contract.VOUCHER_META_TEMPLATE_NAME,
+                        code=message.VOUCHER_TEMPLATE_CODE,
+                        language=message.VOUCHER_TEMPLATE_LANGUAGE,
+                        body=message.VOUCHER_TEMPLATE_BODY,
+                        meta_template_name=message.VOUCHER_META_TEMPLATE_NAME,
                         is_active=True,
                     )
                 )
             else:
                 assert row is not None  # REPAIR_UPDATE is returned only with a row
-                row.body = template_contract.VOUCHER_TEMPLATE_BODY
-                row.meta_template_name = template_contract.VOUCHER_META_TEMPLATE_NAME
+                row.body = message.VOUCHER_TEMPLATE_BODY
+                row.meta_template_name = message.VOUCHER_META_TEMPLATE_NAME
                 row.is_active = True
             report["applied"] = True
             # Returned from INSIDE the transaction on purpose: the commit
@@ -193,6 +213,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         allow_abbrev=False,
     )
     parser.add_argument("--company-id", type=int, required=True)
+    parser.add_argument(
+        "--contract",
+        choices=(LEGACY_CONTRACT, PRODUCTION_CONTRACT),
+        default=LEGACY_CONTRACT,
+        help="Explicitly choose production-10eur-v2; the historical default remains legacy-15eur.",
+    )
     parser.add_argument("--apply", action="store_true", help="Without it this command only reports.")
     return parser.parse_args(argv)
 
@@ -204,7 +230,7 @@ async def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "reason": "unknown_company"}, ensure_ascii=False))
         return EXIT_ARGUMENTS
     try:
-        report, code = await reconcile(company_id=args.company_id, apply=args.apply)
+        report, code = await reconcile(company_id=args.company_id, apply=args.apply, contract=args.contract)
     except ScriptError as exc:
         print(json.dumps({"ok": False, "reason": "meta_unavailable", "detail": str(exc)}, ensure_ascii=False))
         return EXIT_BLOCKED

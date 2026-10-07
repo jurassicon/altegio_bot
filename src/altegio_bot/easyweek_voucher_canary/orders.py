@@ -229,7 +229,7 @@ def _exact_int(value: object) -> int | None:
     return value if type(value) is int else None
 
 
-def classify_order(payload: object) -> tuple[str, str]:
+def classify_order(payload: object, *, expected_price_minor: int = SUPPORTED_VOUCHER_PRICE_MINOR) -> tuple[str, str]:
     """``(order_state, payment_proof)`` from documented fields only.
 
     Every state is an allowlist. A status that is absent, null, not a string or
@@ -259,7 +259,7 @@ def classify_order(payload: object) -> tuple[str, str]:
     invoice = invoice if isinstance(invoice, dict) else order
     amount_due = _exact_int(invoice.get("amount_due"))
     amount_paid = _exact_int(invoice.get("amount_paid"))
-    settled = amount_due == 0 and amount_paid == SUPPORTED_VOUCHER_PRICE_MINOR
+    settled = amount_due == 0 and amount_paid == expected_price_minor
 
     # Refund wins over payment; a refunded order having been paid is expected.
     # Reverted AND cancelled at once is not, and is not a state to act on.
@@ -307,6 +307,32 @@ def _total_levels(order: dict[str, Any]) -> list[dict[str, Any]] | None:
     if not isinstance(invoice, dict):
         return None
     return [order, invoice]
+
+
+def paid_order_amounts_proven(payload: object, *, expected_price_minor: int) -> bool:
+    """Exact settled invoice for a new production product, never a refund gate.
+
+    The documented paid status plus exact totals proves settlement. An absent
+    invoice is not invented: the observed POS response may expose subtotal and
+    status only. Every published amount must agree; account_paid_amount is not
+    evidence. Without a paid status the existing settled-invoice proof applies.
+    """
+    order = order_object(payload)
+    if order is None:
+        return False
+    if classify_order(payload, expected_price_minor=expected_price_minor)[0] != ORDER_PAID:
+        return False
+    levels = _total_levels(order)
+    if levels is None:
+        return False
+    totals = [level[key] for level in levels for key in _TOTAL_KEYS if key != "amount_due" and key in level]
+    if not totals or any(_exact_int(value) != expected_price_minor for value in totals):
+        return False
+    for key, expected in (("amount_paid", expected_price_minor), ("amount_due", 0)):
+        values = [level[key] for level in levels if key in level]
+        if any(_exact_int(value) != expected for value in values):
+            return False
+    return True
 
 
 def _order_total_reasons(order: dict[str, Any], *, expected_price_minor: int) -> tuple[str, ...]:

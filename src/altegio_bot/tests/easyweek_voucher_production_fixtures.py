@@ -189,6 +189,11 @@ def production_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_staffer_uuid", STAFFER_UUID, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_account_uuid", ACCOUNT_UUID, raising=False)
     pin_synthetic_issuer(monkeypatch)
+    # The same synthetic deployment also backs explicit §45 tests. Historical
+    # requests never consult this new-product account proof.
+    from altegio_bot.campaigns.easyweek_voucher_production import account
+
+    monkeypatch.setattr(account, "expected_account_fingerprint", lambda: account.account_fingerprint(ACCOUNT_UUID))
 
 
 def production_request(*, run_id: int, batch_id: int | None = None) -> ProductionRequest:

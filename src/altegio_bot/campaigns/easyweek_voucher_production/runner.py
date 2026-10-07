@@ -65,13 +65,13 @@ from altegio_bot.campaigns.easyweek_voucher_delivery.binding import (
 )
 from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import DELIVERY_REJECTED, DeliveryOutcome
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
+from altegio_bot.campaigns.easyweek_voucher_production.account import prove_current_account
 from altegio_bot.campaigns.easyweek_voucher_production.authorisation import (
     StagePlan,
     stage_digest,
     verify_plan_authorisation,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.baseline import (
-    PRODUCTION_BASELINE_VERSION,
     ProductionBaselineProof,
     prove_production_baseline,
 )
@@ -82,7 +82,6 @@ from altegio_bot.campaigns.easyweek_voucher_production.composition import (
 )
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPLY_FLAG_MISSING,
-    APPROVAL_ARITHMETIC,
     ARTIFACT_UNPROVEN,
     BASELINE_DRIFT,
     BATCH_HALTED,
@@ -110,7 +109,6 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ORDER_NOT_PAYABLE,
     ORDER_UNPROVEN,
     PREVIEW_ALREADY_FROZEN,
-    PRODUCTION_SCHEMA_VERSION,
     PRODUCTION_SCOPE,
     RECONCILE_BUSY,
     RECONCILE_UNRESOLVED,
@@ -124,9 +122,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_REFUND,
     STOPPED_BY_OPERATOR,
     TEMPLATE_PARAMETERS_UNPROVEN,
-    UNIT_PRICE_MINOR,
     UNKNOWN_STAGE,
-    VOUCHER_TEMPLATE_CODE,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     IssuerMembership,
@@ -136,8 +132,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
 from altegio_bot.campaigns.easyweek_voucher_production.read_sessions import release_reads_before_http
 from altegio_bot.campaigns.easyweek_voucher_production.readiness import (
     ProductionPrerequisites,
+    prove_live_meta_template,
     prove_prerequisites,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.validity import issued_voucher_validity_reason
 from altegio_bot.easyweek_client import EasyWeekError
 from altegio_bot.easyweek_voucher_canary.artifact import observe_artifact
 from altegio_bot.easyweek_voucher_canary.orders import (
@@ -149,6 +147,7 @@ from altegio_bot.easyweek_voucher_canary.orders import (
     classify_order,
     find_marker_orders,
     order_object,
+    paid_order_amounts_proven,
     payable_order_reasons,
 )
 from altegio_bot.easyweek_voucher_canary.voucher_line import prove_voucher_line
@@ -157,6 +156,12 @@ from altegio_bot.easyweek_voucher_identity import (
     KARLSRUHE_LOCATION_UUID,
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown, VoucherMutationResponse
+from altegio_bot.easyweek_voucher_production_contract import (
+    CURRENT_PRODUCTION_CONTRACT,
+    LEGACY_PRODUCTION_CONTRACT,
+    ProductionVoucherContract,
+    production_contract,
+)
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_CREATE_CLAIMED,
     VOUCHER_PRODUCTION_ITEM_CREATE_REJECTED,
@@ -246,6 +251,7 @@ class VoucherMutator(Protocol):
         voucher_template_uuid: str,
         price_minor: int,
         marker: str,
+        product_contract_version: str | None = None,
     ) -> VoucherMutationResponse: ...
 
     async def pay_voucher_order(self, *, order_uuid: str, account_uuid: str) -> VoucherMutationResponse: ...
@@ -316,9 +322,42 @@ class StageReport:
     external_calls: dict[str, int] = field(default_factory=dict)
     # Every batch this phase knows about, for `status` only.
     batches: list[dict[str, Any]] = field(default_factory=list)
+    # What would stop this batch being DELIVERED, as opposed to what stopped
+    # this stage. A freeze carries these and still succeeds: it bought nothing,
+    # and saying so is the whole value of freezing before buying.
+    delivery_blockers: list[str] = field(default_factory=list)
+
+    def _contract(self) -> ProductionVoucherContract:
+        """Which contract this report is ABOUT.
+
+        Resolved from what the baseline positively NAMES, never from what it
+        fails to name. The reviewed version picked the historical contract
+        whenever there was no baseline — and ``run_status`` passes none — so a
+        `status` read on an empty ledger, and the mixed list of every batch,
+        both printed 1500 and ``N × 1500`` as though that were the contract new
+        mailings use. It is not: new mailings are 1000.
+
+        A report about one batch does not depend on this at all. It prints that
+        batch's own frozen amount, 1500 or 1000, whichever it was frozen under.
+        """
+        version = (self.baseline or {}).get("baseline_version")
+        if version == LEGACY_PRODUCTION_CONTRACT.baseline_version:
+            return LEGACY_PRODUCTION_CONTRACT
+        return CURRENT_PRODUCTION_CONTRACT
 
     def as_safe_dict(self) -> dict[str, Any]:
         batch = dict(self.batch)
+        contract = self._contract()
+        # Two different numbers, deliberately not merged. `unit_price_minor` is
+        # what THIS report is about — a frozen batch's own amount, or, with no
+        # batch, the contract the baseline named. `default_` is what a NEW
+        # mailing costs, and it does not move with the subject: a report about a
+        # historical €15 batch must not be readable as "new mailings are €15".
+        unit_price_minor = (
+            int(batch.get("voucher_unit_price_minor", contract.unit_price_minor))
+            if batch.get("exists")
+            else contract.unit_price_minor
+        )
         return {
             "mode": "voucher_production_stage",
             "batch_scope": PRODUCTION_SCOPE,
@@ -361,8 +400,19 @@ class StageReport:
             "webhook_read_count": batch.get("webhook_read_count", 0),
             "recipient_basis": batch.get("recipient_basis"),
             "first_visit_proof": batch.get("first_visit_proof"),
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "voucher_unit_price_minor": unit_price_minor,
+            "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {unit_price_minor}",
+            # What a new mailing costs, beside what this report is about. A
+            # reader looking at a historical batch, or at a list holding both
+            # versions, can see the two apart instead of inferring one from the
+            # other.
+            "default_voucher_unit_price_minor": CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            "default_product_contract_version": CURRENT_PRODUCTION_CONTRACT.version,
+            # Known blockers to delivering this batch, whether or not they
+            # refused this stage. Never empty-by-omission: a stage that did not
+            # ask reports nothing here, and a stage that asked reports what it
+            # found.
+            "delivery_blockers": list(dict.fromkeys(self.delivery_blockers)),
             # Repeated verbatim on every stage, success included. A mailing of
             # forty proven sends is still not a campaign permission.
             "campaign_send_authorized": False,
@@ -387,9 +437,11 @@ class ProductionRequest:
     company_id: int = KARLSRUHE_COMPANY_ID
     location_uuid: str = KARLSRUHE_LOCATION_UUID
     voucher_template_uuid: str = EASYWEEK_VOUCHER_TEMPLATE_UUID
+    schema_version: str = "2"
+    product_contract_version: str | None = None
 
 
-def _voucher_code(payload: object) -> str | None:
+def _voucher_code(payload: object, *, contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT) -> str | None:
     """The one issued code of this order, in memory, or ``None``.
 
     Read through the same §35 proof the payment gate uses, so a body this phase
@@ -400,8 +452,8 @@ def _voucher_code(payload: object) -> str | None:
         return None
     proof = prove_voucher_line(
         order,
-        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-        expected_price_minor=UNIT_PRICE_MINOR,
+        expected_template_uuid=contract.template_uuid,
+        expected_price_minor=contract.unit_price_minor,
     )
     if not proof.proven:
         return None
@@ -425,6 +477,7 @@ def _identity_from_composition(
     """
     if not composition.proven or composition.campaign_period_start is None or composition.campaign_period_end is None:
         return None
+    contract = production_contract(composition.schema_version)
     items: list[ledger_module.BatchItemIdentity] = []
     for member in composition.members:
         customer = member.easyweek_customer_uuid
@@ -456,12 +509,14 @@ def _identity_from_composition(
         staffer_uuid=request.staffer_uuid,
         payment_account_uuid=request.payment_account_uuid,
         voucher_template_uuid=request.voucher_template_uuid,
-        baseline_version=PRODUCTION_BASELINE_VERSION,
+        baseline_version=contract.baseline_version,
         frozen_digest=composition.composition_digest(),
         items=tuple(items),
         batch_id=None,
         schema_version=composition.schema_version,
         recipient_basis=composition.recipient_basis,
+        product_contract_version=contract.version,
+        message_contract_code=contract.message_code,
     )
 
 
@@ -524,6 +579,8 @@ def _identity_from_snapshot(
         batch_id=int(snapshot.batch_id or 0),
         schema_version=snapshot.schema_version,
         recipient_basis=snapshot.recipient_basis,
+        product_contract_version=snapshot.product_contract_version,
+        message_contract_code=snapshot.message_contract_code,
     )
 
 
@@ -547,8 +604,14 @@ def _runtime_identity_matches(
     """
     if not snapshot.exists:
         return True
+    contract = production_contract(request.schema_version, contract_version=request.product_contract_version)
     bound = (
-        snapshot.location_uuid == request.location_uuid
+        production_contract(snapshot.schema_version).version == contract.version
+        and snapshot.product_contract_version == contract.version
+        and snapshot.message_contract_code == contract.message_code
+        and snapshot.voucher_unit_price_minor == contract.unit_price_minor
+        and request.voucher_template_uuid == contract.template_uuid
+        and snapshot.location_uuid == request.location_uuid
         and snapshot.payment_account_uuid == request.payment_account_uuid
         and snapshot.voucher_template_uuid == request.voucher_template_uuid
     )
@@ -573,12 +636,14 @@ def _refusal(
     snapshot: ledger_module.BatchSnapshot,
     *,
     baseline: ProductionBaselineProof | None = None,
+    delivery_blockers: tuple[str, ...] | list[str] = (),
 ) -> StageReport:
     """A stage that did not act. Nothing left this process."""
     return StageReport(
         stage=stage,
         outcome="refused",
         reasons=list(reasons),
+        delivery_blockers=list(delivery_blockers),
         external_effect_attempted=False,
         reconciliation_required=snapshot.reconciliation_required,
         manual_cleanup_required=any(entry.manual_cleanup_required for entry in snapshot.items),
@@ -606,7 +671,9 @@ async def _exact_order(order_reader: Any, order_uuid: str | None) -> tuple[objec
     return payload, None
 
 
-async def _baseline_now(order_reader: Any) -> tuple[ProductionBaselineProof, tuple[str, ...]]:
+async def _baseline_now(
+    order_reader: Any, *, contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT
+) -> tuple[ProductionBaselineProof, tuple[str, ...]]:
     """Read the template and compare it with this phase's approved baseline.
 
     A drift is reported, never absorbed. The caller decides what a drift means
@@ -615,14 +682,63 @@ async def _baseline_now(order_reader: Any) -> tuple[ProductionBaselineProof, tup
     tidiness of the configuration it is cleaning up after.
     """
     try:
-        payload = await order_reader.get_voucher_template(EASYWEEK_VOUCHER_TEMPLATE_UUID)
+        payload = await order_reader.get_voucher_template(contract.template_uuid)
     except Exception:  # noqa: BLE001 - an unread template is an unproven one
         return (
-            ProductionBaselineProof(proven=False, baseline_version=PRODUCTION_BASELINE_VERSION),
+            ProductionBaselineProof(proven=False, baseline_version=contract.baseline_version),
             (BASELINE_DRIFT,),
         )
-    proof = prove_production_baseline(payload)
+    proof = prove_production_baseline(payload, contract=contract)
     return proof, () if proof.proven else (BASELINE_DRIFT,)
+
+
+async def _production_environment_now(
+    order_reader: Any, *, request: ProductionRequest
+) -> tuple[dict[str, bool], tuple[str, ...]]:
+    """Prove the workspace currency and issue location from documented GETs.
+
+    The product's own fields cannot establish the denomination's currency or
+    which workspace the configured credentials actually selected. This runs
+    only for new issuance/send stages; cleanup uses the frozen order bindings.
+    """
+    expected = CURRENT_PRODUCTION_CONTRACT.digest_material()
+    try:
+        payload = await order_reader.get_workspace()
+        workspace = order_object(payload) or {}
+        workspace_proven = (
+            workspace.get("uuid") == expected["workspace_uuid"]
+            and workspace.get("slug") == expected["workspace_slug"]
+            and workspace.get("currency") == expected["currency"]
+        )
+    except Exception:  # noqa: BLE001 - an unread workspace is never proof
+        workspace_proven = False
+    try:
+        locations = await order_reader.list_locations()
+        location_proven = (
+            isinstance(locations, list)
+            and all(isinstance(row, dict) and canonical_uuid(row.get("uuid")) is not None for row in locations)
+            and sum(row.get("uuid") == expected["location_uuid"] for row in locations) == 1
+        )
+    except Exception:  # noqa: BLE001 - no invented membership on a failed GET
+        location_proven = False
+    account_proven = await prove_current_account(
+        order_reader, account_uuid=request.payment_account_uuid, location_uuid=request.location_uuid
+    )
+    facts = {
+        "workspace_proven": workspace_proven,
+        "location_proven": location_proven,
+        "account_proven": account_proven,
+    }
+    reasons = tuple(
+        reason
+        for passed, reason in (
+            (workspace_proven, "voucher_production_workspace_unproven"),
+            (location_proven, "voucher_production_location_unproven"),
+            (account_proven, "voucher_production_account_unproven"),
+        )
+        if not passed
+    )
+    return facts, reasons
 
 
 async def _item_order_preconditions(
@@ -630,6 +746,7 @@ async def _item_order_preconditions(
     *,
     stage: str,
     item: ledger_module.ItemSnapshot,
+    contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT,
 ) -> tuple[list[str], str | None, list[dict[str, Any]]]:
     """What one slot's remote order must look like for this stage."""
     reasons: list[str] = []
@@ -640,13 +757,13 @@ async def _item_order_preconditions(
         return [order_reason], None, observations
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload)
+    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
     observation = observe_artifact(
         payload,
         stage=f"{stage}_plan_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
-        expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-        expected_price_minor=UNIT_PRICE_MINOR,
+        expected_template_uuid=contract.template_uuid,
+        expected_price_minor=contract.unit_price_minor,
     )
     observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -668,12 +785,19 @@ async def _item_order_preconditions(
             ORDER_NOT_PAYABLE
             for _ in payable_order_reasons(
                 payload,
-                expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-                expected_price_minor=UNIT_PRICE_MINOR,
+                expected_template_uuid=contract.template_uuid,
+                expected_price_minor=contract.unit_price_minor,
             )
         )
     elif stage == STAGE_DELIVER:
-        if state != ORDER_PAID:
+        if contract.request_schema_version == "3":
+            validity_reason = issued_voucher_validity_reason(payload, now=utcnow())
+            if validity_reason is not None:
+                reasons.append(validity_reason)
+        if state != ORDER_PAID or (
+            contract.request_schema_version == "3"
+            and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+        ):
             reasons.append(ORDER_NOT_PAID)
     elif stage == STAGE_REFUND:
         # Strictly paid. An order that already reads refunded has nothing left
@@ -805,8 +929,17 @@ async def build_stage_plan(
     what every caller below acts on.
     """
     issued_at = now or utcnow()
+    contract = production_contract(request.schema_version, contract_version=request.product_contract_version)
     reasons: list[str] = []
+    if request.voucher_template_uuid != contract.template_uuid:
+        reasons.append(IDENTITY_BINDING_MISMATCH)
     observations: list[dict[str, Any]] = []
+    environment: dict[str, bool] | None = None
+    if request.schema_version == "3" and stage != STAGE_REFUND:
+        environment, environment_reasons = await _production_environment_now(order_reader, request=request)
+        reasons.extend(environment_reasons)
+        if request.location_uuid != KARLSRUHE_LOCATION_UUID or request.company_id != KARLSRUHE_COMPANY_ID:
+            reasons.append(IDENTITY_BINDING_MISMATCH)
 
     if stage not in STAGE_ITEM_SOURCE_STATUSES and stage != STAGE_FREEZE:
         reasons.append(UNKNOWN_STAGE)
@@ -830,6 +963,11 @@ async def build_stage_plan(
             # to fix in order.
             issuer_membership = IssuerMembership(reason=ISSUER_MEMBERSHIP_INCOMPLETE)
 
+    live_meta_proof = (
+        await prove_live_meta_template(reader=order_reader)
+        if request.schema_version == "3" and stage != STAGE_REFUND
+        else None
+    )
     prerequisites = await prove_prerequisites(
         session,
         stage=stage,
@@ -837,6 +975,8 @@ async def build_stage_plan(
         sender_code=request.sender_code,
         enabled=enabled,
         issuer_membership=issuer_membership,
+        schema_version=request.schema_version,
+        live_meta_proof=live_meta_proof,
     )
     reasons.extend(prerequisites.reasons)
 
@@ -905,14 +1045,14 @@ async def build_stage_plan(
             # entitlements. Counting them would make every later stage report
             # the batch as a conflict with itself.
             exclude_batch_id=batch_id,
-            schema_version=snapshot.schema_version if snapshot.exists else PRODUCTION_SCHEMA_VERSION,
+            schema_version=snapshot.schema_version if snapshot.exists else request.schema_version,
         )
         reasons.extend(composition.reasons)
 
     # The template baseline, before every stage that will touch money or a
     # phone. A refund reads it too — for the report — but a drift does not stop
     # it: the money should come back either way.
-    baseline, baseline_reasons = await _baseline_now(order_reader)
+    baseline, baseline_reasons = await _baseline_now(order_reader, contract=contract)
     if stage != STAGE_REFUND:
         reasons.extend(baseline_reasons)
 
@@ -1009,6 +1149,7 @@ async def build_stage_plan(
                     order_reader,
                     stage=stage,
                     item=entry,
+                    contract=contract,
                 )
                 reasons.extend(item_reasons)
                 observations.extend(item_observations)
@@ -1024,8 +1165,8 @@ async def build_stage_plan(
         "batch_id": snapshot.batch_id,
         "location_uuid": request.location_uuid,
         "voucher_template_uuid": request.voucher_template_uuid,
-        "voucher_unit_price_minor": UNIT_PRICE_MINOR,
-        "approval_arithmetic": APPROVAL_ARITHMETIC,
+        "voucher_unit_price_minor": contract.unit_price_minor,
+        "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.unit_price_minor}",
         "target_slots": sorted(target_slots),
         "prerequisites": prerequisites.as_safe_dict(),
         "composition": composition.as_safe_dict(),
@@ -1061,6 +1202,11 @@ async def build_stage_plan(
         "baseline": baseline.as_safe_dict(),
         "batch": snapshot.as_safe_dict(),
     }
+
+    if request.schema_version == "3":
+        snapshot_facts["product_contract"] = contract.digest_material()
+        if environment is not None:
+            snapshot_facts["environment"] = environment
 
     unique = tuple(dict.fromkeys(reasons))
     plan = StagePlan(
@@ -1133,6 +1279,7 @@ async def _authorise(
         slot=slot,
         enabled=enabled,
     )
+    blockers = prerequisites.delivery_blockers
 
     reasons: list[str] = []
     if not apply:
@@ -1154,7 +1301,13 @@ async def _authorise(
             None,
             None,
             None,
-            _refusal(stage, tuple(dict.fromkeys(reasons)), snapshot, baseline=baseline),
+            _refusal(
+                stage,
+                tuple(dict.fromkeys(reasons)),
+                snapshot,
+                baseline=baseline,
+                delivery_blockers=blockers,
+            ),
         )
     return plan, composition, prerequisites, baseline, snapshot, None
 
@@ -1181,7 +1334,7 @@ async def run_freeze(
     can see. There is no path from here to a frozen batch whose approved numbers
     do not describe it.
     """
-    plan, composition, _prereq, baseline, _snapshot, refused = await _authorise(
+    plan, composition, prerequisites, baseline, _snapshot, refused = await _authorise(
         session,
         session_maker,
         stage=STAGE_FREEZE,
@@ -1197,12 +1350,17 @@ async def run_freeze(
     )
     if refused is not None:
         return refused
-    assert plan is not None and composition is not None and baseline is not None
+    assert plan is not None and composition is not None and baseline is not None and prerequisites is not None
+    # A freeze is allowed to succeed with these outstanding, and must never be
+    # read as a launch-ready mailing while they are. §45.2's issued-validity
+    # capability is the one that matters today: the batch is composed, approved
+    # and bought nothing, and it still could not be delivered.
+    blockers = prerequisites.delivery_blockers
 
     identity = _identity_from_composition(request, composition)
     if identity is None or approval.expected_recipient_count is None or approval.approved_exposure_minor is None:
         current = await ledger_module.load_for_preview(session_maker, campaign_run_id=request.preview_run_id)
-        return _refusal(STAGE_FREEZE, [COMPOSITION_DRIFTED], current, baseline=baseline)
+        return _refusal(STAGE_FREEZE, [COMPOSITION_DRIFTED], current, baseline=baseline, delivery_blockers=blockers)
 
     outcome = await ledger_module.freeze_batch(
         session_maker,
@@ -1216,7 +1374,7 @@ async def run_freeze(
             ledger_module.FREEZE_REFUSED_EXISTS: PREVIEW_ALREADY_FROZEN,
             ledger_module.FREEZE_REFUSED_APPROVAL: COMPOSITION_DRIFTED,
         }.get(outcome.reason, SNAPSHOT_NOT_FROZEN)
-        return _refusal(STAGE_FREEZE, [reason], outcome.snapshot, baseline=baseline)
+        return _refusal(STAGE_FREEZE, [reason], outcome.snapshot, baseline=baseline, delivery_blockers=blockers)
 
     return StageReport(
         stage=STAGE_FREEZE,
@@ -1228,6 +1386,7 @@ async def run_freeze(
         batch=outcome.snapshot.as_safe_dict(),
         baseline=baseline.as_safe_dict(),
         external_calls={"create": 0, "pay": 0, "refund": 0, "meta": 0},
+        delivery_blockers=list(blockers),
     )
 
 
@@ -1275,6 +1434,7 @@ async def run_create(
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_CREATE, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
+    contract = production_contract(snapshot.schema_version, contract_version=snapshot.product_contract_version)
 
     customers = {member.slot: member.easyweek_customer_uuid for member in composition.members}
     results: list[SlotResult] = []
@@ -1342,7 +1502,8 @@ async def run_create(
                 customer_uuid=customer,
                 staffer_uuid=identity.staffer_uuid,
                 voucher_template_uuid=identity.voucher_template_uuid,
-                price_minor=UNIT_PRICE_MINOR,
+                price_minor=contract.unit_price_minor,
+                **({"product_contract_version": contract.version} if snapshot.schema_version == "3" else {}),
                 marker=item.reconciliation_marker,
             )
         except EasyWeekVoucherMutationUnknown:
@@ -1411,6 +1572,7 @@ async def run_create(
             order_reader=order_reader,
             response=response,
             voucher_template_uuid=identity.voucher_template_uuid,
+            contract=contract,
         )
         results.append(result)
         if result.outcome != "created":
@@ -1437,6 +1599,7 @@ async def _verify_created(
     order_reader: Any,
     response: VoucherMutationResponse,
     voucher_template_uuid: str,
+    contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT,
 ) -> SlotResult:
     """A 2xx is a claim. Only an exact readback makes it a fact.
 
@@ -1480,21 +1643,29 @@ async def _verify_created(
         return SlotResult(slot=slot, outcome="unknown", reasons=[order_reason], external_effect_attempted=True)
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload)
+    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
     observation = observe_artifact(
         payload,
         stage="create_readback",
         expected_customer_uuid=customer_uuid,
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=UNIT_PRICE_MINOR,
+        expected_price_minor=contract.unit_price_minor,
     )
     proven = (
         order.get("comment") == item.reconciliation_marker
         and observation.order_customer_binding_proven
         and observation.voucher_line_proven
         and state == ORDER_OPEN
+        and (
+            contract.request_schema_version != "3"
+            or not payable_order_reasons(
+                payload,
+                expected_template_uuid=contract.template_uuid,
+                expected_price_minor=contract.unit_price_minor,
+            )
+        )
     )
-    code = _voucher_code(payload) if proven else None
+    code = _voucher_code(payload, contract=contract) if proven else None
     mac: tuple[str, str] | None = None
     if code is not None:
         try:
@@ -1637,7 +1808,7 @@ async def run_pay(
     supplied_phrase: str,
     enabled: bool | None = None,
 ) -> StageReport:
-    """Pay for each proven order, once. Real money, exactly €15 per slot."""
+    """Pay for each proven order, once. The exact amount this batch froze, per slot."""
     plan, composition, _prereq, baseline, snapshot, refused = await _authorise(
         session,
         session_maker,
@@ -1661,6 +1832,7 @@ async def run_pay(
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_PAY, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
+    contract = production_contract(snapshot.schema_version, contract_version=snapshot.product_contract_version)
 
     results: list[SlotResult] = []
     calls = 0
@@ -1691,7 +1863,18 @@ async def run_pay(
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[order_reason]))
             halted = True
             continue
-        code = _voucher_code(payload)
+        if contract.request_schema_version == "3" and (
+            classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] != ORDER_OPEN
+            or payable_order_reasons(
+                payload,
+                expected_template_uuid=contract.template_uuid,
+                expected_price_minor=contract.unit_price_minor,
+            )
+        ):
+            results.append(SlotResult(slot=slot, outcome="refused", reasons=[ORDER_NOT_PAYABLE]))
+            halted = True
+            continue
+        code = _voucher_code(payload, contract=contract)
         if code is None or not await ledger_module.binding_matches(
             session_maker,
             batch_id=batch_id,
@@ -1768,6 +1951,7 @@ async def run_pay(
                 item=item,
                 order_reader=order_reader,
                 voucher_template_uuid=identity.voucher_template_uuid,
+                contract=contract,
             )
         )
         if results[-1].outcome != "paid":
@@ -1792,6 +1976,7 @@ async def _verify_paid(
     item: ledger_module.ItemSnapshot,
     order_reader: Any,
     voucher_template_uuid: str,
+    contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT,
 ) -> SlotResult:
     """A 2xx is a claim. Only a readback showing the exact order paid proves it.
 
@@ -1801,8 +1986,11 @@ async def _verify_paid(
     """
     assert item.target_order_uuid is not None
     payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
-    state = classify_order(payload)[0] if order_reason is None else None
-    if state != ORDER_PAID:
+    state = classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] if order_reason is None else None
+    if state != ORDER_PAID or (
+        contract.request_schema_version == "3"
+        and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+    ):
         await ledger_module.record_item_outcome(
             session_maker,
             batch_id=batch_id,
@@ -1825,7 +2013,7 @@ async def _verify_paid(
         stage="pay_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=UNIT_PRICE_MINOR,
+        expected_price_minor=contract.unit_price_minor,
     )
     order = order_object(payload) or {}
     identity_proven = (
@@ -1835,7 +2023,7 @@ async def _verify_paid(
     )
     binding_proven = False
     if identity_proven:
-        settled = _voucher_code(payload)
+        settled = _voucher_code(payload, contract=contract)
         if settled is not None:
             binding_proven = await ledger_module.binding_matches(
                 session_maker,
@@ -1935,6 +2123,7 @@ async def run_deliver(
     if identity is None or snapshot.batch_id is None:
         return _refusal(STAGE_DELIVER, [COMPOSITION_DRIFTED], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
+    contract = production_contract(snapshot.schema_version, contract_version=snapshot.product_contract_version)
 
     members = {member.slot: member for member in composition.members}
     results: list[SlotResult] = []
@@ -1974,11 +2163,20 @@ async def run_deliver(
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[order_reason]))
             halted = True
             continue
-        if classify_order(payload)[0] != ORDER_PAID:
+        if contract.request_schema_version == "3":
+            validity_reason = issued_voucher_validity_reason(payload, now=utcnow())
+            if validity_reason is not None:
+                results.append(SlotResult(slot=slot, outcome="refused", reasons=[validity_reason]))
+                halted = True
+                continue
+        if classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] != ORDER_PAID or (
+            contract.request_schema_version == "3"
+            and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+        ):
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[ORDER_NOT_PAID]))
             halted = True
             continue
-        code = _voucher_code(payload)
+        code = _voucher_code(payload, contract=contract)
         if code is None:
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[ARTIFACT_UNPROVEN]))
             halted = True
@@ -2004,7 +2202,7 @@ async def run_deliver(
             slot=slot,
             plan_digest=plan.digest,
             live_guard_reproven_at=proof.proven_at,
-            template_code=VOUCHER_TEMPLATE_CODE,
+            template_code=contract.message_code,
             meta_template_name=prerequisites.meta_template_name or "",
             template_language=prerequisites.template_language or "",
             sender_id=prerequisites.sender_id,
@@ -2231,6 +2429,7 @@ async def run_refund(
     if slot not in plan.authorised_slots:
         return _refusal(STAGE_REFUND, [SLOT_UNKNOWN], snapshot, baseline=baseline)
     batch_id = snapshot.batch_id
+    contract = production_contract(snapshot.schema_version, contract_version=snapshot.product_contract_version)
     if item.status in ledger_module.SENT_ITEM_STATUSES:
         return _refusal(STAGE_REFUND, [REFUND_FORBIDDEN_AFTER_SEND], snapshot, baseline=baseline)
     if item.target_order_uuid is None:
@@ -2276,7 +2475,9 @@ async def run_refund(
         ]
     else:
         payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
-        state = classify_order(payload)[0] if order_reason is None else None
+        state = (
+            classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] if order_reason is None else None
+        )
         if state == ORDER_REFUNDED:
             await ledger_module.record_item_outcome(
                 session_maker,
@@ -2327,6 +2528,7 @@ async def _recover_unknown_create(
     location_uuid: str,
     voucher_template_uuid: str,
     order_reader: Any,
+    contract: ProductionVoucherContract = LEGACY_PRODUCTION_CONTRACT,
 ) -> tuple[list[str], str | None, list[dict[str, Any]]]:
     """The GET-only proof path out of one slot's crashed or unknown CREATE.
 
@@ -2380,13 +2582,13 @@ async def _recover_unknown_create(
         return [order_reason], None, observations
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload)
+    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
     observation = observe_artifact(
         payload,
         stage="create_recovery_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=UNIT_PRICE_MINOR,
+        expected_price_minor=contract.unit_price_minor,
     )
     observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -2395,10 +2597,18 @@ async def _recover_unknown_create(
         or not observation.order_customer_binding_proven
         or not observation.voucher_line_proven
         or state != ORDER_OPEN
+        or (
+            contract.request_schema_version == "3"
+            and payable_order_reasons(
+                payload,
+                expected_template_uuid=contract.template_uuid,
+                expected_price_minor=contract.unit_price_minor,
+            )
+        )
     ):
         return [ARTIFACT_UNPROVEN], state, observations
 
-    code = _voucher_code(payload)
+    code = _voucher_code(payload, contract=contract)
     mac: tuple[str, str] | None = None
     if code is not None:
         try:
@@ -2426,7 +2636,7 @@ async def _recover_unknown_create(
         session_maker,
         batch_id=batch_id,
         slot=item.slot,
-        voucher_code=_voucher_code(payload) or "",
+        voucher_code=_voucher_code(payload, contract=contract) or "",
         target_order_uuid=candidate,
     ):
         return [BINDING_MISMATCH], state, observations
@@ -2531,8 +2741,9 @@ async def run_reconcile(
             external_calls={"create": 0, "pay": 0, "refund": 0, "meta": 0},
         )
     batch_id = request.batch_id
+    contract = production_contract(snapshot.schema_version, contract_version=snapshot.product_contract_version)
 
-    baseline, _ = await _baseline_now(order_reader)
+    baseline, _ = await _baseline_now(order_reader, contract=contract)
     observations: list[dict[str, Any]] = []
     reasons: list[str] = []
     results: list[SlotResult] = []
@@ -2552,6 +2763,7 @@ async def run_reconcile(
                 location_uuid=snapshot.location_uuid or request.location_uuid,
                 voucher_template_uuid=snapshot.voucher_template_uuid or request.voucher_template_uuid,
                 order_reader=order_reader,
+                contract=contract,
             )
             observations.extend(slot_observations)
             if slot_reasons:
@@ -2566,14 +2778,14 @@ async def run_reconcile(
             if order_reason is not None:
                 slot_reasons.append(order_reason)
             else:
-                state = classify_order(payload)[0]
+                state = classify_order(payload, expected_price_minor=contract.unit_price_minor)[0]
                 order = order_object(payload) or {}
                 observation = observe_artifact(
                     payload,
                     stage="reconcile_readback",
                     expected_customer_uuid=item.easyweek_customer_uuid or "",
-                    expected_template_uuid=EASYWEEK_VOUCHER_TEMPLATE_UUID,
-                    expected_price_minor=UNIT_PRICE_MINOR,
+                    expected_template_uuid=contract.template_uuid,
+                    expected_price_minor=contract.unit_price_minor,
                 )
                 observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -2584,7 +2796,7 @@ async def run_reconcile(
                 )
                 binding_proven = False
                 if identity_proven:
-                    code = _voucher_code(payload)
+                    code = _voucher_code(payload, contract=contract)
                     if code is not None:
                         binding_proven = await ledger_module.binding_matches(
                             session_maker,
@@ -2595,6 +2807,10 @@ async def run_reconcile(
                         )
                         del code
                 proven = identity_proven and binding_proven
+                if state == ORDER_PAID and contract.request_schema_version == "3":
+                    proven = proven and paid_order_amounts_proven(
+                        payload, expected_price_minor=contract.unit_price_minor
+                    )
                 # Complained about only where it would decide something. A slot
                 # that is already settled — cleaned, refunded, sent — is read
                 # here for the report, and a closed order need not still carry
