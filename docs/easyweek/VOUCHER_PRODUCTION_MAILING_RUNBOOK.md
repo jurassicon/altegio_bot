@@ -1,10 +1,11 @@
-# Production EasyWeek voucher mailing — runbook (§42 storage, §43 operation)
+# Production EasyWeek voucher mailing — runbook (§44 mixed audience, §43 operation)
 
 The working mode: a real operator-curated list, **one €15 voucher per
 recipient**, one WhatsApp message each. Every stage is confirmed separately, in
 the browser. There is no control that runs two stages, and there will not be one.
 
-Read `docs/easyweek/INTEGRATION_PLAN.md` §42 and §43 before the first action.
+Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–44 before the first action.
+§44 adds UUID-first customers, a checked phone list and mixed earned/manual batches.
 
 > **This runbook does not authorise anything.** Each real payment and each real
 > Meta POST happens only after the owner approves that specific stage and the
@@ -61,9 +62,11 @@ slot is a position inside one frozen composition, never a global identifier.
 `provider + company + campaign + customer UUID + both period bounds`, unique
 across all production batches in PostgreSQL. The same person in two previews for
 the same wave is refused; in a different wave they are allowed, because that is
-what a monthly campaign means. **The period is the entitlement, not the send
-date** — a transitional August audience mailed in October is an August
-entitlement.
+what a monthly campaign means. **The preview period is the entitlement, not the send date.** A manual
+Altegio addition may sit in a later campaign preview; its operator attestation
+is shown separately and does not assert a first visit in that preview period.
+Do not change the period, basis or provider to evade an existing conflict.
+This is not universal protection against historical gifts across providers.
 
 ---
 
@@ -388,16 +391,35 @@ or seeing a green readiness panel is not that agreement.
 Everything from here on happens in the browser. No commands, no SSH, no digests,
 no timestamps, no ids to type, no `.env`, no container restarts.
 
-1. Build a **fresh** preview in the existing EasyWeek preview editor and pick the
-   real recipients by hand. Previews and recipients already spent by §36, §37.2,
-   §41 or an earlier production batch are refused; readiness from an older run is
-   not carried forward.
-2. Every active recipient must be `operator_manual_selection` and `candidate`. An
-   earned or owner-test recipient sitting in the same preview **refuses the whole
-   mailing** rather than being filtered out — that is a decision for a human to
-   make again, not for a tool to resolve silently.
-3. A manual basis is an operator's decision, not a proven first visit. Every
-   report says so: `first_visit_proof=not_applicable`.
+1. Build or open an editable EasyWeek Karlsruhe `new_clients_monthly` preview.
+   Its automatic `earned_first_visit` candidates keep their source proofs.
+   Historical canaries and frozen previews remain locked.
+2. To add the transitional Altegio audience, paste one phone per line in
+   **«Добавить список: предыдущий визит в Altegio»**. Explicitly confirm the previous Altegio visit and
+   assignment to Karlsruhe, then press **«Проверить список»**.
+3. Read every result: addable, already present, duplicate, absent customer,
+   ambiguous identity, nonempty/unproven history, branch conflict, opt-out or
+   missing data. The server accepts only existing external EasyWeek customers
+   with exactly zero bookings in this mode — cancelled and future bookings also
+   exclude. A timeout is not an empty history.
+4. The check changes no Client or recipient. Confirm the exact shown eligible
+   subset separately. The server repeats live checks and adds the entire subset
+   atomically with counters. A changed fact means check again; it never leaves
+   half an unnoticed list. Refresh/double-click returns the same applied result.
+5. Existing earned/manual candidates stay unchanged. Ordinary single Add uses
+   the same identity resolver; the additional checkbox assigns a missing local
+   card to Karlsruhe. It retains historical manual semantics and does not silently
+   enable the new zero-booking policy. Remove/Restore retain basis and audit.
+6. Both `earned_first_visit` and `operator_manual_selection` may be in one batch.
+   Unknown and owner-test bases refuse the whole mailing. Earned is re-proven
+   against source/customer/history; manual is the operator's decision, with the
+   typed zero-booking policy shown only where it was explicitly applied.
+
+The campaign period and manual rationale are different facts. Declaring an
+Altegio visit does not prove its first-visit status, its branch or past gifts.
+The UI shows automatic/manual counts, readiness of composition, administrative
+mailing fence and executor configuration separately. A preview is not permission
+to send. Generic campaign Send remains closed.
 
 Then open **Ops → 🎁 Ваучеры** (`/ops/voucher-mailings`). The preview appears
 under «Можно подготовить» with its period and its active count, and
@@ -414,8 +436,8 @@ On the preparation page:
    number of recipients, €15 each, the total, and **who each recipient is** — name
    and the preview row they came from. Checking the list is a read: it never arms
    the confirmation and never creates anything.
-2. Read the period. It is the wave the vouchers are **earned for**, not the month
-   of sending.
+2. Read the period. It is the campaign wave, not the month of sending. Manual additions
+   retain their own operator rationale rather than claiming an earned first visit.
 3. Read the message and the voucher's terms, shown lower on the page. The voucher
    code is an explicit placeholder (`XXXX-XXXX-XXXX`); a real code is never
    displayed anywhere, at any stage.
@@ -683,6 +705,11 @@ the mailing state stays readable afterwards.
 
 ### 12.2 Rollback
 
+**Historical §43 scopes below.** On a §44 deployment, first read §14. The new
+migration refuses these targets while new identity/proof/plan/v2 ledger data
+exists. A database backup is not permission to erase that data.
+
+
 Two different operations get called "the rollback", and they remove different
 things. Decide which one is wanted before running anything.
 
@@ -704,7 +731,7 @@ e2c7b4f16a83  →  a4f1c9d26b70  →  c7e3b8a14f29
 | Mailing still possible afterwards | yes, on the matching older application | **no** |
 
 **`alembic downgrade -1` is scope A, and this runbook used to describe it as scope
-B.** One step back from the current head `c7e3b8a14f29` lands on `a4f1c9d26b70`: the
+B.** One step back from the §43 head `c7e3b8a14f29` lands on `a4f1c9d26b70`: the
 four tables stay exactly where they are, and only the stop-generation column and its
 constraint go. Counting steps is how that sentence became wrong — the count was
 right when there was one §43 revision and silently meant something else as soon as
@@ -834,8 +861,8 @@ mailing, not a way back to the terminal process.
 - **One branch, one campaign, one amount, one template.** Karlsruhe,
   `new_clients_monthly`, €15, `kitilash_ka_new_client_voucher_v1` in German, three
   BODY parameters.
-- **`earned_first_visit` is not served here**, and a mixed-basis snapshot is
-  refused rather than filtered.
+- **Owner-test and unknown bases are refused.** Earned and manual are served
+  together with distinct per-recipient proofs under §44.
 - **No staffer choice.** One approved issuer, configured on the server (§2).
 - **§41 and the historical canaries are untouched.** Their rows, constraints and
   HMAC bindings are exactly as they were, and their recipients are excluded from
@@ -844,3 +871,95 @@ mailing, not a way back to the terminal process.
 Nothing about a successful mailing authorises a campaign. Every report keeps
 saying `campaign_send_authorized=false`, `bulk_delivery_authorized=false` and
 `ready_for_send=false`, and they stay false until a separate PR says otherwise.
+
+
+## 14. §44 identity, migration and closed-fence smoke
+
+No new environment setting or HMAC rotation is needed. `f6a8d2c91b47` follows
+`c7e3b8a14f29`; its successor `d8b4e6a29c13` is the current head. Together they provide:
+
+- typed EasyWeek customer UUID, unique per provider and branch on Client, nullable numeric ID only for
+  such a UUID identity, and time of operator branch assignment;
+- recipient manual policy plus API-check and operator-attestation timestamps;
+- private, operator/session/preview-bound list plans (15-minute TTL);
+- version 2 mixed composition and per-item policy/source proof fields.
+
+The customer API does not prove numeric ID. A local card created here leaves it
+NULL; no ID is invented, no Altegio card is converted, and the visit count stays
+NULL. Adoption requires a captured phone independently matched by full lookup
+and direct customer GET, or a previously stored numeric/UUID binding, as well as
+the current booking/location proof. A current booking alone cannot prove who
+owned an old captured event: bookings can be reassigned. Missing captured phone
+and name are never borrowed from the current customer. Proven phone changes and
+explicit clears preserve the identity and opt-out audit. A clear withdraws queued
+reminders; omitted phone does not clear it. Frozen mailing contacts never change
+silently.
+
+One workspace customer can have distinct Client cards in supported branches.
+Real branch-proven webhooks reuse/create the card for that branch without moving
+another branch's card, jobs or counters. Manual Add still refuses a foreign-only
+identity; mailing remains Karlsruhe-only. Ordinary numeric ingestion with no
+phone and no competing UUID identity needs no voucher API and creates no
+addressless messages. Manual creation fails closed if the branch contains an
+unresolved numeric-only card without phone: a distinct identity cannot yet be
+proved. Later captured contact evidence allows adoption of the same card.
+Identity conflicts remain recoverable without a duplicate card. Opt-outs survive.
+
+The successor migration changes only the UUID unique constraint, preserving all
+rows and ledgers. Its downgrade refuses before DDL when a UUID has multiple
+branch cards. Do not delete or merge real cards to force that downgrade. The
+historical f6 migration and its own populated-downgrade guards are unchanged. No reminders, planner, messages or external customers are created by Add.
+
+Old manual recipients keep policy NULL. Old batches and HMAC bindings retain
+version 1 semantics; deploying version 2 gives an old approval no extra authority.
+Basis, policy, source and customer drift refuse continuation. A new EasyWeek
+booking after PAY blocks DELIVER for the stage; the frozen list and total stay
+unchanged. Use reconciliation and the existing per-item pre-send refund when
+allowed. Do not remove a frozen recipient or create a replacement batch.
+
+**List limits protect the API, not the size of a mailing:** 16 KiB / 200 input
+lines / 100 distinct phones per check, at most two reads in parallel, 15 seconds
+per contact and 90 seconds per list, for both Check and Confirm; three checks
+per minute per operator. Both stages preserve input order and finish or cancel
+all reads before applying writes. A real timeout reports `manual_batch_timeout`,
+with no partial Clients/recipients; it does not mean identity/history changed.
+Multiple separately confirmed lists can extend the same editable preview. The
+server retains no raw API payload; applied plans discard contact material, and
+expired plan contact material is cleared during subsequent list preparation.
+An expired check must be repeated. With a shared Ops account audit identifies
+that account/session, not a distinct human.
+
+**Rollout:** close the mailing fence; stop/drain application and executor together;
+back up; apply the new migration and matching application; start one API and one
+executor. No rolling deploy and no automatic data import. Before opening the fence:
+
+1. Verify one Alembic head and current revision matches it.
+2. Log into Ops and open an editable preview with automatic candidates. Verify
+   the automatic/manual counts, period, identity/composition status, administrative
+   fence, executor state and working transition to «Ваучеры».
+3. Confirm the bulk form offers the two explicit operator attestations and separate
+   check/add actions. A check, if separately authorised against real contacts,
+   performs only GET and does not alter recipients. Rendering the form needs no
+   provider reads. Do not confirm real additions merely to test deployment.
+4. The mailing page must name the closed administrative fence; attempting a new
+   stage cannot execute it. Status, existing delivery webhooks and readable ledgers
+   remain available. Generic send-real stays closed.
+5. Check no unexpected queued operation or migration-created Client/recipient exists.
+   No real FREEZE/CREATE/PAY/DELIVER is needed for this smoke.
+
+**Rollback:** a downgrade to `c7e3b8a14f29` is allowed only while no new UUID
+identities, policy proofs, list plans or version 2 batches exist. Otherwise it
+fails before removing any column/table with `PR-21 downgrade refused`. Even a
+Client whose numeric ID has since been learned still has UUID identity evidence;
+that evidence cannot be erased by downgrade. Preserve the database, close the
+fence and use a reviewed forward fix. Do not delete rows to make downgrade pass.
+On an unused installation only, with both application processes stopped and a
+backup secured, the administrator can explicitly target the parent:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml run --rm --no-deps altegio-api uv run alembic downgrade c7e3b8a14f29
+```
+
+Deploy the matching older application only after successful schema rollback.
+Historical §43 rollback scopes in §12.2 remain documentation of that phase;
+they do not override the §44 data-preservation guard.

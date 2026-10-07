@@ -1139,3 +1139,141 @@ async def _check_constraints(database_url: str, table: str) -> set[str]:
         return {row[0] for row in rows}
     finally:
         await engine.dispose()
+
+
+async def test_pr21_uuid_migration_refuses_loss_and_preserves_legacy_rows(disposable_database: str):
+    """PG16: nullable numeric is UUID-only; populated downgrade refuses atomically."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "c7e3b8a14f29").returncode == 0
+    engine = create_async_engine(disposable_database, isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            version = int(await conn.scalar(text("SHOW server_version_num")))
+            assert 160000 <= version < 170000
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, raw) "
+                    "VALUES ('altegio', 322579, 91000001, '{}'::jsonb)"
+                )
+            )
+        upgraded = _alembic(disposable_database, "upgrade", "f6a8d2c91b47")
+        assert upgraded.returncode == 0, upgraded.stderr
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, easyweek_customer_uuid, raw) "
+                    "VALUES ('easyweek', 322579, NULL, '91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                )
+            )
+            with pytest.raises(Exception):
+                await conn.execute(
+                    text(
+                        "INSERT INTO clients (provider, company_id, altegio_client_id, raw) "
+                        "VALUES ('altegio', 322579, NULL, '{}'::jsonb)"
+                    )
+                )
+            with pytest.raises(Exception):
+                await conn.execute(
+                    text(
+                        "INSERT INTO clients (provider, company_id, altegio_client_id, easyweek_customer_uuid, raw) "
+                        "VALUES ('easyweek', 315607, NULL, '91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                    )
+                )
+        refused = _alembic(disposable_database, "downgrade", "c7e3b8a14f29")
+        assert refused.returncode != 0 and "PR-21 downgrade refused" in refused.stderr
+        async with engine.connect() as conn:
+            assert await conn.scalar(text("SELECT count(*) FROM clients")) == 2
+            assert await conn.scalar(text("SELECT version_num FROM alembic_version")) == "f6a8d2c91b47"
+            assert (
+                await conn.scalar(text("SELECT altegio_client_id FROM clients WHERE provider = 'altegio'")) == 91000001
+            )
+            assert "manual_policy" in await _columns(disposable_database, "campaign_recipients")
+    finally:
+        await engine.dispose()
+
+
+async def test_pr21_empty_upgrade_downgrade_reupgrade_preserves_constraints(disposable_database: str):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert _alembic(disposable_database, "downgrade", "c7e3b8a14f29").returncode == 0
+    assert "easyweek_customer_uuid" not in await _columns(disposable_database, "clients")
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.connect() as conn:
+            constraints = set((await conn.execute(text("SELECT conname FROM pg_constraint"))).scalars())
+            assert {
+                "ck_clients_external_identity",
+                "uq_clients_provider_company_easyweek_uuid",
+                "ck_campaign_recipients_manual_policy",
+                "ck_campaign_recipients_manual_policy_proof",
+                "ck_ew_voucher_production_item_source",
+                "ck_ew_voucher_production_item_policy",
+                "uq_ew_voucher_production_item_entitlement",
+                "ck_ew_voucher_production_item_single_attempt",
+                "ck_ew_voucher_production_item_refund_is_pre_send",
+                "ck_ew_manual_plan_applied",
+            } <= constraints
+    finally:
+        await engine.dispose()
+
+
+async def test_pr21_branch_uuid_upgrade_preserves_rows_and_refuses_lossy_downgrade(disposable_database: str):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "f6a8d2c91b47").returncode == 0
+    engine = create_async_engine(disposable_database, isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            assert 160000 <= int(await conn.scalar(text("SHOW server_version_num"))) < 170000
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, raw) "
+                    "VALUES ('altegio', 322579, 91000001, '{}'::jsonb)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                    "easyweek_customer_uuid, wa_opted_out, raw) VALUES ('easyweek', 322579, 17, "
+                    "'91919191-1212-4343-8787-565656565656', true, '{}'::jsonb)"
+                )
+            )
+            before = (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all()
+        upgraded = _alembic(disposable_database, "upgrade", "head")
+        assert upgraded.returncode == 0, upgraded.stderr
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                    "easyweek_customer_uuid, raw) VALUES ('easyweek', 315607, 17, "
+                    "'91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                )
+            )
+            with pytest.raises(Exception):
+                await conn.execute(
+                    text(
+                        "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                        "easyweek_customer_uuid, raw) VALUES ('easyweek', 315607, NULL, "
+                        "'91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                    )
+                )
+        refused = _alembic(disposable_database, "downgrade", "f6a8d2c91b47")
+        assert refused.returncode != 0 and "PR-21 branch downgrade refused" in refused.stderr
+        async with engine.connect() as conn:
+            assert await conn.scalar(text("SELECT count(*) FROM clients")) == 3
+            assert await conn.scalar(text("SELECT version_num FROM alembic_version")) == "d8b4e6a29c13"
+            assert (
+                await conn.execute(text("SELECT * FROM clients WHERE company_id=322579 ORDER BY id"))
+            ).all() == before
+            # Synthetic fixture cleanup permits exercising the supported reverse path.
+            await conn.execute(text("DELETE FROM clients WHERE company_id=315607"))
+        assert _alembic(disposable_database, "downgrade", "f6a8d2c91b47").returncode == 0
+        assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
+    finally:
+        await engine.dispose()

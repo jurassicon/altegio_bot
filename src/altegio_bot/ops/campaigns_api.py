@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,7 +99,13 @@ from altegio_bot.models.models import (
     MessageTemplate,
     Record,
 )
-from altegio_bot.ops.auth import require_ops_auth
+from altegio_bot.ops.auth import (
+    OpsSessionError,
+    require_csrf,
+    require_ops_auth,
+    require_same_origin,
+    resolve_ops_session,
+)
 from altegio_bot.service_filter import ServiceLookupError
 from altegio_bot.settings import settings
 
@@ -1871,7 +1877,7 @@ _TEST_RECIPIENT_CONFIG_REASONS = frozenset(
 
 
 class AddManualRecipientRequest(BaseModel):
-    """§37.1: a phone number, and deliberately nothing else.
+    """A phone number, plus an explicit Karlsruhe assignment for a missing local card.
 
     No customer UUID, no Altegio client id, no "already verified" flag. The
     identity is established on the server by reading EasyWeek twice; a browser
@@ -1879,11 +1885,14 @@ class AddManualRecipientRequest(BaseModel):
     real message.
     """
 
-    phone: str
+    phone: str = Field(max_length=128)
+    assign_karlsruhe: bool = False
 
 
 @router.post("/runs/{run_id}/recipients/add-manual", status_code=201)
-async def add_manual_recipient_endpoint(run_id: int, body: AddManualRecipientRequest) -> dict[str, Any]:
+async def add_manual_recipient_endpoint(
+    request: Request, run_id: int, body: AddManualRecipientRequest
+) -> dict[str, Any]:
     """Add one operator-chosen recipient to an EasyWeek preview (§37.1).
 
     A separate endpoint from the §36.11 one on purpose. That one adds the single
@@ -1894,6 +1903,16 @@ async def add_manual_recipient_endpoint(run_id: int, body: AddManualRecipientReq
 
     Opens no send path: no job, no outbox row, no voucher, no Meta request.
     """
+    if body.assign_karlsruhe:
+        # The new authority to create a booking-free local identity requires the
+        # authenticated browser decision, while historical local-only adds retain
+        # their established contract.
+        try:
+            resolve_ops_session(request)
+            require_same_origin(request)
+            require_csrf(request)
+        except OpsSessionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail={"reason": exc.reason}) from None
     # Before the client exists: httpx logs the full URL at INFO, and this
     # request's URLs carry a phone number and then a customer UUID.
     redact_easyweek_url_logging()
@@ -1904,6 +1923,7 @@ async def add_manual_recipient_endpoint(run_id: int, body: AddManualRecipientReq
                 run_id=run_id,
                 phone=body.phone,
                 reader=client,
+                assign_karlsruhe=body.assign_karlsruhe,
             )
     except EasyWeekError:
         # The live reads are the only external calls, and they happen before the

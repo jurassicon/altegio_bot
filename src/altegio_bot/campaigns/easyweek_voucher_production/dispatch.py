@@ -267,6 +267,8 @@ class RecipientLine:
     campaign_recipient_id: int
     display_name: str
     preview_run_id: int
+    recipient_basis: str | None = None
+    manual_policy: str | None = None
 
     def as_ui_dict(self) -> dict[str, Any]:
         # Named `as_ui_dict`, not `as_safe_dict`, on purpose: the name is the
@@ -276,6 +278,8 @@ class RecipientLine:
             "campaign_recipient_id": self.campaign_recipient_id,
             "display_name": self.display_name,
             "preview_run_id": self.preview_run_id,
+            "recipient_basis": self.recipient_basis,
+            "manual_policy": self.manual_policy,
         }
 
 
@@ -304,6 +308,8 @@ async def recipient_lines(
                     EasyWeekVoucherProductionBatchItem.campaign_recipient_id,
                     EasyWeekVoucherProductionBatchItem.campaign_run_id,
                     CampaignRecipient.display_name,
+                    EasyWeekVoucherProductionBatchItem.recipient_basis,
+                    EasyWeekVoucherProductionBatchItem.manual_policy,
                 )
                 .join(
                     CampaignRecipient,
@@ -319,6 +325,8 @@ async def recipient_lines(
             campaign_recipient_id=int(row[1]),
             display_name=(row[3] or "").strip() or f"без имени (строка preview {int(row[1])})",
             preview_run_id=int(row[2]),
+            recipient_basis=row[4],
+            manual_policy=row[5],
         )
         for row in rows
     )
@@ -365,6 +373,8 @@ class CompositionView:
             "unit_price_minor": self.unit_price_minor,
             "composition_digest": self.composition_digest,
             "recipients": [line.as_ui_dict() for line in self.lines],
+            "earned_recipient_count": sum(line.recipient_basis == "earned_first_visit" for line in self.lines),
+            "manual_recipient_count": sum(line.recipient_basis == "operator_manual_selection" for line in self.lines),
             "issuer_display_name": APPROVED_ISSUER_DISPLAY_NAME,
         }
 
@@ -450,6 +460,8 @@ async def inspect_composition(
             display_name=(member.proof.client_display_name or "").strip()
             or f"без имени (строка preview {member.campaign_recipient_id})",
             preview_run_id=preview_run_id,
+            recipient_basis=member.recipient_basis,
+            manual_policy=member.manual_policy,
         )
         for member in composition.members
     )

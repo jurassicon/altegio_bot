@@ -301,6 +301,10 @@ async def test_two_customers_on_one_number_are_refused_without_picking(session_m
         pytest.param(_row(uuid=OTHER_UUID), None, manual_module.CUSTOMER_UNPROVEN, id="uuid_mismatch"),
         pytest.param(_row(phone="+4915100009999"), None, manual_module.CUSTOMER_UNPROVEN, id="phone_mismatch"),
         pytest.param({"nonsense": True}, None, manual_module.CUSTOMER_UNPROVEN, id="malformed"),
+        pytest.param(_row(data=None), None, manual_module.CUSTOMER_UNPROVEN, id="null_data_envelope"),
+        pytest.param(_row(data=[]), None, manual_module.CUSTOMER_UNPROVEN, id="list_data_envelope"),
+        pytest.param(_row(data="invalid"), None, manual_module.CUSTOMER_UNPROVEN, id="text_data_envelope"),
+        pytest.param([_row()], None, manual_module.CUSTOMER_UNPROVEN, id="list_top_level"),
         pytest.param(_row(first_name="   "), None, manual_module.CUSTOMER_NAME_MISSING, id="blank_name"),
         pytest.param(None, EasyWeekError("boom"), manual_module.CUSTOMER_UNPROVEN, id="transport"),
         pytest.param(None, TimeoutError("slow"), manual_module.CUSTOMER_UNPROVEN, id="timeout"),
@@ -340,6 +344,13 @@ async def test_a_lookup_that_never_read_the_workspace_writes_nothing(session_mak
 
 
 @pytest.mark.asyncio
+async def test_a_valid_customer_data_envelope_is_accepted(session_maker, configuration) -> None:
+    run_id = await _preview(session_maker)
+    outcome = await _add(session_maker, run_id, _Reader(card={"data": _row()}))
+    assert outcome.ok is True
+
+
+@pytest.mark.asyncio
 async def test_a_customer_whose_name_is_missing_is_refused(session_maker, configuration) -> None:
     """The delivery template has a name slot; a blank would reach a customer."""
     run_id = await _preview(session_maker)
@@ -369,7 +380,7 @@ async def test_an_unusable_phone_reads_nothing(session_maker, configuration, pho
 
 
 @pytest.mark.asyncio
-async def test_a_number_with_no_local_client_is_refused(session_maker, configuration) -> None:
+async def test_a_number_with_no_local_client_requires_explicit_branch_assignment(session_maker, configuration) -> None:
     run_id = await _preview(session_maker)
     async with session_maker() as session:
         async with session.begin():
@@ -379,7 +390,7 @@ async def test_a_number_with_no_local_client_is_refused(session_maker, configura
 
     outcome = await _add(session_maker, run_id, reader)
 
-    assert outcome.reason == manual_module.CLIENT_ABSENT
+    assert outcome.reason == "manual_recipient_branch_assignment_required"
     assert reader.calls == []
 
 
@@ -415,7 +426,7 @@ async def test_a_client_from_another_company_does_not_count(session_maker, confi
 
     outcome = await _add(session_maker, run_id)
 
-    assert outcome.reason == manual_module.CLIENT_ABSENT
+    assert outcome.reason == "manual_recipient_identity_conflict"
 
 
 @pytest.mark.asyncio
@@ -1657,7 +1668,8 @@ async def test_the_easyweek_detail_page_marks_altegio_only_sections_closed(
 
     page = (await http_client.get(f"/ops/campaigns/{run_id}")).text
 
-    assert "Delivery — закрыто (§37.1)" in page
+    assert "Ваучерная рассылка" in page
+    assert "Generic campaign send-real" in page
     assert "Loyalty — не применяется" in page
     assert "Follow-up — закрыто (§37.1)" in page
     # The Altegio follow-up schedule fields are not rendered for EasyWeek.

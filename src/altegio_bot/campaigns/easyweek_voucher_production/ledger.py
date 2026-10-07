@@ -81,6 +81,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import voucher_code_matches
+from altegio_bot.campaigns.easyweek_voucher_production.composition import source_proof_digest
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPROVAL_ARITHMETIC,
     PRODUCTION_SCHEMA_VERSION,
@@ -90,6 +91,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
 )
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     VOUCHER_PRODUCTION_COMPLETED,
     VOUCHER_PRODUCTION_FROZEN,
@@ -270,6 +272,10 @@ class ItemSnapshot:
     reconciliation_marker: str
     status: str
     reason_code: str | None = None
+    recipient_basis: str = RECIPIENT_BASIS_MANUAL
+    manual_policy: str | None = None
+    source_booking_uuid: str | None = None
+    source_proof_digest: str | None = None
     voucher_value_minor: int = UNIT_PRICE_MINOR
     voucher_quantity: int = 1
     target_order_uuid: str | None = None
@@ -308,6 +314,12 @@ class ItemSnapshot:
         return {
             "slot": self.slot,
             "campaign_recipient_id": self.campaign_recipient_id,
+            "recipient_basis": self.recipient_basis,
+            "manual_policy": self.manual_policy,
+            "source_proof_digest": self.source_proof_digest,
+            "first_visit_proof": "earned_first_visit"
+            if self.recipient_basis == RECIPIENT_BASIS_EARNED
+            else "not_applicable",
             "status": self.status,
             "reason_code": self.reason_code,
             "voucher_value_minor": self.voucher_value_minor,
@@ -342,6 +354,8 @@ class BatchSnapshot:
 
     exists: bool
     batch_id: int | None = None
+    schema_version: str = "1"
+    recipient_basis: str = RECIPIENT_BASIS_MANUAL
     status: str | None = None
     halted_reason_code: str | None = None
     baseline_version: str | None = None
@@ -408,9 +422,20 @@ class BatchSnapshot:
             "company_id": self.company_id,
             "campaign_code": self.campaign_code,
             "campaign_run_id": self.campaign_run_id,
-            "recipient_basis": RECIPIENT_BASIS_MANUAL if self.exists else None,
+            "recipient_basis": self.recipient_basis if self.exists else None,
             # A manual selection has no first visit to prove, and says so.
-            "first_visit_proof": "not_applicable" if self.exists else None,
+            "first_visit_proof": (
+                "not_applicable"
+                if self.recipient_basis == RECIPIENT_BASIS_MANUAL
+                else "earned_first_visit"
+                if self.recipient_basis == RECIPIENT_BASIS_EARNED
+                else "per_recipient"
+            )
+            if self.exists
+            else None,
+            "schema_version": self.schema_version if self.exists else None,
+            "earned_recipient_count": sum(entry.recipient_basis == RECIPIENT_BASIS_EARNED for entry in self.items),
+            "manual_recipient_count": sum(entry.recipient_basis == RECIPIENT_BASIS_MANUAL for entry in self.items),
             # The wave this batch is bound to, in one glance and in full. It is
             # the entitlement key, so it belongs in every report an operator
             # reads, not only in the digest that signs it.
@@ -450,6 +475,10 @@ def _item_snapshot(row: EasyWeekVoucherProductionBatchItem) -> ItemSnapshot:
         reconciliation_marker=row.reconciliation_marker,
         status=row.status,
         reason_code=row.reason_code,
+        recipient_basis=row.recipient_basis,
+        manual_policy=row.manual_policy,
+        source_booking_uuid=_text(row.source_booking_uuid),
+        source_proof_digest=row.source_proof_digest,
         voucher_value_minor=int(row.voucher_value_minor),
         voucher_quantity=int(row.voucher_quantity),
         target_order_uuid=_text(row.target_order_uuid),
@@ -546,6 +575,8 @@ async def _snapshot(session: AsyncSession, row: EasyWeekVoucherProductionBatch |
     items = await _items(session, batch_id=row.id)
     return BatchSnapshot(
         exists=True,
+        schema_version=row.request_schema_version,
+        recipient_basis=row.recipient_basis,
         batch_id=int(row.id),
         status=row.status,
         halted_reason_code=row.halted_reason_code,
@@ -667,6 +698,14 @@ class BatchItemIdentity:
     campaign_recipient_id: int
     easyweek_customer_uuid: str
     reconciliation_marker: str
+    recipient_basis: str = RECIPIENT_BASIS_MANUAL
+    manual_policy: str | None = None
+    source_booking_uuid: str | None = None
+    source_proof_digest: str | None = None
+    manual_policy_checked_at: str | None = None
+    manual_operator_attested_at: str | None = None
+    client_id: int | None = None
+    destination_phone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -691,6 +730,8 @@ class BatchIdentity:
     frozen_digest: str
     items: tuple[BatchItemIdentity, ...]
     batch_id: int | None = None
+    schema_version: str = PRODUCTION_SCHEMA_VERSION
+    recipient_basis: str = RECIPIENT_BASIS_MANUAL
 
     @property
     def recipient_count(self) -> int:
@@ -722,7 +763,9 @@ class BatchIdentity:
         if self.batch_id is not None and int(row.id) != self.batch_id:
             return False
         return (
-            int(row.company_id) == self.company_id
+            row.request_schema_version == self.schema_version
+            and row.recipient_basis == self.recipient_basis
+            and int(row.company_id) == self.company_id
             and row.campaign_code == self.campaign_code
             and int(row.campaign_run_id) == self.campaign_run_id
             and row.campaign_period_start == self.campaign_period_start
@@ -747,6 +790,10 @@ class BatchIdentity:
             int(row.campaign_recipient_id) == expected.campaign_recipient_id
             and _text(row.easyweek_customer_uuid) == expected.easyweek_customer_uuid
             and row.reconciliation_marker == expected.reconciliation_marker
+            and row.recipient_basis == expected.recipient_basis
+            and row.manual_policy == expected.manual_policy
+            and _text(row.source_booking_uuid) == expected.source_booking_uuid
+            and row.source_proof_digest == expected.source_proof_digest
             and int(row.voucher_value_minor) == UNIT_PRICE_MINOR
             and int(row.voucher_quantity) == 1
         )
@@ -762,7 +809,9 @@ class BatchIdentity:
         if self.batch_id is not None and snapshot.batch_id != self.batch_id:
             return False
         if (
-            snapshot.company_id != self.company_id
+            snapshot.schema_version != self.schema_version
+            or snapshot.recipient_basis != self.recipient_basis
+            or snapshot.company_id != self.company_id
             or snapshot.campaign_code != self.campaign_code
             or snapshot.campaign_run_id != self.campaign_run_id
             or snapshot.campaign_period_start != _iso(self.campaign_period_start)
@@ -787,6 +836,10 @@ class BatchIdentity:
                 row.campaign_recipient_id != entry.campaign_recipient_id
                 or row.easyweek_customer_uuid != entry.easyweek_customer_uuid
                 or row.reconciliation_marker != entry.reconciliation_marker
+                or row.recipient_basis != entry.recipient_basis
+                or row.manual_policy != entry.manual_policy
+                or row.source_booking_uuid != entry.source_booking_uuid
+                or row.source_proof_digest != entry.source_proof_digest
                 or row.voucher_value_minor != UNIT_PRICE_MINOR
                 or row.voucher_quantity != 1
             ):
@@ -900,6 +953,8 @@ async def freeze_batch(
             # won the race has already set `status='skipped'`, and this is where
             # that becomes visible rather than in a check taken seconds ago.
             for entry in identity.items:
+                from altegio_bot.campaigns.easyweek_manual_identity import local_identity
+
                 recipient = await session.get(CampaignRecipient, entry.campaign_recipient_id)
                 if (
                     recipient is None
@@ -908,8 +963,35 @@ async def freeze_batch(
                     or recipient.company_id != identity.company_id
                     or recipient.status != "candidate"
                     or recipient.is_opted_out
-                    or (recipient.recipient_basis or "") != RECIPIENT_BASIS_MANUAL
-                    or _text(recipient.easyweek_customer_uuid) != entry.easyweek_customer_uuid
+                    or (entry.client_id is not None and recipient.client_id != entry.client_id)
+                    or (entry.destination_phone is not None and recipient.phone_e164 != entry.destination_phone)
+                    or (recipient.recipient_basis or "") != entry.recipient_basis
+                    or recipient.manual_policy != entry.manual_policy
+                    or _text(recipient.source_booking_uuid) != entry.source_booking_uuid
+                    or (
+                        entry.recipient_basis == RECIPIENT_BASIS_EARNED
+                        and source_proof_digest(recipient) != entry.source_proof_digest
+                    )
+                    or _iso(recipient.manual_policy_checked_at) != entry.manual_policy_checked_at
+                    or _iso(recipient.manual_operator_attested_at) != entry.manual_operator_attested_at
+                    or (
+                        entry.recipient_basis == RECIPIENT_BASIS_MANUAL
+                        and _text(recipient.easyweek_customer_uuid) != entry.easyweek_customer_uuid
+                    )
+                ):
+                    return FreezeOutcome(False, FREEZE_REFUSED_SNAPSHOT, BatchSnapshot(exists=False))
+                client, identity_reason = await local_identity(
+                    session,
+                    company_id=identity.company_id,
+                    phone=recipient.phone_e164 or "",
+                    customer_uuid=entry.easyweek_customer_uuid,
+                    lock=True,
+                )
+                if (
+                    identity_reason
+                    or client is None
+                    or client.id != recipient.client_id
+                    or client.wa_opted_out is not False
                 ):
                     return FreezeOutcome(False, FREEZE_REFUSED_SNAPSHOT, BatchSnapshot(exists=False))
 
@@ -942,12 +1024,12 @@ async def freeze_batch(
             now = utcnow()
             header = EasyWeekVoucherProductionBatch(
                 batch_scope=PRODUCTION_SCOPE,
-                request_schema_version=PRODUCTION_SCHEMA_VERSION,
+                request_schema_version=identity.schema_version,
                 baseline_version=identity.baseline_version,
                 provider=PROVIDER_EASYWEEK,
                 company_id=identity.company_id,
                 campaign_code=identity.campaign_code,
-                recipient_basis=RECIPIENT_BASIS_MANUAL,
+                recipient_basis=identity.recipient_basis,
                 campaign_run_id=identity.campaign_run_id,
                 campaign_period_start=identity.campaign_period_start,
                 campaign_period_end=identity.campaign_period_end,
@@ -980,7 +1062,12 @@ async def freeze_batch(
                         provider=PROVIDER_EASYWEEK,
                         company_id=identity.company_id,
                         campaign_code=identity.campaign_code,
-                        recipient_basis=RECIPIENT_BASIS_MANUAL,
+                        recipient_basis=entry.recipient_basis,
+                        manual_policy=entry.manual_policy,
+                        source_booking_uuid=uuid_module.UUID(entry.source_booking_uuid)
+                        if entry.source_booking_uuid
+                        else None,
+                        source_proof_digest=entry.source_proof_digest,
                         campaign_run_id=identity.campaign_run_id,
                         campaign_recipient_id=entry.campaign_recipient_id,
                         easyweek_customer_uuid=uuid_module.UUID(entry.easyweek_customer_uuid),
@@ -1364,6 +1451,58 @@ async def clear_stop_locked(
     return True
 
 
+async def _current_recipient_matches(
+    session: AsyncSession,
+    *,
+    identity: BatchIdentity,
+    row: EasyWeekVoucherProductionBatchItem,
+) -> bool:
+    """Close local identity/proof/consent races at the v2 durable claim boundary.
+
+    No HTTP and no whole-batch scan. Refund callers deliberately bypass this:
+    changed eligibility must never trap a paid, unsent voucher.
+    """
+    if identity.schema_version == "1":
+        return True
+    from altegio_bot.campaigns.easyweek_manual_identity import local_identity
+
+    expected = identity.item(int(row.slot))
+    recipient = await session.get(CampaignRecipient, row.campaign_recipient_id, with_for_update=True)
+    if expected is None or recipient is None:
+        return False
+    if (
+        recipient.provider != PROVIDER_EASYWEEK
+        or recipient.campaign_run_id != identity.campaign_run_id
+        or recipient.company_id != identity.company_id
+        or recipient.status != "candidate"
+        or recipient.is_opted_out
+        or recipient.recipient_basis != expected.recipient_basis
+        or recipient.manual_policy != expected.manual_policy
+        or (expected.client_id is not None and recipient.client_id != expected.client_id)
+        or (expected.destination_phone is not None and recipient.phone_e164 != expected.destination_phone)
+        or _text(recipient.source_booking_uuid) != expected.source_booking_uuid
+        or (
+            expected.recipient_basis == RECIPIENT_BASIS_EARNED
+            and source_proof_digest(recipient) != expected.source_proof_digest
+        )
+        or (
+            expected.recipient_basis == RECIPIENT_BASIS_MANUAL
+            and _text(recipient.easyweek_customer_uuid) != expected.easyweek_customer_uuid
+        )
+        or _iso(recipient.manual_policy_checked_at) != expected.manual_policy_checked_at
+        or _iso(recipient.manual_operator_attested_at) != expected.manual_operator_attested_at
+    ):
+        return False
+    client, reason = await local_identity(
+        session,
+        company_id=identity.company_id,
+        phone=recipient.phone_e164 or "",
+        customer_uuid=expected.easyweek_customer_uuid,
+        lock=True,
+    )
+    return reason is None and client is not None and client.id == recipient.client_id and client.wa_opted_out is False
+
+
 async def _claim(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -1444,6 +1583,8 @@ async def _claim(
             if row is None:
                 return ClaimOutcome(False, CLAIM_REFUSED_MISSING_ROW, None)
             if not identity.matches_item(row):
+                return ClaimOutcome(False, CLAIM_REFUSED_IDENTITY, row.status)
+            if not allow_halted and not await _current_recipient_matches(session, identity=identity, row=row):
                 return ClaimOutcome(False, CLAIM_REFUSED_IDENTITY, row.status)
             if row.status not in claimable_from:
                 return ClaimOutcome(False, CLAIM_REFUSED_STATE, row.status)
@@ -1609,6 +1750,8 @@ async def claim_send(
             if row is None:
                 return ClaimOutcome(False, CLAIM_REFUSED_MISSING_ROW, None)
             if not identity.matches_item(row):
+                return ClaimOutcome(False, CLAIM_REFUSED_IDENTITY, row.status)
+            if not await _current_recipient_matches(session, identity=identity, row=row):
                 return ClaimOutcome(False, CLAIM_REFUSED_IDENTITY, row.status)
             if row.status not in SEND_CLAIMABLE_FROM or int(row.send_attempt_count or 0) != 0:
                 return ClaimOutcome(False, CLAIM_REFUSED_STATE, row.status)
@@ -1807,6 +1950,34 @@ async def record_item_outcome(
             )
 
 
+def _stored_binding_material(header: EasyWeekVoucherProductionBatch, row: EasyWeekVoucherProductionBatchItem) -> str:
+    return binding_material(
+        batch_id=int(header.id),
+        slot=int(row.slot),
+        schema_version=header.request_schema_version,
+        frozen_digest=header.frozen_digest,
+        recipient_basis=row.recipient_basis,
+        manual_policy=row.manual_policy,
+        source_proof_digest=row.source_proof_digest,
+        customer_uuid=_text(row.easyweek_customer_uuid),
+    )
+
+
+async def load_binding_material(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    batch_id: int,
+    slot: int,
+) -> str:
+    """Read the persisted version and proof; old voucher MACs retain their domain."""
+    async with session_maker() as session:
+        header = await _header_by_id(session, batch_id)
+        row = await _one_item(session, batch_id=batch_id, slot=slot)
+        if header is None or row is None:
+            raise ValueError("voucher_production_binding_identity_unproven")
+        return _stored_binding_material(header, row)
+
+
 async def binding_matches(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -1845,7 +2016,7 @@ async def binding_matches(
             # written for one slot cannot verify another slot's code — not
             # within one batch, and not across two batches whose slot numbers
             # legitimately coincide.
-            ledger_uuid=binding_material(batch_id=int(header.id), slot=int(row.slot)),
+            ledger_uuid=_stored_binding_material(header, row),
             target_order_uuid=target_order_uuid,
             voucher_template_uuid=_text(header.voucher_template_uuid) or "",
             domain=VOUCHER_PRODUCTION_DOMAIN,

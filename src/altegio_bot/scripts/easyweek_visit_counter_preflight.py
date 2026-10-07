@@ -229,7 +229,7 @@ async def check_succeeded_event(
     )
     if client is None:
         return REASON_NO_CLIENT, record, None
-    if int(client.altegio_client_id) != visit.customer_id:
+    if client.altegio_client_id != visit.customer_id:
         return REASON_CLIENT_MISMATCH, record, client
     return PROVEN, record, client
 

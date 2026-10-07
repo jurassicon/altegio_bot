@@ -38,26 +38,24 @@ limit; inventing a new limit here would be this code deciding how large a real
 campaign may be. What is enforced instead is that nobody can freeze a batch
 without knowing — and recording — how many people it reaches and what it costs.
 
-One basis, one branch, one campaign, one period
------------------------------------------------
-Only ``operator_manual_selection`` is served here. An earned candidate belongs
-to §36 and would arrive carrying a first-visit proof this phase has no business
-spending; the owner's test account belongs to §36.11. Either sitting in the
-snapshot refuses the batch rather than being skipped.
+Two bases, one branch, one campaign, one period
+----------------------------------------------
+PR-21 serves earned first visits and operator selections together. Each member
+retains its own proof and policy; a batch never claims one shared first visit.
+Unknown and owner-test bases refuse the whole composition. Version 1 batches
+remain manual-only and retain their original frozen digest.
 
-Live, from scratch, every time
------------------------------
-Each member is re-proven by §37.2's own ``prove_manual_recipient``: the local
-client, the current number, the absence of an opt-out, and a live EasyWeek read
-of that exact customer. A manual basis has no visit to prove and says so —
-``first_visit_proof=not_applicable``, never a quiet ``true``.
+The earned proof reuses the source-event, record, booking, customer, complete
+history, service, period and consent guards. Manual selections reuse their
+identity proof; only the explicitly attested no-EasyWeek-bookings policy adds
+a complete zero-history requirement. Refunds deliberately require neither.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -65,12 +63,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_eligibility import BookingReader
+from altegio_bot.campaigns.easyweek_manual_recipient import prove_customer
 from altegio_bot.campaigns.easyweek_manual_voucher import identity as manual_identity
 from altegio_bot.campaigns.easyweek_manual_voucher.eligibility import (
     FIRST_VISIT_NOT_APPLICABLE,
     ManualRecipientProof,
     prove_manual_recipient,
 )
+from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import RecipientProof, prove_recipient
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPROVAL_ARITHMETIC,
     APPROVAL_COUNT_MISMATCH,
@@ -102,8 +102,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     UNIT_PRICE_MINOR,
     production_marker,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.read_sessions import release_reads_before_http
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     CampaignRecipient,
     CampaignRun,
@@ -209,7 +211,25 @@ class ProductionMember:
 
     slot: int
     campaign_recipient_id: int
-    proof: ManualRecipientProof
+    proof: ManualRecipientProof | RecipientProof
+    recipient_basis: str = RECIPIENT_BASIS_MANUAL
+    client_id: int | None = None
+    manual_policy: str | None = None
+    manual_policy_checked_at: str | None = None
+    manual_operator_attested_at: str | None = None
+    source_booking_uuid: str | None = None
+    source_proof_digest: str | None = None
+
+    def immutable_proof(self) -> dict[str, Any]:
+        return {
+            "recipient_basis": self.recipient_basis,
+            "client_id": self.client_id,
+            "manual_policy": self.manual_policy,
+            "manual_policy_checked_at": self.manual_policy_checked_at,
+            "manual_operator_attested_at": self.manual_operator_attested_at,
+            "source_booking_uuid": self.source_booking_uuid,
+            "source_proof_digest": self.source_proof_digest,
+        }
 
     @property
     def easyweek_customer_uuid(self) -> str | None:
@@ -227,6 +247,13 @@ class ProductionMember:
         proof = dict(self.proof.as_safe_dict())
         # §37.2's answers, in this phase's vocabulary. See `translate_reason`.
         proof["reasons"] = [translate_reason(reason) for reason in proof.get("reasons", [])]
+        proof["recipient_basis"] = self.recipient_basis
+        proof["first_visit_proof"] = (
+            "earned_first_visit" if self.recipient_basis == RECIPIENT_BASIS_EARNED else FIRST_VISIT_NOT_APPLICABLE
+        )
+        proof["manual_policy"] = self.manual_policy
+        proof["operator_previous_altegio_visit_attested"] = self.manual_operator_attested_at is not None
+        proof["source_proof_digest"] = self.source_proof_digest
         return {
             "slot": self.slot,
             "campaign_recipient_id": self.campaign_recipient_id,
@@ -252,6 +279,20 @@ class ProductionComposition:
     # or "none", and a composition that refused carries no members to count.
     observed_active: int = 0
     approval: BatchApproval = BatchApproval()
+    schema_version: str = PRODUCTION_SCHEMA_VERSION
+
+    @property
+    def recipient_basis(self) -> str:
+        bases = {member.recipient_basis for member in self.members}
+        return next(iter(bases)) if len(bases) == 1 else "mixed"
+
+    @property
+    def first_visit_proof(self) -> str:
+        if self.recipient_basis == RECIPIENT_BASIS_MANUAL:
+            return FIRST_VISIT_NOT_APPLICABLE
+        if self.recipient_basis == RECIPIENT_BASIS_EARNED:
+            return "earned_first_visit"
+        return "per_recipient"
 
     @property
     def recipient_count(self) -> int:
@@ -279,11 +320,11 @@ class ProductionComposition:
         """
         material = {
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": PRODUCTION_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "provider": PROVIDER_EASYWEEK,
             "company_id": KARLSRUHE_COMPANY_ID,
             "campaign_code": NEW_CLIENT_CAMPAIGN_CODE,
-            "recipient_basis": RECIPIENT_BASIS_MANUAL,
+            "recipient_basis": self.recipient_basis,
             "campaign_run_id": self.preview_run_id,
             "campaign_period_start": self.campaign_period_start.isoformat()
             if self.campaign_period_start is not None
@@ -302,6 +343,7 @@ class ProductionComposition:
                     "campaign_recipient_id": member.campaign_recipient_id,
                     "easyweek_customer_uuid": member.easyweek_customer_uuid,
                     "reconciliation_marker": member.marker(preview_run_id=self.preview_run_id),
+                    **(member.immutable_proof() if self.schema_version != "1" else {}),
                 }
                 for member in self.members
             ],
@@ -324,11 +366,11 @@ class ProductionComposition:
         """
         material = {
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": PRODUCTION_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "provider": PROVIDER_EASYWEEK,
             "company_id": KARLSRUHE_COMPANY_ID,
             "campaign_code": NEW_CLIENT_CAMPAIGN_CODE,
-            "recipient_basis": RECIPIENT_BASIS_MANUAL,
+            "recipient_basis": self.recipient_basis,
             "campaign_run_id": self.preview_run_id,
             "campaign_period_start": self.campaign_period_start.isoformat()
             if self.campaign_period_start is not None
@@ -345,6 +387,7 @@ class ProductionComposition:
                     "campaign_recipient_id": member.campaign_recipient_id,
                     "easyweek_customer_uuid": member.easyweek_customer_uuid,
                     "reconciliation_marker": member.marker(preview_run_id=self.preview_run_id),
+                    **(member.immutable_proof() if self.schema_version != "1" else {}),
                 }
                 for member in self.members
             ],
@@ -384,10 +427,12 @@ class ProductionComposition:
             "campaign_period_end": self.campaign_period_end.isoformat()
             if self.campaign_period_end is not None
             else None,
-            "recipient_basis": RECIPIENT_BASIS_MANUAL,
-            "first_visit_proof": FIRST_VISIT_NOT_APPLICABLE,
+            "recipient_basis": self.recipient_basis,
+            "first_visit_proof": self.first_visit_proof,
             "observed_active_recipients": self.observed_active,
             "recipient_count": self.recipient_count,
+            "earned_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_EARNED for member in self.members),
+            "manual_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_MANUAL for member in self.members),
             "voucher_unit_price_minor": UNIT_PRICE_MINOR,
             "total_exposure_minor": self.total_exposure_minor,
             # Stated rather than implied: this phase has no recipient ceiling,
@@ -399,6 +444,51 @@ class ProductionComposition:
             "approval_digest": self.digest() if self.proven else None,
             "slots": [member.as_safe_dict(preview_run_id=self.preview_run_id) for member in self.members],
         }
+
+
+class _ConsistentEarnedBookingReader:
+    """Bind all source reads in one earned proof to the same observed payload.
+
+    The shared earned guard verifies history, then reads the booking again to
+    obtain its customer UUID. Production must never spend customer A's history
+    on a customer B observed only by that last read. Reads remain live; the
+    digest only rejects drift, and is neither persisted nor exposed in errors.
+    """
+
+    def __init__(self, reader: Any) -> None:
+        self.reader = reader
+        self.observed: dict[str, str] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.reader, name)
+
+    async def get_booking(self, booking_uuid: str) -> dict[str, Any]:
+        payload = await self.reader.get_booking(booking_uuid)
+        try:
+            fingerprint = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            ).hexdigest()
+        except (TypeError, ValueError):
+            raise ValueError("voucher_production_source_booking_unproven") from None
+        previous = self.observed.setdefault(booking_uuid, fingerprint)
+        if previous != fingerprint:
+            raise ValueError("voucher_production_source_booking_drift")
+        return payload
+
+
+def source_proof_digest(recipient: CampaignRecipient) -> str:
+    """Fingerprint durable earned evidence; never manufacture visit evidence."""
+    material = {
+        "client_id": recipient.client_id,
+        "source_easyweek_event_id": recipient.source_easyweek_event_id,
+        "source_record_id": recipient.source_record_id,
+        "source_booking_uuid": str(recipient.source_booking_uuid) if recipient.source_booking_uuid else None,
+        "source_visits_total": recipient.source_visits_total,
+        "source_visits_total_updated_at": recipient.source_visits_total_updated_at.isoformat()
+        if recipient.source_visits_total_updated_at
+        else None,
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
 async def _historically_consumed(
@@ -506,6 +596,7 @@ async def active_recipient_ids(session: AsyncSession, *, preview_run_id: int) ->
     return [int(row[0]) for row in rows], [str(row[1] or "") for row in rows]
 
 
+@release_reads_before_http("client_reader")
 async def prove_production_composition(
     session: AsyncSession,
     *,
@@ -514,6 +605,7 @@ async def prove_production_composition(
     now: datetime,
     approval: BatchApproval | None = None,
     exclude_batch_id: int | None = None,
+    schema_version: str = PRODUCTION_SCHEMA_VERSION,
 ) -> ProductionComposition:
     """Read one preview's active snapshot and prove every member of it, live.
 
@@ -548,10 +640,13 @@ async def prove_production_composition(
     recipient_ids, bases = await active_recipient_ids(session, preview_run_id=preview_run_id)
     observed = len(recipient_ids)
 
-    if any(basis != RECIPIENT_BASIS_MANUAL for basis in bases):
-        # An earned or owner-test row is sitting in the snapshot. Refused whole:
-        # serving "the manual ones" would be this tool deciding which of the
-        # operator's rows counted.
+    if any(
+        basis
+        not in ({RECIPIENT_BASIS_MANUAL} if schema_version == "1" else {RECIPIENT_BASIS_MANUAL, RECIPIENT_BASIS_EARNED})
+        for basis in bases
+    ):
+        # Unknown/test bases refuse the full composition. Legacy batches never
+        # acquire earned eligibility merely because a newer app is deployed.
         return ProductionComposition(
             False, preview_run_id, (COMPOSITION_MIXED_BASIS,), observed_active=observed, approval=supplied
         )
@@ -578,14 +673,94 @@ async def prove_production_composition(
     members: list[ProductionMember] = []
     reasons: list[str] = []
     for slot, recipient_id in enumerate(recipient_ids, start=1):
-        proof = await prove_manual_recipient(
-            session,
-            preview_run_id=preview_run_id,
+        recipient = await session.get(CampaignRecipient, recipient_id)
+        assert recipient is not None
+        basis = recipient.recipient_basis
+        policy = recipient.manual_policy
+        if basis == RECIPIENT_BASIS_EARNED:
+            proof = await prove_recipient(
+                session,
+                preview_run_id=preview_run_id,
+                campaign_recipient_id=recipient_id,
+                expected_company_id=KARLSRUHE_COMPANY_ID,
+                client_reader=_ConsistentEarnedBookingReader(client_reader),
+                now=now,
+            )
+            if proof.proven:
+                # Source/history UUIDs alone do not establish the destination.
+                # Legacy Clients may still have no UUID column populated, so
+                # local phone equality cannot substitute for this live bridge.
+                customer, _reason = await prove_customer(
+                    client_reader, phone=proof.destination_phone or "", require_name=False
+                )
+                destination_current = customer is not None and customer.uuid == proof.easyweek_customer_uuid
+                proof = replace(
+                    proof,
+                    proven=destination_current,
+                    reasons=() if destination_current else (CUSTOMER_IDENTITY_NOT_CURRENT,),
+                    checks={**(proof.checks or {}), "workspace_customer_destination_current": destination_current},
+                )
+        else:
+            proof = await prove_manual_recipient(
+                session,
+                preview_run_id=preview_run_id,
+                campaign_recipient_id=recipient_id,
+                client_reader=client_reader,
+                now=now,
+            )
+        if proof.proven:
+            from altegio_bot.campaigns.easyweek_manual_identity import local_identity
+
+            _client, identity_reason = await local_identity(
+                session,
+                company_id=KARLSRUHE_COMPANY_ID,
+                phone=proof.destination_phone or "",
+                customer_uuid=proof.easyweek_customer_uuid,
+            )
+            if identity_reason or _client is None or _client.id != recipient.client_id:
+                proof = replace(proof, proven=False, reasons=(identity_reason or LOCAL_CLIENT_UNPROVEN,))
+        if proof.proven and not proof.client_display_name:
+            proof = replace(proof, proven=False, reasons=(CUSTOMER_NAME_MISSING,))
+        if policy is not None:
+            from altegio_bot.campaigns.easyweek_manual_batch import prove_zero_booking_history
+
+            if (
+                schema_version == "1"
+                or basis != RECIPIENT_BASIS_MANUAL
+                or policy != "altegio_visit_zero_easyweek_bookings"
+                or recipient.manual_policy_checked_at is None
+                or recipient.manual_operator_attested_at is None
+            ):
+                proof = replace(proof, proven=False, reasons=(RECIPIENT_BASIS_UNSUPPORTED,))
+            elif proof.proven:
+                history_reason = await prove_zero_booking_history(
+                    client_reader,
+                    customer_uuid=proof.easyweek_customer_uuid or "",
+                )
+                checks = {**(proof.checks or {}), "zero_easyweek_bookings": history_reason is None}
+                proof = replace(
+                    proof,
+                    proven=history_reason is None,
+                    reasons=(history_reason,) if history_reason else (),
+                    checks=checks,
+                )
+        member = ProductionMember(
+            slot=slot,
             campaign_recipient_id=recipient_id,
-            client_reader=client_reader,
-            now=now,
+            proof=proof,
+            recipient_basis=basis,
+            client_id=recipient.client_id,
+            manual_policy=policy,
+            manual_policy_checked_at=recipient.manual_policy_checked_at.isoformat()
+            if recipient.manual_policy_checked_at
+            else None,
+            manual_operator_attested_at=recipient.manual_operator_attested_at.isoformat()
+            if recipient.manual_operator_attested_at
+            else None,
+            source_booking_uuid=str(recipient.source_booking_uuid) if recipient.source_booking_uuid else None,
+            source_proof_digest=source_proof_digest(recipient) if basis == RECIPIENT_BASIS_EARNED else None,
         )
-        members.append(ProductionMember(slot=slot, campaign_recipient_id=recipient_id, proof=proof))
+        members.append(member)
         reasons.extend(translate_reason(reason) for reason in proof.reasons)
 
     if reasons:
@@ -601,6 +776,7 @@ async def prove_production_composition(
             campaign_period_end=run.period_end,
             observed_active=observed,
             approval=supplied,
+            schema_version=schema_version,
         )
 
     customer_uuids = [member.easyweek_customer_uuid or "" for member in members]
@@ -637,6 +813,7 @@ async def prove_production_composition(
         campaign_period_end=run.period_end,
         observed_active=observed,
         approval=supplied,
+        schema_version=schema_version,
     )
 
 

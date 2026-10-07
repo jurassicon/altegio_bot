@@ -978,6 +978,7 @@ console.log(JSON.stringify({
 
 
 _COMPOSITION_FUNCTIONS = (
+    "basisLabel",
     "renderOffer",
     "renderComposition",
     "plannedComposition",

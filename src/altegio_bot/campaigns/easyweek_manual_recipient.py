@@ -48,6 +48,12 @@ from typing import Any, Final, Protocol
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.campaigns.easyweek_manual_identity import (
+    BRANCH_ASSIGNMENT_REQUIRED,
+    KARLSRUHE_COMPANY_ID,
+    ensure_local_identity,
+    local_identity,
+)
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.customer_api import (
     LOOKUP_ABSENT,
@@ -61,7 +67,6 @@ from altegio_bot.easyweek_migration.customer_api import (
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_MANUAL,
-    RECIPIENT_BASIS_TEST,
     CampaignRecipient,
     CampaignRun,
     Client,
@@ -183,7 +188,36 @@ async def _preview_blocker(session: AsyncSession, run: CampaignRun) -> str | Non
     return None
 
 
-async def prove_customer(reader: CustomerReader, *, phone: str) -> tuple[ProvenCustomer | None, str | None]:
+class _CompleteCustomerLookup:
+    """Require stable pagination and an exact final row count."""
+
+    def __init__(self, reader: CustomerReader) -> None:
+        self.reader = reader
+        self.expected: tuple[int, int] | None = None
+        self.seen = 0
+
+    async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        payload = await self.reader.list_customers(params=params)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError(CUSTOMER_UNPROVEN)
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(CUSTOMER_UNPROVEN)
+        last, total = meta.get("last_page"), meta.get("total")
+        if type(last) is not int or type(total) is not int or last < 1 or total < 0:
+            raise ValueError(CUSTOMER_UNPROVEN)
+        if self.expected is not None and self.expected != (last, total):
+            raise ValueError(CUSTOMER_UNPROVEN)
+        self.expected = (last, total)
+        self.seen += len(payload["data"])
+        if self.seen > total or (params["page"] == last and self.seen != total):
+            raise ValueError(CUSTOMER_UNPROVEN)
+        return payload
+
+
+async def prove_customer(
+    reader: CustomerReader, *, phone: str, require_name: bool = True
+) -> tuple[ProvenCustomer | None, str | None]:
     """Resolve a number to exactly one customer, then read that customer back.
 
     Two reads, deliberately. The listing answers "who has this number?" across
@@ -197,7 +231,10 @@ async def prove_customer(reader: CustomerReader, *, phone: str) -> tuple[ProvenC
     timeout, a 429, a 5xx and an auth failure all stop here, before the caller
     opens a transaction.
     """
-    lookup = await lookup_customer_by_phone(reader, phone)
+    try:
+        lookup = await lookup_customer_by_phone(_CompleteCustomerLookup(reader), phone)
+    except Exception:  # noqa: BLE001 - unavailable lookup is never an absence
+        return None, CUSTOMER_UNPROVEN
     if lookup.outcome == LOOKUP_PHONE_UNUSABLE:
         return None, PHONE_UNUSABLE
     if lookup.outcome == LOOKUP_ABSENT:
@@ -208,51 +245,41 @@ async def prove_customer(reader: CustomerReader, *, phone: str) -> tuple[ProvenC
         # One number, two customers — a couple, a family phone, a duplicated
         # import. Picking the first would pick a person.
         return None, CUSTOMER_AMBIGUOUS
-    if lookup.outcome == LOOKUP_FIRST_NAME_MISSING:
+    if lookup.outcome == LOOKUP_FIRST_NAME_MISSING and require_name:
         return None, CUSTOMER_NAME_MISSING
-    if lookup.outcome != LOOKUP_FOUND or lookup.uuid is None or lookup.phone is None:
+    if lookup.outcome not in (LOOKUP_FOUND, LOOKUP_FIRST_NAME_MISSING) or lookup.uuid is None or lookup.phone is None:
         # Undetermined: transport, auth, malformed, incomplete pagination. The
         # workspace was not read, so nothing about it is known.
         return None, CUSTOMER_UNPROVEN
 
     try:
         payload = await reader.get_customer(lookup.uuid)
-        card = read_customer_card(payload, expected_phone=lookup.phone)
+        if not isinstance(payload, dict):
+            return None, CUSTOMER_UNPROVEN
+        if "data" in payload and not isinstance(payload["data"], dict):
+            return None, CUSTOMER_UNPROVEN
+        body = payload["data"] if "data" in payload else payload
+        card = read_customer_card(body, expected_phone=lookup.phone)
     except Exception:  # noqa: BLE001 - every read failure is the same refusal
         return None, CUSTOMER_UNPROVEN
 
     if card.uuid != lookup.uuid or card.phone != lookup.phone:
         return None, CUSTOMER_UNPROVEN
     first_name = (card.first_name or "").strip()
-    if not first_name:
+    if require_name and (not first_name or len(first_name) > 256):
         # The delivery template has a name slot. An empty one either fails at
         # Meta or reaches a customer as a blank.
         return None, CUSTOMER_NAME_MISSING
+    # Real booking ingestion only needs UUID/phone identity; the normalizer
+    # already owns its display name. Voucher paths keep requiring a usable name.
+    if not require_name and len(first_name) > 256:
+        first_name = ""
     return ProvenCustomer(uuid=card.uuid, phone=card.phone, first_name=first_name), None
 
 
 async def _one_local_client(session: AsyncSession, *, company_id: int, phone: str) -> tuple[Client | None, str | None]:
-    """Exactly one EasyWeek client for this number in this branch, or a refusal."""
-    rows = list(
-        (
-            await session.execute(
-                select(Client)
-                .where(Client.provider == PROVIDER_EASYWEEK)
-                .where(Client.company_id == company_id)
-                .where(Client.phone_e164 == phone)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not rows:
-        return None, CLIENT_ABSENT
-    if len(rows) > 1:
-        return None, CLIENT_AMBIGUOUS
-    client = rows[0]
-    if client.wa_opted_out:
-        return None, CLIENT_OPTED_OUT
-    return client, None
+    """Compatibility wrapper: the resolver checks all branches and opt-outs."""
+    return await local_identity(session, company_id=company_id, phone=phone)
 
 
 def _active(row: CampaignRecipient) -> bool:
@@ -268,6 +295,7 @@ async def add_manual_recipient(
     reader: CustomerReader,
     customer_uuid: object = None,
     altegio_client_id: object = None,
+    assign_karlsruhe: bool = False,
 ) -> ManualRecipientOutcome:
     """Add — or reactivate, or explicitly include — one recipient by hand.
 
@@ -307,6 +335,8 @@ async def add_manual_recipient(
         _client, client_blocker = await _one_local_client(session, company_id=company_id, phone=destination)
         if client_blocker is not None:
             return ManualRecipientOutcome(False, client_blocker)
+        if _client is None and (company_id != KARLSRUHE_COMPANY_ID or not assign_karlsruhe):
+            return ManualRecipientOutcome(False, BRANCH_ASSIGNMENT_REQUIRED)
 
     # -- the live reads, outside any transaction ----------------------------
     proven, reason = await prove_customer(reader, phone=destination)
@@ -325,71 +355,93 @@ async def add_manual_recipient(
                 return ManualRecipientOutcome(False, await _locked_reason(session_maker, run_id))
 
             blocker = await _preview_blocker(session, run)
+            if run.company_ids != [company_id]:
+                return ManualRecipientOutcome(False, RUN_NOT_EDITABLE)
             if blocker is not None:
                 return ManualRecipientOutcome(False, blocker)
 
-            client, client_blocker = await _one_local_client(session, company_id=company_id, phone=destination)
+            client, client_blocker = await ensure_local_identity(
+                session,
+                company_id=company_id,
+                phone=destination,
+                customer_uuid=proven.uuid,
+                first_name=proven.first_name,
+                assign_karlsruhe=assign_karlsruhe,
+            )
             if client is None:
                 assert client_blocker is not None
                 return ManualRecipientOutcome(False, client_blocker)
-
-            proven_uuid = uuid_module.UUID(proven.uuid)
-            existing = list(
-                (
-                    await session.execute(
-                        select(CampaignRecipient)
-                        .where(CampaignRecipient.campaign_run_id == run_id)
-                        .where(CampaignRecipient.provider == PROVIDER_EASYWEEK)
-                        .where(
-                            (CampaignRecipient.client_id == client.id)
-                            | (CampaignRecipient.easyweek_customer_uuid == proven_uuid)
-                        )
-                        .order_by(CampaignRecipient.id)
-                    )
-                )
-                .scalars()
-                .all()
+            outcome = await apply_proven_recipient(
+                session, run=run, company_id=company_id, client=client, proven=proven
             )
-            if len(existing) > 1:
-                # Two rows for one person. Which one an operator meant is not a
-                # question a script answers by taking the first.
-                return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)
-
-            if existing:
-                outcome = _reuse(existing[0], proven_uuid=proven_uuid, name=proven.first_name, phone=destination)
-                if outcome.ok:
-                    await recompute_snapshot_counters(session, run)
+            if not outcome.ok:
+                await session.rollback()
                 return outcome
-
-            row = CampaignRecipient(
-                provider=PROVIDER_EASYWEEK,
-                campaign_run_id=run_id,
-                company_id=company_id,
-                client_id=client.id,
-                # No Altegio identity: this path never asked the Altegio CRM,
-                # which has nothing to say about an EasyWeek customer.
-                altegio_client_id=None,
-                phone_e164=destination,
-                display_name=proven.first_name,
-                local_client_found=True,
-                is_opted_out=False,
-                status="candidate",
-                excluded_reason=None,
-                recipient_basis=RECIPIENT_BASIS_MANUAL,
-                easyweek_customer_uuid=proven_uuid,
-                meta={"manually_added_at": utcnow().isoformat()},
-            )
-            session.add(row)
-            await session.flush()
-            recipient_id = row.id
             await recompute_snapshot_counters(session, run)
-            return ManualRecipientOutcome(
-                True,
-                None,
-                recipient_id=recipient_id,
-                action=ACTION_CREATED,
-                recipient_basis=RECIPIENT_BASIS_MANUAL,
+            return outcome
+
+
+async def apply_proven_recipient(
+    session: AsyncSession, *, run: CampaignRun, company_id: int, client: Client, proven: ProvenCustomer
+) -> ManualRecipientOutcome:
+    """Apply one server-proven identity; caller owns locking and counter refresh."""
+    destination = proven.phone
+    proven_uuid = uuid_module.UUID(proven.uuid)
+    existing = list(
+        (
+            await session.execute(
+                select(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == run.id)
+                .where(CampaignRecipient.provider == PROVIDER_EASYWEEK)
+                .where(
+                    (CampaignRecipient.client_id == client.id)
+                    | (CampaignRecipient.easyweek_customer_uuid == proven_uuid)
+                )
+                .order_by(CampaignRecipient.id)
             )
+        )
+        .scalars()
+        .all()
+    )
+    if len(existing) > 1:
+        # Two rows for one person. Which one an operator meant is not a
+        # question a script answers by taking the first.
+        return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)
+
+    if existing:
+        if existing[0].client_id != client.id or existing[0].company_id != company_id:
+            return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)
+        outcome = _reuse(existing[0], proven_uuid=proven_uuid, name=proven.first_name, phone=destination)
+        return outcome
+
+    row = CampaignRecipient(
+        provider=PROVIDER_EASYWEEK,
+        campaign_run_id=run.id,
+        company_id=company_id,
+        client_id=client.id,
+        # No Altegio identity: this path never asked the Altegio CRM,
+        # which has nothing to say about an EasyWeek customer.
+        altegio_client_id=None,
+        phone_e164=destination,
+        display_name=proven.first_name,
+        local_client_found=True,
+        is_opted_out=False,
+        status="candidate",
+        excluded_reason=None,
+        recipient_basis=RECIPIENT_BASIS_MANUAL,
+        easyweek_customer_uuid=proven_uuid,
+        meta={"manually_added_at": utcnow().isoformat()},
+    )
+    session.add(row)
+    await session.flush()
+    recipient_id = row.id
+    return ManualRecipientOutcome(
+        True,
+        None,
+        recipient_id=recipient_id,
+        action=ACTION_CREATED,
+        recipient_basis=RECIPIENT_BASIS_MANUAL,
+    )
 
 
 def _reuse(
@@ -405,7 +457,7 @@ def _reuse(
     candidate as `manual` would quietly discard a proof; reactivating a manual
     one as `earned` would quietly manufacture one.
     """
-    if row.recipient_basis == RECIPIENT_BASIS_TEST:
+    if row.recipient_basis not in ("earned_first_visit", RECIPIENT_BASIS_MANUAL):
         # The canary's account, which has its own contract and its own endpoint.
         # Rewriting it here would convert one basis into another silently.
         return ManualRecipientOutcome(False, ROWS_AMBIGUOUS)

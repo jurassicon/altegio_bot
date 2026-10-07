@@ -51,6 +51,7 @@ from altegio_bot.models.models import (
     MessageJob,
     OutboxMessage,
 )
+from altegio_bot.ops.easyweek_recipient_editor import manual_batch_editor
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
 from altegio_bot.workers.followup_worker import STALE_PROCESSING_MINUTES
@@ -59,6 +60,7 @@ from .auth import (
     SESSION_COOKIE,
     SESSION_MAX_AGE,
     check_session_token,
+    csrf_token_for,
     make_session_token,
     require_ops_auth,
 )
@@ -3872,7 +3874,8 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
           <option value="altegio">altegio</option>
           <option value="easyweek">easyweek</option>
         </select>
-        <div class="form-text">EasyWeek: preview и редактирование snapshot (§37.1). Отправка закрыта.</div>
+        <div class="form-text">EasyWeek: preview и редактирование snapshot.
+          Ваучерная рассылка Karlsruhe — в разделе «Ваучеры».</div>
       </div>
 
       <div class="col-md-4 altegio-only">
@@ -3923,9 +3926,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
         <b>EasyWeek preview (§37.1).</b> Кампания <code>new_clients_monthly</code>,
         шаблон доставки <code>new_client_voucher</code>.
         Здесь можно построить preview и вручную отредактировать список получателей.
-        <b>Отправка в §37.1 ещё закрыта</b> — выдача ваучеров, оплата и сообщения Meta
-        открываются отдельным следующим этапом. Карты лояльности, Altegio CRM и
-        follow-up к EasyWeek не применяются.
+        Для Karlsruhe перейдите в <a href="/ops/voucher-mailings">«Ваучеры»</a>:
+        проверка состава и отдельные подтверждения FREEZE, CREATE, PAY, DELIVER.
+        Наличие preview не разрешает отправку. Generic send-real, MessageJob/Outbox и follow-up закрыты.
       </div>
     </div>
 
@@ -3986,9 +3989,9 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     </dl>
     <div id="ew-template-status" class="text-muted small">⏳ Проверка шаблона филиала…</div>
     <div class="alert alert-warning small mt-2 mb-0">
-      §37.1 открывает <b>только preview и редактор snapshot</b>. Send-real, follow-up,
-      jobs, Outbox и массовая доставка для EasyWeek закрыты; Altegio newsletter и
-      follow-up к EasyWeek не относятся и здесь не используются.
+      Этот экран показывает шаблон и состав preview. Ваучерная рассылка Karlsruhe доступна
+      в <a href="/ops/voucher-mailings">разделе «Ваучеры»</a> после проверки состава,
+      конфигурации и отдельных подтверждений. Generic send-real, follow-up, jobs и Outbox остаются закрытыми.
     </div>
   </div>
 </div>
@@ -4085,9 +4088,10 @@ async def ops_new_clients_campaign_page(request: Request) -> str:
     </button>
     <span class="text-muted ms-2 small altegio-only">Доступно после создания preview</span>
     <div id="easyweek-send-closed" class="alert alert-secondary mt-2 mb-0 d-none">
-      Редактор snapshot готов. <b>Отправка EasyWeek в §37.1 закрыта</b> — выдача ваучеров,
-      оплата и сообщения Meta открываются отдельным следующим этапом, после проверки
-      редактора. Кнопка запуска намеренно недоступна, а не ведёт в Altegio send-real.
+      Preview готов к редактированию. Для Karlsruhe подготовьте состав в
+      <a href="/ops/voucher-mailings">разделе «Ваучеры»</a>.
+      Там показаны readiness, administrative fence и executor. Каждая стадия требует отдельного подтверждения.
+      Generic campaign send-real, MessageJob/Outbox и follow-up остаются закрытыми.
     </div>
   </div>
   <div id="run-alert" class="mb-3"></div>
@@ -4409,7 +4413,8 @@ function prefillRejection(run, runId) {{
     // An EasyWeek preview opens in the editor, never in the runner: §37.1
     // opens editing and nothing else.
     return {{level: "warning",
-      message: "Preview #" + runId + " относится к EasyWeek. Запуск для EasyWeek закрыт (§37.1); " +
+      message: "Preview #" + runId + " относится к EasyWeek. " +
+        "Ваучерная рассылка Karlsruhe доступна в разделе «Ваучеры»; " +
         "доступен только просмотр и редактирование snapshot."}};
   }}
   const companies = run.company_ids || [];
@@ -5846,8 +5851,10 @@ async function deleteOutstandingCards() {{
 
 
 @router.get("/campaigns/{run_id}", response_class=HTMLResponse)
-async def ops_campaign_run_detail(run_id: int) -> str:
+async def ops_campaign_run_detail(request: Request, run_id: int) -> str:
     tz = _local_tz()
+    token = request.cookies.get(SESSION_COOKIE, "")
+    editor_csrf = csrf_token_for(token) if token else ""
 
     async with SessionLocal() as session:
         run = await session.get(CampaignRun, run_id)
@@ -5867,6 +5874,19 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         recipient_rows = (await session.execute(recipient_count_stmt)).all()
         recipients_by_status: dict[str, int] = {row.status: int(row.cnt) for row in recipient_rows}
         recipients_total = sum(recipients_by_status.values())
+        basis_counts = dict(
+            (
+                await session.execute(
+                    select(CampaignRecipient.recipient_basis, func.count(CampaignRecipient.id))
+                    .where(
+                        CampaignRecipient.campaign_run_id == run_id,
+                        CampaignRecipient.provider == run.provider,
+                        CampaignRecipient.status == "candidate",
+                    )
+                    .group_by(CampaignRecipient.recipient_basis)
+                )
+            ).all()
+        )
 
         # The EasyWeek editor needs a human-readable view of the active
         # snapshot near the top of the detail page. The full recipient page
@@ -6099,8 +6119,7 @@ async def ops_campaign_run_detail(run_id: int) -> str:
             )
         )
         lead = (
-            "Это EasyWeek preview. Обычный send-real для EasyWeek закрыт — используется "
-            "только controlled voucher delivery canary (§36)."
+            "Preview создан; состав можно редактировать. Подготовка ваучерной рассылки — в разделе «Ваучеры»."
             if is_easyweek
             else "Это preview-run. Запустите send-real или отредактируйте snapshot."
         )
@@ -6154,6 +6173,17 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   <div class="card-header" id="add-recipient-header">{add_header}</div>
   <div class="card-body">
     <div id="add-recipient-hint">{add_hint}</div>
+    {
+            (
+                '<div class="form-check mb-2" id="add-karlsruhe-wrap">'
+                '<input id="add-karlsruhe" type="checkbox" class="form-check-input">'
+                '<label class="form-check-label" for="add-karlsruhe">Если локальной карточки нет, '
+                "явно назначаю клиента в Karlsruhe для этой рассылки. "
+                "Это решение оператора; workspace-карточка не доказывает филиал.</label></div>"
+            )
+            if is_easyweek and run.company_ids == [322579]
+            else ""
+        }
     <div id="add-recipient-test-hint" class="alert alert-warning small py-2 d-none">
       Добавляется <b>только заранее настроенный тестовый аккаунт</b> controlled voucher
       delivery canary (§36.11). Customer UUID берётся из серверной конфигурации;
@@ -6175,6 +6205,8 @@ async def ops_campaign_run_detail(run_id: int) -> str:
   </div>
 </div>
 """
+        if is_easyweek and run.company_ids == [322579] and run.campaign_code == "new_clients_monthly":
+            preview_actions_block += manual_batch_editor(run_id=run_id, csrf=editor_csrf)
     elif run.mode == "preview":
         # failed / queued / other — no editing, no delete
         preview_actions_block = f"""
@@ -6295,12 +6327,57 @@ async def ops_campaign_run_detail(run_id: int) -> str:
         # Delivery counters are the Altegio send path's own. For EasyWeek they
         # would be a row of zeros presented as a working feature, which is worse
         # than saying plainly that the path is closed.
-        delivery_block = """
-<div class="card mb-3">
-  <div class="card-header">📨 Delivery — закрыто (§37.1)</div>
+        mailing_url = (
+            f"/ops/voucher-mailings/{production_batch_id}"
+            if production_batch_id is not None
+            else f"/ops/voucher-mailings/prepare?preview_run_id={run_id}"
+        )
+        scoped = run.company_ids == [322579] and run.campaign_code == "new_clients_monthly"
+        supported = all(basis in {RECIPIENT_BASIS_EARNED, RECIPIENT_BASIS_MANUAL} for basis in basis_counts)
+        composition_note = (
+            "Состав зафиксирован; редактирование закрыто"
+            if canary_locked
+            else (
+                "Preview создан; состав редактируется"
+                if run.mode == "preview" and run.status == "completed" and not used_as_source
+                else f"Состояние preview: {run.status}; редактирование недоступно"
+            )
+        )
+        identity_note = (
+            "Есть неподдерживаемое основание: test или неизвестное. Подготовка откажет."
+            if not supported
+            else "Живые identity и eligibility не проверены этой страницей. Проверьте состав в разделе «Ваучеры»."
+        )
+        fence = (
+            "открыт" if settings.easyweek_voucher_production_mailing_enabled else "закрыт — новые стадии заблокированы"
+        )
+        executor = (
+            "включён в настройках; состояние процесса здесь не проверяется"
+            if settings.easyweek_voucher_production_executor_enabled
+            else "выключен — выполнение недоступно"
+        )
+        voucher_link = (
+            f'<a id="preview-vouchers-link" href="{mailing_url}" class="btn btn-primary">Ваучеры</a>'
+            if scoped and (not canary_locked or production_batch_id is not None)
+            else (
+                "Исторический ledger: подготовка новой рассылки недоступна."
+                if canary_locked
+                else "Ваучерная рассылка доступна только для Karlsruhe / new_clients_monthly."
+            )
+        )
+        delivery_block = f"""
+<div id="easyweek-mailing-readiness" class="card mb-3">
+  <div class="card-header">📨 Ваучерная рассылка</div>
   <div class="card-body">
-    <p class="text-muted mb-0">EasyWeek send-real, jobs, Outbox и массовая доставка закрыты.
-    §37.1 открывает только preview и редактор snapshot.</p>
+    <p>{_esc(composition_note)}.</p>
+    <p id="preview-basis-counts">Automatic: {basis_counts.get(RECIPIENT_BASIS_EARNED, 0)};
+      manual: {basis_counts.get(RECIPIENT_BASIS_MANUAL, 0)}.</p>
+    <p>{_esc(identity_note)}</p>
+    <p>Administrative mailing fence: {_esc(fence)}. Executor: {_esc(executor)}.</p>
+    <p>Preview сам по себе не разрешает отправку. FREEZE, CREATE, PAY и DELIVER требуют отдельных подтверждений.</p>
+    {voucher_link}
+    <p class="text-muted small mt-2 mb-0">Generic campaign send-real, MessageJob/Outbox
+      и follow-up для EasyWeek закрыты.</p>
   </div>
 </div>
 """
@@ -6797,6 +6874,8 @@ function showAddRecipientForm(mode) {{
   const testHint = document.getElementById("add-recipient-test-hint");
   if (manualHint) manualHint.classList.toggle("d-none", isTest);
   if (testHint) testHint.classList.toggle("d-none", !isTest);
+  const assignment = document.getElementById("add-karlsruhe-wrap");
+  if (assignment) assignment.classList.toggle("d-none", isTest);
   document.getElementById("add-recipient-alert").innerHTML = "";
   document.getElementById("add-recipient-form").classList.remove("d-none");
 }}
@@ -6808,6 +6887,7 @@ function hideAddRecipientForm() {{
 // Which contract this page's Add button follows. Rendered by the server so the
 // browser never has to guess the provider from a URL.
 const IS_EASYWEEK = {is_easyweek_js};
+const EDITOR_CSRF = {json.dumps(editor_csrf)};
 
 // Stable reason codes turned into sentences. The codes are what a wrapper
 // branches on; an operator should not have to read them.
@@ -6817,15 +6897,20 @@ const MANUAL_ADD_REASONS = {{
   "manual_recipient_run_not_easyweek": "Этот preview не относится к EasyWeek.",
   "manual_recipient_run_not_editable": "Preview больше нельзя редактировать.",
   "manual_recipient_branch_unknown": "Филиал этого preview не настроен на сервере.",
-  "manual_recipient_preview_frozen": "Preview занят controlled voucher canary — редактирование закрыто.",
+  "manual_recipient_preview_frozen": "Preview занят voucher ledger — редактирование закрыто.",
   "manual_recipient_customer_absent": "В EasyWeek нет клиента с таким номером. Клиент не создаётся автоматически.",
   "manual_recipient_customer_ambiguous": "На этот номер в EasyWeek приходится несколько клиентов.",
   "manual_recipient_customer_unproven": "EasyWeek не подтвердил клиента. Повторите позже.",
   "manual_recipient_customer_name_missing": "У клиента в EasyWeek не заполнено имя — оно нужно для шаблона.",
-  "manual_recipient_local_client_absent": "Клиента с таким номером нет в локальной базе этого филиала.",
+  "manual_recipient_local_client_absent":
+    "Локальной карточки нет. Для Karlsruhe требуется явное назначение филиала оператором.",
   "manual_recipient_local_client_ambiguous": "В локальной базе несколько клиентов с этим номером.",
   "manual_recipient_opted_out": "Клиент отказался от сообщений WhatsApp.",
   "manual_recipient_rows_ambiguous": "В snapshot уже есть конфликтующие строки для этого клиента.",
+  "manual_recipient_branch_assignment_required":
+    "Локальной карточки нет. Подтвердите назначение Karlsruhe перед добавлением.",
+  "manual_recipient_branch_conflict": "Конфликт филиала / identity — клиент не переносится автоматически.",
+  "manual_recipient_identity_conflict": "Конфликт identity или телефона.",
   "manual_recipient_identity_not_accepted": "Идентификатор клиента из браузера не принимается.",
 }};
 
@@ -6842,6 +6927,8 @@ async function submitAddRecipient(runId) {{
   }}
   const body = {{}};
   if (phone) body.phone = phone;
+  const assignment = document.getElementById("add-karlsruhe");
+  if (IS_EASYWEEK && ADD_RECIPIENT_MODE === "manual" && assignment && assignment.checked) body.assign_karlsruhe = true;
   if (cid) body.altegio_client_id = parseInt(cid);
   // §37.1 for EasyWeek: a separate endpoint from the §36.11 canary one, which
   // adds only the configured test account and must keep refusing everything
@@ -6851,7 +6938,7 @@ async function submitAddRecipient(runId) {{
     : "/ops/campaigns/runs/" + runId + "/recipients/add";
   const resp = await fetch(endpoint, {{
     method: "POST",
-    headers: {{"Content-Type": "application/json"}},
+    headers: {{"Content-Type": "application/json", "X-Ops-CSRF": EDITOR_CSRF}},
     body: JSON.stringify(body),
   }});
   const data = await resp.json();

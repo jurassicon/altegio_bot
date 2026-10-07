@@ -23,6 +23,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import altegio_bot.db as app_db
+import altegio_bot.easyweek_uuid_identity as uuid_identity
 from altegio_bot.easyweek_multi_service import (
     MULTI_SERVICE_JOB_DIGEST_KEY,
     MULTI_SERVICE_SNAPSHOT_KEY,
@@ -1520,6 +1521,7 @@ async def _capture_and_process(
     async with session_maker() as session:
         async with session.begin():
             await _capture(session, payload, event_hint=event_hint, payload_hash=payload_hash)
+    # Ordinary numeric ingestion does not require a preliminary voucher identity pass.
     assert await _run_until_idle() == 1
 
 
@@ -5969,6 +5971,7 @@ KARLSRUHE_PEDIKUERE_GEL = "Pediküre mit Gel-Lack"
 KARLSRUHE_SHELLAC_ID = 1030234
 _KARLSRUHE_PRICES = {KARLSRUHE_SHELLAC: 4200, KARLSRUHE_PEDIKUERE_GEL: 5100}
 _KARLSRUHE_TOTAL = sum(_KARLSRUHE_PRICES.values())
+_KARLSRUHE_CUSTOMER_UUID = "70000000-0000-4000-8000-000000000001"
 
 
 def _karlsruhe_location_map() -> str:
@@ -6015,6 +6018,7 @@ def _karlsruhe_booking() -> dict[str, Any]:
     return {
         "uuid": TEST_BOOKING_UUID,
         "location_uuid": KARLSRUHE_LOCATION_UUID,
+        "customer": {"uuid": _KARLSRUHE_CUSTOMER_UUID},
         "currency": "EUR",
         "order": {"subtotal": _KARLSRUHE_TOTAL, "total": _KARLSRUHE_TOTAL},
         "ordered_services": rows,
@@ -6035,6 +6039,17 @@ def _karlsruhe_catalog() -> list[dict[str, Any]]:
 
 
 class _KarlsruheReader(_MultiReader):
+    async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        assert customer_uuid == _KARLSRUHE_CUSTOMER_UUID
+        return {"uuid": customer_uuid, "phone": "+49000000000", "first_name": "Synthetic Karlsruhe"}
+
+    async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        assert params == {"phone": "+49000000000", "page": 1}
+        return {
+            "data": [await self.get_customer(_KARLSRUHE_CUSTOMER_UUID)],
+            "meta": {"current_page": 1, "last_page": 1, "per_page": 100, "total": 1},
+        }
+
     async def list_location_services(self, location_uuid: str, *, page: int) -> dict[str, Any]:
         assert (location_uuid, page) == (KARLSRUHE_LOCATION_UUID, 1)
         return {
@@ -6068,6 +6083,11 @@ def _enable_karlsruhe_planning(
     )
     monkeypatch.setattr(
         worker,
+        "EasyWeekClient",
+        lambda: _KarlsruheReader(booking if booking is not None else _karlsruhe_booking(), _karlsruhe_catalog()),
+    )
+    monkeypatch.setattr(
+        uuid_identity,
         "EasyWeekClient",
         lambda: _KarlsruheReader(booking if booking is not None else _karlsruhe_booking(), _karlsruhe_catalog()),
     )

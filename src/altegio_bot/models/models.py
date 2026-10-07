@@ -366,7 +366,8 @@ class SmartTestRun(Base):
 class Client(Base):
     """
     Клиент в контексте филиала (provider, company_id).
-    Уникальность: (provider, company_id, altegio_client_id).
+    Numeric identity and EasyWeek UUID are unique per provider/branch. The same
+    workspace customer can have one distinct card in each supported branch.
     """
 
     __tablename__ = "clients"
@@ -376,6 +377,21 @@ class Client(Base):
             "company_id",
             "altegio_client_id",
             name="uq_clients_provider_company_altegio_id",
+        ),
+        UniqueConstraint(
+            "provider", "company_id", "easyweek_customer_uuid", name="uq_clients_provider_company_easyweek_uuid"
+        ),
+        CheckConstraint(
+            "easyweek_customer_uuid IS NULL OR provider = 'easyweek'",
+            name="ck_clients_easyweek_uuid_provider",
+        ),
+        CheckConstraint(
+            "altegio_client_id IS NOT NULL OR (provider = 'easyweek' AND easyweek_customer_uuid IS NOT NULL)",
+            name="ck_clients_external_identity",
+        ),
+        CheckConstraint(
+            "easyweek_identity_assigned_at IS NULL OR (provider = 'easyweek' AND easyweek_customer_uuid IS NOT NULL)",
+            name="ck_clients_easyweek_assignment",
         ),
         Index("ix_clients_provider_company_phone", "provider", "company_id", "phone_e164"),
         Index("ix_clients_wa_opted_out_at", "wa_opted_out", "wa_opted_out_at"),
@@ -413,7 +429,11 @@ class Client(Base):
     company_id: Mapped[int] = mapped_column(Integer, index=True)
     # Historically named for Altegio; conceptually the external client id of
     # whichever provider owns the row (EasyWeek supplies ``:customer_id``).
-    altegio_client_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    altegio_client_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    # A customer may be known by the proven public UUID before any booking
+    # provides its numeric id. Never manufacture an id to populate the old field.
+    easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    easyweek_identity_assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     phone_e164: Mapped[str | None] = mapped_column(
         String(32),
@@ -1362,6 +1382,16 @@ class CampaignRecipient(Base):
             "AND source_visits_total_updated_at IS NOT NULL)",
             name="ck_campaign_recipients_active_earned_has_proof",
         ),
+        CheckConstraint(
+            "manual_policy IS NULL OR (provider = 'easyweek' AND recipient_basis = 'operator_manual_selection' "
+            "AND manual_policy = 'altegio_visit_zero_easyweek_bookings')",
+            name="ck_campaign_recipients_manual_policy",
+        ),
+        CheckConstraint(
+            "(manual_policy IS NULL) = (manual_policy_checked_at IS NULL) AND "
+            "(manual_policy IS NULL) = (manual_operator_attested_at IS NULL)",
+            name="ck_campaign_recipients_manual_policy_proof",
+        ),
         # One ACTIVE row per proven customer per run. Keyed on the customer UUID
         # rather than the phone: one number can legitimately belong to two
         # customers, which is an ambiguity the add path refuses outright — but
@@ -1492,6 +1522,11 @@ class CampaignRecipient(Base):
         PostgresUUID(as_uuid=True),
         nullable=True,
     )
+
+    # §44 is opt-in. NULL retains §37's historical manual-selection contract.
+    manual_policy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manual_policy_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    manual_operator_attested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # What the segmenter had decided before an operator included this person
     # anyway. Kept so an override never erases the reason it overrode: the row
@@ -3807,7 +3842,7 @@ class EasyWeekVoucherSnapshotBatchAttempt(Base):
 # approved numbers do not describe its own composition is not a batch this
 # schema can store.
 VOUCHER_PRODUCTION_SCOPE = "easyweek_voucher_production_mailing_v1"
-VOUCHER_PRODUCTION_SCHEMA_VERSION = "1"
+VOUCHER_PRODUCTION_SCHEMA_VERSION = "2"
 
 # €15 per recipient, exactly. Not a default and not a maximum: the one value a
 # slot of this phase is allowed to be worth.
@@ -3962,7 +3997,9 @@ class EasyWeekVoucherProductionBatch(Base):
             name="ck_ew_voucher_production_batch_campaign",
         ),
         CheckConstraint(
-            f"recipient_basis = '{RECIPIENT_BASIS_MANUAL}'",
+            "(request_schema_version = '1' AND recipient_basis = 'operator_manual_selection') OR "
+            "(request_schema_version = '2' AND recipient_basis IN "
+            "('earned_first_visit', 'operator_manual_selection', 'mixed'))",
             name="ck_ew_voucher_production_batch_basis",
         ),
         # 9. At least one recipient. An empty batch is not a small batch: there
@@ -4166,8 +4203,20 @@ class EasyWeekVoucherProductionBatchItem(Base):
             name="ck_ew_voucher_production_item_campaign",
         ),
         CheckConstraint(
-            f"recipient_basis = '{RECIPIENT_BASIS_MANUAL}'",
+            "recipient_basis IN ('earned_first_visit', 'operator_manual_selection')",
             name="ck_ew_voucher_production_item_basis",
+        ),
+        CheckConstraint(
+            "(recipient_basis = 'earned_first_visit' AND source_booking_uuid IS NOT NULL "
+            "AND source_proof_digest IS NOT NULL AND manual_policy IS NULL) OR "
+            "(recipient_basis = 'operator_manual_selection' AND source_booking_uuid IS NULL "
+            "AND source_proof_digest IS NULL)",
+            name="ck_ew_voucher_production_item_source",
+        ),
+        CheckConstraint(
+            "manual_policy IS NULL OR (recipient_basis = 'operator_manual_selection' "
+            "AND manual_policy = 'altegio_visit_zero_easyweek_bookings')",
+            name="ck_ew_voucher_production_item_policy",
         ),
         # 17. Exactly one voucher of exactly €15. Not a default and not a
         # maximum: the two numbers this slot is allowed to be worth.
@@ -4279,6 +4328,9 @@ class EasyWeekVoucherProductionBatchItem(Base):
     company_id: Mapped[int] = mapped_column(Integer, nullable=False)
     campaign_code: Mapped[str] = mapped_column(String(128), nullable=False)
     recipient_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    manual_policy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_booking_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    source_proof_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
@@ -4919,3 +4971,27 @@ class ChatwootOutboundMirror(Base):
     company_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekManualRecipientPlan(Base):
+    """Short-lived, private operator/session-bound list check (§44)."""
+
+    __tablename__ = "easyweek_manual_recipient_plans"
+    __table_args__ = (
+        CheckConstraint("policy = 'altegio_visit_zero_easyweek_bookings'", name="ck_ew_manual_plan_policy"),
+        CheckConstraint("expires_at > created_at", name="ck_ew_manual_plan_expiry"),
+        CheckConstraint("(applied_at IS NULL) = (result IS NULL)", name="ck_ew_manual_plan_applied"),
+        Index("ix_ew_manual_plan_expiry", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("campaign_runs.id", ondelete="RESTRICT"), nullable=False)
+    operator_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy: Mapped[str] = mapped_column(String(64), nullable=False)
+    proof_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
