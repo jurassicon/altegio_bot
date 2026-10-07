@@ -32,6 +32,7 @@ from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
+    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
@@ -43,6 +44,21 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     staffers_page,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+
+@pytest.fixture
+def issued_validity_capability(monkeypatch):
+    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
+
+    This module's subject is the pinned issuer.
+    With the real default the fixed €10 contract refuses CREATE and PAY
+    outright, before any order exists. That refusal is proven WITHOUT this
+    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
+    weakens it. This models question (a) only — whether any issued term could
+    be proven at all — and never question (b) about one particular voucher.
+    """
+    model_issued_validity_capability(monkeypatch)
+
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -295,7 +311,13 @@ async def _frozen(client, session_maker, transports, *, count: int, offset: int 
 
 
 async def test_every_client_and_every_batch_is_issued_by_the_one_approved_staffer(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Three clients in one mailing and a second mailing: one issuer throughout."""
     count = 3
@@ -344,7 +366,14 @@ async def test_every_client_and_every_batch_is_issued_by_the_one_approved_staffe
 
 
 async def test_the_operator_account_does_not_change_who_issues(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    monkeypatch,
 ):
     """A different Ops operator confirming changes the audit, never the issuer."""
     from altegio_bot.ops.auth import SESSION_COOKIE, make_session_token
@@ -438,7 +467,14 @@ async def test_an_issuer_who_left_the_branch_blocks_new_creates(
 
 
 async def test_an_issuer_drift_after_the_confirmation_blocks_execution(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    monkeypatch,
 ):
     """The configuration changes between the confirmation and the stage. Zero POSTs.
 
@@ -476,7 +512,13 @@ async def test_an_issuer_drift_after_the_confirmation_blocks_execution(
 
 
 async def test_the_catalogue_is_walked_once_per_stage_not_once_per_recipient(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A mailing of twelve does one catalogue walk, which keeps the stage linear."""
     count = 12
@@ -507,7 +549,14 @@ async def test_the_historical_staffer_binding_of_a_frozen_batch_is_not_rewritten
 
 
 async def test_an_allowed_refund_does_not_depend_on_the_current_issuer(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    monkeypatch,
 ):
     """§43.9: the issuer rule must not strand a pre-send refund.
 
@@ -645,7 +694,14 @@ async def test_preparing_a_step_still_requires_a_proven_membership(
 
 
 async def test_a_staffer_change_after_a_refund_plan_still_lets_the_money_come_back(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports, monkeypatch
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
+    monkeypatch,
 ):
     """The drift case §43.9 forbids stranding: plan a refund, THEN lose the issuer.
 

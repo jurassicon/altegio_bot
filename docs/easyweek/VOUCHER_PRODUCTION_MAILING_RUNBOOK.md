@@ -8,10 +8,25 @@ The voucher is single use, valid for one month **from activation**, with any
 unused balance forfeited. Receiving the WhatsApp message does not start or
 restart the term. Approval TTL remains a separate 30-minute authorization rule.
 
-**Rollout is blocked pending issued-voucher validity evidence.** The new send
-guard deliberately returns `voucher_production_validity_unproven`: the available
-issued-artifact evidence does not establish activation/expiry semantics. Future
-looking dates alone do not prove validity. See the scoped rollout section below.
+**Rollout is blocked pending issued-voucher validity evidence, and the block now
+lands before the money.** Two different questions are kept apart:
+
+* **(a) Can this application prove the term of any issued voucher at all?** No.
+  There is no implemented, evidenced way to read a voucher's activation instant
+  and expiry boundary. So a schema 3 contract refuses **CREATE and PAY**, with
+  `voucher_production_validity_capability_unproven`, before the first order
+  exists. A FREEZE is still allowed — it is local and buys nothing — and its
+  report and the readiness panel both name the blocker, so a frozen composition
+  is never presented as a mailing that is ready to go out.
+* **(b) Is one particular issued voucher still valid?** Only askable once a
+  voucher exists. That guard is unchanged and still returns
+  `voucher_production_validity_unproven`, with `voucher_production_voucher_expired`
+  for an observed expired signal.
+
+Future-looking dates alone prove neither. Answering (a) is a reviewed
+implementation change against read-only provider evidence, not a setting: there
+is no environment variable, no flag and no UI bypass. See the scoped rollout
+section below.
 
 Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–45 before the first action.
 §44 adds UUID-first customers, a checked phone list and mixed earned/manual batches.
@@ -606,6 +621,20 @@ This is terminal and is never retried: a slot may hold a committed claim whose
 request went out. Reconcile, then confirm a fresh plan for what is provably
 untouched.
 
+**«Прервано» means a possible external effect, and nothing else means it.** A
+failure that happens while the stage is still being re-proven — Meta unreachable
+while the exact approved template is read back, for instance — is a plain
+refusal: the operation finishes, it names its reason, and there is nothing to
+reconcile. If a pre-send failure ever shows as «прервано», or an operation sits
+in «выполняется» for ten minutes and then turns into it, that is a defect to
+report rather than a mailing to reconcile.
+
+A Meta read that times out, is refused or is cut short therefore reads as
+`voucher_production_template_unproven` — the same answer as a template that is
+not approved, because in both cases this evaluation did not prove the approval.
+Press the stage button again to build a fresh plan; nothing retries by itself,
+and no token, URL or provider message appears in the answer.
+
 ---
 
 ## 10. What the CLI is still for
@@ -627,6 +656,22 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 `status` reads the durable ledger with no HTTP at all, and works with the fence
 closed. `plan --stage ...` performs reads only and writes nothing. `reconcile`
 reads the outside world back and records what it read.
+
+**How to read the amounts in a `status` report.** The report distinguishes what
+it is ABOUT from the default:
+
+| Field | What it means |
+| --- | --- |
+| `voucher_unit_price_minor`, `approval_arithmetic` | the subject of this report: a named batch's own frozen amount, or, with no batch named, the current contract |
+| `default_voucher_unit_price_minor`, `default_product_contract_version` | what a **new** mailing costs — always the €10 contract, whatever this report is about |
+| each row of `batches[]` | that batch's own `voucher_unit_price_minor` and `total_exposure_minor` |
+
+So a named historical batch reads €15 in the subject and €10 in the default; a
+named new batch reads €10 in both; an empty ledger and the mixed list of every
+batch read €10, with each listed row carrying its own amount. A report has never
+been the place to look up a batch's money — the batch's own row is — but it must
+not state last contract's nominal as this one's, which is what an earlier build
+did whenever no batch was named.
 
 `freeze`, `create`, `pay`, `deliver` and `refund` refuse. There is no flag that
 reopens them, `--apply` included. The internal executor is not an exception to
@@ -1008,17 +1053,38 @@ tokens, voucher codes, customer details or raw API responses into a ticket.
    must exactly match the new local contract, including one month **from
    activation**, single use and forfeited balance. PENDING/REJECTED/other text
    block. No fallback to `10eur_v1` or the historical €15 template exists.
-3. **Issued-voucher activation/expiry remains unproven.** Existing evidence
-   confirms code/template/value/price only. The official [Get POS order
+3. **Issued-voucher activation/expiry remains unproven, and new issuing is
+   closed because of it.** Existing evidence confirms code/template/value/price
+   only. The official [Get POS order
    documentation](https://developers.easyweek.io/docs/api-reference/endpoints/orders/get-order/)
    provides no populated voucher date example; the [template documentation](https://developers.easyweek.io/docs/api-reference/endpoints/voucher-templates/list-voucher-templates/)
    distinguishes product definitions from issued vouchers. Neither establishes
    the actual activation instant, timezone, expiry boundary or expiry semantics
-   of a particular code. The application therefore refuses new DELIVER with
-   `voucher_production_validity_unproven`. An observed expired signal returns
-   `voucher_production_voucher_expired`; future-looking candidate fields still
-   do not authorize delivery. An API evidence review and implemented positive
-   proof are required before release of real sending. There is no flag bypass.
+   of a particular code.
+
+   Because the capability itself does not exist, the application refuses a new
+   **CREATE and PAY** with `voucher_production_validity_capability_unproven` —
+   before any order, any payment and any external call. This is enforced in the
+   plan the backend rebuilds, so it also refuses an approval that was stored
+   while an earlier build allowed one; disabled buttons are a consequence of it,
+   never the mechanism. A FREEZE still succeeds and names the blocker in its own
+   report, which is what makes the composition checkable while it is free.
+
+   DELIVER additionally refuses with `voucher_production_validity_unproven`, and
+   an observed expired signal returns `voucher_production_voucher_expired`;
+   future-looking candidate fields still do not authorize delivery. An API
+   evidence review and an implemented positive proof are required before real
+   sending is released. There is no flag bypass.
+
+   **Delivery readiness may not be claimed until that positive proof is
+   implemented and proven.** Reading this runbook, a green readiness panel or a
+   successful freeze is not that proof.
+
+   Already existing objects are unaffected: read-only `status`, the diagnostics
+   commands, `reconcile` and an allowed pre-send `refund` all keep working while
+   this blocker stands, which is what keeps real money recoverable. Historical
+   schema 1/2 batches are **not** moved under this blocker and keep issuing,
+   paying and delivering under their own €15 contract.
 
 Use an **already existing**, separately authorized order for evidence; do not
 create/pay a production voucher just to test the deployment. Obtain provider
@@ -1101,6 +1167,9 @@ DDL**, preserving all new data. Close the fence and use a reviewed forward fix;
 never delete rows or convert1000 to1500 to force a downgrade. Existing previews,
 historical ledgers, HMACs and €15 sums are preserved through upgrade/re-upgrade.
 
-Positive full-lifecycle tests use mocked external APIs and a clearly named
-synthetic validity-proof fixture. They verify wiring after evidence exists;
-they do not establish real issued-voucher validity or production readiness.
+Positive full-lifecycle tests use mocked external APIs and two clearly named
+synthetic fixtures, one per question: `issued_validity_capability` models (a),
+the capability existing at all, and `synthetic_validity_proven` models (b), one
+voucher's term being proven. They verify wiring for the day evidence exists;
+they do not establish real issued-voucher validity or production readiness, and
+the regressions that cover the real refusals deliberately use neither.

@@ -36,6 +36,7 @@ from altegio_bot.models.models import (
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
+    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
@@ -45,6 +46,21 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+
+@pytest.fixture
+def issued_validity_capability(monkeypatch):
+    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
+
+    This module's subject is what a crash, a restart or a race may leave behind.
+    With the real default the fixed €10 contract refuses CREATE and PAY
+    outright, before any order exists. That refusal is proven WITHOUT this
+    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
+    weakens it. This models question (a) only — whether any issued term could
+    be proven at all — and never question (b) about one particular voucher.
+    """
+    model_issued_validity_capability(monkeypatch)
+
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -116,7 +132,13 @@ async def _items(session_maker, batch_id: int) -> dict[int, EasyWeekVoucherProdu
 
 
 async def test_many_concurrent_confirmations_of_one_offer_make_one_operation(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Five simultaneous POSTs of the same approval. The unique constraint decides."""
     count = 2
@@ -142,7 +164,13 @@ async def test_many_concurrent_confirmations_of_one_offer_make_one_operation(
 
 
 async def test_two_executors_cannot_claim_the_same_operation(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """``FOR UPDATE SKIP LOCKED`` plus a compare-and-set on the status.
 
@@ -267,7 +295,13 @@ async def test_a_stop_racing_a_claim_never_lets_one_more_slot_through(
 
 
 async def test_a_crash_before_any_claim_leaves_nothing_to_recover(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The executor dies before it reaches the first slot. No claim, no doubt."""
     count = 2
@@ -290,7 +324,13 @@ async def test_a_crash_before_any_claim_leaves_nothing_to_recover(
 
 
 async def test_a_crash_after_a_claim_reads_as_may_have_happened(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The claim is committed before the request leaves, so it is the durable trace.
 
@@ -333,7 +373,13 @@ async def test_a_crash_after_a_claim_reads_as_may_have_happened(
 
 
 async def test_a_crash_after_the_external_effect_but_before_the_answer_is_not_retried(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The worst moment: the voucher exists, and the process never wrote it down.
 
@@ -390,7 +436,13 @@ async def test_a_crash_after_the_external_effect_but_before_the_answer_is_not_re
 
 
 async def test_a_restart_never_returns_an_operation_to_the_queue(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """There is no path from ``running`` or ``interrupted`` back to ``queued``.
 
@@ -413,7 +465,13 @@ async def test_a_restart_never_returns_an_operation_to_the_queue(
 
 
 async def test_an_expired_lease_interrupts_rather_than_retries(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A worker killed between the claim and the next heartbeat."""
     count = 1
@@ -430,7 +488,13 @@ async def test_an_expired_lease_interrupts_rather_than_retries(
 
 
 async def test_a_live_executor_is_not_swept(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A slow stage must not be called abandoned while its worker is renewing."""
     count = 1
@@ -449,7 +513,13 @@ async def test_a_live_executor_is_not_swept(
 
 
 async def test_a_finished_operation_is_never_overwritten(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A late writer must not replace an interrupted row with a tidier-looking one."""
     count = 1
@@ -474,7 +544,13 @@ async def test_a_finished_operation_is_never_overwritten(
 
 
 async def test_approvals_and_audit_survive_a_crash(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """The record of who authorised what is not lost with the process that ran it."""
     count = 1
@@ -508,7 +584,13 @@ async def test_approvals_and_audit_survive_a_crash(
 
 
 async def test_the_database_refuses_a_second_operation_for_one_approval(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """Not the button, not the handler: the constraint."""
     from sqlalchemy.exc import IntegrityError
@@ -543,7 +625,13 @@ async def test_the_database_refuses_a_second_operation_for_one_approval(
 
 
 async def test_a_queued_operation_cannot_hold_a_lease(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    issued_validity_capability,
+    executor_enabled,
+    ui_client,
+    transports,
 ):
     """A CHECK, so a sweep can never mistake a waiting row for an abandoned one."""
     from sqlalchemy.exc import IntegrityError

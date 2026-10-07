@@ -652,6 +652,10 @@ class BatchHeadline:
     total_exposure_minor: int
     reconciliation_required: bool
     frozen_at: str | None
+    # The amount THIS batch was frozen under. A listing holds both contract
+    # versions at once, so a row that printed only its total would leave a
+    # reader to divide one by the other and guess which nominal applied.
+    voucher_unit_price_minor: int = UNIT_PRICE_MINOR
 
     def as_safe_dict(self) -> dict[str, Any]:
         period = None
@@ -664,6 +668,7 @@ class BatchHeadline:
             "halted": self.status == VOUCHER_PRODUCTION_HALTED,
             "campaign_period": period,
             "recipient_count": self.recipient_count,
+            "voucher_unit_price_minor": self.voucher_unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
             "reconciliation_required": self.reconciliation_required,
             "frozen_at": self.frozen_at,
@@ -703,6 +708,7 @@ async def list_batches(
             total_exposure_minor=int(row.total_exposure_minor),
             reconciliation_required=bool(row.reconciliation_required),
             frozen_at=_iso(row.frozen_at),
+            voucher_unit_price_minor=int(row.voucher_unit_price_minor),
         )
         for row in rows
     )

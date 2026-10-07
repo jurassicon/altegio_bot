@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production import template_contract
+from altegio_bot.campaigns.easyweek_voucher_production import validity as validity_module
 from altegio_bot.campaigns.easyweek_voucher_production.composition import BatchApproval
 from altegio_bot.easyweek_voucher_production_contract import (
     CURRENT_PRODUCTION_CONTRACT as CONTRACT,
@@ -17,6 +18,22 @@ from altegio_bot.easyweek_voucher_production_contract import (
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate
 from altegio_bot.tests import easyweek_voucher_production_fixtures as old
+
+
+def model_issued_validity_capability(monkeypatch) -> None:
+    """Model §45.2 question (a) — "can any issued term be proven?" — as answered.
+
+    For a test whose subject is something else and which therefore has to get
+    past the early blocker: the durability of a claim, the serialisation of two
+    operations, the whole browser path. It patches the one narrow pure boundary
+    that decides the capability and nothing else, so question (b) — "is THIS
+    voucher still valid?" — keeps refusing unless a test models that separately.
+
+    It models the capability EXISTING. It is not evidence that the provider
+    publishes issued-voucher dates, and the tests that cover the real current
+    refusal deliberately never call it.
+    """
+    monkeypatch.setattr(validity_module, "ISSUED_VALIDITY_PROOF_IMPLEMENTED", True)
 
 
 def production_request(*, run_id: int, batch_id: int | None = None):
@@ -164,3 +181,79 @@ async def seed_template_and_sender(session_maker):
                     is_active=True,
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# The browser round trip, for the suites that need the REAL authorisation path
+# ---------------------------------------------------------------------------
+# One copy, shared. A stage that is only ever planned in-process proves nothing
+# about a stored approval: the plan endpoint writes an approval row, the confirm
+# endpoint spends it into a durable operation, and the executor rebuilds the plan
+# live before it acts. Several §45 regressions are specifically about what
+# happens BETWEEN those steps, so they need the real round trip rather than a
+# direct call into the runner.
+
+PLAN_URL = "/ops/voucher-mailings/api/plan"
+CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
+
+
+async def ui_plan(client, **payload: Any) -> dict[str, Any]:
+    """One stage offer, over HTTP, exactly as the page asks for it."""
+    return (await client.post(PLAN_URL, json=payload)).json()
+
+
+async def ui_confirm(client, offer: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Spend the offer by echoing the server's own numbers back, as the page does."""
+    response = await client.post(
+        CONFIRM_URL,
+        json={
+            "approval_id": offer["approval"]["approval_id"],
+            "confirmed_count": offer["targets"]["stage_target_count"],
+            "confirmed_amount_minor": offer["targets"]["stage_amount_minor"],
+        },
+    )
+    return response.status_code, response.json()
+
+
+async def ui_execute(session_maker):
+    """One pass of the real executor over the real queue."""
+    from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+    return await worker_module.run_once(session_maker, owner="test-executor")
+
+
+async def ui_frozen(client, session_maker, transports, *, count: int):
+    """A new-contract batch frozen through the browser and the executor."""
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
+
+    run_id, _ = await old.seed_production_preview(session_maker, count=count)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=count)
+    transports.use(reader=reader)
+    offer = await ui_plan(
+        client,
+        stage="freeze",
+        preview_run_id=run_id,
+        expected_recipient_count=count,
+        approved_exposure_minor=count * CONTRACT.unit_price_minor,
+    )
+    assert offer["ready"], offer["reasons"]
+    assert (await ui_confirm(client, offer))[0] == 200
+    assert await ui_execute(session_maker) is not None
+    snapshot = await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)
+    batch_id = int(snapshot.batch_id or 0)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+    return run_id, batch_id, reader
+
+
+def close_meta_read_seam(reader: Any) -> Any:
+    """Take away the read-adapter seam, so the Meta proof uses the real client.
+
+    ``prove_live_meta_template`` prefers ``reader.list_meta_templates`` when the
+    reader has one, which is how most tests supply a Meta listing. A test about
+    the production transport has to get PAST that preference: with the seam shut
+    the proof builds the real ``MetaTemplateClient``, which is where the
+    ``httpx`` errors actually come from.
+    """
+    reader.list_meta_templates = None
+    return reader

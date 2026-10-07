@@ -322,16 +322,39 @@ class StageReport:
     external_calls: dict[str, int] = field(default_factory=dict)
     # Every batch this phase knows about, for `status` only.
     batches: list[dict[str, Any]] = field(default_factory=list)
+    # What would stop this batch being DELIVERED, as opposed to what stopped
+    # this stage. A freeze carries these and still succeeds: it bought nothing,
+    # and saying so is the whole value of freezing before buying.
+    delivery_blockers: list[str] = field(default_factory=list)
+
+    def _contract(self) -> ProductionVoucherContract:
+        """Which contract this report is ABOUT.
+
+        Resolved from what the baseline positively NAMES, never from what it
+        fails to name. The reviewed version picked the historical contract
+        whenever there was no baseline — and ``run_status`` passes none — so a
+        `status` read on an empty ledger, and the mixed list of every batch,
+        both printed 1500 and ``N × 1500`` as though that were the contract new
+        mailings use. It is not: new mailings are 1000.
+
+        A report about one batch does not depend on this at all. It prints that
+        batch's own frozen amount, 1500 or 1000, whichever it was frozen under.
+        """
+        version = (self.baseline or {}).get("baseline_version")
+        if version == LEGACY_PRODUCTION_CONTRACT.baseline_version:
+            return LEGACY_PRODUCTION_CONTRACT
+        return CURRENT_PRODUCTION_CONTRACT
 
     def as_safe_dict(self) -> dict[str, Any]:
         batch = dict(self.batch)
-        contract = (
-            CURRENT_PRODUCTION_CONTRACT
-            if (self.baseline or {}).get("baseline_version") == CURRENT_PRODUCTION_CONTRACT.baseline_version
-            else LEGACY_PRODUCTION_CONTRACT
-        )
+        contract = self._contract()
+        # Two different numbers, deliberately not merged. `unit_price_minor` is
+        # what THIS report is about — a frozen batch's own amount, or, with no
+        # batch, the contract the baseline named. `default_` is what a NEW
+        # mailing costs, and it does not move with the subject: a report about a
+        # historical €15 batch must not be readable as "new mailings are €15".
         unit_price_minor = (
-            batch.get("voucher_unit_price_minor", contract.unit_price_minor)
+            int(batch.get("voucher_unit_price_minor", contract.unit_price_minor))
             if batch.get("exists")
             else contract.unit_price_minor
         )
@@ -379,6 +402,17 @@ class StageReport:
             "first_visit_proof": batch.get("first_visit_proof"),
             "voucher_unit_price_minor": unit_price_minor,
             "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {unit_price_minor}",
+            # What a new mailing costs, beside what this report is about. A
+            # reader looking at a historical batch, or at a list holding both
+            # versions, can see the two apart instead of inferring one from the
+            # other.
+            "default_voucher_unit_price_minor": CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            "default_product_contract_version": CURRENT_PRODUCTION_CONTRACT.version,
+            # Known blockers to delivering this batch, whether or not they
+            # refused this stage. Never empty-by-omission: a stage that did not
+            # ask reports nothing here, and a stage that asked reports what it
+            # found.
+            "delivery_blockers": list(dict.fromkeys(self.delivery_blockers)),
             # Repeated verbatim on every stage, success included. A mailing of
             # forty proven sends is still not a campaign permission.
             "campaign_send_authorized": False,
@@ -602,12 +636,14 @@ def _refusal(
     snapshot: ledger_module.BatchSnapshot,
     *,
     baseline: ProductionBaselineProof | None = None,
+    delivery_blockers: tuple[str, ...] | list[str] = (),
 ) -> StageReport:
     """A stage that did not act. Nothing left this process."""
     return StageReport(
         stage=stage,
         outcome="refused",
         reasons=list(reasons),
+        delivery_blockers=list(delivery_blockers),
         external_effect_attempted=False,
         reconciliation_required=snapshot.reconciliation_required,
         manual_cleanup_required=any(entry.manual_cleanup_required for entry in snapshot.items),
@@ -1243,6 +1279,7 @@ async def _authorise(
         slot=slot,
         enabled=enabled,
     )
+    blockers = prerequisites.delivery_blockers
 
     reasons: list[str] = []
     if not apply:
@@ -1264,7 +1301,13 @@ async def _authorise(
             None,
             None,
             None,
-            _refusal(stage, tuple(dict.fromkeys(reasons)), snapshot, baseline=baseline),
+            _refusal(
+                stage,
+                tuple(dict.fromkeys(reasons)),
+                snapshot,
+                baseline=baseline,
+                delivery_blockers=blockers,
+            ),
         )
     return plan, composition, prerequisites, baseline, snapshot, None
 
@@ -1291,7 +1334,7 @@ async def run_freeze(
     can see. There is no path from here to a frozen batch whose approved numbers
     do not describe it.
     """
-    plan, composition, _prereq, baseline, _snapshot, refused = await _authorise(
+    plan, composition, prerequisites, baseline, _snapshot, refused = await _authorise(
         session,
         session_maker,
         stage=STAGE_FREEZE,
@@ -1307,12 +1350,17 @@ async def run_freeze(
     )
     if refused is not None:
         return refused
-    assert plan is not None and composition is not None and baseline is not None
+    assert plan is not None and composition is not None and baseline is not None and prerequisites is not None
+    # A freeze is allowed to succeed with these outstanding, and must never be
+    # read as a launch-ready mailing while they are. §45.2's issued-validity
+    # capability is the one that matters today: the batch is composed, approved
+    # and bought nothing, and it still could not be delivered.
+    blockers = prerequisites.delivery_blockers
 
     identity = _identity_from_composition(request, composition)
     if identity is None or approval.expected_recipient_count is None or approval.approved_exposure_minor is None:
         current = await ledger_module.load_for_preview(session_maker, campaign_run_id=request.preview_run_id)
-        return _refusal(STAGE_FREEZE, [COMPOSITION_DRIFTED], current, baseline=baseline)
+        return _refusal(STAGE_FREEZE, [COMPOSITION_DRIFTED], current, baseline=baseline, delivery_blockers=blockers)
 
     outcome = await ledger_module.freeze_batch(
         session_maker,
@@ -1326,7 +1374,7 @@ async def run_freeze(
             ledger_module.FREEZE_REFUSED_EXISTS: PREVIEW_ALREADY_FROZEN,
             ledger_module.FREEZE_REFUSED_APPROVAL: COMPOSITION_DRIFTED,
         }.get(outcome.reason, SNAPSHOT_NOT_FROZEN)
-        return _refusal(STAGE_FREEZE, [reason], outcome.snapshot, baseline=baseline)
+        return _refusal(STAGE_FREEZE, [reason], outcome.snapshot, baseline=baseline, delivery_blockers=blockers)
 
     return StageReport(
         stage=STAGE_FREEZE,
@@ -1338,6 +1386,7 @@ async def run_freeze(
         batch=outcome.snapshot.as_safe_dict(),
         baseline=baseline.as_safe_dict(),
         external_calls={"create": 0, "pay": 0, "refund": 0, "meta": 0},
+        delivery_blockers=list(blockers),
     )
 
 
