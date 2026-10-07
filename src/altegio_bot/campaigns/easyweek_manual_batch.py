@@ -54,6 +54,7 @@ RATE_LIMIT = "manual_batch_rate_limit"
 PLAN_INVALID = "manual_batch_plan_invalid"
 PLAN_EXPIRED = "manual_batch_plan_expired"
 PLAN_CHANGED = "manual_batch_plan_changed"
+READ_TIMEOUT = "manual_batch_timeout"
 MAX_INPUT_BYTES = 16384
 MAX_INPUT_LINES = 200
 MAX_CONTACTS = 100
@@ -61,6 +62,36 @@ MAX_CONCURRENT_READS = 2
 CONTACT_TIMEOUT_SECONDS = 15
 LIST_TIMEOUT_SECONDS = 90
 PLAN_TTL = timedelta(minutes=15)
+
+
+async def _check_contacts(session_maker, *, run_id, phones, reader):
+    """Same bounded, ordered read phase for preparation and confirmation.
+
+    Cancel and join every sibling before returning on timeout or failure. No
+    provider task may outlive this phase and overlap the write transaction.
+    """
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_READS)
+
+    async def one(phone):
+        async with semaphore:
+            try:
+                async with asyncio.timeout(CONTACT_TIMEOUT_SECONDS):
+                    result = await _check_one(
+                        session_maker, run_id=run_id, company_id=KARLSRUHE_COMPANY_ID, phone=phone, reader=reader
+                    )
+            except TimeoutError:
+                result = {"status": "rejected", "reason": READ_TIMEOUT}
+            return phone, result
+
+    tasks = [asyncio.create_task(one(phone)) for phone in phones]
+    try:
+        async with asyncio.timeout(LIST_TIMEOUT_SECONDS):
+            return await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def prove_zero_booking_history(reader: Any, *, customer_uuid: str) -> str | None:
@@ -341,24 +372,10 @@ async def check_manual_recipients(
                     expires_at=now + PLAN_TTL,
                 )
             )
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_READS)
-
-    async def one(phone: str) -> tuple[str, dict[str, Any]]:
-        async with semaphore:
-            try:
-                async with asyncio.timeout(CONTACT_TIMEOUT_SECONDS):
-                    result = await _check_one(
-                        session_maker, run_id=run_id, company_id=KARLSRUHE_COMPANY_ID, phone=phone, reader=reader
-                    )
-            except TimeoutError:
-                result = {"status": "rejected", "reason": CUSTOMER_UNPROVEN}
-            return phone, result
-
     try:
-        async with asyncio.timeout(LIST_TIMEOUT_SECONDS):
-            checked = await asyncio.gather(*(one(phone) for phone in unique))
+        checked = await _check_contacts(session_maker, run_id=run_id, phones=unique, reader=reader)
     except TimeoutError:
-        return _failure("manual_batch_timeout")
+        return _failure(READ_TIMEOUT)
     accepted = []
     for phone, result in checked:
         public_rows.append(
@@ -460,19 +477,17 @@ async def confirm_manual_recipients(
     # open during these calls, and the browser cannot substitute a subset.
     current = []
     live_changed = False
+    timed_out = False
     try:
-        async with asyncio.timeout(LIST_TIMEOUT_SECONDS):
-            for row in payload["rows"]:
-                async with asyncio.timeout(CONTACT_TIMEOUT_SECONDS):
-                    checked = await _check_one(
-                        session_maker, run_id=run_id, company_id=KARLSRUHE_COMPANY_ID, phone=row["phone"], reader=reader
-                    )
-                if checked != row:
-                    live_changed = True
-                    break
-                current.append(checked)
+        checked_rows = await _check_contacts(
+            session_maker, run_id=run_id, phones=[row["phone"] for row in payload["rows"]], reader=reader
+        )
+        for row, (phone, checked) in zip(payload["rows"], checked_rows, strict=True):
+            timed_out |= checked.get("reason") == READ_TIMEOUT
+            live_changed |= phone != row["phone"] or checked != row
+            current.append(checked)
     except TimeoutError:
-        live_changed = True
+        timed_out = True
     from altegio_bot.campaigns.runner import lock_editable_preview, recompute_snapshot_counters
 
     try:
@@ -494,6 +509,8 @@ async def confirm_manual_recipients(
                     raise _Abort(error)
                 if plan.applied_at is not None:
                     return dict(plan.result)
+                if timed_out:
+                    raise _Abort(READ_TIMEOUT)
                 if live_changed or plan.proof_digest != proof_digest:
                     raise _Abort(PLAN_CHANGED)
                 try:

@@ -1157,7 +1157,7 @@ async def test_pr21_uuid_migration_refuses_loss_and_preserves_legacy_rows(dispos
                     "VALUES ('altegio', 322579, 91000001, '{}'::jsonb)"
                 )
             )
-        upgraded = _alembic(disposable_database, "upgrade", "head")
+        upgraded = _alembic(disposable_database, "upgrade", "f6a8d2c91b47")
         assert upgraded.returncode == 0, upgraded.stderr
         async with engine.connect() as conn:
             await conn.execute(
@@ -1206,7 +1206,7 @@ async def test_pr21_empty_upgrade_downgrade_reupgrade_preserves_constraints(disp
             constraints = set((await conn.execute(text("SELECT conname FROM pg_constraint"))).scalars())
             assert {
                 "ck_clients_external_identity",
-                "uq_clients_provider_easyweek_uuid",
+                "uq_clients_provider_company_easyweek_uuid",
                 "ck_campaign_recipients_manual_policy",
                 "ck_campaign_recipients_manual_policy_proof",
                 "ck_ew_voucher_production_item_source",
@@ -1216,5 +1216,64 @@ async def test_pr21_empty_upgrade_downgrade_reupgrade_preserves_constraints(disp
                 "ck_ew_voucher_production_item_refund_is_pre_send",
                 "ck_ew_manual_plan_applied",
             } <= constraints
+    finally:
+        await engine.dispose()
+
+
+async def test_pr21_branch_uuid_upgrade_preserves_rows_and_refuses_lossy_downgrade(disposable_database: str):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "f6a8d2c91b47").returncode == 0
+    engine = create_async_engine(disposable_database, isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            assert 160000 <= int(await conn.scalar(text("SHOW server_version_num"))) < 170000
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, raw) "
+                    "VALUES ('altegio', 322579, 91000001, '{}'::jsonb)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                    "easyweek_customer_uuid, wa_opted_out, raw) VALUES ('easyweek', 322579, 17, "
+                    "'91919191-1212-4343-8787-565656565656', true, '{}'::jsonb)"
+                )
+            )
+            before = (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all()
+        upgraded = _alembic(disposable_database, "upgrade", "head")
+        assert upgraded.returncode == 0, upgraded.stderr
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                    "easyweek_customer_uuid, raw) VALUES ('easyweek', 315607, 17, "
+                    "'91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                )
+            )
+            with pytest.raises(Exception):
+                await conn.execute(
+                    text(
+                        "INSERT INTO clients (provider, company_id, altegio_client_id, "
+                        "easyweek_customer_uuid, raw) VALUES ('easyweek', 315607, NULL, "
+                        "'91919191-1212-4343-8787-565656565656', '{}'::jsonb)"
+                    )
+                )
+        refused = _alembic(disposable_database, "downgrade", "f6a8d2c91b47")
+        assert refused.returncode != 0 and "PR-21 branch downgrade refused" in refused.stderr
+        async with engine.connect() as conn:
+            assert await conn.scalar(text("SELECT count(*) FROM clients")) == 3
+            assert await conn.scalar(text("SELECT version_num FROM alembic_version")) == "d8b4e6a29c13"
+            assert (
+                await conn.execute(text("SELECT * FROM clients WHERE company_id=322579 ORDER BY id"))
+            ).all() == before
+            # Synthetic fixture cleanup permits exercising the supported reverse path.
+            await conn.execute(text("DELETE FROM clients WHERE company_id=315607"))
+        assert _alembic(disposable_database, "downgrade", "f6a8d2c91b47").returncode == 0
+        assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
     finally:
         await engine.dispose()

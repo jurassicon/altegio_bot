@@ -627,6 +627,8 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     # A numeric hit does not override an independently proven UUID identity.
     # Re-prove outside this transaction before adopting a competing phone, and
     # never silently change the phone of a UUID-bound card.
+    if existing.easyweek_customer_uuid is None and await needs_uuid_resolution(session, booking):
+        raise UUIDIdentityResolutionRequired(booking)
     if booking.carries("phone_e164") and booking.phone_e164 != existing.phone_e164:
         if existing.easyweek_customer_uuid is not None:
             raise UUIDIdentityResolutionRequired(booking)
@@ -638,6 +640,10 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
                 Client.easyweek_customer_uuid.is_not(None),
                 Client.phone_e164 == booking.phone_e164,
                 Client.id != existing.id,
+                or_(
+                    Client.easyweek_customer_uuid != existing.easyweek_customer_uuid,
+                    existing.easyweek_customer_uuid is None,
+                ),
             )
             .limit(1)
         )
@@ -1961,6 +1967,10 @@ async def sync_reminder_jobs(
         now=now,
         is_deleted=bool(record.is_deleted),
     )
+    # Clearing contact data withdraws pending reminders even if the appointment
+    # time did not change. Persist the booking without retaining an old addressee.
+    if client is None or not client.phone_e164:
+        desired = []
     snapshot, _snapshot_error = multi_service_snapshot_from_record_raw(record.raw)
     effective_desired: list[tuple[Any, str]] = []
     for item in desired:

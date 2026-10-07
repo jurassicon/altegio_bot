@@ -192,7 +192,7 @@ async def test_uuid_bound_numeric_card_phone_change_requires_proof(session_maker
         client = await session.get(Client, client_id)
         client.altegio_client_id = TEST_CUSTOMER_ID
         client.phone_e164 = "+4915100000999"
-    monkeypatch.setattr(identity, "EasyWeekClient", lambda: Reader(payload, session_maker))
+    monkeypatch.setattr(identity, "EasyWeekClient", lambda: Reader(payload, session_maker, error=True))
     assert await worker.process_one() is False
     async with session_maker() as session:
         assert (await session.get(Client, client_id)).phone_e164 == "+4915100000999"
@@ -200,18 +200,13 @@ async def test_uuid_bound_numeric_card_phone_change_requires_proof(session_maker
         assert await session.scalar(select(func.count()).select_from(Record)) == 0
 
 
-async def test_first_karlsruhe_booking_without_phone_and_concurrent_operator_add_converge(session_maker, monkeypatch):
+async def test_captured_phone_booking_and_concurrent_operator_add_converge(session_maker, monkeypatch):
     """Pause provider proof, add the operator identity, then resume the webhook."""
     from altegio_bot.campaigns import easyweek_manual_identity as manual_identity
 
     monkeypatch.setattr(identity, "KARLSRUHE_COMPANY_ID", TEST_LOCATION_ID)
     monkeypatch.setattr(manual_identity, "KARLSRUHE_COMPANY_ID", TEST_LOCATION_ID)
     client_id, event_id, payload = await seed(session_maker)
-    payload.pop("customer_phone")
-    payload.pop("customer_attributes.customer_phone")
-    async with session_maker() as session, session.begin():
-        await session.delete(await session.get(Client, client_id))
-        (await session.get(EasyWeekEvent, event_id)).payload = payload
     entered = asyncio.Event()
     release = asyncio.Event()
     base = Reader(payload, session_maker)

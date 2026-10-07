@@ -876,9 +876,9 @@ saying `campaign_send_authorized=false`, `bulk_delivery_authorized=false` and
 ## 14. §44 identity, migration and closed-fence smoke
 
 No new environment setting or HMAC rotation is needed. `f6a8d2c91b47` follows
-`c7e3b8a14f29` and is the one head for this change. It adds:
+`c7e3b8a14f29`; its successor `d8b4e6a29c13` is the current head. Together they provide:
 
-- typed unique workspace EasyWeek UUID on Client, nullable numeric ID only for
+- typed EasyWeek customer UUID, unique per provider and branch on Client, nullable numeric ID only for
   such a UUID identity, and time of operator branch assignment;
 - recipient manual policy plus API-check and operator-attestation timestamps;
 - private, operator/session/preview-bound list plans (15-minute TTL);
@@ -886,10 +886,29 @@ No new environment setting or HMAC rotation is needed. `f6a8d2c91b47` follows
 
 The customer API does not prove numeric ID. A local card created here leaves it
 NULL; no ID is invented, no Altegio card is converted, and the visit count stays
-NULL. The first real booking webhook proves its booking/customer identity via
-GET and attaches the real webhook numeric ID to this same Client. Identity
-conflicts leave the event recoverable without creating a second card. Opt-outs
-survive. No reminders, planner, messages or external customers are created by Add.
+NULL. Adoption requires a captured phone independently matched by full lookup
+and direct customer GET, or a previously stored numeric/UUID binding, as well as
+the current booking/location proof. A current booking alone cannot prove who
+owned an old captured event: bookings can be reassigned. Missing captured phone
+and name are never borrowed from the current customer. Proven phone changes and
+explicit clears preserve the identity and opt-out audit. A clear withdraws queued
+reminders; omitted phone does not clear it. Frozen mailing contacts never change
+silently.
+
+One workspace customer can have distinct Client cards in supported branches.
+Real branch-proven webhooks reuse/create the card for that branch without moving
+another branch's card, jobs or counters. Manual Add still refuses a foreign-only
+identity; mailing remains Karlsruhe-only. Ordinary numeric ingestion with no
+phone and no competing UUID identity needs no voucher API and creates no
+addressless messages. Manual creation fails closed if the branch contains an
+unresolved numeric-only card without phone: a distinct identity cannot yet be
+proved. Later captured contact evidence allows adoption of the same card.
+Identity conflicts remain recoverable without a duplicate card. Opt-outs survive.
+
+The successor migration changes only the UUID unique constraint, preserving all
+rows and ledgers. Its downgrade refuses before DDL when a UUID has multiple
+branch cards. Do not delete or merge real cards to force that downgrade. The
+historical f6 migration and its own populated-downgrade guards are unchanged. No reminders, planner, messages or external customers are created by Add.
 
 Old manual recipients keep policy NULL. Old batches and HMAC bindings retain
 version 1 semantics; deploying version 2 gives an old approval no extra authority.
@@ -900,7 +919,10 @@ allowed. Do not remove a frozen recipient or create a replacement batch.
 
 **List limits protect the API, not the size of a mailing:** 16 KiB / 200 input
 lines / 100 distinct phones per check, at most two reads in parallel, 15 seconds
-per contact and 90 seconds per list, three checks per minute per operator.
+per contact and 90 seconds per list, for both Check and Confirm; three checks
+per minute per operator. Both stages preserve input order and finish or cancel
+all reads before applying writes. A real timeout reports `manual_batch_timeout`,
+with no partial Clients/recipients; it does not mean identity/history changed.
 Multiple separately confirmed lists can extend the same editable preview. The
 server retains no raw API payload; applied plans discard contact material, and
 expired plan contact material is cleared during subsequent list preparation.

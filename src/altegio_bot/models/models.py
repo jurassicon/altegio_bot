@@ -366,8 +366,8 @@ class SmartTestRun(Base):
 class Client(Base):
     """
     Клиент в контексте филиала (provider, company_id).
-    Numeric identity is unique per provider/branch. A proven EasyWeek UUID is
-    unique across this workspace; NULL numeric identity is allowed only for it.
+    Numeric identity and EasyWeek UUID are unique per provider/branch. The same
+    workspace customer can have one distinct card in each supported branch.
     """
 
     __tablename__ = "clients"
@@ -378,7 +378,9 @@ class Client(Base):
             "altegio_client_id",
             name="uq_clients_provider_company_altegio_id",
         ),
-        UniqueConstraint("provider", "easyweek_customer_uuid", name="uq_clients_provider_easyweek_uuid"),
+        UniqueConstraint(
+            "provider", "company_id", "easyweek_customer_uuid", name="uq_clients_provider_company_easyweek_uuid"
+        ),
         CheckConstraint(
             "easyweek_customer_uuid IS NULL OR provider = 'easyweek'",
             name="ck_clients_easyweek_uuid_provider",

@@ -23,12 +23,18 @@ CLIENT_OPTED_OUT = "manual_recipient_opted_out"
 KARLSRUHE_COMPANY_ID = 322579
 
 
+async def lock_workspace_identity(session: AsyncSession) -> None:
+    """Serialize absent-row and cross-branch identity writes, without HTTP."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(724410210071::bigint)"))
+
+
 async def lock_identity(session: AsyncSession, *, phone: str, customer_uuid: str) -> None:
     """Serialize cross-preview creation, including absent-row races.
 
     Lock both keys in stable order. The worker uses this same lock when attaching
     the first real booking to an identity that has no numeric customer ID yet.
     """
+    await lock_workspace_identity(session)
     keys = sorted({f"easyweek-identity-phone:{phone}", f"easyweek-identity-uuid:{customer_uuid}"})
     for value in keys:
         key = int.from_bytes(hashlib.sha256(value.encode()).digest()[:8], "big", signed=True)
@@ -60,14 +66,38 @@ async def local_identity(
         return None, CLIENT_OPTED_OUT
     easyweek = [row for row in rows if row.provider == "easyweek"]
     if len(easyweek) > 1:
-        return None, CLIENT_AMBIGUOUS
+        identities = {row.easyweek_customer_uuid for row in easyweek}
+        numeric_ids = {row.altegio_client_id for row in easyweek if row.altegio_client_id is not None}
+        if None in identities or len(identities) != 1 or len(numeric_ids) > 1:
+            return None, CLIENT_AMBIGUOUS
     # Several legacy identities for the same phone cannot establish one person.
     if len([row for row in rows if row.provider != "easyweek"]) > 1:
         return None, IDENTITY_CONFLICT
     if not easyweek:
+        # An unaddressable numeric card cannot be proven to be a different
+        # person. Refuse a second manual card until an ordinary captured phone
+        # or independent UUID binding resolves it. The worker still ingests
+        # ordinary phone-less bookings when no UUID adoption is in question.
+        unresolved = await session.scalar(
+            select(Client.id)
+            .where(
+                Client.provider == "easyweek",
+                Client.company_id == company_id,
+                Client.easyweek_customer_uuid.is_(None),
+                Client.phone_e164.is_(None),
+            )
+            .limit(1)
+        )
+        if unresolved is not None:
+            return None, IDENTITY_CONFLICT
         return None, None
-    client = easyweek[0]
-    if client.company_id != company_id or client.phone_e164 != phone:
+    branch_clients = [row for row in easyweek if row.company_id == company_id]
+    # A real booking may establish another branch card; a workspace customer
+    # alone cannot authorise the manual import to infer branch membership.
+    if len(branch_clients) != 1:
+        return None, IDENTITY_CONFLICT
+    client = branch_clients[0]
+    if client.phone_e164 != phone:
         return None, IDENTITY_CONFLICT
     if identity is not None and client.easyweek_customer_uuid not in (None, identity):
         return None, IDENTITY_CONFLICT

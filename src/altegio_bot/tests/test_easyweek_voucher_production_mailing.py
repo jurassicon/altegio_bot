@@ -3040,3 +3040,32 @@ async def test_a_create_landing_after_the_create_plan_is_not_created_twice(
     final = await ledger_module.load(session_maker, batch_id=batch_id)
     assert [entry.status for entry in final.items] == [VOUCHER_PRODUCTION_ITEM_CREATED] * count
     assert all(entry.target_order_uuid is not None for entry in final.items)
+
+
+@pytest.mark.parametrize("new_phone", [None, "+4915100000998"])
+async def test_r2_client_contact_change_never_redirects_a_frozen_mailing(
+    session_maker, production_configuration, binding_key, new_phone
+):
+    from altegio_bot.models.models import Client
+
+    run_id, recipient_ids = await seed_production_preview(session_maker, count=1)
+    await seed_template_and_sender(session_maker)
+    reader = FakeReader(count=1)
+    frozen = await _freeze(session_maker, reader, production_request(run_id=run_id), count=1)
+    batch_id = frozen.batch["batch_id"]
+    request = production_request(run_id=run_id, batch_id=batch_id)
+    before = await ledger_module.load(session_maker, batch_id=batch_id)
+    async with session_maker() as session, session.begin():
+        recipient = await session.get(CampaignRecipient, recipient_ids[0])
+        original_phone = recipient.phone_e164
+        client = await session.get(Client, recipient.client_id)
+        client.phone_e164 = new_phone
+    mutator = FakeMutator(create_sequence=[_ok_response(0)])
+    report = await _apply(
+        session_maker, reader, stage=STAGE_CREATE, request=request, mutator=mutator, expect_ready=False
+    )
+    assert report.outcome == "refused" and mutator.calls == []
+    after = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert after == before
+    async with session_maker() as session:
+        assert (await session.get(CampaignRecipient, recipient_ids[0])).phone_e164 == original_phone

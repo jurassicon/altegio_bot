@@ -1517,14 +1517,12 @@ async def _capture_and_process(
     *,
     event_hint: str,
     payload_hash: str,
-    expected_passes: int = 1,
 ) -> None:
     async with session_maker() as session:
         async with session.begin():
             await _capture(session, payload, event_hint=event_hint, payload_hash=payload_hash)
-    # New Karlsruhe customers first persist live UUID identity, then process
-    # the unchanged captured booking in the ordinary worker transaction.
-    assert await _run_until_idle() == expected_passes
+    # Ordinary numeric ingestion does not require a preliminary voucher identity pass.
+    assert await _run_until_idle() == 1
 
 
 async def _easyweek_jobs(session_maker) -> list[MessageJob]:
@@ -6105,7 +6103,6 @@ async def test_karlsruhe_resource_shadow_is_proven_but_suppressed_by_category(
         _in(_karlsruhe_webhook(), days=3),
         event_hint="booking-created",
         payload_hash="karlsruhe-resource-shadow",
-        expected_passes=2,
     )
 
     async with bound_session_local() as session:
@@ -6131,7 +6128,6 @@ async def test_karlsruhe_resource_shadow_stays_unproven_while_the_fence_is_close
         _in(_karlsruhe_webhook(), days=3),
         event_hint="booking-created",
         payload_hash="karlsruhe-resource-shadow-fenced",
-        expected_passes=2,
     )
 
     async with bound_session_local() as session:
@@ -6165,7 +6161,6 @@ async def test_karlsruhe_resource_shadow_plans_digest_bound_jobs_when_the_catego
         _in(_karlsruhe_webhook(), days=3),
         event_hint="booking-created",
         payload_hash="karlsruhe-resource-shadow-allowed",
-        expected_passes=2,
     )
 
     jobs = await _easyweek_jobs(bound_session_local)
@@ -6285,7 +6280,6 @@ async def test_a_forbidden_pair_is_re_proved_and_still_suppressed_after_the_resc
         _in(_karlsruhe_webhook(), days=3),
         event_hint="booking-created",
         payload_hash="count-semantics-nail-created",
-        expected_passes=2,
     )
     await _capture_and_process(
         bound_session_local,
