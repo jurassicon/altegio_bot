@@ -334,6 +334,7 @@ def frozen_template_mismatches(
     template_payload: object,
     *,
     facts: dict[str, Any] | None = None,
+    expected_template_uuid: str = EASYWEEK_VOUCHER_TEMPLATE_UUID,
 ) -> tuple[str, ...]:
     """Field names whose value is not the frozen fact the owner approved.
 
@@ -352,7 +353,7 @@ def frozen_template_mismatches(
     expected_facts = FROZEN_TEMPLATE_FACTS if facts is None else facts
     template = _object(template_payload)
     mismatched: list[str] = []
-    if template.get("uuid") != EASYWEEK_VOUCHER_TEMPLATE_UUID:
+    if template.get("uuid") != expected_template_uuid:
         mismatched.append("uuid")
     for name, expected in expected_facts.items():
         observed = template.get(name)

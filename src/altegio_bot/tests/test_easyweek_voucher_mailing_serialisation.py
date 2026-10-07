@@ -22,27 +22,38 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
+from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_PLANNED,
     EasyWeekVoucherProductionBatchItem,
 )
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     PROVIDER_MESSAGE_IDS,
     FakeMutator,
-    FakeReader,
     FakeSender,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
+
+
+@pytest.fixture
+def synthetic_validity_proven(monkeypatch):
+    """Send concurrency acceptance assumes independently proven validity; rollout remains blocked."""
+    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
+
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -98,7 +109,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
         stage="freeze",
         preview_run_id=run_id,
         expected_recipient_count=count,
-        approved_exposure_minor=count * 1500,
+        approved_exposure_minor=count * 1000,
     )
     assert offer["ready"], offer["reasons"]
     status, _ = await _confirm(client, offer)
@@ -340,7 +351,13 @@ async def test_a_stop_does_not_permanently_block_status_or_reconcile_or_refund(
 
 
 async def test_pay_and_deliver_honour_the_same_stop_rules(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """The guarantee is per claim, so it is the same for every acting stage."""
     count = 3
@@ -393,7 +410,13 @@ async def test_pay_and_deliver_honour_the_same_stop_rules(
 
 
 async def test_a_reconcile_during_an_active_send_does_not_lose_the_success(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """The reported scenario: reconcile mid-send, then Meta answers successfully.
 
@@ -444,7 +467,13 @@ async def test_a_reconcile_during_an_active_send_does_not_lose_the_success(
 
 
 async def test_a_displaced_row_still_absorbs_the_providers_success(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """Belt and braces: even if a row IS parked, the acceptance is not thrown away.
 
@@ -485,7 +514,13 @@ async def test_a_displaced_row_still_absorbs_the_providers_success(
 
 
 async def test_a_lost_ledger_write_is_never_reported_as_success(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """If the acceptance genuinely cannot be recorded, say so — do not claim success.
 
@@ -557,7 +592,13 @@ async def test_reconcile_stays_available_after_a_genuine_interruption(
 
 
 async def test_a_reconcile_racing_a_worker_claim_cannot_park_a_live_row(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """The write-time guard, not just the admission one.
 

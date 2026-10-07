@@ -33,13 +33,15 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionOperation,
 )
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     FakeMutator,
-    FakeReader,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
@@ -82,7 +84,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
         stage="freeze",
         preview_run_id=run_id,
         expected_recipient_count=count,
-        approved_exposure_minor=count * 1500,
+        approved_exposure_minor=count * 1000,
     )
     await _confirm(client, offer)
     assert await worker_module.run_once(session_maker, owner="test-executor") is not None
@@ -1245,6 +1247,7 @@ async def test_pr21_branch_uuid_upgrade_preserves_rows_and_refuses_lossy_downgra
         upgraded = _alembic(disposable_database, "upgrade", "head")
         assert upgraded.returncode == 0, upgraded.stderr
         async with engine.connect() as conn:
+            upgraded_revision = await conn.scalar(text("SELECT version_num FROM alembic_version"))
             assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
             await conn.execute(
                 text(
@@ -1265,7 +1268,7 @@ async def test_pr21_branch_uuid_upgrade_preserves_rows_and_refuses_lossy_downgra
         assert refused.returncode != 0 and "PR-21 branch downgrade refused" in refused.stderr
         async with engine.connect() as conn:
             assert await conn.scalar(text("SELECT count(*) FROM clients")) == 3
-            assert await conn.scalar(text("SELECT version_num FROM alembic_version")) == "d8b4e6a29c13"
+            assert await conn.scalar(text("SELECT version_num FROM alembic_version")) == upgraded_revision
             assert (
                 await conn.execute(text("SELECT * FROM clients WHERE company_id=322579 ORDER BY id"))
             ).all() == before

@@ -47,19 +47,16 @@ from typing import Any, Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import binding_key_reason
+from altegio_bot.campaigns.easyweek_voucher_production import template_contract
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ACCOUNT_UNCONFIGURED,
-    APPROVAL_ARITHMETIC,
     BOOKING_LINK_UNPROVEN,
     ISSUER_MEMBERSHIP_INCOMPLETE,
     PRODUCTION_DISABLED,
     SENDER_UNPROVEN,
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
-    UNIT_PRICE_MINOR,
-    VOUCHER_TEMPLATE_CODE,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     IssuerMembership,
@@ -67,6 +64,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     pinned_issuer,
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
+from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
 
@@ -97,6 +95,7 @@ class ProductionPrerequisites:
 
     stage: str
     fence_open: bool
+    schema_version: str = "2"
     # ``None`` means proven; a string is the blocker.
     staffer_reason: str | None = None
     account_reason: str | None = None
@@ -107,6 +106,7 @@ class ProductionPrerequisites:
     issuer_membership: IssuerMembership | None = None
     key_reason: str | None = None
     template_reason: str | None = None
+    live_meta_verified: bool = False
     sender_reason: str | None = None
     booking_link_reason: str | None = None
     delivery_checks_applied: bool = True
@@ -149,6 +149,8 @@ class ProductionPrerequisites:
         return not self.reasons
 
     def as_safe_dict(self) -> dict[str, Any]:
+        contract = production_contract(self.schema_version)
+
         def applicable(reason: str | None) -> Any:
             return (reason is None) if self.delivery_checks_applied else NOT_REQUIRED_FOR_REFUND
 
@@ -175,12 +177,13 @@ class ProductionPrerequisites:
             ),
             "hmac_key_usable": applicable(self.key_reason),
             "template_proven": applicable(self.template_reason),
+            "live_meta_verified": self.live_meta_verified,
             "sender_proven": applicable(self.sender_reason),
             # Presence only: the link is a real public URL, and a report is
             # pasted into tickets.
             "booking_link_proven": applicable(self.booking_link_reason),
             "template_parameter_count": template_contract.VOUCHER_TEMPLATE_ARITY,
-            "template_code": VOUCHER_TEMPLATE_CODE,
+            "template_code": contract.message_code,
             "meta_template_name": self.meta_template_name,
             "template_language": self.template_language,
             # Presence only: a phone-number id identifies a real line.
@@ -188,8 +191,8 @@ class ProductionPrerequisites:
             # Repeated on every report so a green stage can never read as a
             # campaign permission. There is no recipient ceiling in this phase;
             # what bounds the money is the arithmetic the operator approved.
-            "voucher_unit_price_minor": UNIT_PRICE_MINOR,
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "voucher_unit_price_minor": contract.unit_price_minor,
+            "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.unit_price_minor}",
             "reasons": list(self.reasons),
         }
 
@@ -203,6 +206,9 @@ async def prove_prerequisites(
     enabled: bool | None = None,
     issuer_membership: IssuerMembership | None = None,
     require_membership: bool = True,
+    schema_version: str = "2",
+    live_meta_proof: template_contract.TemplateProof | None = None,
+    require_live_meta: bool = True,
 ) -> ProductionPrerequisites:
     """The prerequisites THIS stage actually depends on.
 
@@ -213,6 +219,7 @@ async def prove_prerequisites(
     never send. The other checks are not merely skipped — they are not run, so a
     missing key or a deleted template row cannot raise on the way past.
     """
+    message = template_contract.for_schema(schema_version)
     fence_open = settings.easyweek_voucher_production_mailing_enabled if enabled is None else enabled
     account_uuid = _canonical(settings.easyweek_voucher_production_mailing_account_uuid)
     account_reason = None if account_uuid else ACCOUNT_UNCONFIGURED
@@ -220,6 +227,7 @@ async def prove_prerequisites(
     if stage == STAGE_REFUND:
         return ProductionPrerequisites(
             stage=stage,
+            schema_version=schema_version,
             fence_open=bool(fence_open),
             account_reason=account_reason,
             payment_account_uuid=account_uuid,
@@ -254,8 +262,8 @@ async def prove_prerequisites(
                 select(MessageTemplate)
                 .where(MessageTemplate.provider == PROVIDER_EASYWEEK)
                 .where(MessageTemplate.company_id == company_id)
-                .where(MessageTemplate.code == VOUCHER_TEMPLATE_CODE)
-                .where(MessageTemplate.language == template_contract.VOUCHER_TEMPLATE_LANGUAGE)
+                .where(MessageTemplate.code == message.VOUCHER_TEMPLATE_CODE)
+                .where(MessageTemplate.language == message.VOUCHER_TEMPLATE_LANGUAGE)
             )
         )
         .scalars()
@@ -271,10 +279,18 @@ async def prove_prerequisites(
         # own closed one, so the answer is mapped rather than echoed: an operator
         # reading a §42 report should never see a §36 reason code.
         template_reason = (
-            TEMPLATE_UNPROVEN
-            if template_contract.db_row_blocker(active[0], company_id=company_id) is not None
-            else None
+            TEMPLATE_UNPROVEN if message.db_row_blocker(active[0], company_id=company_id) is not None else None
         )
+
+    live_meta_verified = bool(
+        live_meta_proof is not None
+        and live_meta_proof.proven
+        and live_meta_proof.meta_verified
+        and live_meta_proof.meta_template_name == message.VOUCHER_META_TEMPLATE_NAME
+        and live_meta_proof.language == message.VOUCHER_TEMPLATE_LANGUAGE
+    )
+    if schema_version == "3" and require_live_meta and not live_meta_verified:
+        template_reason = TEMPLATE_UNPROVEN
 
     sender = (
         await session.execute(
@@ -288,6 +304,7 @@ async def prove_prerequisites(
 
     return ProductionPrerequisites(
         stage=stage,
+        schema_version=schema_version,
         fence_open=bool(fence_open),
         # The pin answers both "configured?" and "the approved one?", so there is
         # no separate staffer reason left to report: a second code derived from
@@ -314,6 +331,7 @@ async def prove_prerequisites(
         account_reason=account_reason,
         key_reason=key_reason,
         template_reason=template_reason,
+        live_meta_verified=live_meta_verified,
         sender_reason=None if sender_ok else SENDER_UNPROVEN,
         booking_link_reason=booking_link_reason,
         booking_link=booking_link or None,
@@ -322,9 +340,39 @@ async def prove_prerequisites(
         payment_account_uuid=account_uuid,
         sender_id=sender.id if sender_ok and sender is not None else None,
         phone_number_id=(sender.phone_number_id or "").strip() if sender_ok and sender is not None else None,
-        meta_template_name=template_contract.VOUCHER_META_TEMPLATE_NAME,
-        template_language=template_contract.VOUCHER_TEMPLATE_LANGUAGE,
+        meta_template_name=message.VOUCHER_META_TEMPLATE_NAME,
+        template_language=message.VOUCHER_TEMPLATE_LANGUAGE,
     )
 
 
-__all__ = ["NOT_REQUIRED_FOR_REFUND", "ProductionPrerequisites", "prove_prerequisites"]
+async def prove_live_meta_template(*, reader: Any = None) -> template_contract.TemplateProof:
+    """Read the exact v2 approval; API failure is an unproven contract.
+
+    ``reader.list_meta_templates`` is the test/read-adapter seam. A real
+    EasyWeek reader has no such method; production uses the read-only Meta
+    template client, with no template creation or modification capability.
+    """
+    from altegio_bot.scripts.clone_meta_templates_for_location import MetaTemplateClient, ScriptError
+
+    try:
+        if reader is not None and callable(getattr(reader, "list_meta_templates", None)):
+            templates = await reader.list_meta_templates()
+        else:
+            token = settings.whatsapp_access_token.strip()
+            waba_id = (settings.meta_waba_id or "").strip()
+            if not token or not waba_id:
+                return template_contract.prove_meta_templates([])
+            async with MetaTemplateClient(
+                token=token,
+                waba_id=waba_id,
+                graph_url=settings.whatsapp_graph_url,
+                api_version=settings.whatsapp_api_version,
+                timeout_seconds=20.0,
+            ) as client:
+                templates = await client.list_templates()
+        return template_contract.prove_meta_templates(templates)
+    except ScriptError:
+        return template_contract.prove_meta_templates([])
+
+
+__all__ = ["prove_live_meta_template", "NOT_REQUIRED_FOR_REFUND", "ProductionPrerequisites", "prove_prerequisites"]

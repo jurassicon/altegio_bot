@@ -84,6 +84,7 @@ from altegio_bot.easyweek_voucher_identity import (
     SUPPORTED_VOUCHER_PRICE_MINOR,
     SUPPORTED_VOUCHER_QUANTITY,
 )
+from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT
 from altegio_bot.settings import settings
 
 logger = logging.getLogger("easyweek_voucher_mutation")
@@ -194,7 +195,7 @@ def _pinned(value: object, *, expected: str, label: str, operation: str) -> str:
     return expected
 
 
-def _pinned_price(value: object, *, operation: str) -> int:
+def _pinned_price(value: object, *, operation: str, expected_price_minor: int = SUPPORTED_VOUCHER_PRICE_MINOR) -> int:
     """Accept only the exact supported nominal, as an exact ``int``.
 
     ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` to
@@ -203,9 +204,9 @@ def _pinned_price(value: object, *, operation: str) -> int:
     """
     if type(value) is not int:
         raise EasyWeekPermanentError("price_minor must be an exact integer", operation=operation)
-    if value != SUPPORTED_VOUCHER_PRICE_MINOR:
+    if value != expected_price_minor:
         raise EasyWeekPermanentError("price_minor is not the supported voucher nominal", operation=operation)
-    return SUPPORTED_VOUCHER_PRICE_MINOR
+    return expected_price_minor
 
 
 def _safe_marker(value: object, *, operation: str) -> str:
@@ -494,6 +495,7 @@ class EasyWeekVoucherMutationClient:
         voucher_template_uuid: str,
         price_minor: int,
         marker: str,
+        product_contract_version: str | None = None,
     ) -> VoucherMutationResponse:
         """``POST /orders`` — one open POS order with exactly one voucher line.
 
@@ -503,18 +505,30 @@ class EasyWeekVoucherMutationClient:
         a second line and a bulk quantity have no parameter and no place in the
         body, so they cannot appear by accident or by argument.
         """
+        # Existing canaries cannot acquire the new product by changing a UUID
+        # or amount. Only the explicit production contract selects its fixed
+        # pair; arbitrary contract names and mixed pairs fail before the wire.
+        expected_template = EASYWEEK_VOUCHER_TEMPLATE_UUID
+        expected_price = SUPPORTED_VOUCHER_PRICE_MINOR
+        if product_contract_version is not None:
+            if product_contract_version != CURRENT_PRODUCTION_CONTRACT.version:
+                raise EasyWeekPermanentError("unsupported product contract", operation=CREATE_OPERATION)
+            if self._workspace_slug != "kitilash":
+                raise EasyWeekPermanentError("unsupported production workspace", operation=CREATE_OPERATION)
+            expected_template = CURRENT_PRODUCTION_CONTRACT.template_uuid
+            expected_price = CURRENT_PRODUCTION_CONTRACT.unit_price_minor
         pinned_location = _pinned(
             location_uuid, expected=KARLSRUHE_LOCATION_UUID, label="location_uuid", operation=CREATE_OPERATION
         )
         pinned_template = _pinned(
             voucher_template_uuid,
-            expected=EASYWEEK_VOUCHER_TEMPLATE_UUID,
+            expected=expected_template,
             label="voucher_template_uuid",
             operation=CREATE_OPERATION,
         )
         canonical_customer = _canonical_uuid(customer_uuid, label="customer_uuid", operation=CREATE_OPERATION)
         canonical_staffer = _canonical_uuid(staffer_uuid, label="staffer_uuid", operation=CREATE_OPERATION)
-        exact_price = _pinned_price(price_minor, operation=CREATE_OPERATION)
+        exact_price = _pinned_price(price_minor, operation=CREATE_OPERATION, expected_price_minor=expected_price)
         safe_marker = _safe_marker(marker, operation=CREATE_OPERATION)
 
         body: dict[str, Any] = {

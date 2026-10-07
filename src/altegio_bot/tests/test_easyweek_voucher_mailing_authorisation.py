@@ -25,6 +25,11 @@ from altegio_bot.campaigns.easyweek_voucher_production import operations as oper
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import EasyWeekVoucherProductionApproval
 from altegio_bot.ops.auth import SESSION_COOKIE, make_session_token
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (
     OPS_SECRET,
     OPS_USER,
@@ -35,10 +40,7 @@ from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     FakeMutator,
-    FakeReader,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
 
@@ -79,7 +81,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
                 "stage": "freeze",
                 "preview_run_id": run_id,
                 "expected_recipient_count": count,
-                "approved_exposure_minor": count * 1500,
+                "approved_exposure_minor": count * 1000,
             },
         )
     ).json()
@@ -579,7 +581,7 @@ async def test_an_approval_for_one_batch_cannot_run_a_stage_of_another(
                 "stage": "freeze",
                 "preview_run_id": run_b,
                 "expected_recipient_count": count,
-                "approved_exposure_minor": count * 1500,
+                "approved_exposure_minor": count * 1000,
             },
         )
     ).json()
@@ -707,14 +709,14 @@ async def test_the_approval_records_exactly_the_slots_the_operator_was_shown(
     assert pay_offer["ready"], pay_offer["reasons"]
     assert pay_offer["targets"]["target_slots"] == [1]
     assert pay_offer["targets"]["stage_target_count"] == 1
-    assert pay_offer["targets"]["stage_amount_minor"] == 1500
+    assert pay_offer["targets"]["stage_amount_minor"] == 1000
     # The batch total is shown separately and is NOT what is being approved.
-    assert pay_offer["targets"]["batch_exposure_minor"] == count * 1500
+    assert pay_offer["targets"]["batch_exposure_minor"] == count * 1000
 
     approval = await operations_module.load_approval(session_maker, approval_id=pay_offer["approval"]["approval_id"])
     assert approval is not None
     assert approval.target_slots == (1,)
-    assert approval.stage_amount_minor == 1500
+    assert approval.stage_amount_minor == 1000
 
     # Now slot 2's voucher appears in the window between the plan and the payment.
     await _make_slot_created(session_maker, batch_id=batch_id, slot=2, order_index=1)

@@ -29,15 +29,17 @@ from altegio_bot.easyweek_client import EasyWeekRetryableError
 from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.settings import settings
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     OTHER_STAFFER_UUID,
     STAFFER_UUID,
     FakeMutator,
-    FakeReader,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
     staffers_page,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
@@ -272,7 +274,7 @@ async def _frozen(client, session_maker, transports, *, count: int, offset: int 
                 "stage": "freeze",
                 "preview_run_id": run_id,
                 "expected_recipient_count": count,
-                "approved_exposure_minor": count * 1500,
+                "approved_exposure_minor": count * 1000,
             },
         )
     ).json()

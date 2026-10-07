@@ -44,17 +44,19 @@ from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_PLANNED,
     EasyWeekVoucherProductionBatchItem,
 )
+from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
+    FakeReader,
+    marker_orders,
+    seed_template_and_sender,
+)
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import StubTransports, session_cookie
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     ORDER_UUIDS,
     VOUCHER_CODE_SENTINELS,
     FakeMutator,
-    FakeReader,
     FakeSender,
     accepted_outcome,
-    marker_orders,
     seed_production_preview,
-    seed_template_and_sender,
     unknown_outcome,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
@@ -67,6 +69,12 @@ CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
 STOP_URL = "/ops/voucher-mailings/api/stop"
 RECONCILE_URL = "/ops/voucher-mailings/api/reconcile"
 STATUS_URL = "/ops/voucher-mailings/api/status"
+
+
+@pytest.fixture
+def synthetic_validity_proven(monkeypatch):
+    """Conditional send acceptance; production expiry evidence is still a rollout blocker."""
+    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
 
 
 # ===========================================================================
@@ -174,7 +182,7 @@ async def _frozen(client, session_maker, transports, *, count: int) -> tuple[int
         preview_run_id=run_id,
         reader=reader,
         count=count,
-        minor=count * 1500,
+        minor=count * 1000,
     )
     assert frozen is not None and frozen.status == "completed", frozen
     batch_id = await _batch_id(session_maker, run_id=run_id)
@@ -222,7 +230,13 @@ async def _paid(client, session_maker, transports, *, count: int) -> tuple[int, 
 
 
 async def test_an_operator_runs_the_whole_mailing_from_the_browser(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """One operator, one browser, four confirmations, three recipients paid and sent.
 
@@ -255,10 +269,10 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
         preview_run_id=run_id,
         reader=reader,
         count=count,
-        minor=count * 1500,
+        minor=count * 1000,
     )
     assert freeze_offer["targets"]["stage_target_count"] == count
-    assert freeze_offer["targets"]["stage_amount_minor"] == count * 1500
+    assert freeze_offer["targets"]["stage_amount_minor"] == count * 1000
     assert frozen is not None and frozen.status == "completed"
     batch_id = await _batch_id(session_maker, run_id=run_id)
     assert batch_id is not None
@@ -295,7 +309,7 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
         reader=reader,
         mutator=FakeMutator(pay_sequence=[_ok(i) for i in range(count)], reader=reader, settles=settles),
     )
-    assert pay_offer["targets"]["stage_amount_minor"] == count * 1500
+    assert pay_offer["targets"]["stage_amount_minor"] == count * 1000
     assert paid is not None and paid.status == "completed"
     assert paid.result["external_calls"]["pay"] == count
 
@@ -391,7 +405,7 @@ async def test_work_survives_the_tab_that_started_it(
         stage="freeze",
         preview_run_id=run_id,
         expected_recipient_count=count,
-        approved_exposure_minor=count * 1500,
+        approved_exposure_minor=count * 1000,
     )
     status, body = await _confirm(ui_client, offer)
     assert status == 200
@@ -592,7 +606,13 @@ async def test_continuing_after_a_stop_needs_a_fresh_confirmation_and_repeats_no
 
 
 async def test_an_unknown_send_stops_the_rest_and_the_ui_offers_reconciliation(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """One ambiguous Meta answer halts the suffix, and the browser says so.
 
@@ -654,7 +674,7 @@ async def test_an_allowed_pre_send_refund_runs_from_the_browser(
         slot=1,
     )
     assert offer["targets"]["stage_target_count"] == 1
-    assert offer["targets"]["stage_amount_minor"] == 1500
+    assert offer["targets"]["stage_amount_minor"] == 1000
     assert finished is not None and finished.status == "completed", finished.result
     assert mutator.calls.count("refund") == 1
     items = await _items(session_maker, batch_id)
@@ -978,6 +998,7 @@ console.log(JSON.stringify({
 
 
 _COMPOSITION_FUNCTIONS = (
+    "reasonLabel",
     "basisLabel",
     "renderOffer",
     "renderComposition",
@@ -1128,7 +1149,13 @@ console.log(JSON.stringify(cases));
 
 
 async def test_no_page_or_api_answer_carries_a_code_or_an_identity(
-    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+    synthetic_validity_proven,
 ):
     """Every sentinel this suite can leak, hunted across the whole operator surface."""
     from altegio_bot.tests.easyweek_voucher_production_fixtures import (

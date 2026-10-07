@@ -50,11 +50,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.campaigns import easyweek_manual_batch
-from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract
 from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
+from altegio_bot.campaigns.easyweek_voucher_production import template_contract
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     API_UNAVAILABLE,
     DATABASE_UNAVAILABLE,
@@ -64,7 +64,6 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     OPS_SESSION_REQUIRED,
     PRODUCTION_STAGES,
     STAGE_CREATE,
-    UNIT_PRICE_MINOR,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     APPROVED_ISSUER_DISPLAY_NAME,
@@ -74,6 +73,7 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
+from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT, production_contract
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -231,7 +231,7 @@ def _executor_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _readiness() -> dict[str, Any]:
+async def _readiness(schema_version: str = "3") -> dict[str, Any]:
     """Why a mailing could or could not act, without naming a single secret."""
     from altegio_bot.campaigns.easyweek_voucher_production.readiness import prove_prerequisites
 
@@ -248,6 +248,8 @@ async def _readiness() -> dict[str, Any]:
                 # a step is prepared, and the panel says so rather than reporting a
                 # blocker nobody checked.
                 require_membership=False,
+                schema_version=schema_version,
+                require_live_meta=False,
             )
         facts = prerequisites.as_safe_dict()
     except SQLAlchemyError:
@@ -258,7 +260,7 @@ async def _readiness() -> dict[str, Any]:
     return facts
 
 
-def _message_preview() -> dict[str, str]:
+def _message_preview(schema_version: str = "3") -> dict[str, str]:
     """The approved message and the voucher's terms, with a PLACEHOLDER code.
 
     Rendered from the repository's own named body — the contract the Meta template
@@ -266,19 +268,26 @@ def _message_preview() -> dict[str, str]:
     is a placeholder by construction: there is no path from this page to a real
     one, because a real one only exists between a paid order read and one POST.
     """
+    message_contract = template_contract.for_schema(schema_version)
     registry = configured_easyweek_locations()
     location = registry.locations.get(production_runner.KARLSRUHE_COMPANY_ID) if registry.ready else None
     booking_link = (location.booking_page_url or "").strip() if location is not None else ""
-    body = template_contract.VOUCHER_TEMPLATE_BODY.format(
+    body = message_contract.VOUCHER_TEMPLATE_BODY.format(
         client_name=CLIENT_NAME_PLACEHOLDER,
         voucher_code=VOUCHER_CODE_PLACEHOLDER,
         booking_link=booking_link or "<Buchungslink nicht konfiguriert>",
     )
     return {
-        "meta_template_name": template_contract.VOUCHER_META_TEMPLATE_NAME,
-        "language": template_contract.VOUCHER_TEMPLATE_LANGUAGE,
+        "meta_template_name": message_contract.VOUCHER_META_TEMPLATE_NAME,
+        "language": message_contract.VOUCHER_TEMPLATE_LANGUAGE,
         "body": body,
         "voucher_code_placeholder": VOUCHER_CODE_PLACEHOLDER,
+        "terms": (
+            "10 EUR. Одноразовый ваучер. Срок действия — один календарный месяц с активации, "
+            "а не с получения WhatsApp-сообщения. Неиспользованный остаток сгорает."
+            if schema_version == "3"
+            else "Исторический ваучер 15 EUR. Исходные условия сохранены."
+        ),
     }
 
 
@@ -618,8 +627,12 @@ def _money(minor: Any) -> str:
 
 def _reason_rows(reasons: list[str]) -> str:
     if not reasons:
-        return "<li class='text-success'>Все проверки пройдены.</li>"
-    return "".join(f"<li><code>{_esc(reason)}</code></li>" for reason in reasons)
+        return "<li class='text-success'>Локальные проверки пройдены.</li>"
+    labels = {
+        "voucher_production_validity_unproven": "Срок действия выданного ваучера не подтверждён — отправка закрыта.",
+        "voucher_production_voucher_expired": "Срок действия ваучера истёк — отправка закрыта.",
+    }
+    return "".join(f"<li>{_esc(labels.get(reason, ''))} <code>{_esc(reason)}</code></li>" for reason in reasons)
 
 
 def _issuer_banner() -> str:
@@ -643,6 +656,8 @@ def _readiness_block(facts: dict[str, Any]) -> str:
   <div class="small text-muted">
     Исполнитель стадий: {_esc(executor)}. Значения секретов и UUID здесь не показываются.
     Принадлежность мастера филиалу проверяется живым чтением при подготовке шага.
+    Для новых рассылок точный APPROVED-шаблон Meta проверяется живым чтением перед каждым шагом.
+    Отправка требует подтверждённого срока действия каждого выданного ваучера.
   </div>
 </div>
 """
@@ -789,7 +804,8 @@ async def page_index(request: Request) -> str:
 </p>
 {candidate_table}
 <div class="alert alert-secondary small mt-4">
-  Один ваучер {_esc(_money(UNIT_PRICE_MINOR))} на получателя. Потолка получателей нет:
+  Новые рассылки: один ваучер {_esc(_money(CURRENT_PRODUCTION_CONTRACT.unit_price_minor))} на получателя,
+  одноразовый, срок — один календарный месяц с активации. Потолка получателей нет:
   количество и сумму оператор подтверждает явно перед фиксацией списка.
   Массовая отправка не разрешена: <code>campaign_send_authorized=false</code>.
 </div>
@@ -802,11 +818,17 @@ async def page_index(request: Request) -> str:
 async def page_prepare(request: Request, preview_run_id: int) -> str:
     """Check the list, the period, the count and the money — then freeze."""
     csrf = _csrf_for(request)
-    message = _message_preview()
+    try:
+        existing = await ledger_module.load_for_preview(SessionLocal, campaign_run_id=preview_run_id)
+    except SQLAlchemyError:
+        return _page("Состояние недоступно", "Не удалось прочитать состояние preview. Обновите страницу.")
+    schema_version = existing.schema_version if existing.exists else "3"
+    contract = production_contract(schema_version)
+    message = _message_preview(schema_version)
     body = f"""
 <h1 class="h4 mb-3">Подготовка рассылки — preview #{preview_run_id}</h1>
 {_issuer_banner()}
-{_readiness_block(await _readiness())}
+{_readiness_block(await _readiness(schema_version))}
 <div class="alert alert-secondary">
   Состав редактируется в <a href="/ops/campaigns/{preview_run_id}">редакторе preview</a>:
   там добавляют и исключают получателей. После фиксации состав меняться не может.
@@ -838,7 +860,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
       </div>
       <div class="col-auto">
         <label class="form-label small mb-1" for="f-euro">Общая сумма, €</label>
-        <input id="f-euro" type="text" class="form-control form-control-sm" placeholder="например 45.00">
+        <input id="f-euro" type="text" class="form-control form-control-sm" placeholder="например 30.00">
       </div>
       <div class="col-auto">
         <button id="btn-plan-freeze" class="btn btn-primary btn-sm" onclick="planFreeze()">
@@ -864,6 +886,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
       <code>{_esc(message["language"])}</code>. Вместо реального кода — placeholder
       <code>{_esc(message["voucher_code_placeholder"])}</code>: настоящий код не показывается нигде.
     </p>
+    <p class="voucher-terms">{_esc(message["terms"])}</p>
     <pre class="border rounded p-2 bg-white">{_esc(message["body"])}</pre>
   </div>
 </div>
@@ -873,7 +896,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
 const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
-const UNIT_PRICE_MINOR = {int(UNIT_PRICE_MINOR)};
+const UNIT_PRICE_MINOR = {contract.unit_price_minor};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -938,7 +961,9 @@ async def page_mailing(request: Request, batch_id: int) -> str:
         )
 
     preview_run_id = int(batch.get("campaign_run_id") or 0)
-    message = _message_preview()
+    schema_version = str(batch.get("schema_version") or "1")
+    contract = production_contract(schema_version)
+    message = _message_preview(schema_version)
     header_rows = [
         ("Период кампании", batch.get("campaign_period") or "—"),
         ("Получателей (зафиксировано)", str(batch.get("recipient_count") or 0)),
@@ -962,7 +987,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
   Период кампании — это волна, за которую положен ваучер, а не месяц отправки.
 </p>
 {_issuer_banner()}
-{_readiness_block(await _readiness())}
+{_readiness_block(await _readiness(schema_version))}
 <table class="table table-sm w-auto">{header_table}</table>
 
 <div id="stop-banner"></div>
@@ -1016,6 +1041,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
       <code>{_esc(message["language"])}</code>. Вместо кода — placeholder
       <code>{_esc(message["voucher_code_placeholder"])}</code>.
     </p>
+    <p class="voucher-terms">{_esc(message["terms"])}</p>
     <pre class="border rounded p-2 bg-white">{_esc(message["body"])}</pre>
   </div>
 </div>
@@ -1025,7 +1051,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
 const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {preview_run_id};
 const BATCH_ID = {batch_id};
-const UNIT_PRICE_MINOR = {int(UNIT_PRICE_MINOR)};
+const UNIT_PRICE_MINOR = {contract.unit_price_minor};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -1322,7 +1348,7 @@ async function inspectComposition() {
   const data = result.data || {};
   if (!data.composition_proven) {
     if (panel) panel.classList.add("d-none");
-    const reasons = (data.reasons || []).join(", ");
+    const reasons = (data.reasons || []).map(reasonLabel).join(", ");
     const note = reasons
       ? "Состав нельзя зафиксировать: " + reasons
       : "Состав пуст.";
@@ -1401,7 +1427,7 @@ function renderOffer(stage, result, options) {
   if (!data.ready) {
     OFFER = null;
     hideConfirm();
-    const reasons = (data.reasons || []).join(", ");
+    const reasons = (data.reasons || []).map(reasonLabel).join(", ");
     const text = reasons
       ? "Действие недоступно: " + reasons
       : "Действие недоступно.";
@@ -1640,6 +1666,14 @@ async function loadRecipients() {
     lines[person.slot] = person;
   }
   RECIPIENTS = lines;
+}
+
+function reasonLabel(reason) {
+  if (reason === "voucher_production_validity_unproven") {
+    return "Срок действия выданного ваучера не подтверждён — отправка закрыта";
+  }
+  if (reason === "voucher_production_voucher_expired") return "Срок действия ваучера истёк — отправка закрыта";
+  return reason;
 }
 
 function refundSlot(slot) {

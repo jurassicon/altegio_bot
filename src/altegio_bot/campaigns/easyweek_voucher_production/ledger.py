@@ -83,11 +83,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import voucher_code_matches
 from altegio_bot.campaigns.easyweek_voucher_production.composition import source_proof_digest
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
-    APPROVAL_ARITHMETIC,
     PRODUCTION_SCHEMA_VERSION,
     PRODUCTION_SCOPE,
     UNIT_PRICE_MINOR,
     binding_material,
+)
+from altegio_bot.easyweek_voucher_production_contract import (
+    LEGACY_PRODUCTION_CONTRACT,
+    ProductionVoucherContract,
+    production_contract,
 )
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
@@ -355,6 +359,8 @@ class BatchSnapshot:
     exists: bool
     batch_id: int | None = None
     schema_version: str = "1"
+    product_contract_version: str = LEGACY_PRODUCTION_CONTRACT.version
+    message_contract_code: str = LEGACY_PRODUCTION_CONTRACT.message_code
     recipient_basis: str = RECIPIENT_BASIS_MANUAL
     status: str | None = None
     halted_reason_code: str | None = None
@@ -434,6 +440,14 @@ class BatchSnapshot:
             if self.exists
             else None,
             "schema_version": self.schema_version if self.exists else None,
+            **(
+                {
+                    "product_contract_version": self.product_contract_version,
+                    "message_contract_code": self.message_contract_code,
+                }
+                if self.schema_version == "3"
+                else {}
+            ),
             "earned_recipient_count": sum(entry.recipient_basis == RECIPIENT_BASIS_EARNED for entry in self.items),
             "manual_recipient_count": sum(entry.recipient_basis == RECIPIENT_BASIS_MANUAL for entry in self.items),
             # The wave this batch is bound to, in one glance and in full. It is
@@ -452,7 +466,9 @@ class BatchSnapshot:
             # an operator sees that for themselves.
             "approved_recipient_count": self.approved_recipient_count,
             "approved_exposure_minor": self.approved_exposure_minor,
-            "approval_arithmetic": APPROVAL_ARITHMETIC,
+            "approval_arithmetic": (
+                f"approved_exposure_minor = expected_recipient_count * {self.voucher_unit_price_minor}"
+            ),
             "reconciliation_required": self.reconciliation_required,
             # Execution, acceptance, delivery and reading, counted separately.
             # `completed` below refers to the EXECUTION of the stages; it never
@@ -576,6 +592,8 @@ async def _snapshot(session: AsyncSession, row: EasyWeekVoucherProductionBatch |
     return BatchSnapshot(
         exists=True,
         schema_version=row.request_schema_version,
+        product_contract_version=row.product_contract_version,
+        message_contract_code=row.message_contract_code,
         recipient_basis=row.recipient_basis,
         batch_id=int(row.id),
         status=row.status,
@@ -731,7 +749,16 @@ class BatchIdentity:
     items: tuple[BatchItemIdentity, ...]
     batch_id: int | None = None
     schema_version: str = PRODUCTION_SCHEMA_VERSION
+    product_contract_version: str | None = None
+    message_contract_code: str | None = None
     recipient_basis: str = RECIPIENT_BASIS_MANUAL
+
+    @property
+    def contract(self) -> ProductionVoucherContract:
+        contract = production_contract(self.schema_version, contract_version=self.product_contract_version)
+        if self.message_contract_code is not None and self.message_contract_code != contract.message_code:
+            raise ValueError("voucher_production_contract_unproven")
+        return contract
 
     @property
     def recipient_count(self) -> int:
@@ -764,6 +791,8 @@ class BatchIdentity:
             return False
         return (
             row.request_schema_version == self.schema_version
+            and row.product_contract_version == self.contract.version
+            and row.message_contract_code == self.contract.message_code
             and row.recipient_basis == self.recipient_basis
             and int(row.company_id) == self.company_id
             and row.campaign_code == self.campaign_code
@@ -777,8 +806,8 @@ class BatchIdentity:
             and row.baseline_version == self.baseline_version
             and row.frozen_digest == self.frozen_digest
             and int(row.recipient_count) == self.recipient_count
-            and int(row.voucher_unit_price_minor) == UNIT_PRICE_MINOR
-            and int(row.total_exposure_minor) == UNIT_PRICE_MINOR * self.recipient_count
+            and int(row.voucher_unit_price_minor) == self.contract.unit_price_minor
+            and int(row.total_exposure_minor) == self.contract.unit_price_minor * self.recipient_count
         )
 
     def matches_item(self, row: EasyWeekVoucherProductionBatchItem) -> bool:
@@ -794,7 +823,7 @@ class BatchIdentity:
             and row.manual_policy == expected.manual_policy
             and _text(row.source_booking_uuid) == expected.source_booking_uuid
             and row.source_proof_digest == expected.source_proof_digest
-            and int(row.voucher_value_minor) == UNIT_PRICE_MINOR
+            and int(row.voucher_value_minor) == self.contract.unit_price_minor
             and int(row.voucher_quantity) == 1
         )
 
@@ -810,6 +839,8 @@ class BatchIdentity:
             return False
         if (
             snapshot.schema_version != self.schema_version
+            or snapshot.product_contract_version != self.contract.version
+            or snapshot.message_contract_code != self.contract.message_code
             or snapshot.recipient_basis != self.recipient_basis
             or snapshot.company_id != self.company_id
             or snapshot.campaign_code != self.campaign_code
@@ -823,8 +854,8 @@ class BatchIdentity:
             or snapshot.baseline_version != self.baseline_version
             or snapshot.frozen_digest != self.frozen_digest
             or snapshot.recipient_count != self.recipient_count
-            or snapshot.voucher_unit_price_minor != UNIT_PRICE_MINOR
-            or snapshot.total_exposure_minor != UNIT_PRICE_MINOR * self.recipient_count
+            or snapshot.voucher_unit_price_minor != self.contract.unit_price_minor
+            or snapshot.total_exposure_minor != self.contract.unit_price_minor * self.recipient_count
         ):
             return False
         stored = {entry.slot: entry for entry in snapshot.items}
@@ -840,7 +871,7 @@ class BatchIdentity:
                 or row.manual_policy != entry.manual_policy
                 or row.source_booking_uuid != entry.source_booking_uuid
                 or row.source_proof_digest != entry.source_proof_digest
-                or row.voucher_value_minor != UNIT_PRICE_MINOR
+                or row.voucher_value_minor != self.contract.unit_price_minor
                 or row.voucher_quantity != 1
             ):
                 return False
@@ -923,6 +954,15 @@ async def freeze_batch(
     it, and the CHECK constraints would then reject the write with a constraint
     name instead of a reason an operator can read.
     """
+    try:
+        contract = identity.contract
+    except ValueError:
+        return FreezeOutcome(False, FREEZE_REFUSED_SNAPSHOT, BatchSnapshot(exists=False))
+    if (
+        identity.voucher_template_uuid != contract.template_uuid
+        or identity.baseline_version != contract.baseline_version
+    ):
+        return FreezeOutcome(False, FREEZE_REFUSED_SNAPSHOT, BatchSnapshot(exists=False))
     async with session_maker() as session:
         async with session.begin():
             # 1. The editor's lock, taken first and held for the transaction.
@@ -1018,13 +1058,18 @@ async def freeze_batch(
             # it. Re-checked against THIS transaction's rows, so an approval for
             # four people cannot freeze a five-person snapshot.
             count = identity.recipient_count
-            if approved_recipient_count != count or approved_exposure_minor != UNIT_PRICE_MINOR * count:
+            if (
+                approved_recipient_count != count
+                or approved_exposure_minor != identity.contract.unit_price_minor * count
+            ):
                 return FreezeOutcome(False, FREEZE_REFUSED_APPROVAL, BatchSnapshot(exists=False))
 
             now = utcnow()
             header = EasyWeekVoucherProductionBatch(
                 batch_scope=PRODUCTION_SCOPE,
                 request_schema_version=identity.schema_version,
+                product_contract_version=identity.contract.version,
+                message_contract_code=identity.contract.message_code,
                 baseline_version=identity.baseline_version,
                 provider=PROVIDER_EASYWEEK,
                 company_id=identity.company_id,
@@ -1039,8 +1084,8 @@ async def freeze_batch(
                 voucher_template_uuid=uuid_module.UUID(identity.voucher_template_uuid),
                 frozen_digest=identity.frozen_digest,
                 recipient_count=count,
-                voucher_unit_price_minor=UNIT_PRICE_MINOR,
-                total_exposure_minor=UNIT_PRICE_MINOR * count,
+                voucher_unit_price_minor=identity.contract.unit_price_minor,
+                total_exposure_minor=identity.contract.unit_price_minor * count,
                 approved_recipient_count=approved_recipient_count,
                 approved_exposure_minor=approved_exposure_minor,
                 status=VOUCHER_PRODUCTION_FROZEN,
@@ -1073,7 +1118,7 @@ async def freeze_batch(
                         easyweek_customer_uuid=uuid_module.UUID(entry.easyweek_customer_uuid),
                         campaign_period_start=identity.campaign_period_start,
                         campaign_period_end=identity.campaign_period_end,
-                        voucher_value_minor=UNIT_PRICE_MINOR,
+                        voucher_value_minor=identity.contract.unit_price_minor,
                         voucher_quantity=1,
                         reconciliation_marker=entry.reconciliation_marker,
                         status=VOUCHER_PRODUCTION_ITEM_PLANNED,
@@ -1955,6 +2000,8 @@ def _stored_binding_material(header: EasyWeekVoucherProductionBatch, row: EasyWe
         batch_id=int(header.id),
         slot=int(row.slot),
         schema_version=header.request_schema_version,
+        product_contract_version=header.product_contract_version,
+        message_contract_code=header.message_contract_code,
         frozen_digest=header.frozen_digest,
         recipient_basis=row.recipient_basis,
         manual_policy=row.manual_policy,
