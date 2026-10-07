@@ -21,7 +21,8 @@ from altegio_bot.campaigns.easyweek_manual_recipient import prove_customer
 from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import _booking_customer_uuid
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_locations import configured_easyweek_locations
-from altegio_bot.easyweek_normalizer import NormalizedBooking
+from altegio_bot.easyweek_migration.customers import normalized_international_phone
+from altegio_bot.easyweek_normalizer import NormalizedBooking, normalize_event
 from altegio_bot.models.models import Client, EasyWeekEvent
 
 
@@ -36,14 +37,18 @@ async def lock_customer_phone(session, phone: str | None) -> None:
     await lock_workspace_identity(session)
 
 
-async def needs_uuid_resolution(session, booking: NormalizedBooking) -> bool:
+async def needs_uuid_resolution(session, booking: NormalizedBooking, *, existing_client: Client | None = None) -> bool:
     # No unconditional Karlsruhe/voucher prerequisite for ordinary ingestion.
-    conditions = or_(
-        Client.altegio_client_id == booking.customer_id,
-        (Client.company_id == booking.company_id) & Client.altegio_client_id.is_(None),
-    )
-    if booking.phone_e164:
-        conditions = or_(conditions, Client.phone_e164 == booking.phone_e164)
+    conditions = Client.altegio_client_id == booking.customer_id
+    # An absent-row creation may race a manual Add. A known numeric card does
+    # not become ambiguous merely because an unrelated manual card exists.
+    if existing_client is None:
+        conditions = or_(conditions, (Client.company_id == booking.company_id) & Client.altegio_client_id.is_(None))
+    phone = booking.phone_e164
+    if not booking.carries("phone_e164") and existing_client is not None:
+        phone = existing_client.phone_e164
+    if phone:
+        conditions = or_(conditions, Client.phone_e164 == phone)
     return bool(
         await session.scalar(
             select(Client.id)
@@ -75,7 +80,9 @@ def _customer_body(payload):
     return body if isinstance(body, dict) else None
 
 
-async def resolve_webhook_identity(session_factory, *, event_id: int, booking: NormalizedBooking, reader=None) -> bool:
+async def resolve_webhook_identity(
+    session_factory, *, event_id: int, booking: NormalizedBooking, reader=None, apply_stale_contact=None
+) -> bool:
     """Read independently, then recheck the bridge under identity/event locks."""
     registry = configured_easyweek_locations()
     location = registry.locations.get(booking.company_id) if registry.ready else None
@@ -86,6 +93,7 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
     if conflict:
         return False
     captured_phone = booking.phone_e164 if booking.carries("phone_e164") else None
+    proven_phone = captured_phone
     if captured_phone is None and known_uuid is None:
         return False
 
@@ -102,19 +110,27 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
         identity = uuid.UUID(customer_uuid)
         if known_uuid is not None and known_uuid != identity:
             return False
-        if captured_phone is not None:
-            proof, reason = await prove_customer(reader, phone=captured_phone, require_name=False)
-            if reason is not None or proof is None or proof.uuid != customer_uuid:
-                return False
-        else:
+        if known_uuid is not None:
+            # Numeric↔UUID already identifies this person independently of a
+            # historical phone snapshot. Prove today's contact on THAT UUID;
+            # never require an obsolete number to remain searchable forever.
             card = _customer_body(await reader.get_customer(customer_uuid))
             if card is None or str(uuid.UUID(card.get("uuid", ""))) != customer_uuid:
                 return False
-            if booking.carries("phone_e164") and (
-                "phone" not in card
-                or card["phone"] is not None
-                and (not isinstance(card["phone"], str) or card["phone"].strip() != "")
-            ):
+            if booking.carries("phone_e164"):
+                if "phone" not in card:
+                    return False
+                raw_phone = card["phone"]
+                proven_phone = normalized_international_phone(raw_phone)
+                if (
+                    proven_phone is None
+                    and raw_phone is not None
+                    and (not isinstance(raw_phone, str) or raw_phone.strip() != "")
+                ):
+                    return False
+        if proven_phone is not None:
+            proof, reason = await prove_customer(reader, phone=proven_phone, require_name=False)
+            if reason is not None or proof is None or proof.uuid != customer_uuid:
                 return False
     except Exception:
         return False
@@ -126,13 +142,26 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
         event = await session.scalar(select(EasyWeekEvent).where(EasyWeekEvent.id == event_id).with_for_update())
         if event is None or event.status != "captured" or event.booking_uuid != booking.booking_uuid:
             return False
+        if (
+            normalize_event(
+                event_hint=event.event_hint,
+                payload=event.payload,
+                body_truncated=bool(event.body_truncated),
+                location_registry=registry.locations,
+            )
+            != booking
+        ):
+            return False
+        stale_contact = captured_phone != proven_phone
+        if stale_contact and apply_stale_contact is None:
+            return False
         await lock_workspace_identity(session)
         current_uuid, conflict = await _known_binding(session, booking.customer_id)
         if conflict or current_uuid not in (None, identity) or known_uuid is not None and current_uuid != known_uuid:
             return False
         selectors = [Client.easyweek_customer_uuid == identity, Client.altegio_client_id == booking.customer_id]
-        if captured_phone is not None:
-            selectors.append(Client.phone_e164 == captured_phone)
+        if proven_phone is not None:
+            selectors.append(Client.phone_e164 == proven_phone)
         rows = list(
             (
                 await session.scalars(
@@ -147,8 +176,8 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
             if row.easyweek_customer_uuid == identity and row.altegio_client_id not in (None, booking.customer_id):
                 return False
             if (
-                captured_phone is not None
-                and row.phone_e164 == captured_phone
+                proven_phone is not None
+                and row.phone_e164 == proven_phone
                 and (
                     row.easyweek_customer_uuid not in (None, identity)
                     or row.altegio_client_id not in (None, booking.customer_id)
@@ -168,7 +197,7 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
             client.easyweek_customer_uuid = identity
             client.altegio_client_id = booking.customer_id
             if booking.carries("phone_e164"):
-                client.phone_e164 = booking.phone_e164
+                client.phone_e164 = proven_phone
             opted_out = next((row for row in rows if row.wa_opted_out), None)
             if opted_out is not None and not client.wa_opted_out:
                 client.wa_opted_out = True
@@ -182,7 +211,7 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
                     company_id=booking.company_id,
                     altegio_client_id=booking.customer_id,
                     easyweek_customer_uuid=identity,
-                    phone_e164=captured_phone,
+                    phone_e164=proven_phone,
                     display_name=booking.display_name,
                     raw={},
                     wa_opted_out=any(row.wa_opted_out for row in rows),
@@ -190,4 +219,9 @@ async def resolve_webhook_identity(session_factory, *, event_id: int, booking: N
                     wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
                 )
             )
+        if stale_contact:
+            # Consume the same event's business changes atomically with the
+            # proven contact. Otherwise the next pass would restore/re-prove
+            # its obsolete phone forever. Captured payload remains untouched.
+            await apply_stale_contact(session, event, proven_phone)
         return True

@@ -44,6 +44,7 @@ import logging
 import math
 import signal
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -627,7 +628,9 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     # A numeric hit does not override an independently proven UUID identity.
     # Re-prove outside this transaction before adopting a competing phone, and
     # never silently change the phone of a UUID-bound card.
-    if existing.easyweek_customer_uuid is None and await needs_uuid_resolution(session, booking):
+    if existing.easyweek_customer_uuid is None and await needs_uuid_resolution(
+        session, booking, existing_client=existing
+    ):
         raise UUIDIdentityResolutionRequired(booking)
     if booking.carries("phone_e164") and booking.phone_e164 != existing.phone_e164:
         if existing.easyweek_customer_uuid is not None:
@@ -2120,6 +2123,22 @@ async def apply_booking(
     client_present = booking.carries("customer_id")
     client = await upsert_client(session, booking) if client_present else None
     record = await upsert_record(session, booking, client, client_present=client_present, record=record)
+    reminder_client = client
+    if reminder_client is None and record.client_id is not None:
+        # Missing customer_id means preserve the established link, not "there
+        # is no client". Resolve only within this provider and branch before
+        # deciding whether the appointment still owes reminders.
+        reminder_client = await session.scalar(
+            select(Client)
+            .where(
+                Client.id == record.client_id,
+                Client.provider == PROVIDER,
+                Client.company_id == record.company_id,
+            )
+            .with_for_update()
+        )
+        if reminder_client is None:
+            raise NormalizationError(NormalizationError.IDENTITY_CONFLICT)
     # Flush so the record has its primary key before services and the job
     # reference it.
     await session.flush()
@@ -2138,7 +2157,7 @@ async def apply_booking(
     # just wrote, and inside the same transaction under the same lock: a
     # reminder queue that disagreed with the appointment it belongs to would be
     # the whole failure mode.
-    await sync_reminder_jobs(session, record=record, booking=booking, client=client)
+    await sync_reminder_jobs(session, record=record, booking=booking, client=reminder_client)
     # PR-12, after the reminders and under the same lock, for the same reason:
     # the comeback is decided from the Record we just wrote, and a withdrawal
     # that did not commit with the booking state that caused it would leave an
@@ -2155,7 +2174,9 @@ async def apply_booking(
     return record
 
 
-async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> None:
+async def process_claimed_event(
+    session: AsyncSession, event: EasyWeekEvent, *, proven_contact: tuple[str | None] | None = None
+) -> None:
     """Normalise and apply one already-claimed event.
 
     Runs inside the caller's transaction: the claim, the domain writes and the
@@ -2173,6 +2194,13 @@ async def process_claimed_event(session: AsyncSession, event: EasyWeekEvent) -> 
         body_truncated=bool(event.body_truncated),
         location_registry=registry.locations if registry.ready else {},
     )
+    if proven_contact is not None:
+        # Only the UUID resolver supplies this, while holding the same event
+        # and identity locks after independent proof. All business fields and
+        # the immutable captured payload retain their original meaning.
+        if booking is None or not booking.carries("phone_e164"):
+            raise NormalizationError(NormalizationError.IDENTITY_CONFLICT)
+        booking = replace(booking, phone_e164=proven_contact[0])
 
     if booking is None:
         # booking-succeeded. Terminal for the lifecycle — it never rewrites the
@@ -2751,7 +2779,31 @@ async def process_one() -> bool:
         if isinstance(exc, UUIDIdentityResolutionRequired):
             # The claim and all domain writes have rolled back. GETs must not
             # hold that transaction while proving the new UUID/numeric bridge.
-            if await resolve_webhook_identity(SessionLocal, event_id=transient_event_id, booking=exc.booking):
+            async def apply_stale_contact(session, event, phone):
+                if not settings.easyweek_processing_enabled:
+                    raise RecoverableCategoryConfigurationError("processing_disabled")
+                event.status = STATUS_PROCESSING
+                await process_claimed_event(session, event, proven_contact=(phone,))
+
+            try:
+                resolved = await resolve_webhook_identity(
+                    SessionLocal,
+                    event_id=transient_event_id,
+                    booking=exc.booking,
+                    apply_stale_contact=apply_stale_contact,
+                )
+            except RecoverableCategoryConfigurationError as proof_error:
+                await defer_for_configuration(transient_event_id, proof_error.reason)
+                return False
+            except Exception as proof_error:
+                # A business-write failure after contact proof rolls back the
+                # identity, event and jobs together, then uses ordinary retry.
+                logger.error(
+                    "easyweek event=%s identity_apply_error type=%s", transient_event_id, type(proof_error).__name__
+                )
+                await schedule_retry(transient_event_id)
+                return True
+            if resolved:
                 return True
             await schedule_retry(transient_event_id)
             return False
