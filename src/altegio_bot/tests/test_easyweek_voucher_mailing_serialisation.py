@@ -13,13 +13,25 @@ created after all. The scenario is scripted exactly as reported.
 compare-and-set that records ``provider_message_id`` no longer matched and the
 acceptance was lost — while the operation still reported success.
 
+**§45.4.** The stop a confirmation races is now TERMINAL on the fixed €10
+contract, so the pair has two orders rather than one outcome set, and each is
+pinned by its own test instead of being left to whichever order the machine
+happens to win. ``applied`` is not an acceptable result in either of them: the
+stop is durable before the executor is started, so a stage that went on to buy
+would be a violation, not an interleaving. ``stopped`` is not either — that is
+what the per-slot guard reports when a stop lands DURING a stage, and here the
+stage has not begun.
+
 Only EasyWeek and Meta are faked. The HTTP layer, the session, the CSRF check, the
 approvals, the operations, the per-item ledger and the executor are the real ones.
+Where an order has to be fixed, it is fixed by holding one real call at its entry
+until the other has committed — never by substituting a result.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from sqlalchemy import select
@@ -316,7 +328,61 @@ async def test_no_second_operation_is_admitted_while_one_is_queued(
     assert len([entry for entry in operations if entry.stage == "create"]) == 1
 
 
-async def test_concurrent_stop_and_confirm_never_both_win(
+# How long a gated order waits for the other request to reach its own entry. A
+# regression that stops routing through the gated call must FAIL here, loudly and
+# quickly, rather than hang a required CI job until the runner kills it.
+GATE_TIMEOUT = 30.0
+
+
+async def _reached(event: asyncio.Event, what: str) -> None:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=GATE_TIMEOUT)
+    except TimeoutError as error:  # pragma: no cover - only on a regression
+        raise AssertionError(f"{what} never reached its gate, so this order was not exercised") from error
+
+
+@contextlib.asynccontextmanager
+async def _gate(module: Any, name: str, release: asyncio.Event, arrived: asyncio.Event):
+    """Hold one real call at its entry until ``release`` is set.
+
+    The ordering control these two tests need, and nothing more: the wrapped
+    function is the real one, it is called with the real arguments, and its result
+    is returned untouched. Only WHEN it runs is decided here, which is what makes
+    "stop first" and "confirm first" reproducible instead of a coin toss the
+    machine wins differently on each run.
+
+    ``arrived`` fires as the gated call enters, so the other request can be
+    launched knowing this one is genuinely in flight — both requests are open at
+    the same time, against the same batch, exactly as two operators would be.
+    """
+    real = getattr(module, name)
+
+    async def gated(*args: Any, **kwargs: Any):
+        arrived.set()
+        await release.wait()
+        return await real(*args, **kwargs)
+
+    setattr(module, name, gated)
+    try:
+        yield
+    finally:
+        setattr(module, name, real)
+
+
+async def _assert_nothing_was_spent(session_maker, batch_id: int, mutator: FakeMutator) -> None:
+    """The invariant both orders share: a refused stage costs nothing, anywhere."""
+    assert mutator.calls == [], mutator.calls
+    for slot, row in (await _items(session_maker, batch_id)).items():
+        assert row.status == VOUCHER_PRODUCTION_ITEM_PLANNED, slot
+        assert row.create_claimed_at is None, slot
+        assert row.send_attempt_count == 0, slot
+        assert row.reconciliation_required is False, slot
+        assert row.voucher_code_hmac is None, slot
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+
+
+async def test_a_stop_committing_first_refuses_a_confirmation_already_in_flight(
     session_maker,
     production_configuration,
     binding_key,
@@ -324,36 +390,124 @@ async def test_concurrent_stop_and_confirm_never_both_win(
     ui_client,
     transports,
 ):
-    """Whichever order PostgreSQL picks, the pair is consistent.
+    """Order A of the §45.4 race, made deterministic: the stop reaches the batch first.
 
-    Either the confirmation landed first and the stop then blocks the claims, or the
-    stop landed first and the confirmation is refused. What must never happen is a
-    confirmed operation running with the stop considered lifted.
+    The confirmation is a real request, already inside its transaction and holding
+    its approval row, when the stop commits. It must be refused outright — the
+    terminal stop is not something a confirmation that was already under way gets
+    to outrun — and no operation may be queued for an executor to pick up.
     """
     count = 3
     run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
-    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(i) for i in range(count)]))
+    mutator = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
+    transports.use(reader=reader, mutator=mutator)
     offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
 
-    confirm_result, _stop_result = await asyncio.gather(
-        _confirm(ui_client, offer),
-        ui_client.post(STOP_URL, json={"batch_id": batch_id}),
-    )
-    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
-    confirm_status, _ = confirm_result
+    confirm_arrived = asyncio.Event()
+    stop_committed = asyncio.Event()
+
+    async def drive_stop():
+        # Only once the confirmation is provably in flight at its admission read.
+        await _reached(confirm_arrived, "the confirmation")
+        response = await ui_client.post(STOP_URL, json={"batch_id": batch_id})
+        stop_committed.set()
+        return response
+
+    # The confirmation's admission read is what the stop has to beat, so that is
+    # where it waits. Its approval row lock is held throughout; the stop takes the
+    # batch header's lock, which is why the two can interleave at all.
+    async with _gate(ledger_module, "admission_locked", stop_committed, confirm_arrived):
+        confirm_result, stop_response = await asyncio.gather(_confirm(ui_client, offer), drive_stop())
+
+    stop_body = stop_response.json()
+    assert stop_body["stop_active"] is True and stop_body["stop_terminal"] is True
+    confirm_status, confirm_body = confirm_result
+    assert confirm_status == 409, confirm_body
+    assert confirm_body["reasons"] == ["voucher_production_stop_terminal"]
+
+    # Nothing was queued, so there is nothing for the executor to do.
+    operations = await operations_module.list_operations(session_maker, batch_id=batch_id)
+    assert [entry for entry in operations if entry.stage == "create"] == []
+    assert await worker_module.run_once(session_maker, owner="test-executor") is None
+    await _assert_nothing_was_spent(session_maker, batch_id, mutator)
+
+    # The approval is spent by nothing and is not a second chance either: a fresh
+    # plan for any spending stage is refused too.
+    stale = await operations_module.load_approval(session_maker, approval_id=offer["approval"]["approval_id"])
+    assert stale is not None and stale.pending is True
+    for stage in ("create", "pay", "deliver"):
+        again = await _plan(ui_client, stage=stage, preview_run_id=run_id, batch_id=batch_id)
+        assert not again["ready"], stage
+        assert "voucher_production_stop_terminal" in again["reasons"], stage
+
+
+async def test_a_confirmation_committing_first_is_still_refused_by_the_executor(
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+):
+    """Order B of the same race, and the one the old test got wrong.
+
+    It allowed ``applied`` here, which cannot be right: the stop is durable before
+    the executor is ever started, so a stage that went on to buy three vouchers
+    would be a §45.4 violation rather than an accepted interleaving. It also
+    allowed ``stopped``, which the per-slot guard produces when a stop lands DURING
+    a stage — not when the stage has not begun.
+
+    What actually happens, and what is asserted: the queued operation is refused as
+    a whole, because the executor rebuilds the plan live and the plan sees the
+    terminal stop. Nothing is claimed and nothing is bought.
+    """
+    count = 3
+    run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
+    mutator = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
+    transports.use(reader=reader, mutator=mutator)
+    offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
+
+    stop_arrived = asyncio.Event()
+    confirm_committed = asyncio.Event()
+
+    async def drive_confirm():
+        # Only once the stop request is provably in flight at its own write.
+        await _reached(stop_arrived, "the stop")
+        result = await _confirm(ui_client, offer)
+        confirm_committed.set()
+        return result
+
+    async with _gate(ledger_module, "request_stop", confirm_committed, stop_arrived):
+        confirm_result, stop_response = await asyncio.gather(
+            drive_confirm(), ui_client.post(STOP_URL, json={"batch_id": batch_id})
+        )
+
+    confirm_status, confirm_body = confirm_result
+    assert confirm_status == 200, confirm_body
+    stop_body = stop_response.json()
+    assert stop_body["stop_active"] is True and stop_body["stop_terminal"] is True
+
+    # The operation really was queued — this order is not the other one in disguise.
+    operations = await operations_module.list_operations(session_maker, batch_id=batch_id)
+    assert len([entry for entry in operations if entry.stage == "create"]) == 1
 
     finished = await worker_module.run_once(session_maker, owner="test-executor")
-    if confirm_status == 409:
-        # The stop won admission: nothing was queued at all.
-        assert finished is None
-        assert state.active is True
-    else:
-        # The confirmation won admission. The stop then governs the claims, so the
-        # stage either stops immediately or runs — never half of each inconsistently.
-        assert finished is not None
-        assert finished.outcome_code in ("stopped", "applied")
-        if finished.outcome_code == "stopped":
-            assert all(row.create_claimed_at is None for row in (await _items(session_maker, batch_id)).values())
+    assert finished is not None
+    assert finished.outcome_code == "refused", finished.result
+    assert finished.status == "refused"
+    assert finished.finished_at is not None
+    assert "voucher_production_stop_terminal" in (finished.reason_codes or [])
+    # Terminal, and specifically not the two outcomes the old expectation allowed.
+    assert finished.outcome_code not in ("applied", "stopped")
+    await _assert_nothing_was_spent(session_maker, batch_id, mutator)
+
+    # And the refusal is not a licence to try again from anywhere.
+    assert await worker_module.run_once(session_maker, owner="test-executor") is None
+    for stage in ("create", "pay", "deliver"):
+        again = await _plan(ui_client, stage=stage, preview_run_id=run_id, batch_id=batch_id)
+        assert not again["ready"], stage
+        assert "voucher_production_stop_terminal" in again["reasons"], stage
+    await _assert_nothing_was_spent(session_maker, batch_id, mutator)
 
 
 async def test_a_stop_does_not_permanently_block_status_or_reconcile_or_refund(
