@@ -1044,6 +1044,12 @@ console.log(JSON.stringify({
 
 _COMPOSITION_FUNCTIONS = (
     "reasonLabel",
+    "compositionReasonLabel",
+    "compositionBlockers",
+    "stateRowClass",
+    "stateCell",
+    "nameSourceNote",
+    "excludeCell",
     "basisLabel",
     "renderOffer",
     "renderComposition",
@@ -1066,6 +1072,8 @@ let OFFER = null;
 let COMPOSITION = null;
 let COMPOSITION_NOTE = null;
 let COMPOSITION_STALE = false;
+let COMPOSITION_FREEZABLE = true;
+let COMPOSITION_BUSY = false;
 const PANELS = {};
 globalThis.document = {
   getElementById: (id) => (PANELS[id] = PANELS[id] || {

@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -135,6 +135,13 @@ class CompositionRequest(BaseModel):
     preview_run_id: int
 
 
+class ExcludeRecipientRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_run_id: int = Field(gt=0)
+    campaign_recipient_id: int = Field(gt=0)
+
+
 class RecipientCheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -209,6 +216,11 @@ def _principal_or_error(request: Request) -> tuple[operations_module.OpsPrincipa
         operations_module.OpsPrincipal(account=account, session_fingerprint=fingerprint),
         None,
     )
+
+
+# Diagnostic answers name real people. They are for one authenticated operator, in
+# one moment, and must not sit in a shared cache or a browser's back/forward store.
+_PRIVATE_HEADERS: Final = {"Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache"}
 
 
 def _executor_available() -> bool:
@@ -511,7 +523,51 @@ async def api_composition(request: Request, payload: CompositionRequest) -> JSON
     if refusal is not None or principal is None:
         return refusal or _session_error(OpsSessionError("ops_session_invalid"))
     view = await dispatch_module.inspect_composition(SessionLocal, preview_run_id=payload.preview_run_id)
-    return JSONResponse(status_code=200, content=view.as_ui_dict())
+    return JSONResponse(status_code=200, content=view.as_ui_dict(), headers=_PRIVATE_HEADERS)
+
+
+@router.post("/api/exclude-recipient")
+async def api_exclude_recipient(request: Request, payload: ExcludeRecipientRequest) -> JSONResponse:
+    """Soft-remove one recipient from the preview being checked. Reaches nobody.
+
+    Its own narrow endpoint, behind this module's ``_principal_or_error`` — Ops
+    session, CSRF and same-origin — rather than the older campaigns route, whose
+    protection contour is a different story and was never reviewed for use as a
+    privileged path from this page.
+
+    The browser sends two integers and nothing else: no UUID, no identity proof and
+    no claim that a check succeeded. None of those would be permission, and
+    accepting them would make the page's state an input to an authorisation
+    decision. Everything that decides this is read on the server, under the run's
+    row lock.
+
+    It changes one preview's composition. No Client, EasyWeek customer, booking,
+    voucher, order, ledger row or entitlement is touched, and no stage is started.
+    """
+    principal, refusal = _principal_or_error(request)
+    if refusal is not None or principal is None:
+        return refusal or _session_error(OpsSessionError("ops_session_invalid"))
+    try:
+        outcome = await dispatch_module.exclude_recipient(
+            SessionLocal,
+            preview_run_id=payload.preview_run_id,
+            campaign_recipient_id=payload.campaign_recipient_id,
+            principal=principal,
+        )
+    except SQLAlchemyError:
+        # The database, not a decision. Answered as a 503 with no verdict, so the
+        # page reports an unknown result and offers a re-read instead of claiming
+        # the person was or was not excluded.
+        return JSONResponse(
+            status_code=503,
+            content={"applied": False, "reason": "voucher_production_database_unavailable"},
+            headers=_PRIVATE_HEADERS,
+        )
+    return JSONResponse(
+        status_code=200 if outcome.applied else 409,
+        content=outcome.as_ui_dict(),
+        headers=_PRIVATE_HEADERS,
+    )
 
 
 async def _recipient_request(request: Request, schema: type[BaseModel]) -> BaseModel | None:
@@ -608,6 +664,7 @@ async def api_recipients(batch_id: int) -> JSONResponse:
     return JSONResponse(
         status_code=200,
         content={"batch_id": batch_id, "recipients": [line.as_ui_dict() for line in lines]},
+        headers=_PRIVATE_HEADERS,
     )
 
 
@@ -841,12 +898,24 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
   Состав редактируется в <a href="/ops/campaigns/{preview_run_id}">редакторе preview</a>:
   там добавляют и исключают получателей. После фиксации состав меняться не может.
 </div>
-<div id="composition-panel" class="card mb-3">
+<style>
+  /* The spinner only decorates the sentence beside it, so switching the animation
+     off leaves a complete indicator rather than a silent one. */
+  @media (prefers-reduced-motion: reduce) {{
+    #composition-status .spinner-border {{ animation: none; border-right-color: currentColor; }}
+  }}
+</style>
+<div id="composition-panel" class="card mb-3" aria-busy="false">
   <div class="card-header">Состав и сумма</div>
   <div class="card-body">
     <button id="btn-load" class="btn btn-outline-primary btn-sm" onclick="loadComposition()">
       Проверить состав
     </button>
+    <!-- The running state, as text, announced on its own: role=status plus
+         aria-live means a screen reader hears "Проверяем состав…" without the
+         focus moving, and aria-busy on the panel says the numbers below are
+         not current. -->
+    <div id="composition-status" class="mt-2" role="status" aria-live="polite" aria-atomic="true"></div>
     <div id="composition-summary" class="mt-3"></div>
     <div id="composition-slots" class="mt-3"></div>
   </div>
@@ -932,9 +1001,12 @@ function loadComposition() {{
 }}
 
 function planFreeze() {{
-  if (COMPOSITION === null || COMPOSITION_STALE) {{
-    /* Review F1: the numbers are only meaningful against a list that was actually
-       proven. Nothing on screen may stand in for that check. */
+  if (COMPOSITION_BUSY) return;
+  if (COMPOSITION === null || COMPOSITION_STALE || !COMPOSITION_FREEZABLE) {{
+    /* Review F1, and now the shown-but-refused case: the numbers are only
+       meaningful against a list that was actually proven IN FULL. A composition
+       displayed so the operator can find the failing row is not a permission, and
+       there is no automatic "allowed subset" to fall back on. */
     setAlert("warning", "Сначала проверьте состав — показанные данные не подтверждены.");
     return;
   }}
@@ -1266,17 +1338,29 @@ function mayRefund(item) {
    and the confirmation then told the operator "Отказ: неизвестно" about a stage that
    was at that moment queued in the database. An absent decision is not a refusal,
    and this is where the two stop being confused. */
-async function postJson(path, payload) {
+/* ``options.timeoutMs`` bounds the wait and is passed ONLY by reads. A stage
+   mutation never gets one: giving up on its answer would turn "the server may have
+   acted" into a screen that looks decided, which is the one thing this phase never
+   does. And even for a read, an aborted request is reported as no answer — the
+   browser stopping listening is not the server stopping work. */
+async function postJson(path, payload, options) {
+  const timeoutMs = (options && options.timeoutMs) || 0;
+  const controller = timeoutMs > 0 && typeof AbortController === "function" ? new AbortController() : null;
+  const timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
   let response = null;
   try {
     response = await fetch(path, {
       method: "POST",
       headers: {"Content-Type": "application/json", "X-Ops-CSRF": CSRF},
       credentials: "same-origin",
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: controller ? controller.signal : undefined
     });
   } catch (err) {
-    return {status: 0, transport: true, undecided: true, structured: false, data: {}};
+    const timedOut = controller !== null && controller.signal.aborted;
+    return {status: 0, transport: true, undecided: true, structured: false, timedOut: timedOut, data: {}};
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
   let data = null;
   let readable = true;
@@ -1290,6 +1374,7 @@ async function postJson(path, payload) {
     transport: false,
     undecided: undecided,
     structured: structured,
+    timedOut: false,
     data: structured ? data : {}
   };
 }
@@ -1299,7 +1384,22 @@ async function postJson(path, payload) {
    came back that says nothing — a gateway's error page, a body that stops half way.
    Neither is a decision, and neither is reported as one. */
 function undecidedLabel(result) {
+  if (result.timedOut) {
+    /* Deliberately not "проверка остановлена": this browser stopped waiting, and
+       what the server did with the request is not something the abort established. */
+    return "Ответ не получен за отведённое время";
+  }
   return result.transport ? "Ответ не получен" : "Ответ сервера не распознан";
+}
+
+/* Why a DECIDED answer still refuses this operator. Separated from `undecided`,
+   because these have an action attached: log in again, wait, or read the reason. */
+function refusalLabel(result) {
+  if (result.status === 401 || result.status === 403) {
+    return "Сессия Ops недействительна или запрос отклонён проверкой origin/CSRF. Войдите заново.";
+  }
+  if (result.status === 429) return "Слишком много запросов. Подождите и повторите проверку.";
+  return null;
 }
 
 /* Which of the three a CONFIRMATION answer is. Anything short of a complete,
@@ -1353,51 +1453,159 @@ let COMPOSITION_NOTE = null;
    arrived. Said on the panel, and the freeze waits for a fresh check. */
 let COMPOSITION_STALE = false;
 
+/* Whether the audience on screen is one a freeze may be built on. Separate from
+   "is there an audience on screen at all", which is `COMPOSITION`: a refused
+   composition is now SHOWN, because the operator has to see which row failed, and
+   showing it must never be mistaken for permission to freeze it. */
+let COMPOSITION_FREEZABLE = false;
+
+/* Which state the screen is in. Every answer carries the epoch it was asked in,
+   and an answer from an older epoch is dropped: a slow check that lands after the
+   operator excluded somebody, or after a newer check, must not restore the list it
+   was reading — removed row, old numbers, old confirmation and all. */
+let COMPOSITION_EPOCH = 0;
+let COMPOSITION_BUSY = false;
+
+/* A read, so it may be given up on. 20 seconds is longer than the live proof of a
+   realistic list and short enough that a hung connection does not leave an operator
+   watching a spinner with no way out. */
+const COMPOSITION_READ_TIMEOUT_MS = 20000;
+
 function compositionDigest() {
   return (COMPOSITION && COMPOSITION.composition_digest) || null;
+}
+
+/* The actions that must not compete with a running check or with each other. The
+   server re-checks everything independently; this only stops an operator starting a
+   second thing while the first is still deciding what the audience is. */
+function setCompositionBusy(busy, label) {
+  COMPOSITION_BUSY = busy;
+  const panel = document.getElementById("composition-panel");
+  if (panel) panel.setAttribute("aria-busy", busy ? "true" : "false");
+  const area = document.getElementById("composition-status");
+  if (area) {
+    area.innerHTML = busy
+      /* The text is the indicator; the spinner only decorates it. Under reduced
+         motion the animation is switched off in CSS and this still reads correctly,
+         and a screen reader gets it through role=status on the container. */
+      ? '<span class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span>' +
+        '<span id="composition-progress">' + escapeHtml(label || "Проверяем состав…") + "</span>"
+      : "";
+  }
+  for (const id of ["btn-load", "btn-plan-freeze", "btn-confirm"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = busy;
+  }
+  for (const button of document.querySelectorAll("button[data-exclude-recipient]")) {
+    button.disabled = busy;
+  }
+}
+
+/* The shown result stops being an authorisation, right now, before any answer is
+   waited for. Called when a check starts and when a recipient is excluded: in both
+   cases what is on screen describes a composition that no longer exists. */
+function invalidateShownComposition() {
+  /* The running state belongs to the epoch that started it, and this IS the screen
+     moving on — so it ends here. Without this, an answer dropped for being stale
+     would leave the panel marked busy and its controls disabled with nothing left
+     to clear them: the caller that starts work turns it back on immediately, and a
+     caller that only invalidates leaves a usable screen behind. */
+  setCompositionBusy(false);
+  COMPOSITION_EPOCH += 1;
+  COMPOSITION_FREEZABLE = false;
+  COMPOSITION_STALE = COMPOSITION !== null;
+  OFFER = null;
+  hideConfirm();
+  const panel = document.getElementById("freeze-panel");
+  if (panel) panel.classList.add("d-none");
+  const hint = document.getElementById("approval-hint");
+  if (hint) hint.textContent = "";
+  renderComposition();
+  return COMPOSITION_EPOCH;
 }
 
 /* Review R3, and now F1: this proves and SHOWS the audience, authorises nothing,
    and is the only thing that may fill the composition panel. */
 async function inspectComposition() {
-  const result = await postJson("/ops/voucher-mailings/api/composition",
-    {preview_run_id: PREVIEW_RUN_ID});
-  /* Checking the list must never arm the confirmation. */
-  OFFER = null;
-  hideConfirm();
+  /* One check at a time. A second press while the first is deciding would race two
+     answers onto one screen, and the later one is not reliably the newer one. */
+  if (COMPOSITION_BUSY) return;
+  /* Before anything is awaited: the old result stops being an authorisation and the
+     confirmation dialog goes away. An operator must never be able to confirm against
+     a list that is currently being re-read. */
+  const epoch = invalidateShownComposition();
+  setCompositionBusy(true, "Проверяем состав…");
+  setAlert("secondary", "Проверяем состав…");
+  let result = null;
+  try {
+    result = await postJson("/ops/voucher-mailings/api/composition",
+      {preview_run_id: PREVIEW_RUN_ID}, {timeoutMs: COMPOSITION_READ_TIMEOUT_MS});
+  } finally {
+    /* Whatever happened — success, refusal, 429, 5xx, unreadable body, lost network,
+       timeout — the screen stops saying it is working. Only the check that still owns
+       the screen clears it, so a late answer cannot unlock a newer one's controls. */
+    if (epoch === COMPOSITION_EPOCH) setCompositionBusy(false);
+  }
+  /* The screen moved on: a newer check, or an exclusion. This answer describes an
+     audience that is no longer the question, so it is dropped entirely. */
+  if (epoch !== COMPOSITION_EPOCH) return;
+
   const panel = document.getElementById("freeze-panel");
   if (result.undecided) {
-    /* No answer is not an empty audience — and neither is an error page or a body
-       that stops half way. What was read earlier stays on screen, marked:
-       overwriting it with zeros would turn a lost connection into a mailing that
-       looks like it has nobody in it. */
+    /* No answer is not an empty audience — and neither is an error page, a body
+       that stops half way, or a wait this browser gave up on. What was read earlier
+       stays on screen, marked: overwriting it with zeros would turn a lost
+       connection into a mailing that looks like it has nobody in it. */
     if (panel) panel.classList.add("d-none");
     COMPOSITION_STALE = COMPOSITION !== null;
     renderComposition();
     setAlert("danger", undecidedLabel(result) + ": состав не прочитан. Повторите проверку.");
     return;
   }
-  const data = result.data || {};
-  if (!data.composition_proven) {
+  const refused = refusalLabel(result);
+  if (refused !== null) {
     if (panel) panel.classList.add("d-none");
-    const reasons = (data.reasons || []).map(reasonLabel).join(", ");
-    const note = reasons
-      ? "Состав нельзя зафиксировать: " + reasons
-      : "Состав пуст.";
-    /* A refusal is not a composition, so it does not become one. */
     COMPOSITION_STALE = COMPOSITION !== null;
-    COMPOSITION_NOTE = COMPOSITION === null ? note : null;
     renderComposition();
-    setAlert("warning", note);
+    setAlert("danger", refused);
     return;
   }
+  const data = result.data || {};
+  if (data.composition_known === false) {
+    /* The fence is shut, or EasyWeek or the database could not be reached. The
+       answer contains no audience, so it must not replace the one on screen. */
+    if (panel) panel.classList.add("d-none");
+    COMPOSITION_STALE = COMPOSITION !== null;
+    COMPOSITION_NOTE = COMPOSITION === null
+      ? "Актуальный состав неизвестен: " + ((data.blockers || data.reasons || []).map(reasonLabel).join(", ")
+        || "проверка не выполнена")
+      : null;
+    renderComposition();
+    setAlert("danger", "Актуальный состав неизвестен. Повторите проверку.");
+    return;
+  }
+
+  /* A refused composition IS shown from here on. The whole point of this screen is
+     that an operator can see WHICH row failed and why — a single global error with
+     no list was the defect. What a refusal still does not do is arm the freeze. */
   COMPOSITION = data;
   COMPOSITION_NOTE = null;
   COMPOSITION_STALE = false;
+  COMPOSITION_FREEZABLE = data.composition_proven === true;
   renderComposition();
-  if (panel) panel.classList.remove("d-none");
-  prefillApprovalFields(data);
-  setAlert("info", "Состав проверен. Подтвердите количество и сумму.");
+  if (COMPOSITION_FREEZABLE) {
+    if (panel) panel.classList.remove("d-none");
+    prefillApprovalFields(data);
+    setAlert("info", "Состав проверен. Подтвердите количество и сумму.");
+    return;
+  }
+  if (panel) panel.classList.add("d-none");
+  const problems = Number(data.refused_count || 0) + Number(data.unchecked_count || 0);
+  const summary = problems > 0
+    ? "Проверку не прошли получателей: " + problems + ". Причины показаны в таблице."
+    : "Состав нельзя зафиксировать: " + ((data.blockers || data.reasons || []).map(reasonLabel).join(", ")
+      || "состав пуст");
+  setAlert("warning", summary);
 }
 
 /* The plan's own view of the audience: PII-free, and authoritative about its SIZE
@@ -1413,6 +1621,7 @@ function plannedComposition(offer) {
    are, not only in the alert area, because the numbers are what gets believed. */
 function markCompositionStale(text) {
   COMPOSITION_STALE = true;
+  COMPOSITION_FREEZABLE = false;
   renderComposition();
   const hint = document.getElementById("approval-hint");
   if (hint) hint.textContent = "";
@@ -1522,18 +1731,35 @@ function renderComposition() {
       "Эти данные могли измениться после проверки. Нажмите «Проверить состав» заново." +
       "</div>"
     : "";
+  const problems = Number(data.refused_count || 0) + Number(data.unchecked_count || 0);
   if (summary) {
+    /* The money for what is SHOWN, labelled as such. A problematic composition has
+       a cost on screen and that cost is not an approved amount: the freeze takes the
+       operator's own statement and re-proves the whole audience first. */
+    const moneyRow = problems > 0
+      ? "<tr><th>Сумма показанного состава</th><td id=\"c-total\">" +
+        escapeHtml(moneyLabel(data.total_exposure_minor)) +
+        "</td></tr><tr><th></th><td class=\"small text-muted\" id=\"c-total-note\">" +
+        "Это не разрешённая сумма: зафиксировать можно только состав, прошедший проверку полностью." +
+        "</td></tr>"
+      : "<tr><th>Общая сумма</th><td id=\"c-total\">" +
+        escapeHtml(moneyLabel(data.total_exposure_minor)) + "</td></tr>";
     summary.innerHTML = stale +
       "<table class=\"table table-sm w-auto\">" +
       "<tr><th>Период кампании</th><td id=\"c-period\">" +
       escapeHtml(data.campaign_period || "—") + "</td></tr>" +
       "<tr><th>Получателей</th><td id=\"c-count\">" +
       Number(data.recipient_count || 0) + "</td></tr>" +
-      "<tr><th>Общая сумма</th><td id=\"c-total\">" +
-      escapeHtml(moneyLabel(data.total_exposure_minor)) + "</td></tr>" +
+      "<tr><th>Активных строк preview</th><td id=\"c-observed\">" +
+      Number(data.observed_active_count || 0) + "</td></tr>" +
+      "<tr><th>Прошли проверку</th><td id=\"c-proven\">" +
+      Number(data.proven_count || 0) + "</td></tr>" +
+      "<tr><th>Не прошли / не проверены</th><td id=\"c-problems\">" +
+      Number(data.refused_count || 0) + " / " + Number(data.unchecked_count || 0) + "</td></tr>" +
+      moneyRow +
       "<tr><th>На одного</th><td>" +
       escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>" +
-      "</table>";
+      "</table>" + compositionBlockers(data);
   }
   if (slotsArea) {
     const people = data.recipients || [];
@@ -1541,19 +1767,192 @@ function renderComposition() {
     for (const person of people) {
       /* The ordinal and the preview row are different things and both are shown:
          confusing them would point an action at the wrong person (review R7). */
-      rows += "<tr><td>" + escapeHtml(person.slot) + "</td><td>" +
-        escapeHtml(person.display_name) + "</td><td>" +
+      rows += "<tr class=\"" + escapeHtml(stateRowClass(person)) + "\">" +
+        "<td>" + escapeHtml(person.slot) + "</td><td>" +
+        escapeHtml(person.display_name) + nameSourceNote(person) + "</td><td>" +
         "<a href=\"/ops/campaigns/" + encodeURIComponent(person.preview_run_id) +
         "/recipients\" target=\"_blank\">#" + escapeHtml(person.campaign_recipient_id) + "</a></td><td>" +
-        escapeHtml(basisLabel(person)) + "</td><td>" +
-        escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>";
+        escapeHtml(basisLabel(person)) + "</td><td>" + stateCell(person) + "</td><td>" +
+        escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td><td>" +
+        excludeCell(person) + "</td></tr>";
     }
     slotsArea.innerHTML = rows
       ? "<table class=\"table table-sm w-auto\" id=\"composition-table\"><thead><tr><th>№</th>" +
         "<th>Клиент</th><th>Строка preview</th><th>Основание / политика</th>" +
-        "<th>Сумма</th></tr></thead><tbody>" + rows + "</tbody></table>"
+        "<th>Состояние</th><th>Сумма</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>"
       : "<p class=\"text-muted\">Состав пуст.</p>";
   }
+}
+
+/* The blockers that belong to the BATCH, listed where they cannot be mistaken for
+   one person's problem. Never attached to a row: attributing a shared refusal to
+   whichever client happened to be first is how an operator excludes the wrong one. */
+function compositionBlockers(data) {
+  const blockers = data.blockers || [];
+  if (!blockers.length) return "";
+  let items = "";
+  for (const code of blockers) {
+    items += "<li>" + escapeHtml(compositionReasonLabel(code)) +
+      " <code>" + escapeHtml(code) + "</code></li>";
+  }
+  return '<div class="alert alert-warning py-2" id="composition-blockers">' +
+    "<b>Общие причины отказа, не отнесённые к одной строке:</b><ul class=\"mb-0 mt-1\">" +
+    items + "</ul></div>";
+}
+
+/* Three states, three appearances — and specifically no green for a row nobody
+   checked. A table that coloured "unchecked" like "proven" would be telling the
+   operator the opposite of what happened. */
+function stateRowClass(person) {
+  if (person.state === "refused") return "table-danger";
+  if (person.state === "unchecked") return "table-warning";
+  return "";
+}
+
+function stateCell(person) {
+  if (person.state === "proven") {
+    return '<span class="text-success">Проверен</span>';
+  }
+  const label = person.state === "unchecked" ? "Не проверен" : "Не прошёл проверку";
+  const reasons = person.reasons || [];
+  let detail = "";
+  for (const code of reasons) {
+    /* The readable explanation first, the technical code after it: the operator acts
+       on the sentence, and the code is what goes into a ticket. */
+    detail += "<div class=\"small\">" + escapeHtml(compositionReasonLabel(code)) +
+      " <code>" + escapeHtml(code) + "</code></div>";
+  }
+  if (!reasons.length && person.state === "unchecked") {
+    detail = "<div class=\"small text-muted\">Проверка остановилась раньше этой строки.</div>";
+  }
+  return "<b>" + escapeHtml(label) + "</b>" + detail;
+}
+
+/* Where the name came from, when it did not come from a proof. Shown so nobody
+   reads a preview value as evidence that this person was identified. */
+function nameSourceNote(person) {
+  return person.name_from_preview
+    ? ' <span class="small text-muted">(из preview, не из проверки личности)</span>'
+    : "";
+}
+
+/* The button carries the preview row id and NOTHING else — not the name, not a
+   proof, not a "this was checked" flag. The name for the confirmation is looked up
+   from the shown composition at press time, so no customer data is ever embedded in
+   an HTML attribute or an inline handler. */
+function excludeCell(person) {
+  if (person.state === "proven") return "";
+  const id = Number(person.campaign_recipient_id);
+  if (!Number.isInteger(id) || id <= 0) return "";
+  return '<button type="button" class="btn btn-outline-danger btn-sm" data-exclude-recipient="' +
+    String(id) + '" onclick="excludeRecipient(' + String(id) + ')">Исключить из этого preview</button>';
+}
+
+/* The row the shown composition holds for this preview id, or null. */
+function shownRecipient(recipientId) {
+  const people = (COMPOSITION && COMPOSITION.recipients) || [];
+  for (const person of people) {
+    if (Number(person.campaign_recipient_id) === Number(recipientId)) return person;
+  }
+  return null;
+}
+
+/* Soft-remove one recipient from THIS preview, from the row the operator is looking
+   at. The client card is not deleted and nothing about a voucher is touched — the
+   confirmation says so, because "исключить" could otherwise be read as "удалить". */
+async function excludeRecipient(recipientId) {
+  if (COMPOSITION_BUSY) return;
+  const person = shownRecipient(recipientId);
+  const who = person ? person.display_name : "строка preview #" + recipientId;
+  if (!window.confirm(
+      "Исключить получателя из этого preview?\n\n"
+      + who + " (строка preview #" + recipientId + ")\n\n"
+      + "Карточка клиента не удаляется, записи и ваучеры не затрагиваются —"
+      + " меняется только состав этого preview.\n\n"
+      + "После исключения нужно будет заново проверить состав: показанный результат"
+      + " и подтверждение количества перестанут действовать.")) {
+    return;
+  }
+  /* The shown result stops being an authorisation before the request is even sent,
+     so a slow answer cannot leave a confirmable list on screen. */
+  const epoch = invalidateShownComposition();
+  setCompositionBusy(true, "Исключаем получателя…");
+  let result = null;
+  try {
+    result = await postJson("/ops/voucher-mailings/api/exclude-recipient",
+      {preview_run_id: PREVIEW_RUN_ID, campaign_recipient_id: Number(recipientId)});
+  } finally {
+    if (epoch === COMPOSITION_EPOCH) setCompositionBusy(false);
+  }
+  if (epoch !== COMPOSITION_EPOCH) return;
+
+  if (result.undecided) {
+    /* A mutation whose answer was lost. It may well have been applied, so neither
+       outcome is claimed and the operator is sent to re-read the composition. */
+    setAlert("warning", undecidedLabel(result) +
+      ": неизвестно, применено ли исключение. Проверьте состав заново.");
+    return;
+  }
+  const refused = refusalLabel(result);
+  if (refused !== null) {
+    setAlert("danger", refused);
+    return;
+  }
+  const data = result.data || {};
+  if (data.applied !== true) {
+    setAlert("warning", compositionReasonLabel(data.reason || "") ||
+      "Исключение не выполнено.");
+    return;
+  }
+  setAlert("info", data.already_excluded
+    ? "Получатель уже был исключён. Проверьте состав заново."
+    : "Получатель исключён из preview. Проверьте состав заново — количество и сумма изменились.");
+}
+
+/* One reason code, in the operator's words. The composition codes an operator can
+   actually meet on this screen; anything else falls through to the shared labels and
+   then to the raw code, which is still more useful than inventing a sentence. */
+function compositionReasonLabel(code) {
+  /* The table lives inside the function so the shipped source of this one answer is
+     one self-contained unit: the page, and the test that executes it in node, read
+     exactly the same bytes. */
+  const labels = {
+  "manual_recipient_identity_conflict":
+    "Локальная карточка клиента не подтверждает филиал или привязку — проверьте карточку Karlsruhe",
+  "manual_recipient_local_client_ambiguous":
+    "На этот телефон приходится несколько EasyWeek-карточек — неясно, кому отправлять",
+  "manual_recipient_opted_out": "Клиент отказался от сообщений WhatsApp",
+  "manual_recipient_branch_assignment_required": "Нужно явное назначение филиала Karlsruhe",
+  "manual_recipient_history_nonempty": "В EasyWeek есть записи — политика «ноль записей» не выполнена",
+  "manual_recipient_history_unproven": "Историю записей EasyWeek не удалось прочитать полностью",
+  "voucher_production_recipient_unproven": "Получателя не удалось доказать по текущим данным",
+  "voucher_production_recipient_basis_unsupported": "Основание получателя не поддерживается этим контрактом",
+  "voucher_production_recipient_not_candidate": "Строка preview больше не активный кандидат",
+  "voucher_production_recipient_opted_out": "Клиент отказался от сообщений WhatsApp",
+  "voucher_production_customer_uuid_missing": "У получателя нет подтверждённого EasyWeek-клиента",
+  "voucher_production_customer_identity_not_current": "EasyWeek-клиент изменился после добавления в preview",
+  "voucher_production_customer_phone_not_current": "Телефон в EasyWeek не совпадает с телефоном получателя",
+  "voucher_production_customer_name_missing": "В EasyWeek нет пригодного имени для сообщения",
+  "voucher_production_customer_ambiguous": "Поиск в EasyWeek вернул несколько клиентов",
+  "voucher_production_customer_lookup_undetermined": "Поиск клиента в EasyWeek не дал однозначного ответа",
+  "voucher_production_local_client_unproven": "Локальная карточка не совпадает со строкой preview",
+  "voucher_production_live_guard_uncertain": "Живая проверка не дала определённого ответа",
+  "voucher_production_composition_duplicate_customer":
+    "Два получателя указывают на одного человека — оставьте одну строку",
+  "voucher_production_composition_mixed_basis": "В составе есть недопустимое основание получателя",
+  "voucher_production_composition_empty": "В составе нет активных получателей",
+  "voucher_production_run_unproven": "Preview не подходит для этой рассылки",
+  "voucher_production_preview_already_consumed": "Этот preview уже использован предыдущей рассылкой",
+  "voucher_production_entitlement_already_exists": "Ваучер за этот период уже выдан",
+  "voucher_production_preview_already_frozen": "Состав уже зафиксирован — изменить его нельзя",
+  "voucher_production_disabled": "Административный доступ к рассылке закрыт",
+  "voucher_production_api_unavailable": "EasyWeek недоступен — состав не прочитан",
+  "voucher_production_database_unavailable": "База данных недоступна — состав не прочитан",
+  "voucher_production_runtime_identity_unusable": "Настройки рассылки на сервере неполны",
+  "voucher_production_recipient_not_excludable":
+    "Эту строку нельзя исключить: состав уже зафиксирован или preview недоступен для правки"
+};
+  return labels[code] || reasonLabel(code);
 }
 
 function basisLabel(person) {

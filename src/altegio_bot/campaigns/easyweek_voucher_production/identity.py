@@ -200,6 +200,13 @@ ISSUER_SUPPLIED_BY_CLIENT: Final = "voucher_production_issuer_supplied_by_client
 # claimed and nothing about them is in doubt.
 STOPPED_BY_OPERATOR: Final = "voucher_production_stopped_by_operator"
 
+# -- excluding one recipient from the preview being checked -------------------
+# The soft removal refused: the snapshot is no longer editable, a voucher batch is
+# already frozen onto it, a canary holds it, the row belongs to another run, or the
+# segmenter had already excluded it for its own reason. One code rather than the
+# operation's own Russian prose, which was written for a different screen.
+RECIPIENT_NOT_EXCLUDABLE: Final = "voucher_production_recipient_not_excludable"
+
 # -- browser authorisation of one stage (§43.4) ------------------------------
 APPROVAL_UNKNOWN: Final = "voucher_production_approval_unknown"
 APPROVAL_NOT_READY: Final = "voucher_production_approval_not_ready"

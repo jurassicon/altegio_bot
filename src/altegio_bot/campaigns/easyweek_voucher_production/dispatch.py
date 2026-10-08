@@ -35,13 +35,14 @@ import contextlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import VoucherDeliveryClient
+from altegio_bot.campaigns.easyweek_voucher_production import composition as composition_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as runner_module
@@ -58,15 +59,18 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPROVAL_EXPOSURE_MISMATCH,
     APPROVAL_EXPOSURE_MISSING,
     APPROVAL_NOT_READY,
+    COMPOSITION_DUPLICATE_CUSTOMER,
     DATABASE_UNAVAILABLE,
     EXECUTION_INTERRUPTED,
     EXECUTOR_UNAVAILABLE,
     ISSUER_SUPPLIED_BY_CLIENT,
     KARLSRUHE_COMPANY_ID,
+    NEW_CLIENT_CAMPAIGN_CODE,
     OPERATION_UNKNOWN,
     PLAN_EXPIRED,
     PRODUCTION_DISABLED,
     PRODUCTION_STAGES,
+    RECIPIENT_NOT_EXCLUDABLE,
     RECONCILE_BUSY,
     RUNTIME_IDENTITY_UNUSABLE,
     SLOT_UNKNOWN,
@@ -253,6 +257,14 @@ def _refused_offer(stage: str, reasons: tuple[str, ...]) -> StageOffer:
     return StageOffer(stage=stage, ready=False, reasons=reasons, approval=None)
 
 
+# The three states one row of a checked composition can be in. Strings rather than
+# booleans: "not proven" and "not checked" are different answers and a pair of
+# booleans invites reading one as the other.
+LINE_PROVEN: Final = "proven"
+LINE_REFUSED: Final = "refused"
+LINE_UNCHECKED: Final = "unchecked"
+
+
 @dataclass(frozen=True)
 class RecipientLine:
     """One slot and the person it addresses — for the authorised UI only.
@@ -276,6 +288,23 @@ class RecipientLine:
     preview_run_id: int
     recipient_basis: str | None = None
     manual_policy: str | None = None
+    # Which of the three this row is. ``PROVEN`` means this member's own live proof
+    # succeeded; ``REFUSED`` means it did not and the reasons below say why;
+    # ``UNCHECKED`` means the composition stopped before this row was proven at all.
+    # The three are deliberately not two: a row nobody checked must never be shown
+    # with the colour of one that passed.
+    state: str = LINE_PROVEN
+    # This ROW's own reason codes, as the member's proof reported them. A reason
+    # that belongs to the batch rather than to one person is reported separately on
+    # the view and never attached here, because attributing a shared blocker to
+    # whichever row happened to be first is how an operator removes the wrong
+    # person.
+    reasons: tuple[str, ...] = ()
+    # The name came from the local preview row, not from an identity proof. True on
+    # an early refusal, where there is no proven customer to name — the preview
+    # value is good enough to FIND the row on screen and is not evidence of
+    # anything.
+    name_from_preview: bool = False
 
     def as_ui_dict(self) -> dict[str, Any]:
         # Named `as_ui_dict`, not `as_safe_dict`, on purpose: the name is the
@@ -287,6 +316,9 @@ class RecipientLine:
             "preview_run_id": self.preview_run_id,
             "recipient_basis": self.recipient_basis,
             "manual_policy": self.manual_policy,
+            "state": self.state,
+            "reasons": list(self.reasons),
+            "name_from_preview": self.name_from_preview,
         }
 
 
@@ -363,6 +395,22 @@ class CompositionView:
     total_exposure_minor: int
     unit_price_minor: int
     lines: tuple[RecipientLine, ...] = ()
+    # Whether this answer describes the audience AT ALL. ``False`` when the fence is
+    # shut or EasyWeek or the database could not be reached: there is no composition
+    # in that answer, only the absence of one. The distinction exists because the
+    # alternative — reporting zero — turns a lost connection into a mailing that
+    # looks like it has nobody in it, and an operator cannot tell the two apart.
+    known: bool = True
+    # How many ACTIVE preview rows there are, independently of how many could be
+    # proven. An operator reading a refusal needs to know whether the answer is
+    # "thirty-four" or "none".
+    observed_active: int = 0
+    # Reasons that belong to the BATCH rather than to any one row: a duplicate that
+    # cannot be pinned to specific rows, an entitlement already taken in another
+    # batch, a preview already consumed, a run that is not a usable preview. Kept
+    # apart from the row reasons so nothing attributes a shared blocker to whoever
+    # happens to be listed first.
+    blockers: tuple[str, ...] = ()
     # WHICH audience this is, as the freeze would sign it. Reported so the page can
     # tell "the list I am showing" from "the list a plan just re-proved" (review F1):
     # one member swapped for another leaves the count and the money identical, so a
@@ -370,12 +418,34 @@ class CompositionView:
     # It is a digest over slots and preview rows — no name, number or secret.
     composition_digest: str | None = None
 
+    @property
+    def proven_line_count(self) -> int:
+        return sum(line.state == LINE_PROVEN for line in self.lines)
+
+    @property
+    def refused_line_count(self) -> int:
+        return sum(line.state == LINE_REFUSED for line in self.lines)
+
+    @property
+    def unchecked_line_count(self) -> int:
+        return sum(line.state == LINE_UNCHECKED for line in self.lines)
+
     def as_ui_dict(self) -> dict[str, Any]:
         return {
             "composition_proven": self.proven,
+            # Said separately from `composition_proven`, which answers "may this be
+            # frozen"; this one answers "do we know what the audience is at all".
+            "composition_known": self.known,
             "reasons": list(self.reasons),
+            "blockers": list(self.blockers),
             "campaign_period": self.campaign_period,
             "recipient_count": self.recipient_count,
+            "observed_active_count": self.observed_active,
+            "proven_count": self.proven_line_count,
+            "refused_count": self.refused_line_count,
+            "unchecked_count": self.unchecked_line_count,
+            # The money for what is SHOWN. Never an approved amount: the freeze
+            # takes the operator's own statement and re-proves the whole audience.
             "total_exposure_minor": self.total_exposure_minor,
             "unit_price_minor": self.unit_price_minor,
             "composition_digest": self.composition_digest,
@@ -419,6 +489,9 @@ async def inspect_composition(
             recipient_count=0,
             total_exposure_minor=0,
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            # Not an audience of nobody: an answer that contains no audience.
+            known=False,
+            blockers=(PRODUCTION_DISABLED,),
         )
     carrier = transports or Transports()
     try:
@@ -440,6 +513,9 @@ async def inspect_composition(
             recipient_count=0,
             total_exposure_minor=0,
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            # Not an audience of nobody: an answer that contains no audience.
+            known=False,
+            blockers=(RUNTIME_IDENTITY_UNUSABLE,),
         )
     except EasyWeekError:
         return CompositionView(
@@ -449,6 +525,9 @@ async def inspect_composition(
             recipient_count=0,
             total_exposure_minor=0,
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            # Not an audience of nobody: an answer that contains no audience.
+            known=False,
+            blockers=(API_UNAVAILABLE,),
         )
     except SQLAlchemyError:
         return CompositionView(
@@ -458,21 +537,18 @@ async def inspect_composition(
             recipient_count=0,
             total_exposure_minor=0,
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            # Not an audience of nobody: an answer that contains no audience.
+            known=False,
+            blockers=(DATABASE_UNAVAILABLE,),
         )
 
     reasons = tuple(reason for reason in composition.reasons if reason not in _APPROVAL_NUMBER_REASONS)
-    lines = tuple(
-        RecipientLine(
-            slot=member.slot,
-            campaign_recipient_id=member.campaign_recipient_id,
-            display_name=(member.proof.client_display_name or "").strip()
-            or f"без имени (строка preview {member.campaign_recipient_id})",
-            preview_run_id=preview_run_id,
-            recipient_basis=member.recipient_basis,
-            manual_policy=member.manual_policy,
-        )
-        for member in composition.members
-    )
+    lines = await _composition_lines(session_maker, preview_run_id=preview_run_id, composition=composition)
+    # What the batch could not establish, as opposed to what one row could not. A
+    # reason is a ROW's only if that row's own proof reported it; everything left
+    # over belongs to the batch and is shown as such.
+    attributed = {reason for line in lines for reason in line.reasons}
+    blockers = tuple(reason for reason in reasons if reason not in attributed)
     return CompositionView(
         # Proven for the purpose of this screen: a real audience the operator may
         # now put numbers to. The freeze still proves everything again, including
@@ -488,6 +564,125 @@ async def inspect_composition(
         # report for a composition that could not be established.
         composition_digest=composition.composition_digest() if composition.proven else None,
         lines=lines,
+        known=True,
+        observed_active=composition.observed_active or composition.recipient_count,
+        blockers=blockers,
+    )
+
+
+async def _composition_lines(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    preview_run_id: int,
+    composition: composition_module.ProductionComposition,
+) -> tuple[RecipientLine, ...]:
+    """Every active row of this preview, with what the live proof made of it.
+
+    The whole audience, including the rows that refused: a check that stops on one
+    person must still show the other thirty-three, or the operator is told "the list
+    is wrong" and given nothing to act on.
+
+    Two shapes, because the composition stops at two different depths. When members
+    were built, each one carries its own proof and its own reasons. When the
+    composition refused BEFORE the live reads — an unusable run, a mixed basis, an
+    approval mismatch — there are no members at all, and the rows are listed from the
+    local preview as UNCHECKED so the screen can still say how many there are.
+    """
+    if not composition.members:
+        return await _unchecked_lines(session_maker, preview_run_id=preview_run_id)
+    duplicates = _duplicate_slots(composition)
+    lines: list[RecipientLine] = []
+    for member in composition.members:
+        reasons = [composition_module.translate_reason(reason) for reason in member.proof.reasons]
+        if member.slot in duplicates:
+            # The one batch-level blocker that CAN be pinned to rows reliably: the
+            # duplicate is these two members and nobody else, which is what the
+            # operator has to see to decide which of them to exclude. Only the slots
+            # of this preview are named — no customer UUID, and nothing about any
+            # other campaign's people.
+            reasons.append(COMPOSITION_DUPLICATE_CUSTOMER)
+        name = (member.proof.client_display_name or "").strip()
+        lines.append(
+            RecipientLine(
+                slot=member.slot,
+                campaign_recipient_id=member.campaign_recipient_id,
+                display_name=name or f"без имени (строка preview {member.campaign_recipient_id})",
+                preview_run_id=preview_run_id,
+                recipient_basis=member.recipient_basis,
+                manual_policy=member.manual_policy,
+                state=LINE_PROVEN if member.proof.proven and not reasons else LINE_REFUSED,
+                reasons=tuple(dict.fromkeys(reasons)),
+                name_from_preview=not name,
+            )
+        )
+    return tuple(lines)
+
+
+def _duplicate_slots(composition: composition_module.ProductionComposition) -> frozenset[int]:
+    """Slots whose proven customer appears more than once in this composition.
+
+    Two preview rows, one human. The unique index catches it at freeze; naming the
+    rows here is what lets an operator fix it rather than read a constraint. Members
+    with no proven customer are skipped: an absent UUID is not a duplicate of
+    another absent UUID, and grouping them would accuse rows of a problem they do
+    not have.
+    """
+    seen: dict[str, list[int]] = {}
+    for member in composition.members:
+        customer = (member.easyweek_customer_uuid or "").strip()
+        if customer:
+            seen.setdefault(customer, []).append(member.slot)
+    return frozenset(slot for slots in seen.values() if len(slots) > 1 for slot in slots)
+
+
+async def _unchecked_lines(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    preview_run_id: int,
+) -> tuple[RecipientLine, ...]:
+    """The active preview rows, named from the preview, marked unchecked.
+
+    Display only. The preview's own ``display_name`` is what the operator curated,
+    which is enough to FIND a row on screen — and it is deliberately not allowed to
+    stand in for an identity proof: these lines carry no proven state, and the freeze
+    re-proves every one of them from scratch.
+    """
+    from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient
+
+    try:
+        async with session_maker() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            CampaignRecipient.id,
+                            CampaignRecipient.display_name,
+                            CampaignRecipient.recipient_basis,
+                            CampaignRecipient.manual_policy,
+                        )
+                        .where(CampaignRecipient.campaign_run_id == preview_run_id)
+                        .where(CampaignRecipient.provider == PROVIDER_EASYWEEK)
+                        .where(CampaignRecipient.status == composition_module.ACTIVE_RECIPIENT_STATUS)
+                        .order_by(CampaignRecipient.id.asc())
+                    )
+                ).all()
+            )
+    except SQLAlchemyError:
+        # The audience is simply unknown then, which the caller already reports.
+        return ()
+    return tuple(
+        RecipientLine(
+            slot=index,
+            campaign_recipient_id=int(row[0]),
+            display_name=(row[1] or "").strip() or f"без имени (строка preview {int(row[0])})",
+            preview_run_id=preview_run_id,
+            recipient_basis=str(row[2]) if row[2] else None,
+            manual_policy=str(row[3]) if row[3] else None,
+            state=LINE_UNCHECKED,
+            reasons=(),
+            name_from_preview=True,
+        )
+        for index, row in enumerate(rows, start=1)
     )
 
 
@@ -704,6 +899,122 @@ async def confirm_stage(
         },
     )
     return outcome
+
+
+@dataclass(frozen=True)
+class ExclusionOutcome:
+    """What an exclusion did, or the named reason it did not happen.
+
+    Three answers, not two. ``applied`` is a durable soft removal; ``refused`` is a
+    decision this phase made about the request; and ``reason=None`` with
+    ``applied=False`` never occurs, because an exclusion that neither happened nor
+    was refused would be an unknown — and an unknown is reported by the caller
+    failing, not by this returning a tidy value for it.
+    """
+
+    applied: bool
+    reason: str | None = None
+    campaign_recipient_id: int | None = None
+    status: str | None = None
+    excluded_reason: str | None = None
+    # Already out before this request. The removal is idempotent, and an operator
+    # pressing twice must read "already excluded" rather than an error.
+    already_excluded: bool = False
+
+    def as_ui_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "reason": self.reason,
+            "campaign_recipient_id": self.campaign_recipient_id,
+            "status": self.status,
+            "excluded_reason": self.excluded_reason,
+            "already_excluded": self.already_excluded,
+        }
+
+
+async def exclude_recipient(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    preview_run_id: int,
+    campaign_recipient_id: int,
+    principal: operations_module.OpsPrincipal,
+) -> ExclusionOutcome:
+    """Soft-remove ONE recipient from this preview. Reaches no provider at all.
+
+    The business operation is the existing one — ``remove_recipient_from_preview``
+    — reused rather than reimplemented, so this shares its editability and canary
+    locks, its ``skipped``/``manual_removed`` audit trail, its preserved basis and
+    typed bindings, its counter recount in the same transaction, and its
+    idempotence. What this adds is the scope: it may only touch a Karlsruhe
+    EasyWeek preview of this campaign, and it states that expectation to be
+    re-verified under the run's row lock.
+
+    Deliberately NOT routed through the older campaigns endpoint. That one has its
+    own protection contour, and promoting it to a privileged path from here would
+    mean inheriting an authorisation story nobody reviewed for this use.
+
+    Nothing about a voucher is touched: no Client, no EasyWeek customer, no
+    booking, no order, no ledger row and no entitlement. The person stays in the
+    database; only this preview's composition changes.
+    """
+    from altegio_bot.campaigns.runner import remove_recipient_from_preview
+    from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient
+
+    # Read beforehand ONLY to word the answer: "excluded" and "already excluded" are
+    # the same durable outcome, and an operator who pressed twice should read the
+    # second rather than a success that looks like a second removal. Deliberately not
+    # a guard — the removal itself is idempotent under the run's row lock, so a race
+    # here can mislabel a sentence and can never change what happened.
+    async with session_maker() as session:
+        before = await session.get(CampaignRecipient, campaign_recipient_id)
+        was_excluded = before is not None and before.excluded_reason == "manual_removed"
+
+    try:
+        recipient = await remove_recipient_from_preview(
+            preview_run_id,
+            campaign_recipient_id,
+            expect_provider=PROVIDER_EASYWEEK,
+            expect_company_id=KARLSRUHE_COMPANY_ID,
+            expect_campaign_code=NEW_CLIENT_CAMPAIGN_CODE,
+        )
+    except ValueError:
+        # The operation's own refusal: not editable, frozen, already automatically
+        # excluded, another run's row, another branch. Reported as one reason code
+        # rather than as its message, because the message is Russian prose written
+        # for another screen and this answer goes through a JSON contract.
+        await operations_module.record_audit(
+            session_maker,
+            principal=principal,
+            action="exclude_recipient",
+            outcome=RECIPIENT_NOT_EXCLUDABLE,
+            campaign_run_id=preview_run_id,
+            detail={"campaign_recipient_id": campaign_recipient_id},
+        )
+        return ExclusionOutcome(
+            applied=False,
+            reason=RECIPIENT_NOT_EXCLUDABLE,
+            campaign_recipient_id=campaign_recipient_id,
+        )
+
+    await operations_module.record_audit(
+        session_maker,
+        principal=principal,
+        action="exclude_recipient",
+        outcome="excluded",
+        campaign_run_id=preview_run_id,
+        detail={
+            "campaign_recipient_id": campaign_recipient_id,
+            "status": recipient.status,
+            "excluded_reason": recipient.excluded_reason,
+        },
+    )
+    return ExclusionOutcome(
+        applied=True,
+        campaign_recipient_id=campaign_recipient_id,
+        status=recipient.status,
+        excluded_reason=recipient.excluded_reason,
+        already_excluded=was_excluded,
+    )
 
 
 async def request_stop(

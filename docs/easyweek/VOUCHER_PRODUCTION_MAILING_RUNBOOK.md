@@ -490,23 +490,80 @@ copied anywhere.
 
 On the preparation page:
 
-1. Press **«Проверить состав»**. The page shows the campaign period, the exact
-   number of recipients, €10 each for a new mailing, the total, and **who each recipient is** — name
-   and the preview row they came from. Checking the list is a read: it never arms
-   the confirmation and never creates anything.
-2. Read the period. It is the campaign wave, not the month of sending. Manual additions
+1. Press **«Проверить состав»**. The page immediately shows a spinner and
+   *«Проверяем состав…»* — the check re-proves every recipient against EasyWeek, so
+   on a real list it takes a few seconds. While it runs, the other controls are
+   disabled and any previous result stops counting: a confirmation prepared earlier
+   disappears, because it described a list that is being re-read. A second press
+   does nothing; there is one check in flight at a time.
+2. The check always ends — on success, on a refusal, on an authorisation error, on
+   a server error, on an unreadable answer, on a lost connection, and on a wait that
+   ran out. Each says what happened and leaves **«Проверить состав»** pressable
+   again. A wait that ran out means this browser stopped listening; it does not
+   mean the server stopped, so nothing is claimed about what it did.
+3. On success the page shows the campaign period, the exact number of recipients,
+   €10 each for a new mailing, the total, and **who each recipient is** — name and
+   the preview row they came from. Checking the list is a read: it never arms the
+   confirmation and never creates anything.
+4. Read the period. It is the campaign wave, not the month of sending. Manual additions
    retain their own operator rationale rather than claiming an earned first visit.
-3. Read the message and the voucher's terms, shown lower on the page. The voucher
+5. Read the message and the voucher's terms, shown lower on the page. The voucher
    code is an explicit placeholder (`XXXX-XXXX-XXXX`); a real code is never
    displayed anywhere, at any stage.
-4. If the list is wrong, go back to the preview editor and change it there. After
-   the freeze the composition cannot change.
-5. Type the number of recipients and the total in euro, exactly as shown, and
+6. If the list is wrong, go back to the preview editor and change it there, or
+   exclude a single problematic recipient from this page — see §6.1. After the
+   freeze the composition cannot change.
+7. Type the number of recipients and the total in euro, exactly as shown, and
    press **«Проверить и зафиксировать»**. The server compares both against the
    live snapshot and refuses the whole freeze on any mismatch.
-6. A confirmation panel states what will happen. Press **«Подтвердить»**.
+8. A confirmation panel states what will happen. Press **«Подтвердить»**.
 
 The freeze writes the batch locally. **No money moves and no message is sent.**
+
+### 6.1 When the check refuses: finding the row and excluding it
+
+A check refuses **as a whole** — a part of a list is a different mailing from the
+one an operator was looking at — and it now shows the whole list anyway, so the
+row behind the refusal can be found and dealt with.
+
+Each line says which of three it is: **Проверен**, **Не прошёл проверку**, or
+**Не проверен**. The last one means the check stopped before reaching that row, so
+nothing about it was established; it is never shown as passed. A failing line
+carries the reason in plain Russian plus its technical code, which is what goes
+into a ticket. Above the table: how many active rows the preview has, how many
+passed, and how many failed or were not checked.
+
+Reasons that belong to the batch rather than to one person — an entitlement already
+taken by another mailing, a preview already consumed, an unusable run — are listed
+separately under «Общие причины отказа, не отнесённые к одной строке». They are
+deliberately not attached to a client: blaming whoever is listed first is how the
+wrong person gets excluded.
+
+Two things the screen will not do. It will not report «0 получателей» when it
+could not read the audience — a lost EasyWeek read, a closed fence or a database
+error says the composition is **unknown** and keeps the previous list marked
+stale. And the sum shown for a problematic list is labelled as not being an
+approved amount: the freeze still requires the whole remaining list to pass.
+
+To drop one recipient from this mailing, press **«Исключить из этого preview»** on
+their row. A confirmation names the person and their preview row and states what
+the action does: the **client card is not deleted**, no booking or voucher is
+touched, and only this preview's composition changes. Pressing it twice is the same
+exclusion.
+
+After an exclusion the shown result and the prepared confirmation stop being valid
+and the page says so. Press **«Проверить состав»** again to see the remaining list,
+its new count and its new total. Nothing is frozen, created, paid or sent
+automatically, and there is no "allowed subset" the page builds on its own.
+
+If the answer to an exclusion is lost, the page says the result is **unknown** and
+asks for the list to be re-read. It does not claim success, does not claim failure,
+and never repeats the request by itself.
+
+A preview that a voucher batch is already frozen onto, or that a canary holds,
+refuses the exclusion server-side with
+`voucher_production_recipient_not_excludable`. That answer is produced under the
+run's own row lock, so it holds against a freeze happening in another tab.
 
 The freeze runs on the executor like every other step, so for a moment there is a
 confirmed operation and no batch yet. The page says so and waits; when the batch
@@ -977,6 +1034,16 @@ mailing, not a way back to the terminal process.
 - **§41 and the historical canaries are untouched.** Their rows, constraints and
   HMAC bindings are exactly as they were, and their recipients are excluded from
   this phase.
+- **The number of Altegio cards on a phone is not evidence.** One person may hold
+  several legacy Altegio cards across branches and several inside one branch. The
+  count establishes nothing about identity and no longer refuses a composition, and
+  there is no ceiling on it. Those cards are still read for one thing: a matching
+  opt-out on any of them blocks the recipient. They are never merged, renamed,
+  rebound or given a UUID to clear a refusal.
+- **Excluding a recipient is not deleting anybody.** It is a soft removal from one
+  preview — `skipped` / `manual_removed`, with the basis, the typed bindings and
+  the audit trail kept. No Client, EasyWeek customer, booking, voucher, order,
+  ledger row or entitlement is touched, and there is no restore workflow here.
 - **Voucher validity is not proven here, and not claimed (§45.4).** EasyWeek owns
   the term, the balance and redemption. This application does not read an
   individual issued code's activation instant or expiry boundary, and no report
