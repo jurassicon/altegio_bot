@@ -31,11 +31,19 @@ Three things are treated as machine attribution:
 | Bot author / committer | `copilot-swe-agent[bot] <…+Copilot@users.noreply.github.com>` | **reported only**, needs `--identity-map` |
 | Agent branch name in a merge subject | `Merge pull request #42 from jurassicon/copilot/fix-…` | **reported only**, needs `--merge-slug-prefix` |
 
-Four things are deliberately left alone, and the tests pin each one:
+Five things are deliberately left alone, and the tests pin each one:
 
 - **Human co-authors.** `Co-authored-by: jurassicon <…>` is a person, and this
   repository has 52 of those lines. A rule that removed every
   `Co-authored-by:` would delete the owner's own attribution.
+- **Anyone who merely looks like an agent.** A machine identity is confirmed by
+  something a person cannot hold — GitHub's `[bot]` account suffix, or an agent
+  vendor's own no-reply address — never by a word appearing somewhere in a name
+  or an email. `Co-Authored-By: Jean-Claude Dupont <jcd@example.org>` and
+  `Co-Authored-By: Devin Smith <devin@example.org>` are people, and both keep
+  their lines. The audit reports such resemblances as **ambiguous** so that a
+  human can look at them; nothing removes or replaces an ambiguous identity,
+  and an identity map may not name one.
 - **The forge committer.** `GitHub <noreply@github.com>` is the real committer
   of 210 merges made through the web UI. It is a platform, not an agent.
 - **Functional mentions.** Dozens of commit messages in this repository discuss
@@ -102,7 +110,7 @@ Numbers, not content — the content stays local.
 | | |
 | --- | --- |
 | Commits reachable from the audited refs | 1080 |
-| Published branches on `origin` | 7 |
+| Published branches on `origin` | 8 |
 | Published tags | 0 (the two local `backup/*` tags were never pushed) |
 | `refs/pull/*/head` refs on the forge | 211, which a client cannot rewrite |
 | Commits with an AI co-author trailer | 1 |
@@ -148,13 +156,23 @@ Rewrite the mirror:
 cd /Users/cherkasov/Documents/Dev/altegio_bot && uv run python -m altegio_bot.scripts.clean_git_authorship --repo /tmp/authorship-rehearsal.git --merge-slug-prefix copilot --identity-map /tmp/identity-map.json --workdir /tmp/authorship-filter-inputs --apply
 ```
 
-The two files it generates — `replace-message.txt` and `mailmap.txt` — are the
-whole instruction set, and they are plain text. Read them before trusting the
-result.
+Read `message-plan.txt` in the workdir before trusting the result: it is the
+written record of exactly which removals are configured, which merge-slug
+prefix was opted into, and the rule that tidying happens **only** in a message
+something was actually removed from.
+
+The message transformation itself is not a file of substitutions. It cannot be:
+"close the blank-line hole, but only where a trailer was removed" is not
+expressible as an unconditional substitution list, and describing the rules
+twice — once for filter-repo, once for the preview — is what let the two drift
+apart in an earlier version. The rewrite therefore calls
+`transform_message` through a `git filter-repo --message-callback`, and the
+audit preview calls the same function. `mailmap.txt` stays a real
+`--mailmap` file, because identity replacement genuinely is a mapping.
 
 Note what the tool scoped for you: a `--mirror` clone of a GitHub repository
 brings down all 211 `refs/pull/*` refs, and those belong to the forge. The
-rewrite covers the 7 publishable branches only; asking it to rewrite a
+rewrite covers the publishable branches only; asking it to rewrite a
 forge-owned ref is refused, because the result could never be pushed.
 
 ---
@@ -167,10 +185,22 @@ cd /Users/cherkasov/Documents/Dev/altegio_bot && uv run python -m altegio_bot.sc
 
 It walks filter-repo's own `commit-map` and, for every old→new pair, asserts
 that the tree is identical, that both the author and committer timestamps and
-UTC offsets are unchanged, that the parent list maps one-to-one, that no commit
-was dropped, and that each ref still holds the same number of commits. Then it
-re-audits the result and prints what is left. It exits non-zero if any of that
-fails.
+UTC offsets are unchanged, that the parent list maps one-to-one, and that no
+commit was dropped.
+
+It then proves each **agreed** ref individually, and the agreed set is read
+from the ORIGINAL repository — never from the rewrite, which would let a
+deleted branch vanish from its own verification. Every agreed ref must still
+exist, and its tip must be the original tip mapped through the commit map. An
+equal commit count is an additional check, not a substitute: pointing `main` at
+`side` keeps the count and changes the history. For an annotated tag the
+comparison is the commit the tag points at, because the tag object itself
+legitimately gets a new SHA. A ref that cannot be reasoned about is reported as
+`unverifiable`, and an empty or unreadable `commit-map` is a FAIL rather than a
+vacuous pass.
+
+Then it re-audits the result and prints what is left. It exits non-zero if any
+of that fails.
 
 Signatures are **reported, not asserted**. A rewrite cannot re-sign, so the
 line `signatures no longer present: N` is the honest outcome, and the rehearsal
@@ -178,27 +208,34 @@ below shows what N is here.
 
 ### The rehearsal performed on 2026-10-08
 
+Eight published branches, no published tags, the `copilot/` merge-slug prefix
+opted into, and the Copilot bot identity mapped to a named person through an
+explicit `--identity-map`:
+
 ```
-mapped commits:            1079
+mapped commits:            1080
+agreed refs checked:       8
 dropped commits:           0
 tree mismatches:           0
 author date mismatches:    0
 committer date mismatches: 0
 parent structure changes:  0
 ref commit count changes:  0
+missing refs:              0
+ref tip mismatches:        0
+unverifiable refs:         0
 signatures no longer present: 210
 residual attribution findings: 0
 verdict: PASS
 ```
 
-Spot checks on that rehearsal: the Claude trailer was gone and its body ended
-on its last substantive line; an agent log trailer was gone while the human
-`Co-authored-by` line beside it survived; `Merge pull request #42 from
-jurassicon/copilot/fix-contacts-without-names` became `… from
-jurassicon/fix-contacts-without-names`, keeping the PR number; `.gitignore`
-still listed `CLAUDE.md` and `.claude/`; and the bot identity was gone from all
-seven branches while `GitHub <noreply@github.com>` remained the committer of
-the merges it really made.
+Spot checks on that rehearsal: no machine identity remained on any of the eight
+branches, while `GitHub <noreply@github.com>` stayed the committer of the merges
+it really made; all 52 `Co-authored-by: jurassicon <…>` lines survived; a grep
+for `anthropic`, `agent-logs-url` and `generated with` across all eight branches
+returned nothing; `.gitignore` still listed `CLAUDE.md` and `.claude/`; and
+`Merge pull request #42 from jurassicon/copilot/fix-contacts-without-names`
+became `… from jurassicon/fix-contacts-without-names`, keeping the PR number.
 
 The bot identity was still reachable from `refs/pull/*` in the same clone. That
 is not a defect of the rewrite — see step 7.
@@ -236,6 +273,7 @@ were:
 | ref | original | rehearsed result |
 | --- | --- | --- |
 | `refs/heads/main` | `10755c5ec630` | `a7fae533c255` |
+| `refs/heads/chore/clean-authorship` | `6bf8b07e50c9` | `04c3ef60869f` |
 | `refs/heads/fix/easyweek-approved-template-contract` | `38b708ff0e56` | `a42604be7186` |
 | `refs/heads/feature/easyweek-manual-voucher-delivery-canary` | `54fa6b769209` | `99780ded2890` |
 | `refs/heads/feature/easyweek-pr9-review-3d` | `f8693bb5943e` | `09da29aeb91f` |
@@ -260,22 +298,52 @@ cd /tmp/authorship-rehearsal.git && git push --force-with-lease=refs/heads/fix/e
 Repeat for each remaining agreed ref. `filter-repo` removes the `origin` remote
 from the clone it rewrote, which is why the URL is spelled out.
 
-If a branch is also to be renamed — the audit lists every ref whose own name
-carries an agent prefix, and `copilot/debug-chatwoot-signature-failure` is the
-published one — that is a separate decision. A message rewrite cannot move a
-ref: push the new name and delete the old one explicitly.
+### Renaming a branch whose name carries an agent prefix
+
+The audit lists every ref whose own name reads as an agent's, and
+`copilot/debug-chatwoot-signature-failure` is the published one. A message
+rewrite cannot move a ref, so this is a separate decision and a separate pair
+of pushes — **both of them leased.**
+
+A delete is as destructive as a force-push and needs the same protection. `git
+push --delete` on its own removes the old name whatever state it is in: if
+somebody pushed to that branch after your snapshot, their commit is not in the
+replacement you just created, and the delete throws it away. So the delete
+states the SHA it expects to find, and git refuses it as `stale info` when the
+remote has moved.
+
+Use the SHA for the stage you are at: the snapshot from step 3 if the branch
+was not rewritten, or the result you published in step 6 if it was. Do **not**
+read the remote's current value just before deleting and feed that back in —
+that defeats the whole point, because it would accept whatever happens to be
+there, which is exactly the commit you have not seen.
+
+**First** create the new name, with a lease asserting the name is still free.
+An empty expected value means "expect this ref not to exist", so an occupied
+name is refused rather than overwritten:
 
 ```bash
-cd /tmp/authorship-rehearsal.git && git push https://github.com/jurassicon/altegio_bot refs/heads/copilot/debug-chatwoot-signature-failure:refs/heads/debug-chatwoot-signature-failure
+cd /tmp/authorship-rehearsal.git && git push --force-with-lease=refs/heads/debug-chatwoot-signature-failure: https://github.com/jurassicon/altegio_bot refs/heads/copilot/debug-chatwoot-signature-failure:refs/heads/debug-chatwoot-signature-failure
 ```
 
+**Only if that succeeded**, delete the old name, leased at the SHA you agreed:
+
 ```bash
-cd /tmp/authorship-rehearsal.git && git push https://github.com/jurassicon/altegio_bot --delete refs/heads/copilot/debug-chatwoot-signature-failure
+cd /tmp/authorship-rehearsal.git && git push --force-with-lease=refs/heads/copilot/debug-chatwoot-signature-failure:46b9d7a984f70a8a4d9cd1f1df0d94346641070d https://github.com/jurassicon/altegio_bot --delete refs/heads/copilot/debug-chatwoot-signature-failure
 ```
+
+If the create is refused, **stop**: do not run the delete. There would be no
+replacement for the branch you are about to remove. Investigate the name that
+is already taken, then start this pair again.
+
+If the delete is refused, the branch has moved since your snapshot. The commit
+that caused the refusal is still on the remote and still reachable — nothing is
+lost by the refusal. Fetch it, decide what to do with it, re-run the rewrite
+including it, publish, and only then delete with the new expected SHA.
 
 Deleting a branch that still has an open PR closes that PR, so check before the
-second command. The local `backup/before-remove-claude-coauthor` branch was
-never published; it is renamed or dropped in your own clone only.
+delete. The local `backup/before-remove-claude-coauthor` branch was never
+published; it is renamed or dropped in your own clone only.
 
 ---
 
@@ -323,7 +391,8 @@ is reset or dropped.
 | --- | --- |
 | Tool | `src/altegio_bot/scripts/clean_git_authorship.py` |
 | Tests | `src/altegio_bot/tests/test_git_authorship_cleanup.py`, in the required gate |
-| Rules an operator can read | generated into `--workdir`: `replace-message.txt`, `mailmap.txt` |
+| Engine | `git-filter-repo`, a **locked dev dependency** in `[dependency-groups] dev`; `uv sync --frozen` installs it on a laptop and on every required CI runner |
+| What an operator can read before applying | generated into `--workdir`: `message-plan.txt`, `mailmap.txt` |
 | filter-repo's own old→new record | `<clone>/filter-repo/commit-map` |
 
 The tests build their own repositories under `tmp_path` and rewrite only bare

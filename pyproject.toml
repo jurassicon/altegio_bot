@@ -35,6 +35,14 @@ dev = [
   # browser suite FAILS rather than skips when it is missing: see
   # ALTEGIO_REQUIRE_BROWSER_TESTS in the required gate.
   'playwright>=1.47',
+  # The history-rewriting engine behind
+  # `altegio_bot.scripts.clean_git_authorship`. A dev dependency rather than a
+  # runtime one: the application never rewrites history, and only the tool and
+  # its required regressions need it. Pinned into the lock so `uv sync --frozen`
+  # provides it identically on a laptop and on every required CI runner —
+  # the suite must not quietly skip because a Homebrew install happened to be
+  # on one machine's PATH and not on the runner's.
+  'git-filter-repo>=2.47',
 ]
 
 [tool.setuptools]

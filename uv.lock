@@ -35,6 +35,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "git-filter-repo" },
     { name = "playwright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -58,6 +59,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "git-filter-repo", specifier = ">=2.47" },
     { name = "playwright", specifier = ">=1.47" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
@@ -179,6 +181,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/52/08/8c8508db6c7b9aae8f7175046af41baad690771c9bcde676419965e338c7/fastapi-0.128.0.tar.gz", hash = "sha256:1cc179e1cef10a6be60ffe429f79b829dce99d8de32d7acb7e6c8dfdf7f2645a", size = 365682, upload-time = "2025-12-27T15:21:13.714Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/05/5cbb59154b093548acd0f4c7c474a118eda06da25aa75c616b72d8fcd92a/fastapi-0.128.0-py3-none-any.whl", hash = "sha256:aebd93f9716ee3b4f4fcfe13ffb7cf308d99c9f3ab5622d8877441072561582d", size = 103094, upload-time = "2025-12-27T15:21:12.154Z" },
+]
+
+[[package]]
+name = "git-filter-repo"
+version = "2.47.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/bb/7a283f568af6b0528ade65e8ace84bd6ba46003e429101bcd62c232d01a5/git_filter_repo-2.47.0.tar.gz", hash = "sha256:411b27e68a080c07a69c233cb526dbc2d848b09a72f10477f4444dd0822cf290", size = 275743, upload-time = "2024-12-04T03:10:48.2Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/60/d3943f0880ebcb7e0bdf79254d10dddd39c7b656eeecae32b8806ff66dec/git_filter_repo-2.47.0-py3-none-any.whl", hash = "sha256:2cd04929b9024e83e65db571cbe36aec65ead0cb5f9ec5abe42158654af5ad83", size = 76282, upload-time = "2024-12-04T03:10:46.064Z" },
 ]
 
 [[package]]
