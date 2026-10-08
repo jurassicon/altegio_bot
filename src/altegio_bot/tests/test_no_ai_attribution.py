@@ -1,0 +1,353 @@
+"""Required file policy: reject AI authorship signatures, not product mentions.
+
+After the owner commits this test, changing or removing it (including its
+patterns, sole exemption or CI coverage) requires explicit owner permission.
+Fix an offending file instead of weakening this check to make CI pass.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+# Only this exact file contains intentional signatures as regression examples.
+EXAMPLE_FILE = Path(__file__).resolve().relative_to(ROOT).as_posix()
+# A claim of authorship. A vendor named in passing is not one, which is why
+# this has to be present before any name is looked at.
+ATTRIBUTION = (
+    r"(?:co-authored-by[ \t]*:"
+    r"|(?:generated|written|created|authored)[ \t]+(?:by|with)"
+    r"|(?:author|ai-assisted-by|assisted-by|generated-by)[ \t]*:)"
+)
+
+# What ordinary Markdown or a link may wrap the name in: emphasis, code ticks,
+# a link bracket. Bounded, so `**Claude Code**` and `[Claude Code](…)` read the
+# same as the bare name. The closing form is separate and non-empty, because a
+# closing wrapper is itself proof that the name ended there.
+WRAP_OPEN = r"[*_`\[]{0,2}"
+# ``(?!\w)`` is what separates a closing marker from an underscore INSIDE a
+# word. Underscores are word characters, so without it `Claude_Code` read as
+# the name `Claude` closed by `_`, and a plain identifier became a signature.
+WRAP_CLOSE = r"[*_`\]]{1,2}(?!\w)"
+
+# Underscore emphasis, which needs naming on its own for the same reason: `*`
+# and a backtick are not word characters, so a word boundary already sees the
+# name end through them, while `_` is one and hides it. The closing run is a
+# backreference, so the markup has to agree — `_x_` and `__x__`, not `_x__` —
+# and it must not be followed by a word character, which is what keeps
+# `_ChatGPT_client_` out.
+EMPHASIS_OPEN = r"(?P<emphasis>_{1,2})"
+EMPHASIS_CLOSE = r"(?P=emphasis)(?!\w)"
+
+# Names no person is plausibly called in an authorship line. Once one of these
+# follows an authorship phrase the line has already said what it says, so
+# whatever explanation trails after it — ` for this project`, ` on 2026-10-08`,
+# ` — do not edit` — changes nothing and must not hide the signature.
+UNAMBIGUOUS_AI_NAME = (
+    r"(?:ChatGPT"
+    r"|Claude[ \t]+(?:Code|Opus|Sonnet|Haiku)(?:[ \t]+\d+(?:\.\d+)*)?"
+    r"|(?:GitHub[ \t]+)?Copilot"
+    r"|OpenAI(?:[ \t]+(?:Codex|ChatGPT))?"
+    r"|Anthropic"
+    r"|Codex)"
+)
+
+# `Claude` on its own is a real given name, so this one keeps the strict
+# ending: the attribution has to stop naming anybody right after it. That is
+# what keeps `Written by Claude Dupont` and `Co-Authored-By: Jean-Claude
+# Dupont <…>` out of the findings.
+AMBIGUOUS_AI_NAME = r"Claude"
+NAME_END = r"(?=[ \t]*(?:$|[<\]\(\"'`.,!]|-->|\*/))"
+
+SIGNATURE = re.compile(
+    "|".join(
+        (
+            # An unambiguous agent name: a trailing explanation is allowed.
+            # The word boundary sees the end of the name through `*`, a
+            # backtick or a bracket, all of which are non-word characters.
+            r"\b" + ATTRIBUTION + r"[ \t]*" + WRAP_OPEN + UNAMBIGUOUS_AI_NAME + r"\b",
+            # The same name closed by underscore emphasis, which the boundary
+            # above cannot see because `_` is a word character. Matched markup
+            # only, and an explanation may follow the closing run.
+            r"\b" + ATTRIBUTION + r"[ \t]*" + EMPHASIS_OPEN + UNAMBIGUOUS_AI_NAME + EMPHASIS_CLOSE,
+            # The ambiguous name, explicitly closed by emphasis or a tick. The
+            # wrapper is what says the name ended, so an explanation may follow
+            # — while `**Claude Dupont**` keeps the surname INSIDE the wrapper
+            # and therefore does not match here.
+            r"\b" + ATTRIBUTION + r"[ \t]*" + WRAP_OPEN + AMBIGUOUS_AI_NAME + WRAP_CLOSE,
+            # The ambiguous name bare: nothing marks where it ends, so the
+            # attribution has to stop naming anybody right there.
+            r"\b" + ATTRIBUTION + r"[ \t]*" + AMBIGUOUS_AI_NAME + NAME_END,
+            # A confirmed agent address in a co-author trailer, whatever display
+            # name it carries.
+            r"\bco-authored-by[ \t]*:[^\r\n]*<"
+            r"(?:noreply@(?:anthropic|openai)\.com|\d+\+copilot@users\.noreply\.github\.com)>",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def signature_locations(root: Path) -> list[str]:
+    tracked = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"])
+    findings = []
+    for raw_path in tracked.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = raw_path.decode("utf-8", errors="surrogateescape")
+        path = root / relative
+        if relative == EXAMPLE_FILE or path.is_symlink() or not path.is_file():
+            continue  # Deleted working-tree files and symlinks have no text to scan.
+        content = path.read_bytes()
+        if b"\0" in content:
+            continue  # Binary assets are outside this text-file policy.
+        for number, line in enumerate(content.decode("utf-8", errors="replace").splitlines(), 1):
+            match = SIGNATURE.search(line)
+            if match:
+                findings.append(f"{relative}:{number}: {match.group(0)}")
+    return findings
+
+
+def test_tracked_files_have_no_ai_authorship_signatures():
+    findings = signature_locations(ROOT)
+    assert not findings, (
+        "AI authorship signatures found; remove them from the listed files. "
+        "Do not change this protected test without explicit owner permission:\n" + "\n".join(findings)
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# Generated with Claude Code",
+        "// Written by GitHub Copilot",
+        "<!-- Created by ChatGPT -->",
+        "/* Authored by OpenAI Codex */",
+        "🤖 Generated with [Claude Code](https://example.invalid)",
+        "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "Co-authored-by: model <noreply@anthropic.com>",
+        "Co-authored-by: assistant <198982749+Copilot@users.noreply.github.com>",
+        "# Author: ChatGPT",
+        "# generated by openai",
+    ],
+)
+def test_signatures_are_rejected(line):
+    assert SIGNATURE.search(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "OPENAI_API_KEY = config.get('OPENAI_API_KEY')",
+        "Compare Anthropic and OpenAI API responses.",
+        "CLAUDE.md",
+        "# Generated by Alembic",
+        "# Generated by OpenAPI Generator",
+        "Co-Authored-By: Jean-Claude Dupont <jcd@example.org>",
+        "Co-Authored-By: Claude Dupont <claude@example.org>",
+        "Co-Authored-By: Devin Smith <devin@example.org>",
+        "# Written by Claude Dupont",
+        "Written by Claude Dupont",
+    ],
+)
+def test_product_mentions_and_human_authorship_are_allowed(line):
+    assert not SIGNATURE.search(line)
+
+
+# The four shapes the reviewed pattern let through. Each is an explicit
+# authorship claim naming an agent; what hid them was the demand that the name
+# be the last thing on the line, and the absence of any handling for the
+# emphasis Markdown ordinarily puts around it.
+ORDINARY_SIGNATURE_VARIANTS = [
+    "# Generated by ChatGPT for this project",
+    "# Generated with Claude Code on 2026-10-08",
+    "# Written by GitHub Copilot — do not edit",
+    "<!-- Generated with **Claude Code** -->",
+    # Underscore emphasis. A word boundary cannot see the end of the name
+    # through it, because `_` is a word character — which is what hid these.
+    "# Generated with _Claude Code_",
+    "<!-- Generated by __ChatGPT__ -->",
+    "# Generated with _Claude Code_ on 2026-10-08",
+    "# Generated by __ChatGPT__ for this project",
+]
+
+
+@pytest.mark.parametrize("line", ORDINARY_SIGNATURE_VARIANTS)
+def test_a_trailing_explanation_or_markdown_emphasis_does_not_hide_a_signature(line):
+    assert SIGNATURE.search(line), f"ordinary signature variant not detected: {line}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The same shapes around the ambiguous name, which must still require
+        # the attribution to stop there: a surname after it means a person.
+        "# Generated with **Claude** on 2026-10-08",
+        "<!-- Written by `Claude` -->",
+    ],
+)
+def test_emphasis_does_not_weaken_the_ambiguous_name_rule(line):
+    assert SIGNATURE.search(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# Written by **Claude Dupont** on 2026-10-08",
+        "<!-- Co-Authored-By: **Jean-Claude Dupont** <jcd@example.org> -->",
+        "Written by _Claude Dupont_",
+        "Written by __Jean-Claude Dupont__",
+    ],
+)
+def test_emphasis_does_not_turn_a_person_into_an_agent(line):
+    assert not SIGNATURE.search(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # An underscore inside an identifier is not closing markup. These are
+        # names in code, and one of them — `Claude_Code` — was a finding before
+        # the closing marker learned to refuse a following word character.
+        "Generated by ChatGPT_client",
+        "Generated by _ChatGPT_client_",
+        "Generated by Claude_Code",
+        "value = ChatGPT_client.send(prompt)",
+        # Markup that does not agree is not markup either.
+        "Generated with _ChatGPT__",
+        "Generated with __ChatGPT_",
+    ],
+)
+def test_an_underscore_inside_a_word_is_not_closing_markup(line):
+    assert not SIGNATURE.search(line)
+
+
+def test_scan_covers_tracked_code_docs_and_tests_with_only_one_exact_exemption(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    paths = ["src/example.py", "docs/guide.md", "tests/example.py", ".github/example.yml", EXAMPLE_FILE]
+    for name in paths:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ordinary text\n# Generated with Claude Code\n", encoding="utf-8")
+    (tmp_path / "asset.bin").write_bytes(b"\0binary")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    (tmp_path / "untracked.txt").write_text("Generated with Claude Code\n", encoding="utf-8")
+    assert sorted(signature_locations(tmp_path)) == sorted(
+        f"{name}:2: Generated with Claude Code" for name in paths if name != EXAMPLE_FILE
+    )
+
+
+def test_the_scan_finds_ordinary_signature_variants_in_tracked_code_and_docs(tmp_path):
+    """The same four shapes, through the real file walk rather than the regex.
+
+    On the reviewed pattern this returned an empty list: a tracked Python file
+    and a tracked Markdown document could both carry an authorship claim and
+    the required check reported nothing.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "module.py").write_text(
+        "import os\n"
+        "# Generated by ChatGPT for this project\n"
+        "value = os.environ.get('OPENAI_API_KEY')\n"
+        "# Generated with Claude Code on 2026-10-08\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text(
+        "# Guide\n"
+        "\n"
+        "Compare Anthropic and OpenAI API responses.\n"
+        "<!-- Generated with **Claude Code** -->\n"
+        "\n"
+        "# Written by GitHub Copilot — do not edit\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+
+    findings = signature_locations(tmp_path)
+    assert [entry.rsplit(": ", 1)[0] for entry in sorted(findings)] == [
+        "README.md:4",
+        "README.md:6",
+        "src/module.py:2",
+        "src/module.py:4",
+    ]
+    # The prose line and the env-var line are not findings.
+    assert not any("README.md:3" in entry or "module.py:3" in entry for entry in findings)
+
+
+def test_the_scan_leaves_human_attribution_and_product_talk_alone(tmp_path):
+    """A repository of entirely legitimate files produces no findings at all."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "CONTRIBUTORS.md").write_text(
+        "Co-Authored-By: Jean-Claude Dupont <jcd@example.org>\n"
+        "Co-Authored-By: Claude Dupont <claude@example.org>\n"
+        "Co-Authored-By: Devin Smith <devin@example.org>\n"
+        "Written by Claude Dupont\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings.py").write_text(
+        "OPENAI_API_KEY = config.get('OPENAI_API_KEY')\n# Compare Anthropic and OpenAI API responses.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "migration.py").write_text(
+        "# Generated by Alembic\n# Generated by OpenAPI Generator\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    assert signature_locations(tmp_path) == []
+
+
+def test_the_scan_finds_underscore_emphasised_signatures_in_a_tracked_markdown_file(tmp_path):
+    """Underscore emphasis, through the real file walk.
+
+    On the reviewed pattern this returned an empty list: a tracked Markdown
+    document could carry two authorship claims and the required check reported
+    nothing, because `_` is a word character and the closing marker therefore
+    produced no word boundary.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text(
+        "# Guide\n"
+        "\n"
+        "# Generated with _Claude Code_\n"
+        "<!-- Generated by __ChatGPT__ -->\n"
+        "\n"
+        "Ordinary prose about the OpenAI API and its limits.\n"
+        "# Generated with _Claude Code_ on 2026-10-08\n"
+        "value = ChatGPT_client.send(prompt)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+
+    findings = signature_locations(tmp_path)
+    assert [entry.rsplit(": ", 1)[0] for entry in sorted(findings)] == [
+        "docs/guide.md:3",
+        "docs/guide.md:4",
+        "docs/guide.md:7",
+    ]
+    # The prose line and the identifier line are not findings.
+    assert not any(":6:" in entry or ":8:" in entry for entry in findings)
+
+
+def test_the_scan_leaves_underscored_identifiers_and_human_names_alone(tmp_path):
+    """A file of entirely legitimate underscores produces no findings."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "client.py").write_text(
+        "ChatGPT_client = None\n"
+        "Claude_Code = 'identifier, not a product'\n"
+        "OPENAI_API_KEY = config.get('OPENAI_API_KEY')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "AUTHORS.md").write_text(
+        "Written by _Claude Dupont_\nWritten by __Jean-Claude Dupont__\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "migration.py").write_text(
+        "# Generated by Alembic\n# Generated by OpenAPI Generator\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    assert signature_locations(tmp_path) == []
