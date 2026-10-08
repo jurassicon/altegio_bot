@@ -1242,13 +1242,29 @@ async def _settle_header(session: AsyncSession, header: EasyWeekVoucherProductio
 
 @dataclass(frozen=True)
 class StopState:
-    """Whether this batch is under an operator stop, and since when."""
+    """Whether this batch is under an operator stop, since when, and how final.
+
+    ``terminal`` is §45.4: on the fixed €10 contract an explicit stop ends that
+    batch's CREATE/PAY/DELIVER for good, so an interface must be able to say
+    "stopped, and not resumable" rather than the "stopped, continue with a fresh
+    confirmation" that schemas ``1`` and ``2`` still mean.
+
+    It is derived from facts already on disk — an uncleared stop row plus the
+    batch header's own ``request_schema_version`` — and deliberately not stored a
+    second time. A column would be a second place for the answer to live, and the
+    only way the two could ever disagree is by being wrong about a batch whose
+    money has already moved.
+
+    Terminal is about EXECUTION only. It never says an issued voucher was
+    annulled, and it never says money came back.
+    """
 
     active: bool
     requested_at: datetime | None = None
     requested_by: str | None = None
     cleared_at: datetime | None = None
     stop_count: int = 0
+    terminal: bool = False
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -1256,6 +1272,9 @@ class StopState:
             "stop_requested_at": _iso(self.requested_at),
             "stop_cleared_at": _iso(self.cleared_at),
             "stop_count": self.stop_count,
+            # True only while a stop is actually in force, so a cleared schema-1/2
+            # stop never reads as a cancellation that happened.
+            "stop_terminal": self.terminal,
         }
 
 
@@ -1269,6 +1288,18 @@ async def _stop_row(
     if for_update:
         stmt = stmt.with_for_update()
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _stop_is_terminal_schema(session: AsyncSession, *, batch_id: int) -> bool:
+    """Does a stop on THIS batch end its execution for good (§45.4)?
+
+    Read off the batch header's own ``request_schema_version``, which is written
+    at freeze time and never afterwards. That is the point: the answer belongs to
+    the durable batch, so no request field, browser payload or re-planned stage can
+    make a schema-3 mailing answer as a schema-2 one to get its slots back.
+    """
+    header = await _header_by_id(session, batch_id)
+    return header is not None and str(header.request_schema_version) == "3"
 
 
 async def _stop_is_active_locked(session: AsyncSession, *, batch_id: int) -> bool:
@@ -1359,10 +1390,18 @@ class BatchAdmission:
     in_flight_operation_id: int | None = None
     stop_active: bool = False
     stop_generation: int = 0
+    # §45.4: whether a stop on THIS batch ends its execution for good. Read from
+    # the header under the same lock as the rest, so an admission never pairs
+    # "there is a stop" with a schema observed at another moment.
+    stop_is_terminal: bool = False
 
     @property
     def busy(self) -> bool:
         return self.in_flight_operation_id is not None
+
+    @property
+    def terminally_stopped(self) -> bool:
+        return self.stop_active and self.stop_is_terminal
 
 
 async def admission_locked(session: AsyncSession, *, batch_id: int) -> BatchAdmission:
@@ -1384,6 +1423,7 @@ async def admission_locked(session: AsyncSession, *, batch_id: int) -> BatchAdmi
         in_flight_operation_id=in_flight,
         stop_active=active,
         stop_generation=generation,
+        stop_is_terminal=str(header.request_schema_version) == "3",
     )
 
 
@@ -1394,6 +1434,25 @@ async def live_execution(session_maker: async_sessionmaker[AsyncSession], *, bat
         if header is None:
             return None
         return await live_execution_locked(session, batch_id=batch_id)
+
+
+async def terminal_stop_active(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> bool:
+    """Is this batch under a stop that ends its execution for good (§45.4)?
+
+    The standalone read, for where a stage is PLANNED: it refuses an operator before
+    anything is offered to them, so a terminally stopped batch never shows a
+    continuation. A plan is a read, so an unlocked read is the right shape for it.
+
+    It is deliberately NOT what the confirm path uses — that takes the answer off
+    :class:`BatchAdmission`, under the header lock that already serialises the stop
+    — and it is not what makes the stop safe. That is the identical read inside
+    :func:`_claim`, under the same lock, which is what an operation queued before
+    the stop runs into.
+    """
+    async with session_maker() as session:
+        if not await _stop_is_active_locked(session, batch_id=batch_id):
+            return False
+        return await _stop_is_terminal_schema(session, batch_id=batch_id)
 
 
 async def stop_is_active(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> bool:
@@ -1413,12 +1472,14 @@ async def stop_state(session_maker: async_sessionmaker[AsyncSession], *, batch_i
         row = await _stop_row(session, batch_id=batch_id)
         if row is None:
             return StopState(active=False)
+        active = row.cleared_at is None
         return StopState(
-            active=row.cleared_at is None,
+            active=active,
             requested_at=row.requested_at,
             requested_by=row.requested_by,
             cleared_at=row.cleared_at,
             stop_count=int(row.stop_count or 0),
+            terminal=active and await _stop_is_terminal_schema(session, batch_id=batch_id),
         )
 
 
@@ -1442,6 +1503,12 @@ async def request_stop(
 
     A stop that had been cleared by a continuation becomes active again, which is
     what an operator pressing it after resuming means.
+
+    On the fixed €10 contract the stop it writes is terminal (§45.4) and nothing
+    clears it, so "cleared then pressed again" is a schema 1/2 story there. The
+    state handed back says which kind this is, so an interface never has to guess.
+    What this still does NOT do, on any schema, is cancel a request already on the
+    wire, refund anything, delete anything or free an entitlement.
     """
     now = utcnow()
     async with session_maker() as session:
@@ -1449,6 +1516,9 @@ async def request_stop(
             header = await _header_by_id(session, batch_id, for_update=True)
             if header is None:
                 return StopState(active=False)
+            # Read under the header lock this transaction already holds, so the
+            # answer handed back cannot disagree with the row just written.
+            terminal = await _stop_is_terminal_schema(session, batch_id=batch_id)
             row = await _stop_row(session, batch_id=batch_id, for_update=True)
             if row is None:
                 row = EasyWeekVoucherProductionStopRequest(
@@ -1459,7 +1529,13 @@ async def request_stop(
                 )
                 session.add(row)
                 await session.flush()
-                return StopState(active=True, requested_at=now, requested_by=requested_by, stop_count=1)
+                return StopState(
+                    active=True,
+                    requested_at=now,
+                    requested_by=requested_by,
+                    stop_count=1,
+                    terminal=terminal,
+                )
             row.stop_count = int(row.stop_count or 0) + 1
             row.requested_at = now
             row.requested_by = requested_by
@@ -1472,6 +1548,7 @@ async def request_stop(
                 requested_at=now,
                 requested_by=requested_by,
                 stop_count=int(row.stop_count),
+                terminal=terminal,
             )
 
 
@@ -1484,16 +1561,25 @@ async def clear_stop_locked(
 ) -> bool:
     """Lift a stop because an operator confirmed a fresh plan for this batch.
 
-    Deliberately not its own endpoint and not a "resume" button. The ONLY thing
-    that lifts a stop is the act §43.9 and §43.6 require for continuing at all: a
-    freshly built plan, re-proven live, confirmed by an authenticated operator for
-    the slots that plan authorises. Clearing it in that same transaction means
-    there is no moment in which a batch is resumable without a decision.
+    Deliberately not its own endpoint and not a "resume" button. For schemas ``1``
+    and ``2`` the ONLY thing that lifts a stop is the act §43.9 and §43.6 require
+    for continuing at all: a freshly built plan, re-proven live, confirmed by an
+    authenticated operator for the slots that plan authorises. Clearing it in that
+    same transaction means there is no moment in which a batch is resumable without
+    a decision.
+
+    §45.4 takes even that away from the fixed €10 contract: an explicit stop there
+    is terminal, so NOTHING lifts it and this function answers ``False`` with the
+    row untouched. The confirm path refuses such a stage before it gets here; this
+    check is the floor under that one, so a future caller cannot resume a terminal
+    stop by reaching for the "lift it" helper.
 
     Runs inside the confirm transaction, which already holds its locks.
     """
     row = await _stop_row(session, batch_id=batch_id, for_update=True)
     if row is None or row.cleared_at is not None:
+        return False
+    if await _stop_is_terminal_schema(session, batch_id=batch_id):
         return False
     row.cleared_at = now
     row.cleared_by = cleared_by
@@ -2310,6 +2396,7 @@ __all__ = [
     "request_stop",
     "resettle",
     "stop_generation",
+    "terminal_stop_active",
     "stop_is_active",
     "stop_state",
 ]

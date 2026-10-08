@@ -3,6 +3,11 @@
 Prints fixed product facts, counters and allowlisted field types only. No
 voucher codes, customer/order identities, dates, request payloads or secrets.
 Run only when an operator authorizes these authenticated GETs.
+
+§45.4: this report is a diagnostic, not a precondition. EasyWeek owns a voucher's
+term, so nothing here has to be run before a mailing, and running it proves no
+voucher's dates. The field TYPES below are printed to describe what the provider
+actually returns — they are not a semantics this code acts on.
 """
 
 from __future__ import annotations
@@ -14,7 +19,10 @@ import json
 from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production.baseline import prove_production_baseline
-from altegio_bot.campaigns.easyweek_voucher_production.validity import issued_voucher_validity_reason
+from altegio_bot.campaigns.easyweek_voucher_production.validity import (
+    PROVIDER_MANAGED_VALIDITY,
+    issued_voucher_validity_reason,
+)
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
@@ -38,8 +46,12 @@ def issued_shape(payload: object) -> dict:
             for node in nodes
             if isinstance(node, dict)
         ],
-        "validity_reason": issued_voucher_validity_reason(payload, now=utcnow()),
-        "positive_validity_contract_supported": False,
+        # §45.4. ``null`` here means "the provider published nothing that says this
+        # voucher is unusable" — never "this application proved the voucher's
+        # term". Which of the two it is matters, so the responsibility is printed
+        # beside it rather than left to be inferred from a missing value.
+        "invalidity_reason": issued_voucher_validity_reason(payload, now=utcnow()),
+        "term_responsibility": PROVIDER_MANAGED_VALIDITY,
     }
 
 

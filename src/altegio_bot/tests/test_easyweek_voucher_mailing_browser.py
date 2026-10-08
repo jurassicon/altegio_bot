@@ -21,8 +21,6 @@ import asyncio
 import contextlib
 import re
 
-import pytest
-
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
@@ -30,7 +28,6 @@ from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (
@@ -47,27 +44,6 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     unknown_outcome,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
-
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is the operator's real browser.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
-
-@pytest.fixture
-def synthetic_validity_proven(monkeypatch):
-    """Conditional send acceptance; production expiry evidence is still a rollout blocker."""
-    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
-
 
 # Only the numeric mailing page. A glob would also match the prepare screen the
 # browser is already on, and `wait_for_url` would return without navigating.
@@ -179,11 +155,9 @@ async def test_an_operator_walks_preview_to_deliver_in_a_browser(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
-    synthetic_validity_proven,
 ):
     """preview → composition → freeze → create → pay → deliver, by clicking."""
     count = 2
@@ -392,7 +366,6 @@ async def test_two_browser_tabs_confirming_one_offer_act_once(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
@@ -435,39 +408,132 @@ async def test_two_browser_tabs_confirming_one_offer_act_once(
     assert_no_page_errors(page)
 
 
-async def test_stop_and_a_fresh_confirmation_from_the_browser(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+async def test_a_terminal_stop_from_the_browser_offers_no_continuation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
-    """Stop is pressed in the browser, then continuing is a fresh decision (R1)."""
+    """§45.4. The stop an operator presses here ends this €10 mailing's execution.
+
+    Supersedes ``test_stop_and_a_fresh_confirmation_from_the_browser``, whose whole
+    point was that a fresh confirmation RESUMED the batch. That is the §43.6 rule the
+    owner replaced for this contract; schemas 1 and 2 keep it, and the API suites
+    cover the server's side of the refusal.
+
+    What the page has to get right is the honesty: it says execution stopped, it does
+    not say the issued vouchers were annulled or the money returned, and it keeps
+    offering the two things that still work — reading and reconciling.
+    """
     count = 3
     run_id, reader = await _seed(session_maker, count=count)
     transports.use(reader=reader)
     batch_id = await _freeze_through_browser(page, session_maker, transports, run_id=run_id, count=count)
     reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
 
-    # Press stop before the stage runs, from the page.
+    # The press is guarded by a dialog that spells the terminality out. Accepting it
+    # explicitly is the test: a browser that silently dismissed it would prove that
+    # an operator can stop a mailing for good without being told.
+    warnings: list[str] = []
+
+    async def _accept(dialog):
+        warnings.append(dialog.message)
+        await dialog.accept()
+
+    page.on("dialog", _accept)
+    await page.wait_for_selector("#btn-stop:not([disabled])")
+    assert "окончательно" in await page.inner_text("#btn-stop")
     await page.click("#btn-stop")
     await page.wait_for_function(
         "() => { const el = document.querySelector('#stop-banner');"
-        " return el && el.innerText.includes('Остановлено'); }"
+        " return el && el.innerText.includes('окончательно'); }"
     )
-    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is True
+    assert warnings and "окончательно" in warnings[0]
+    # Said before the write, not after: what it stops, and what it does not do.
+    assert "не аннулир" in warnings[0] and "возвра" in warnings[0]
 
-    # A plan prepared now knows about the stop, so confirming it is the continuation.
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+
+    banner = await page.inner_text("#stop-banner")
+    assert "не означает" in banner and "аннулированы" in banner
+    # No stage is offered any more, and the stop cannot be pressed a second time.
+    for stage in ("create", "pay", "deliver"):
+        assert await page.get_attribute(f"#btn-stage-{stage}", "disabled") is not None
+    assert await page.get_attribute("#btn-stop", "disabled") is not None
+    # Reading the outside world back is still an operator action.
+    assert await page.get_attribute("#btn-reconcile", "disabled") is None
+    await page.click("#btn-reconcile")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area'); return el && el.innerText.trim().length > 0; }"
+    )
+
+    # Nothing was bought, and the executor has nothing to take.
     mutator = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
     transports.use(reader=reader, mutator=mutator)
-    await page.wait_for_selector("#btn-stage-create:not([disabled])")
-    await page.click("#btn-stage-create")
+    assert await _drain(session_maker) is None
+    assert mutator.calls == []
+    snapshot = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert {item.status for item in snapshot.items} == {"planned"}
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is True
+    assert_no_page_errors(page)
+
+
+async def test_reconcile_and_an_allowed_refund_still_work_after_a_terminal_stop(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """§45.4. Stopping takes away spending, not access to what already happened.
+
+    The batch is paid before the stop, so there is real money out there — which is
+    exactly when an operator must still be able to read the outside world back and
+    get one slot's money returned, from the same interface, with its own separate
+    confirmation.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    batch_id = await _freeze_through_browser(page, session_maker, transports, run_id=run_id, count=count)
+    reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
+    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(i) for i in range(count)]))
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-create")
+    settles = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    transports.use(
+        reader=reader,
+        mutator=FakeMutator(pay_sequence=[_ok(i) for i in range(count)], reader=reader, settles=settles),
+    )
+    await _run_stage_through_browser(page, session_maker, button="btn-stage-pay")
+    await _wait_for_slots_text(page, "paid")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.click("#btn-stop")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#stop-banner');"
+        " return el && el.innerText.includes('окончательно'); }"
+    )
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).terminal is True
+
+    # Reconciliation: still an operator action, and it reopens nothing.
+    transports.use(reader=reader)
+    await page.click("#btn-reconcile")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area'); return el && el.innerText.trim().length > 0; }"
+    )
+
+    # One slot's money back, separately confirmed, through the same page.
+    refunded = await marker_orders(session_maker, batch_id=batch_id, status="refunded")
+    mutator = FakeMutator(refund=_ok(0), reader=reader, settles=refunded)
+    transports.use(reader=reader, mutator=mutator)
+    await page.wait_for_selector("#slots-table button[data-slot='1']")
+    await page.click("#slots-table button[data-slot='1']")
     await page.wait_for_selector("#confirm-panel:not(.d-none)")
     await _press_confirm(page)
     finished = await _drain(session_maker)
+    assert finished is not None and finished.status == "completed", finished
+    assert mutator.calls.count("refund") == 1
+    await _wait_for_slots_text(page, "refunded")
 
-    # The work first, so a failure distinguishes "the stage did not run" from "the
-    # page had not repainted yet".
-    assert finished is not None and finished.outcome_code == "applied", finished
-    assert mutator.calls.count("create") == count
-    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is False
-    await _wait_for_slots_text(page, "created")
+    # And the stop is still terminal: no stage came back with the refund.
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+    for stage in ("create", "pay", "deliver"):
+        assert await page.get_attribute(f"#btn-stage-{stage}", "disabled") is not None
     assert_no_page_errors(page)
 
 
@@ -475,11 +541,9 @@ async def test_a_reconcile_during_an_active_send_is_refused_in_the_browser(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
-    synthetic_validity_proven,
 ):
     """Review R2 from the operator's side: the button answers busy, not success."""
     count = 1
@@ -517,11 +581,9 @@ async def test_unknown_then_reconcile_then_continue_in_the_browser(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
-    synthetic_validity_proven,
 ):
     """An ambiguous send halts the rest, the page says so, and the readback is offered."""
     count = 2
@@ -560,7 +622,7 @@ async def test_unknown_then_reconcile_then_continue_in_the_browser(
 
 
 async def test_an_allowed_refund_names_its_client_and_runs_from_the_browser(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
     """Reviews R6 and R7: the right rows offer a refund, and it says whose it is."""
     count = 2
@@ -601,11 +663,9 @@ async def test_no_refund_is_offered_after_a_send_attempt(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
-    synthetic_validity_proven,
 ):
     """Review R6: the UI must not offer what the server forbids."""
     count = 1
@@ -748,7 +808,7 @@ async def test_an_unauthenticated_browser_is_sent_to_the_login_form(
 
 
 async def test_concurrent_browser_confirmations_of_two_stages_do_not_overlap(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
     """Review R1 in a browser: a second stage cannot start while one is in flight."""
     count = 2
@@ -798,7 +858,7 @@ async def test_concurrent_browser_confirmations_of_two_stages_do_not_overlap(
 
 
 async def test_the_executor_runs_the_work_without_any_manual_exec(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
     """Review R4: a UI-confirmed stage is executed by the worker loop itself.
 
@@ -1534,7 +1594,7 @@ async def test_a_real_refusal_is_still_reported_as_a_refusal(
 
 
 async def test_a_status_error_does_not_blank_a_mailings_progress(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
     """The mailing page keeps what was proven when the next read fails.
 
@@ -1573,12 +1633,10 @@ async def test_operator_adds_checked_subset_to_earned_preview_and_delivers_mixed
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     page,
     transports,
     monkeypatch,
-    synthetic_validity_proven,
 ):
     """Paste → read results → explicit subset → four stage confirmations, all in UI."""
     from sqlalchemy import func, select
@@ -1668,46 +1726,52 @@ async def test_operator_adds_checked_subset_to_earned_preview_and_delivers_mixed
     assert_no_page_errors(page)
 
 
-async def test_the_browser_refuses_to_issue_a_voucher_it_could_not_deliver(
+async def test_the_browser_states_the_terms_and_claims_no_proof_of_its_own(
     session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
-    """F1, in the operator's real browser, with the real default guard.
+    """§45.4, in the operator's real browser, on the real default guard.
 
-    Supersedes ``test_new_voucher_without_proven_expiry_stays_paid_and_unsent_in_browser``,
-    which clicked create, clicked pay, and only then showed the refusal — leaving
-    one real voucher bought and unsendable, in a test that read as the correct
-    production behaviour. The refusal belongs on the CREATE button, where it
-    costs nothing.
+    Supersedes ``test_the_browser_refuses_to_issue_a_voucher_it_could_not_deliver``.
+    That test's refusal is the one the owner removed, so it could not simply be
+    reworded — what it protected is kept and asserted here instead: the terms an
+    operator reads before buying, the honest arithmetic on the confirmation, and the
+    page never claiming a proof this application does not perform.
 
-    What is preserved: the terms shown to the operator, the batch still being
-    freezable and readable, and the composition never being presented as a
-    mailing that is ready to go out.
+    Nothing is bought: the confirmation is cancelled rather than approved, which is
+    also the proof that reaching it is not itself an effect.
     """
     run_id, reader = await _seed(session_maker, count=1)
     transports.use(reader=reader)
     batch_id = await _freeze_through_browser(page, session_maker, transports, run_id=run_id, count=1)
-    assert "10 EUR" in await page.inner_text(".voucher-terms")
-    assert "календарный месяц с активации" in await page.inner_text(".voucher-terms")
-    assert "не с получения WhatsApp" in await page.inner_text(".voucher-terms")
+    terms = await page.inner_text(".voucher-terms")
+    assert "10 EUR" in terms
+    assert "календарный месяц с активации" in terms
+    assert "не с получения WhatsApp" in terms
     assert "10 €" in await page.inner_text("pre")
-    assert "kitilash_ka_new_client_voucher_10eur_v2" in await page.inner_text("body")
+    body = await page.inner_text("body")
+    assert "kitilash_ka_new_client_voucher_10eur_v2" in body
+    # Who answers for the term, said out loud — and no fictional proof anywhere.
+    assert "Срок действия и погашение контролируются EasyWeek" in body
+    assert "не подтверждает дату активации" in body
+    assert "voucher_production_validity_capability_unproven" not in await page.content()
+    assert "issued_validity_capability_proven" not in await page.content()
+    assert "issued_validity_proven" not in await page.content()
 
     reader.orders.update(await marker_orders(session_maker, batch_id=batch_id))
-    # A mutator is installed so that a create which DID happen would be visible
-    # in its call list rather than failing for want of a transport.
+    # A mutator is installed so a create that DID happen would show in its call list
+    # rather than failing for want of a transport.
     mutator = FakeMutator(create_sequence=[_ok(0)])
     transports.use(reader=reader, mutator=mutator)
     await page.wait_for_selector("#btn-stage-create:not([disabled])")
     await page.click("#btn-stage-create")
-    await page.wait_for_function(
-        "document.querySelector('#alert-area').innerText"
-        ".includes('Проверка срока выданного ваучера ещё не реализована')"
-    )
-    # No confirmation screen, so there is nothing for an operator to approve.
-    assert await page.is_hidden("#confirm-panel")
-    assert mutator.create_calls == [] and mutator.pay_calls == []
+    # The step an operator may now take, with the money it commits spelled out.
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    assert "10.00 €" in await page.inner_text("#confirm-summary")
+    await page.click("text=Отмена")
+    await page.wait_for_selector("#confirm-panel.d-none", state="attached")
 
-    # Nothing was bought, nothing is in flight, and nothing needs reconciling.
+    # Cancelled, so nothing was bought and nothing needs reconciling.
+    assert mutator.create_calls == [] and mutator.pay_calls == []
     snapshot = await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)
     assert snapshot.items[0].status == "planned"
     assert snapshot.items[0].send_attempt_count == 0
@@ -1715,14 +1779,15 @@ async def test_the_browser_refuses_to_issue_a_voucher_it_could_not_deliver(
     assert_no_page_errors(page)
 
 
-async def test_an_issued_voucher_with_an_unproven_term_stays_paid_and_unsent_in_browser(
-    session_maker, production_configuration, binding_key, issued_validity_capability, executor_enabled, page, transports
+async def test_a_voucher_easyweek_calls_expired_stays_paid_and_unsent_in_browser(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
 ):
-    """F1 question (b), in the browser: the capability exists, this code is not proven.
+    """§45.4. The invalidity signal EasyWeek actually publishes still stops a send.
 
-    The half of the reviewed test that was always right. These slots are bought
-    under a modelled capability, so the refusal is about one artifact rather than
-    about the contract, and the money stays recoverable.
+    Replaces ``test_an_issued_voucher_with_an_unproven_term_stays_paid_and_unsent_in_browser``,
+    whose premise — an artifact with no dates — is now the normal case. The invariant
+    it was protecting is unchanged: the browser refuses DELIVER, the attempt is not
+    spent, and the money stays recoverable through the refund the page still offers.
     """
     run_id, reader = await _seed(session_maker, count=1)
     transports.use(reader=reader)
@@ -1734,16 +1799,25 @@ async def test_an_issued_voucher_with_an_unproven_term_stays_paid_and_unsent_in_
     transports.use(reader=reader, mutator=FakeMutator(pay_sequence=[_ok(0)], reader=reader, settles=settles))
     await _run_stage_through_browser(page, session_maker, button="btn-stage-pay")
     await _wait_for_slots_text(page, "paid")
+
+    # EasyWeek now says this voucher is unusable.
+    for order in reader.orders.values():
+        if isinstance(order, dict):
+            for voucher in order.get("vouchers") or []:
+                voucher["is_expired"] = True
+
     sender = FakeSender()
     transports.use(reader=reader, sender=sender)
     await page.wait_for_selector("#btn-stage-deliver:not([disabled])")
     await page.click("#btn-stage-deliver")
     await page.wait_for_function(
-        "document.querySelector('#alert-area').innerText.includes('Срок действия выданного ваучера не подтверждён')"
+        "document.querySelector('#alert-area').innerText.includes('EasyWeek сообщает, что ваучер недействителен')"
     )
     assert await page.is_hidden("#confirm-panel")
     assert sender.calls == 0
     snapshot = await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)
     assert snapshot.items[0].status == "paid"
     assert snapshot.items[0].send_attempt_count == 0
+    # The money is still recoverable: the slot still offers its refund.
+    assert await page.locator("#slots-table button[data-slot='1']").count() == 1
     assert_no_page_errors(page)

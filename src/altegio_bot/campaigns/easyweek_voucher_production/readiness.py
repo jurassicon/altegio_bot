@@ -56,9 +56,6 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     ISSUER_MEMBERSHIP_INCOMPLETE,
     PRODUCTION_DISABLED,
     SENDER_UNPROVEN,
-    STAGE_CREATE,
-    STAGE_DELIVER,
-    STAGE_PAY,
     STAGE_REFUND,
     TEMPLATE_UNPROVEN,
 )
@@ -67,7 +64,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     PinnedIssuer,
     pinned_issuer,
 )
-from altegio_bot.campaigns.easyweek_voucher_production.validity import issued_validity_capability_reason
+from altegio_bot.campaigns.easyweek_voucher_production.validity import PROVIDER_MANAGED_VALIDITY
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
@@ -78,17 +75,10 @@ from altegio_bot.settings import settings
 # which would be a lie about a check nobody ran.
 NOT_REQUIRED_FOR_REFUND: Final = "not_required_for_refund"
 
-# What a report prints where the issued-validity capability does not apply at
-# all: the historical contracts, whose terms are not governed by §45.2, and the
-# refund, which sends nothing.
+# What a report prints where the §45.4 validity answer does not apply at all: the
+# historical €15 contracts, whose terms were settled when they were frozen, and
+# the refund, which sends nothing.
 NOT_APPLICABLE: Final = "not_applicable"
-
-# The stages whose work only makes sense if the voucher it produces can
-# eventually be delivered. A FREEZE is deliberately absent: it is local, it buys
-# nothing, and finding out while it is still free that the batch could not have
-# been delivered is exactly what freezing before buying is for — so a freeze
-# REPORTS this blocker instead of refusing over it.
-DELIVERABLE_STAGES: Final = (STAGE_CREATE, STAGE_PAY, STAGE_DELIVER)
 
 
 def _canonical(value: str | None) -> str | None:
@@ -124,12 +114,11 @@ class ProductionPrerequisites:
     key_reason: str | None = None
     template_reason: str | None = None
     live_meta_verified: bool = False
-    # §45.2 question (a): whether ANY issued voucher's term could be proven. Not
-    # a fact about one voucher — nothing has been issued yet when this is asked.
-    # ``None`` means either proven or not applicable to this contract; which of
-    # the two is :attr:`validity_capability_applies`.
-    validity_capability_reason: str | None = None
-    validity_capability_applies: bool = False
+    # §45.4: whether this contract's voucher term is EasyWeek's to answer for.
+    # True for the fixed €10 contract. It is a statement about who owns the term,
+    # never a proof about one voucher's dates, so it contributes no reason and can
+    # never read as a passed check.
+    provider_managed_validity: bool = False
     sender_reason: str | None = None
     booking_link_reason: str | None = None
     delivery_checks_applied: bool = True
@@ -153,10 +142,6 @@ class ProductionPrerequisites:
         if self.delivery_checks_applied:
             found.extend(
                 [
-                    # Before the key, the template and the sender: an operator
-                    # whose contract cannot deliver anything needs to read that
-                    # first, and it is the one blocker no configuration fixes.
-                    self.validity_capability_reason if self.stage in DELIVERABLE_STAGES else None,
                     self.staffer_reason,
                     # The pin and the live membership, in that order: "this is
                     # not the approved staffer" is a more useful answer than
@@ -173,14 +158,20 @@ class ProductionPrerequisites:
 
     @property
     def delivery_blockers(self) -> tuple[str, ...]:
-        """Known reasons this contract could not DELIVER what a stage would buy.
+        """Contract-level reasons this batch could not DELIVER what a stage buys.
 
-        Reported even by the stages these blockers do not refuse, which is the
-        whole point: a freeze is allowed to write a composition and must still
-        say, in the same breath, that the composition is not a launch-ready
-        mailing.
+        Reported even by the stages these blockers would not refuse, so a freeze
+        that is allowed to write a composition still says, in the same breath,
+        whether that composition is a launch-ready mailing.
+
+        §45.4 removed the only member this ever had: "no issued-validity proof"
+        was a blocker while the application was expected to prove each voucher's
+        dates itself, and EasyWeek owns the term instead. It stays as the report's
+        place for a blocker that is about the contract rather than one slot — and
+        it is deliberately NOT where a stop, a product drift, a template fault or
+        a payment fault is reported, each of which has its own reason code.
         """
-        return (self.validity_capability_reason,) if self.validity_capability_reason else ()
+        return ()
 
     @property
     def ready(self) -> bool:
@@ -192,16 +183,21 @@ class ProductionPrerequisites:
         def applicable(reason: str | None) -> Any:
             return (reason is None) if self.delivery_checks_applied else NOT_REQUIRED_FOR_REFUND
 
-        def issued_validity_capability() -> Any:
-            """Three answers, because there are three situations."""
+        def issued_voucher_validity() -> Any:
+            """Who answers for the term, in three situations — never a boolean.
+
+            §45.4. A ``true`` would assert that this application proved each
+            issued voucher's activation and expiry dates, which it does not do;
+            a ``false`` would read as a blocker that no configuration can fix.
+            So the answer names the responsible party instead.
+            """
             if not self.delivery_checks_applied:
                 return NOT_REQUIRED_FOR_REFUND
-            if not self.validity_capability_applies:
-                # A historical contract. Its terms are not §45.2's question, and
-                # printing ``false`` here would read as a blocker on a batch this
-                # phase deliberately leaves alone.
+            if not self.provider_managed_validity:
+                # A historical €15 contract, whose terms were settled when it was
+                # frozen and are not re-decided here.
                 return NOT_APPLICABLE
-            return self.validity_capability_reason is None
+            return PROVIDER_MANAGED_VALIDITY
 
         return {
             "stage": self.stage,
@@ -227,10 +223,11 @@ class ProductionPrerequisites:
             "hmac_key_usable": applicable(self.key_reason),
             "template_proven": applicable(self.template_reason),
             "live_meta_verified": self.live_meta_verified,
-            # §45.2 (a), as its own fact. A report that only said
-            # `template_proven` would let a green readiness panel read as "this
-            # mailing can be sent" while the send path is closed by construction.
-            "issued_validity_capability_proven": issued_validity_capability(),
+            # §45.4, as its own fact and under its own name. The old
+            # `issued_validity_capability_proven` boolean is deliberately gone
+            # rather than pinned to ``true``: nothing may report a proof this
+            # application does not perform.
+            "issued_voucher_validity": issued_voucher_validity(),
             "delivery_blockers": list(self.delivery_blockers),
             "sender_proven": applicable(self.sender_reason),
             # Presence only: the link is a real public URL, and a report is
@@ -275,10 +272,10 @@ async def prove_prerequisites(
     """
     message = template_contract.for_schema(schema_version)
     fence_open = settings.easyweek_voucher_production_mailing_enabled if enabled is None else enabled
-    # §45.2 (a), for the fixed €10 contract only. The historical €15 contracts
-    # are NOT moved under this blocker: their terms were settled when they were
-    # frozen and re-deciding them now would strand their own recovery.
-    capability_applies = schema_version == "3"
+    # §45.4, for the fixed €10 contract only. The historical €15 contracts are not
+    # re-described: their terms were settled when they were frozen and restating
+    # them now would only confuse their own recovery.
+    provider_managed_validity = schema_version == "3"
     account_uuid = _canonical(settings.easyweek_voucher_production_mailing_account_uuid)
     account_reason = None if account_uuid else ACCOUNT_UNCONFIGURED
 
@@ -340,10 +337,6 @@ async def prove_prerequisites(
             TEMPLATE_UNPROVEN if message.db_row_blocker(active[0], company_id=company_id) is not None else None
         )
 
-    # Asked without a payload, a voucher or a network call, so it costs nothing
-    # to ask it here — before the first CREATE rather than at the first DELIVER.
-    validity_capability_reason = issued_validity_capability_reason() if capability_applies else None
-
     live_meta_verified = bool(
         live_meta_proof is not None
         and live_meta_proof.proven
@@ -394,8 +387,7 @@ async def prove_prerequisites(
         key_reason=key_reason,
         template_reason=template_reason,
         live_meta_verified=live_meta_verified,
-        validity_capability_reason=validity_capability_reason,
-        validity_capability_applies=capability_applies,
+        provider_managed_validity=provider_managed_validity,
         sender_reason=None if sender_ok else SENDER_UNPROVEN,
         booking_link_reason=booking_link_reason,
         booking_link=booking_link or None,
@@ -459,7 +451,6 @@ async def prove_live_meta_template(*, reader: Any = None) -> template_contract.T
 
 
 __all__ = [
-    "DELIVERABLE_STAGES",
     "NOT_APPLICABLE",
     "NOT_REQUIRED_FOR_REFUND",
     "ProductionPrerequisites",

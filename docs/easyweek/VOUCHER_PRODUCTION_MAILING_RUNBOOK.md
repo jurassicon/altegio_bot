@@ -8,25 +8,48 @@ The voucher is single use, valid for one month **from activation**, with any
 unused balance forfeited. Receiving the WhatsApp message does not start or
 restart the term. Approval TTL remains a separate 30-minute authorization rule.
 
-**Rollout is blocked pending issued-voucher validity evidence, and the block now
-lands before the money.** Two different questions are kept apart:
+**The voucher term is EasyWeek's responsibility (plan §45.4, owner decision of
+08.10.2026).** This replaces the former rollout blocker, under which the absence
+of issued-voucher dates refused CREATE, PAY and DELIVER for every schema 3
+mailing.
 
-* **(a) Can this application prove the term of any issued voucher at all?** No.
-  There is no implemented, evidenced way to read a voucher's activation instant
-  and expiry boundary. So a schema 3 contract refuses **CREATE and PAY**, with
-  `voucher_production_validity_capability_unproven`, before the first order
-  exists. A FREEZE is still allowed — it is local and buys nothing — and its
-  report and the readiness panel both name the blocker, so a frozen composition
-  is never presented as a mailing that is ready to go out.
-* **(b) Is one particular issued voucher still valid?** Only askable once a
-  voucher exists. That guard is unchanged and still returns
-  `voucher_production_validity_unproven`, with `voucher_production_voucher_expired`
-  for an observed expired signal.
+* **Who answers for the term.** EasyWeek controls validity, the remaining balance
+  and redemption. The product contract — single use, one month from activation,
+  unused balance forfeited — is proven against the product and stated in the
+  approved message. That is the condition the recipient is promised.
+* **What the application does NOT do.** It does not prove the activation instant
+  or the expiry boundary of an individual issued code, and it never reports that
+  it did. Reports name the responsible party instead:
+  `issued_voucher_validity: provider_managed` for schema 3, `not_applicable` for
+  the historical €15 contracts, `not_required_for_refund` for a refund. The old
+  `issued_validity_capability_proven` boolean is gone rather than set to `true`.
+* **What an artifact without dates means now.** A correct issued voucher that
+  carries no activation or expiry field is the ordinary case. It does not block
+  CREATE, PAY or DELIVER, and it does not raise `reconciliation_required`.
+* **What still refuses a send.** A supported, unambiguous statement from EasyWeek
+  that the voucher is unusable — `is_expired: true`, `status: "expired"`, or an
+  `expires_at` / `valid_until` already in the past — refuses DELIVER with
+  `voucher_production_voucher_expired`, at both boundaries: when the stage plan is
+  built and again on the last order read before the send claim. Undocumented
+  provider fields are not invented, and a future date is still not a proof.
+* **Different from "cannot read it".** An order or voucher line that cannot be
+  read, or a code that does not match its binding, is refused by the order,
+  payment, artifact and binding checks — `voucher_production_order_unproven`,
+  `voucher_production_order_not_paid`, `voucher_production_artifact_unproven`,
+  `voucher_production_binding_mismatch`. That is a separate answer from "this
+  artifact carries no optional date", and an external API failure is never
+  positive evidence.
+* **No substitutes.** Nothing replaces a term here: not the age of a preview or a
+  batch, not the CREATE or PAY instant, not an arbitrary limit in hours or days,
+  not a manual per-code date confirmation, and not a mandatory diagnostic before
+  each mailing. The 30-minute approval TTL stays a check on how fresh a
+  permission is and is never read as a voucher's term.
 
-Future-looking dates alone prove neither. Answering (a) is a reviewed
-implementation change against read-only provider evidence, not a setting: there
-is no environment variable, no flag and no UI bypass. See the scoped rollout
-section below.
+Every other guard is unchanged: the exact product and nominal, UUID-first
+identity, the paid-order proof, composition and opt-out, the exact APPROVED Meta
+template, HMAC binding, the financial CHECK constraints, entitlement and dedupe,
+approval binding to operator/stage/batch/slots, one attempt per slot, and no
+refund after a send claim.
 
 Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–45 before the first action.
 §44 adds UUID-first customers, a checked phone list and mixed earned/manual batches.
@@ -342,8 +365,8 @@ per-item ledger, and the operation reads `interrupted` on the mailing page. It i
 never retried — resolve it with «Сверить с EasyWeek» and then a fresh confirmation
 for what is provably untouched (§9.4).
 
-To stop a mailing **without** stopping the service, use the operator's own control:
-«Остановить после текущего запроса» (§8). That is the ordinary way, and the only one
+To stop a mailing **without** stopping the service, use the operator's own control
+in §8 — final for a €10 mailing, a pause for a historical one. That is the ordinary way, and the only one
 that leaves no operation in doubt.
 
 ---
@@ -362,6 +385,17 @@ before the fence is opened.
 4. With the fence closed, press nothing — but confirm the readiness panel names
    `voucher_production_disabled`. No value of any secret appears anywhere on the
    page; readiness is reported as reason codes only.
+4a. On the same page, confirm the §45.4 wording and the absence of the replaced
+   claims. Expect to read *«Срок действия и погашение контролируются EasyWeek»*
+   and that the application does not confirm each code's activation and expiry
+   dates. Expect **not** to find `voucher_production_validity_capability_unproven`,
+   `voucher_production_validity_unproven`, the phrase about issuing and payment
+   being closed, or any `issued_validity_capability_proven` /
+   `issued_validity_proven` field. This is a read of the page only.
+4b. Open an existing mailing page, if one exists, and confirm the stop control
+   reads *«Остановить рассылку окончательно…»* for a €10 batch. **Do not press
+   it.** Its dialog is what explains the terminality; reading the button label is
+   the whole check here.
 5. Confirm a mutating CLI command refuses and does nothing:
 
 ```bash
@@ -530,37 +564,59 @@ before drawing conclusions.
 
 ## 8. Operator: stopping
 
-**«Остановить после текущего запроса»** saves the request for that mailing and
-takes effect at the **next** per-recipient claim, atomically.
+**On a new €10 mailing the stop is final (§45.4).** The button reads
+«Остановить рассылку окончательно…», the page explains what it ends before you
+confirm the dialog, and once saved the mailing's CREATE, PAY and DELIVER are over.
+A historical €15 mailing keeps the older «Остановить после текущего запроса»
+pause described at the end of this section.
 
-What it does **not** do:
+It takes effect at the **next** per-recipient claim, atomically.
+
+What it does **not** do, on either contract:
 
 - it does not cancel a request that is already on the wire. That request's answer
-  — including "unknown" — is recorded as it arrives;
-- it does not refund anything;
-- it does not halt the batch;
-- it does not block status, webhooks, reconciliation or an allowed refund.
+  — including "unknown" — is recorded as it arrives, and later delivery webhooks
+  are still applied;
+- it does not annul an issued voucher and it does not refund anything;
+- it does not delete orders or ledger rows, and it does not release an
+  entitlement;
+- it does not block status, webhooks, reconciliation or an allowed pre-send
+  refund;
+- it does not issue a replacement voucher, and it is not a way to start the same
+  mailing again around dedupe.
 
-Pressing it twice is the same stop. The page shows «Остановлено оператором»,
-which is deliberately a different banner from an unknown outcome, because the next
-step differs: a stop resumes with a fresh confirmation, an unknown needs a
-readback first.
+Pressing it twice is the same stop; there is no stronger stop to escalate to.
+Closing the tab, refreshing the page or signing in again is **not** a stop, and
+does not cancel a mailing either.
 
-**Continuing** is a fresh plan and a fresh confirmation for the slots that plan
-authorises. That confirmation is what lifts the stop — there is no separate
-"resume" button, because continuing must be a decision rather than a toggle.
-Successful and attempted actions are never repeated.
+The banner for a final stop is deliberately different both from the pause and
+from an unknown outcome, because what you do next differs: after a final stop
+there is nothing to continue, after a pause continuing is a fresh confirmation,
+and an unknown needs a readback first. The banner also says, in the same breath,
+that stopping did not annul the issued vouchers and did not return any money.
 
-Two refusals you may meet, and both are the system protecting the stop:
+**After a final stop** these still work, from the same page: reading the state,
+delivery webhooks, **«Сверить с EasyWeek»**, and a separately confirmed allowed
+pre-send refund of a specific recipient. No stage button is offered, and the
+server refuses one anyway.
+
+Refusals you may meet, and all of them are the system protecting the stop:
 
 | Reason | What it means |
 | --- | --- |
-| `voucher_production_stop_active` | the step you are confirming was prepared **before** the stop. A plan from before a stop cannot be the decision to carry on past it — prepare the step again and confirm that |
+| `voucher_production_stop_terminal` | this €10 mailing was stopped for good. Nothing resumes it: not a new plan, not a new confirmation, not a step that was already queued, not a restart, not a reconcile and not a refund. Reconciliation and an allowed refund are still available |
+| `voucher_production_stop_active` | historical contracts only: the step you are confirming was prepared **before** the stop. A plan from before a stop cannot be the decision to carry on past it — prepare the step again and confirm that |
 | `voucher_production_operation_in_flight` | another step of this mailing is still running. Wait for it to finish, then prepare the next one |
 
 So a second browser tab holding a step prepared earlier cannot lift your stop, and
 confirming something in one tab cannot resume a step that is already running in
 another.
+
+**Historical €15 mailings (schema 1/2) only — continuing after a pause** is a
+fresh plan and a fresh confirmation for the slots that plan authorises. That
+confirmation is what lifts the stop; there is no separate "resume" button, because
+continuing must be a decision rather than a toggle. Successful and attempted
+actions are never repeated.
 
 ---
 
@@ -921,6 +977,14 @@ mailing, not a way back to the terminal process.
 - **§41 and the historical canaries are untouched.** Their rows, constraints and
   HMAC bindings are exactly as they were, and their recipients are excluded from
   this phase.
+- **Voucher validity is not proven here, and not claimed (§45.4).** EasyWeek owns
+  the term, the balance and redemption. This application does not read an
+  individual issued code's activation instant or expiry boundary, and no report
+  says otherwise. A supported invalidity signal from the provider still refuses a
+  send.
+- **A STOP is not a cancellation of what already happened.** On the €10 contract
+  it ends further execution for good, and that is all: no refund, no remote
+  cancellation, no deletion, no entitlement release, no replacement voucher.
 
 Nothing about a successful mailing authorises a campaign. Every report keeps
 saying `campaign_send_authorized=false`, `bulk_delivery_authorized=false` and
@@ -1053,45 +1117,37 @@ tokens, voucher codes, customer details or raw API responses into a ticket.
    must exactly match the new local contract, including one month **from
    activation**, single use and forfeited balance. PENDING/REJECTED/other text
    block. No fallback to `10eur_v1` or the historical €15 template exists.
-3. **Issued-voucher activation/expiry remains unproven, and new issuing is
-   closed because of it.** Existing evidence confirms code/template/value/price
-   only. The official [Get POS order
+3. **The issued voucher's term is EasyWeek's to answer for, and that is no
+   longer a blocker (§45.4).** The evidence is unchanged: existing readings
+   confirm code/template/value/price only; the official [Get POS order
    documentation](https://developers.easyweek.io/docs/api-reference/endpoints/orders/get-order/)
-   provides no populated voucher date example; the [template documentation](https://developers.easyweek.io/docs/api-reference/endpoints/voucher-templates/list-voucher-templates/)
-   distinguishes product definitions from issued vouchers. Neither establishes
-   the actual activation instant, timezone, expiry boundary or expiry semantics
-   of a particular code.
+   provides no populated voucher date example, and the [template documentation](https://developers.easyweek.io/docs/api-reference/endpoints/voucher-templates/list-voucher-templates/)
+   distinguishes product definitions from issued vouchers. What changed is the
+   owner's decision about what follows from it.
 
-   Because the capability itself does not exist, the application refuses a new
-   **CREATE and PAY** with `voucher_production_validity_capability_unproven` —
-   before any order, any payment and any external call. This is enforced in the
-   plan the backend rebuilds, so it also refuses an approval that was stored
-   while an earlier build allowed one; disabled buttons are a consequence of it,
-   never the mechanism. A FREEZE still succeeds and names the blocker in its own
-   report, which is what makes the composition checkable while it is free.
+   The application therefore does not prove an individual code's activation
+   instant or expiry boundary, and it must never report that it has. A correct
+   issued artifact with no activation or expiry field does not block CREATE, PAY
+   or DELIVER and does not raise `reconciliation_required`. Reports print
+   `issued_voucher_validity: provider_managed`; there is no
+   `issued_validity_capability_proven` field to look for and nothing is pinned to
+   `true` in its place.
 
-   DELIVER additionally refuses with `voucher_production_validity_unproven`, and
-   an observed expired signal returns `voucher_production_voucher_expired`;
-   future-looking candidate fields still do not authorize delivery. An API
-   evidence review and an implemented positive proof are required before real
-   sending is released. There is no flag bypass.
+   DELIVER still refuses `voucher_production_voucher_expired` on a supported
+   invalidity signal — `is_expired: true`, `status: "expired"`, or a past
+   `expires_at` / `valid_until` — checked both when the stage plan is built and
+   on the last order read before the send claim. Future-looking fields are not a
+   positive proof, undocumented fields are not interpreted, and there is no flag
+   that turns any of this off.
 
-   **Delivery readiness may not be claimed until that positive proof is
-   implemented and proven.** Reading this runbook, a green readiness panel or a
-   successful freeze is not that proof.
+   Read-only `status`, the diagnostics commands, `reconcile` and an allowed
+   pre-send `refund` work as before. Historical schema 1/2 batches keep their own
+   €15 contract and are not reinterpreted.
 
-   Already existing objects are unaffected: read-only `status`, the diagnostics
-   commands, `reconcile` and an allowed pre-send `refund` all keep working while
-   this blocker stands, which is what keeps real money recoverable. Historical
-   schema 1/2 batches are **not** moved under this blocker and keep issuing,
-   paying and delivering under their own €15 contract.
-
-Use an **already existing**, separately authorized order for evidence; do not
-create/pay a production voucher just to test the deployment. Obtain provider
-documentation or support confirmation of the exact artifact path, activation
-trigger, timezone, calendar-month semantics and expiry boundary, then compare
-read-only evidence with the EasyWeek UI. If no eligible existing artifact is
-available, the blocker remains. Do not invent dates or substitute a 30-day TTL.
+The diagnostics below remain available and remain **optional**: they describe
+what the provider returns, they are not a precondition for a mailing, and
+running one proves no voucher's dates. Use an **already existing**, separately
+authorized order; never create or pay a production voucher to test a deployment.
 
 Commands below are for the administrator to run with specific approval. They
 were not run against production during development:
@@ -1108,9 +1164,11 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec altegio-api uv run python -m altegio_bot.scripts.easyweek_voucher_10eur_diagnostics --batch-id B --slot S
 ```
 
-The second command cannot produce positive validity proof. Its purpose is to
-identify the missing evidence safely; a successful process exit means product
-baseline read succeeded, not that DELIVER is ready. Never paste a raw order GET.
+The second command cannot produce a positive validity proof and does not need
+to: it prints candidate field **types** plus `term_responsibility:
+provider_managed` and an `invalidity_reason` that is `null` when EasyWeek has
+said nothing. A successful process exit means the product baseline read
+succeeded, not that DELIVER is ready. Never paste a raw order GET.
 
 ### 14.2 Migration and local template reconciliation
 
@@ -1153,11 +1211,47 @@ docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exe
 
 Confirm no unexpected queued operations; closed fence and executor availability
 are separate indicators. Do not click real FREEZE/CREATE/PAY/DELIVER as a smoke
-test. After **all** blockers are resolved, opening the fence is an administrator
-decision; every financial/send stage still needs its own fresh Ops confirmation.
-Loss of eligibility, opt-out, product/Meta drift or expiry stops the appropriate
-new effect. Reconciliation and proven pre-send refund remain possible; send
-claim still forbids refund. STOP, unknown outcomes and replay retain §43 rules.
+test — a real external effect is not a smoke test. The fence stays **false**
+through development and deployment; opening it afterwards is a separate
+administrator decision taken after acceptance, and opening it creates no batch,
+voucher, payment or message by itself. Every financial and sending stage still
+needs its own fresh Ops confirmation, and the separate FREEZE → CREATE → PAY →
+DELIVER confirmations are unchanged: this phase adds no control that runs two of
+them. Loss of eligibility, opt-out, product/Meta drift or a supported invalidity
+signal stops the appropriate new effect. Reconciliation and a proven pre-send
+refund remain possible; a send claim still forbids a refund. Unknown outcomes and
+replay retain §43 rules; STOP follows §45.4 below for the €10 contract.
+
+### 14.2.1 The operator STOP is terminal on the €10 contract (§45.4)
+
+For request schema 3 an explicit operator STOP **ends** that batch's execution.
+It is not a pause, and the page says so before the press and after it.
+
+* Nothing resumes the batch: not a freshly built plan, not a new confirmation,
+  not an operation that was already queued, not a restart, not a reconcile and
+  not a refund. The refusal is `voucher_production_stop_terminal` and it is
+  enforced where a stage is planned, where an approval is confirmed, and in the
+  executor's own per-item claim, which checks it atomically under the batch
+  header's row lock.
+* Terminality is derived from the batch header's own `request_schema_version`
+  plus the stored stop row. No request payload can name an older schema to get
+  the slots back, and there is no new table or column.
+* Historical schema 1/2 batches keep the §43.6 pause: a stop there is lifted by a
+  fresh plan confirmed in knowledge of it.
+* Closing the tab, refreshing the page, signing in again and restarting a
+  container are **not** a STOP and do not cancel a mailing.
+* A STOP is not a cancellation of a request already on the wire. A success or an
+  unknown outcome is recorded as what it was, later delivery webhooks are still
+  applied, and no slot is marked unsent, refunded or cancelled on EasyWeek's side
+  to make the report tidier.
+* STOP performs no refund, no remote cancellation, no order deletion, no ledger
+  deletion and no entitlement release. It never issues a replacement voucher and
+  never starts a new mailing around dedupe.
+* After a STOP these remain available: reading state, delivery webhooks,
+  reconciliation, and a separately confirmed allowed pre-send REFUND. The
+  interface states plainly that execution stopped and that this does **not** mean
+  issued vouchers were annulled or money returned.
+* No new secret, environment variable or override is introduced by any of this.
 
 ### 14.3 Rollback boundary
 
@@ -1167,9 +1261,9 @@ DDL**, preserving all new data. Close the fence and use a reviewed forward fix;
 never delete rows or convert1000 to1500 to force a downgrade. Existing previews,
 historical ledgers, HMACs and €15 sums are preserved through upgrade/re-upgrade.
 
-Positive full-lifecycle tests use mocked external APIs and two clearly named
-synthetic fixtures, one per question: `issued_validity_capability` models (a),
-the capability existing at all, and `synthetic_validity_proven` models (b), one
-voucher's term being proven. They verify wiring for the day evidence exists;
-they do not establish real issued-voucher validity or production readiness, and
-the regressions that cover the real refusals deliberately use neither.
+Positive full-lifecycle tests run on the real production functions with the
+external APIs mocked. §45.4 removed both synthetic validity fixtures — nothing
+models a capability as answered and nothing replaces the validity boundary with
+a function that returns success — so the positive path is the ordinary artifact,
+dates and all absent. Tests with mocked APIs still prove wiring only: they do
+not establish that a real mailing was sent and are not a readiness claim.

@@ -47,7 +47,6 @@ from altegio_bot.models.models import (
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import StubTransports, session_cookie
@@ -62,21 +61,6 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
 
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is the operator's whole path through the browser.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
-
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed; JS execution tests need it")
 
@@ -85,12 +69,6 @@ CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
 STOP_URL = "/ops/voucher-mailings/api/stop"
 RECONCILE_URL = "/ops/voucher-mailings/api/reconcile"
 STATUS_URL = "/ops/voucher-mailings/api/status"
-
-
-@pytest.fixture
-def synthetic_validity_proven(monkeypatch):
-    """Conditional send acceptance; production expiry evidence is still a rollout blocker."""
-    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
 
 
 # ===========================================================================
@@ -249,11 +227,9 @@ async def test_an_operator_runs_the_whole_mailing_from_the_browser(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """One operator, one browser, four confirmations, three recipients paid and sent.
 
@@ -360,7 +336,6 @@ async def test_no_single_control_walks_create_pay_and_deliver(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -385,7 +360,6 @@ async def test_a_refresh_and_a_second_tab_do_not_create_a_second_effect(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -474,22 +448,27 @@ async def test_readiness_explains_a_closed_fence_without_naming_a_secret(
     assert "voucher_production_disabled" in offer["reasons"]
 
 
-async def test_the_readiness_panel_names_the_issued_validity_blocker_before_any_batch(
+async def test_the_readiness_panel_says_who_answers_for_the_voucher_term(
     session_maker, production_configuration, binding_key, ui_client
 ):
-    """F1. The blocker is visible on the way IN, not discovered after a payment.
+    """§45.4. Replaces the panel assertion that new mailings were closed.
 
-    An operator opening the entry page of a correctly configured deployment —
-    fence open, every identity in place — must be told that new mailings cannot
-    be issued yet. The panel is rendered from the same prerequisites the backend
-    refuses on, so the page and the refusal cannot disagree.
+    The page is rendered from the same prerequisites the backend refuses on, so the
+    two cannot disagree — which is why the old wording had to go rather than be
+    softened. What it must say now is who owns the term; what it must never say is
+    that this application proved any voucher's dates.
     """
     page = await ui_client.get("/ops/voucher-mailings")
     assert page.status_code == 200
-    assert "voucher_production_validity_capability_unproven" in page.text
-    assert "выпуск и оплата новых ваучеров закрыты" in page.text
-    # The one thing it must not read as: ready.
-    assert "alert-success" not in page.text
+    assert "Срок действия и погашение контролируются EasyWeek" in page.text
+    assert "не подтверждает дату активации" in page.text
+    # The replaced claims are gone, not merely reworded.
+    assert "voucher_production_validity_capability_unproven" not in page.text
+    assert "voucher_production_validity_unproven" not in page.text
+    assert "выпуск и оплата новых ваучеров закрыты" not in page.text
+    # And no fictional proof took their place.
+    assert "issued_validity_capability_proven" not in page.text
+    assert "issued_validity_proven" not in page.text
 
 
 async def test_the_status_page_stays_readable_with_the_fence_closed(
@@ -537,7 +516,6 @@ async def test_a_stop_ends_the_stage_after_the_current_request(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -617,20 +595,20 @@ async def test_a_stop_does_not_block_status_or_reconciliation(
     assert answer.status_code == 200 and answer.json()["accepted"] is True
 
 
-async def test_continuing_after_a_stop_needs_a_fresh_confirmation_and_repeats_nothing(
+async def test_a_terminal_stop_ends_the_batch_and_repeats_nothing(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
 ):
-    """A stop blocks the stage it was pressed during; continuing is a new decision.
+    """§45.4. Supersedes ``test_continuing_after_a_stop_needs_a_fresh_confirmation``.
 
-    Two things are proven here. The stop really does block a stage confirmed before
-    it — zero CREATEs. And the way back is a fresh plan and a fresh confirmation,
-    which is the only thing that lifts a stop.
+    Half of that test is unchanged and still the point: a stage confirmed before the
+    stop performs zero CREATEs. What the owner replaced is the other half — there is
+    no way back in. The stored stop is what the API, the page and the executor all
+    read, so none of the three can offer a continuation the others would refuse.
     """
     count = 3
     run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
@@ -641,38 +619,40 @@ async def test_continuing_after_a_stop_needs_a_fresh_confirmation_and_repeats_no
     offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
     status, _ = await _confirm(ui_client, offer)
     assert status == 200
-    await ui_client.post(STOP_URL, json={"batch_id": batch_id})
+    stop = (await ui_client.post(STOP_URL, json={"batch_id": batch_id})).json()
+    assert stop["stop_active"] is True and stop["stop_terminal"] is True
 
-    stopped = await _run_executor(session_maker)
-    assert stopped is not None and stopped.outcome_code == "stopped"
+    finished = await _run_executor(session_maker)
+    assert finished is not None and finished.outcome_code == "refused"
+    assert "voucher_production_stop_terminal" in (finished.reason_codes or [])
     assert blocked.calls.count("create") == 0
 
-    # Continuing: a fresh plan, confirmed. That confirmation lifts the stop.
+    # A fresh plan is not a way back: the offer itself is refused.
     resumed = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
-    _offer, finished = await _stage(
-        ui_client,
-        session_maker,
-        transports,
-        stage="create",
-        preview_run_id=run_id,
-        batch_id=batch_id,
-        reader=reader,
-        mutator=resumed,
-    )
-    assert finished is not None and finished.outcome_code == "applied"
-    assert resumed.calls.count("create") == count
-    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is False
+    transports.use(reader=reader, mutator=resumed)
+    again = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
+    assert not again["ready"]
+    assert "voucher_production_stop_terminal" in again["reasons"]
+    assert resumed.calls == []
+    assert await _run_executor(session_maker) is None
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+
+    # The page says execution stopped — and does not claim an annulment or a refund.
+    status_body = (await ui_client.get(f"{STATUS_URL}?batch_id={batch_id}")).json()
+    assert status_body["stop_active"] is True and status_body["stop_terminal"] is True
+    page = await ui_client.get(f"/ops/voucher-mailings/{batch_id}")
+    assert "окончательно" in page.text
+    assert "не означает" in page.text and "аннулированы" in page.text
 
 
 async def test_an_unknown_send_stops_the_rest_and_the_ui_offers_reconciliation(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """One ambiguous Meta answer halts the suffix, and the browser says so.
 
@@ -717,7 +697,6 @@ async def test_an_allowed_pre_send_refund_runs_from_the_browser(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -1218,11 +1197,9 @@ async def test_no_page_or_api_answer_carries_a_code_or_an_identity(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """Every sentinel this suite can leak, hunted across the whole operator surface."""
     from altegio_bot.tests.easyweek_voucher_production_fixtures import (

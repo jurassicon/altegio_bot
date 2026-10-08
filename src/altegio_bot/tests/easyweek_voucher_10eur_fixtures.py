@@ -1,4 +1,10 @@
-"""Explicit §45 synthetic product; historical 15 EUR fixtures remain unchanged."""
+"""Explicit §45 synthetic product; historical 15 EUR fixtures remain unchanged.
+
+§45.4: there is deliberately no helper here that models an issued voucher's term as
+proven, and none that replaces the validity boundary with a function returning
+success. EasyWeek answers for the term, so the positive path needs neither — and a
+test that wants a REFUSAL builds an artifact EasyWeek calls unusable instead.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,6 @@ from typing import Any
 from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production import template_contract
-from altegio_bot.campaigns.easyweek_voucher_production import validity as validity_module
 from altegio_bot.campaigns.easyweek_voucher_production.composition import BatchApproval
 from altegio_bot.easyweek_voucher_production_contract import (
     CURRENT_PRODUCTION_CONTRACT as CONTRACT,
@@ -18,22 +23,6 @@ from altegio_bot.easyweek_voucher_production_contract import (
 )
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate
 from altegio_bot.tests import easyweek_voucher_production_fixtures as old
-
-
-def model_issued_validity_capability(monkeypatch) -> None:
-    """Model §45.2 question (a) — "can any issued term be proven?" — as answered.
-
-    For a test whose subject is something else and which therefore has to get
-    past the early blocker: the durability of a claim, the serialisation of two
-    operations, the whole browser path. It patches the one narrow pure boundary
-    that decides the capability and nothing else, so question (b) — "is THIS
-    voucher still valid?" — keeps refusing unless a test models that separately.
-
-    It models the capability EXISTING. It is not evidence that the provider
-    publishes issued-voucher dates, and the tests that cover the real current
-    refusal deliberately never call it.
-    """
-    monkeypatch.setattr(validity_module, "ISSUED_VALIDITY_PROOF_IMPLEMENTED", True)
 
 
 def production_request(*, run_id: int, batch_id: int | None = None):
