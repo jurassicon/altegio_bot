@@ -17,6 +17,18 @@ A plain `uv run pytest` is **neither** tier: it is the full project suite, and
 it stays that way. The marker filter lives only in the CI invocation, never in
 `addopts`.
 
+### Protected AI-attribution file check
+
+`src/altegio_bot/tests/test_no_ai_attribution.py` checks tracked text files for
+AI authorship signatures and is collected by the required rest shard. It does
+not inspect or rewrite commit metadata. Only its own exact file is exempted,
+because it holds the signature examples used by its regression tests.
+
+Once the owner commits this check, changing, deleting, renaming, skipping or
+weakening it requires explicit owner permission. This includes its patterns,
+exemptions and CI coverage. Fix the offending files instead of changing the
+check to make CI pass. This is an agent instruction, not a GitHub access rule.
+
 ## Required-gate topology
 
 The required tier executes on **three runners in parallel** and is reported by
