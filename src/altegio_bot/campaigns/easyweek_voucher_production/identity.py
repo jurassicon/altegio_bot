@@ -225,6 +225,19 @@ OPS_ORIGIN_REJECTED: Final = "voucher_production_ops_origin_rejected"
 # have lifted their stop. Continuing is a plan built in full knowledge of the
 # stop, which is what the generation comparison establishes.
 STOP_ACTIVE: Final = "voucher_production_stop_active"
+# §45.4, and ONLY for the fixed €10 contract (request schema ``3``). An explicit
+# operator stop ends that batch's CREATE/PAY/DELIVER for good: the owner decided
+# the vouchers of a mailing somebody deliberately stopped are not wanted later, so
+# a stop there is a terminal cancellation of further execution rather than the
+# pause schemas ``1`` and ``2`` keep.
+#
+# That makes it a different answer from :data:`STOP_ACTIVE`, which says "this plan
+# predates the stop, build a fresh one". Nothing lifts this: not a fresh plan, not
+# a new confirmation, not an operation that was already queued, not a restart, not
+# a reconcile and not a refund. It stops execution only — reading status, delivery
+# webhooks, reconciliation and a separately confirmed pre-send refund all stay
+# available, and it never claims an issued voucher was annulled or money returned.
+STOP_TERMINAL: Final = "voucher_production_stop_terminal"
 # Another operation for this batch is queued or running. Admitting a second one
 # would let it clear the first one's stop and resume the slots behind a request
 # that is still in flight.

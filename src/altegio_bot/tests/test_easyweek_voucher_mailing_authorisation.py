@@ -28,7 +28,6 @@ from altegio_bot.ops.auth import SESSION_COOKIE, make_session_token
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (
@@ -44,21 +43,6 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     seed_production_preview,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
-
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is how a browser click becomes permission for one stage.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -290,7 +274,6 @@ async def test_a_spoofed_actor_in_the_payload_is_ignored(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -355,7 +338,6 @@ async def test_a_tampered_count_or_amount_gives_zero_external_calls(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -392,7 +374,6 @@ async def test_the_browser_cannot_name_the_slots(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -428,7 +409,6 @@ async def test_one_approval_cannot_become_two_operations_even_concurrently(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -462,7 +442,6 @@ async def test_two_operators_cannot_confirm_the_same_offer(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -499,7 +478,6 @@ async def test_an_expired_plan_refuses_at_confirmation(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -529,7 +507,6 @@ async def test_a_plan_that_expires_while_queued_is_not_executed(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -587,7 +564,6 @@ async def test_an_approval_for_one_stage_cannot_run_another(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -628,7 +604,6 @@ async def test_an_approval_for_one_batch_cannot_run_a_stage_of_another(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -727,7 +702,6 @@ async def test_the_approval_records_exactly_the_slots_the_operator_was_shown(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,

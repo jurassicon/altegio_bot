@@ -629,11 +629,14 @@ def _reason_rows(reasons: list[str]) -> str:
     if not reasons:
         return "<li class='text-success'>Локальные проверки пройдены.</li>"
     labels = {
-        "voucher_production_validity_capability_unproven": (
-            "Проверка срока выданного ваучера ещё не реализована — выпуск и оплата новых ваучеров закрыты."
+        # §45.4. EasyWeek answers for the term, so there is no "proof not
+        # implemented" blocker left to explain. What remains is EasyWeek having
+        # said this particular voucher is unusable.
+        "voucher_production_voucher_expired": "EasyWeek сообщает, что ваучер недействителен — отправка закрыта.",
+        "voucher_production_stop_terminal": (
+            "Рассылка остановлена оператором. Для этого контракта остановка окончательная: "
+            "выпуск, оплата и отправка этой партии больше не возобновляются."
         ),
-        "voucher_production_validity_unproven": "Срок действия выданного ваучера не подтверждён — отправка закрыта.",
-        "voucher_production_voucher_expired": "Срок действия ваучера истёк — отправка закрыта.",
     }
     return "".join(f"<li>{_esc(labels.get(reason, ''))} <code>{_esc(reason)}</code></li>" for reason in reasons)
 
@@ -660,9 +663,8 @@ def _readiness_block(facts: dict[str, Any]) -> str:
     Исполнитель стадий: {_esc(executor)}. Значения секретов и UUID здесь не показываются.
     Принадлежность мастера филиалу проверяется живым чтением при подготовке шага.
     Для новых рассылок точный APPROVED-шаблон Meta проверяется живым чтением перед каждым шагом.
-    Отправка требует подтверждённого срока действия каждого выданного ваучера. Пока такая проверка
-    не реализована, новые рассылки нельзя выпускать и оплачивать: заморозка состава доступна,
-    но готовой к отправке рассылкой она не является.
+    Срок действия и погашение контролируются EasyWeek. Приложение не подтверждает дату активации
+    и дату окончания срока каждого выданного кода и не выдаёт такое подтверждение за выполненное.
   </div>
 </div>
 """
@@ -828,6 +830,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
     except SQLAlchemyError:
         return _page("Состояние недоступно", "Не удалось прочитать состояние preview. Обновите страницу.")
     schema_version = existing.schema_version if existing.exists else "3"
+    stop_is_terminal = schema_version == "3"
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
     body = f"""
@@ -902,6 +905,7 @@ const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
+const STOP_IS_TERMINAL = {json.dumps(stop_is_terminal)};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -967,6 +971,9 @@ async def page_mailing(request: Request, batch_id: int) -> str:
 
     preview_run_id = int(batch.get("campaign_run_id") or 0)
     schema_version = str(batch.get("schema_version") or "1")
+    # §45.4 applies to the fixed €10 contract alone; a historical €15 mailing keeps
+    # the §43.6 pause, and this page keeps saying so.
+    stop_is_terminal = schema_version == "3"
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
     header_rows = [
@@ -1016,7 +1023,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
     Отправить сообщения…
   </button>
   <button id="btn-stop" class="btn btn-warning btn-sm" onclick="stopBatch()">
-    Остановить после текущего запроса
+    {"Остановить рассылку окончательно…" if stop_is_terminal else "Остановить после текущего запроса"}
   </button>
   <button id="btn-reconcile" class="btn btn-outline-secondary btn-sm" onclick="reconcile()">
     Сверить с EasyWeek
@@ -1057,6 +1064,10 @@ const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {preview_run_id};
 const BATCH_ID = {batch_id};
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
+/* §45.4, from the batch's own durable schema — never from anything the browser
+   could send back. It decides only what this page SAYS; the server refuses a
+   terminally stopped stage whatever a payload claims. */
+const STOP_IS_TERMINAL = {json.dumps(stop_is_terminal)};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -1152,6 +1163,10 @@ function confirmSummary(offer) {
 function nextAction(state) {
   if (!state || !state.batch || !state.batch.exists) return null;
   if (state.active_operation) return null;
+  /* §45.4: a terminally stopped mailing has no next stage, so the page offers
+     none. Reconciliation and an allowed pre-send refund are deliberately NOT
+     routed through here and stay available below. */
+  if (state.stop_terminal) return null;
   if (state.batch.reconciliation_required) return null;
   if (state.batch.halted) return null;
   const counts = slotCounts(state);
@@ -1177,10 +1192,22 @@ function slotCounts(state) {
 }
 
 /* A stop is not a halt and an unknown is not a stop. The banner has to say which
-   one happened, because the next step differs: a stop resumes with a fresh
-   confirmation, an unknown needs a readback first. */
+   one happened, because the next step differs: a schema 1/2 stop resumes with a
+   fresh confirmation, a §45.4 terminal stop never resumes, and an unknown needs a
+   readback first.
+
+   What the terminal text must NOT imply: that the vouchers already issued were
+   annulled, or that money came back. Execution stopped; the artifacts are exactly
+   where they were, which is why reconciliation and an allowed refund stay. */
 function stateBanner(state) {
   if (!state || !state.batch) return null;
+  if (state.stop_active && state.stop_terminal) {
+    return {kind: "danger", text: "Исполнение остановлено оператором окончательно."
+      + " Выпуск, оплата и отправка этой партии больше не возобновляются — ни новым подтверждением,"
+      + " ни ранее поставленной в очередь операцией."
+      + " Это не означает, что уже выпущенные ваучеры аннулированы или деньги возвращены:"
+      + " сверка и допустимый возврат до отправки остаются доступны."};
+  }
   if (state.stop_active) {
     return {kind: "warning", text: "Остановлено оператором."
       + " Новые запросы не выдаются; продолжение — только по новому подтверждению."};
@@ -1616,6 +1643,20 @@ async function confirmStage() {
 
 async function stopBatch() {
   if (BATCH_ID === null) return;
+  /* §45.4. On the fixed €10 contract this is not a pause, so the operator is told
+     what they are about to make irreversible BEFORE it is written — and told what
+     it does not do, so nobody presses it expecting a refund. */
+  if (STOP_IS_TERMINAL && !window.confirm(
+      "Остановить рассылку окончательно?\n\n"
+      + "Выпуск, оплата и отправка этой партии больше не возобновятся: ни новым планом,"
+      + " ни новым подтверждением, ни ранее поставленной в очередь операцией.\n\n"
+      + "Уже выпущенные ваучеры при этом не аннулируются и деньги сами не возвращаются."
+      + " Запрос, уже отправленный в EasyWeek или Meta, может завершиться успешно —"
+      + " его фактический исход будет показан.\n\n"
+      + "Останутся доступны: чтение состояния, webhooks доставки, сверка"
+      + " и отдельно подтверждаемый возврат до отправки.")) {
+    return;
+  }
   const result = await postJson("/ops/voucher-mailings/api/stop", {batch_id: BATCH_ID});
   if (result.undecided) {
     /* The stop is a durable write, so "no readable answer" must not be reported as
@@ -1674,13 +1715,14 @@ async function loadRecipients() {
 }
 
 function reasonLabel(reason) {
-  if (reason === "voucher_production_validity_capability_unproven") {
-    return "Проверка срока выданного ваучера ещё не реализована — выпуск и оплата новых ваучеров закрыты";
+  /* §45.4: the term belongs to EasyWeek, so the only validity answer left is the
+     provider having said this voucher is unusable. */
+  if (reason === "voucher_production_voucher_expired") {
+    return "EasyWeek сообщает, что ваучер недействителен — отправка закрыта";
   }
-  if (reason === "voucher_production_validity_unproven") {
-    return "Срок действия выданного ваучера не подтверждён — отправка закрыта";
+  if (reason === "voucher_production_stop_terminal") {
+    return "Рассылка остановлена окончательно — выпуск, оплата и отправка этой партии не возобновляются";
   }
-  if (reason === "voucher_production_voucher_expired") return "Срок действия ваучера истёк — отправка закрыта";
   return reason;
 }
 

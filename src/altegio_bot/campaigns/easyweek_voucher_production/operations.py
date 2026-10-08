@@ -60,6 +60,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_FREEZE,
     STAGE_REFUND,
     STOP_ACTIVE,
+    STOP_TERMINAL,
 )
 from altegio_bot.easyweek_voucher_production_contract import LEGACY_PRODUCTION_CONTRACT, production_contract
 from altegio_bot.models.models import (
@@ -483,13 +484,22 @@ async def confirm_approval(
     running operation's stop and let it carry on through the slots behind a request
     that was still in flight.
 
-    *A stop is lifted only by a plan that saw it.* The approval records the batch's
-    stop generation at plan time. While a stop is active, a confirmation is admitted
-    only when that number still matches, so a plan from before the stop — the one
-    sitting in the operator's other tab — is refused rather than becoming a resume
-    nobody asked for. A matching generation means the plan was built in full
-    knowledge of the stop, which is precisely the "fresh plan, confirmed" that §43.6
-    requires for continuing, and it is still the only thing that lifts one.
+    *A stop is lifted only by a plan that saw it.* On schemas ``1`` and ``2`` the
+    approval records the batch's stop generation at plan time. While a stop is
+    active, a confirmation is admitted only when that number still matches, so a
+    plan from before the stop — the one sitting in the operator's other tab — is
+    refused rather than becoming a resume nobody asked for. A matching generation
+    means the plan was built in full knowledge of the stop, which is precisely the
+    "fresh plan, confirmed" that §43.6 requires for continuing, and on those two
+    schemas it is still the only thing that lifts one.
+
+    *On the fixed €10 contract, nothing lifts it.* §45.4 makes an explicit stop
+    terminal for request schema ``3``, so an active stop refuses every CREATE, PAY
+    and DELIVER confirmation for that batch whatever its generation says — a fresh
+    plan included. A REFUND is the one exemption, because it sends nothing and
+    returning money is what has to keep working after a stop. The terminality is
+    read from the batch header's own schema, so a payload cannot name an older one
+    to get the slots back.
     """
     moment = now or utcnow()
     async with session_maker() as session:
@@ -536,6 +546,18 @@ async def confirm_approval(
                     # Somebody else's turn. Reported rather than queued: a second
                     # concurrent operation is not a thing this phase has.
                     return ConfirmOutcome(operation=None, reasons=(OPERATION_IN_FLIGHT,))
+                if admission.terminally_stopped and stored.stage != STAGE_REFUND:
+                    # §45.4, checked before the generation comparison and
+                    # deliberately not subject to it: on the fixed €10 contract an
+                    # explicit stop is terminal, so the plan HAVING been built in
+                    # full knowledge of the stop is no longer a reason to carry on.
+                    # A fresh plan, a second operator and a second tab all land
+                    # here. A refund is exempt: it sends nothing and getting money
+                    # back is exactly what must keep working after a stop.
+                    #
+                    # Taken off the SAME locked read as the stop itself, so this
+                    # cannot pair a live stop with a schema seen at another moment.
+                    return ConfirmOutcome(operation=None, reasons=(STOP_TERMINAL,))
                 if admission.stop_active and stored.stop_generation_at_plan != admission.stop_generation:
                     # A plan from before this stop. It cannot be the decision to
                     # carry on, because its author had not seen the stop.

@@ -13,7 +13,7 @@ from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_m
 from altegio_bot.campaigns.easyweek_voucher_production.identity import TEMPLATE_UNPROVEN
 from altegio_bot.campaigns.easyweek_voucher_production.readiness import prove_live_meta_template
 from altegio_bot.campaigns.easyweek_voucher_production.validity import (
-    VALIDITY_UNPROVEN,
+    PROVIDER_MANAGED_VALIDITY,
     VOUCHER_EXPIRED,
     issued_voucher_validity_reason,
 )
@@ -194,9 +194,18 @@ def test_new_template_facts_do_not_accidentally_keep_old_uuid():
         {"activated_at": "2026-10-01T12:00:00Z", "expires_at": "2026-11-01T12:00:00Z"},
     ],
 )
-def test_product_term_or_plausible_dates_never_prove_issued_validity(facts):
+def test_an_artifact_the_provider_calls_usable_raises_no_validity_reason(facts):
+    """§45.4. No date, a product term, or a future date — all the same answer: none.
+
+    Replaces the unconditional ``validity_unproven`` this used to assert. The
+    policy changed, not the evidence: EasyWeek owns the term, so an artifact it has
+    not called unusable raises no refusal here. The second half of the old test is
+    what survives unchanged — a future date still does not become a POSITIVE proof,
+    which is why this asserts ``None`` rather than any success value, and why the
+    report beside it names the provider instead.
+    """
     now = datetime(2026, 10, 7, tzinfo=timezone.utc)
-    assert issued_voucher_validity_reason({"vouchers": [facts]}, now=now) == VALIDITY_UNPROVEN
+    assert issued_voucher_validity_reason({"vouchers": [facts]}, now=now) is None
 
 
 @pytest.mark.parametrize("field", ["expires_at", "valid_until"])
@@ -225,7 +234,11 @@ def test_read_only_diagnostic_projects_only_known_field_types():
         }
     )
     assert report["date_candidate_fields"] == [{"activated_at": "str", "expires_at": "NoneType"}]
-    assert report["positive_validity_contract_supported"] is False
+    # §45.4: no invalidity signal, and the term is named as EasyWeek's. Neither
+    # field may ever read as this application having proven a date.
+    assert report["invalidity_reason"] is None
+    assert report["term_responsibility"] == PROVIDER_MANAGED_VALIDITY
+    assert "proven" not in json.dumps(report)
     assert "SENTINEL" not in json.dumps(report)
 
 
@@ -448,7 +461,6 @@ async def test_a_meta_transport_failure_after_confirmation_finishes_the_operatio
     an external effect; saying it about a pre-mutation refusal sends an operator
     to reconcile something that never happened.
     """
-    new.model_issued_validity_capability(monkeypatch)
     run_id, batch_id, reader = await new.ui_frozen(ui_client, session_maker, transports, count=1)
 
     # A healthy Meta while the operator reads and confirms the plan.

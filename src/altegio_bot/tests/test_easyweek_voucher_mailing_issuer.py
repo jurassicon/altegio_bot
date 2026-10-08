@@ -32,7 +32,6 @@ from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
@@ -44,21 +43,6 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     staffers_page,
 )
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
-
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is the pinned issuer.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -314,7 +298,6 @@ async def test_every_client_and_every_batch_is_issued_by_the_one_approved_staffe
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -369,7 +352,6 @@ async def test_the_operator_account_does_not_change_who_issues(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -470,7 +452,6 @@ async def test_an_issuer_drift_after_the_confirmation_blocks_execution(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -515,7 +496,6 @@ async def test_the_catalogue_is_walked_once_per_stage_not_once_per_recipient(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -552,7 +532,6 @@ async def test_an_allowed_refund_does_not_depend_on_the_current_issuer(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -697,7 +676,6 @@ async def test_a_staffer_change_after_a_refund_plan_still_lets_the_money_come_ba
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,

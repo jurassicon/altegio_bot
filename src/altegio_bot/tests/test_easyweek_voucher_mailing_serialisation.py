@@ -22,12 +22,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import pytest
 from sqlalchemy import select
 
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
-from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_PLANNED,
@@ -36,7 +34,6 @@ from altegio_bot.models.models import (
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
@@ -45,30 +42,10 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     FakeMutator,
     FakeSender,
     seed_production_preview,
+    unknown_outcome,
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
-
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is one batch doing one thing at a time.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
-
-@pytest.fixture
-def synthetic_validity_proven(monkeypatch):
-    """Send concurrency acceptance assumes independently proven validity; rollout remains blocked."""
-    monkeypatch.setattr(production_runner, "issued_voucher_validity_reason", lambda payload, *, now: None)
-
 
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
@@ -167,7 +144,6 @@ async def test_a_stale_approval_in_a_second_tab_cannot_lift_a_live_stop(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -220,6 +196,9 @@ async def test_a_stale_approval_in_a_second_tab_cannot_lift_a_live_stop(
     assert second_status == 409, second_body
     assert set(second_body["reasons"]) & {
         "voucher_production_operation_in_flight",
+        # §45.4 answers with the terminal code on this contract; either refusal is a
+        # refusal, and which one depends only on which gate the second tab hit first.
+        "voucher_production_stop_terminal",
         "voucher_production_stop_active",
     }, second_body["reasons"]
 
@@ -238,73 +217,86 @@ async def test_a_stale_approval_in_a_second_tab_cannot_lift_a_live_stop(
     assert finished is not None and finished.outcome_code == "stopped"
 
 
-async def test_a_fresh_plan_after_the_stop_is_what_resumes(
+async def test_a_fresh_plan_after_a_terminal_stop_does_not_resume(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
 ):
-    """Continuing is possible, and it is a decision taken in knowledge of the stop."""
+    """§45.4. Inverts ``test_a_fresh_plan_after_the_stop_is_what_resumes``.
+
+    The §43.6 rule was that a plan built in knowledge of the stop IS the decision to
+    carry on. The owner removed that for this contract: the stop ends the batch, so
+    the plan is refused where it used to be the way back in, and nothing a browser
+    can do spends money afterwards.
+    """
     count = 3
     run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
-    await ui_client.post(STOP_URL, json={"batch_id": batch_id})
+    stop = (await ui_client.post(STOP_URL, json={"batch_id": batch_id})).json()
+    assert stop["stop_active"] is True and stop["stop_terminal"] is True
 
-    # A plan built now sees the stop, so confirming it IS the decision to carry on.
-    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(i) for i in range(count)]))
+    mutator = FakeMutator(create_sequence=[_ok(i) for i in range(count)])
+    transports.use(reader=reader, mutator=mutator)
     offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
-    assert offer["ready"], offer["reasons"]
-    status, body = await _confirm(ui_client, offer)
-    assert status == 200, body
-    finished = await worker_module.run_once(session_maker, owner="test-executor")
-    assert finished is not None and finished.outcome_code == "applied"
-    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is False
-    assert all(row.status == "created" for row in (await _items(session_maker, batch_id)).values())
+    assert not offer["ready"]
+    assert "voucher_production_stop_terminal" in offer["reasons"]
+    # No approval was even offered, so there is nothing to confirm and nothing queued.
+    assert offer["approval"] is None
+    assert await worker_module.run_once(session_maker, owner="test-executor") is None
+    assert mutator.calls == []
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is True
+    assert all(
+        row.status == VOUCHER_PRODUCTION_ITEM_PLANNED for row in (await _items(session_maker, batch_id)).values()
+    )
 
 
-async def test_a_second_stop_invalidates_a_plan_made_after_the_first(
+async def test_an_offer_held_open_across_a_terminal_stop_is_refused_at_confirm(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
 ):
-    """The generation is a counter, not a flag.
+    """§45.4, the second gate. The tab that was already open cannot spend its offer.
 
-    A plan built under stop #1 is a legitimate continuation of stop #1 — and not of
-    stop #2. Without a counter, "a stop is active and the plan knew about a stop"
-    would be true for both.
+    Supersedes ``test_a_second_stop_invalidates_a_plan_made_after_the_first``: the
+    generation counter decided which stop a plan had seen, and under a terminal stop
+    there is no plan that may carry on, so the confirmation is refused without
+    consulting it. The counter still governs schemas 1 and 2.
+
+    Pressing stop twice is still one stop, and still escalates to nothing.
     """
     count = 2
     run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
-    await ui_client.post(STOP_URL, json={"batch_id": batch_id})
 
-    transports.use(reader=reader)
+    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(i) for i in range(count)]))
     offer = await _plan(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id)
-    assert offer["ready"]
+    assert offer["ready"], offer["reasons"]
 
-    # The operator changes their mind and stops again before confirming.
+    first = (await ui_client.post(STOP_URL, json={"batch_id": batch_id})).json()
     second = (await ui_client.post(STOP_URL, json={"batch_id": batch_id})).json()
-    assert second["stop_count"] == 2
+    assert first["stop_terminal"] is True
+    assert second["stop_count"] == 2 and second["stop_terminal"] is True
 
     status, body = await _confirm(ui_client, offer)
     assert status == 409
-    assert body["reasons"] == ["voucher_production_stop_active"]
+    assert body["reasons"] == ["voucher_production_stop_terminal"]
     assert await worker_module.run_once(session_maker, owner="test-executor") is None
     assert all(
         row.status == VOUCHER_PRODUCTION_ITEM_PLANNED for row in (await _items(session_maker, batch_id)).values()
     )
+    # The approval stays unspent rather than being consumed by the refusal.
+    stale = await operations_module.load_approval(session_maker, approval_id=offer["approval"]["approval_id"])
+    assert stale is not None and stale.pending is True
 
 
 async def test_no_second_operation_is_admitted_while_one_is_queued(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -328,7 +320,6 @@ async def test_concurrent_stop_and_confirm_never_both_win(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -369,7 +360,6 @@ async def test_a_stop_does_not_permanently_block_status_or_reconcile_or_refund(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -405,11 +395,9 @@ async def test_pay_and_deliver_honour_the_same_stop_rules(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """The guarantee is per claim, so it is the same for every acting stage."""
     count = 3
@@ -436,7 +424,39 @@ async def test_pay_and_deliver_honour_the_same_stop_rules(
     assert items[1].status == "paid"
     assert [items[s].status for s in (2, 3)] == ["created", "created"]
 
-    # DELIVER: a fresh plan for the one paid slot, stopped during its send.
+    # §45.4: the DELIVER half used to be a fresh plan for the one paid slot. Under a
+    # terminal stop there is no such plan, and the paid slot keeps its unspent
+    # attempt — which is exactly what makes it still refundable.
+    sender = FakeSender()
+    transports.use(reader=reader, sender=sender)
+    offer = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
+    assert not offer["ready"]
+    assert "voucher_production_stop_terminal" in offer["reasons"]
+    assert await worker_module.run_once(session_maker, owner="test-executor") is None
+    assert sender.calls == 0
+    items = await _items(session_maker, batch_id)
+    assert items[1].status == "paid"
+    assert items[1].send_attempt_count == 0
+    assert items[1].reconciliation_required is False
+
+
+async def test_a_terminal_stop_survives_a_send_whose_result_was_a_success(
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+):
+    """§45.4. A stop pressed mid-send never rewrites the request already on the wire.
+
+    Meta accepted slot 1 while the operator was pressing stop. That acceptance is
+    recorded as the success it was — not as unsent, not as cancelled — and the
+    remaining slots are never claimed. Honesty in both directions is the point.
+    """
+    count = 3
+    run_id, batch_id, reader = await _paid(ui_client, session_maker, transports, count=count)
+
     class StoppingSender(FakeSender):
         async def send_voucher_template(self, **kwargs: Any) -> Any:
             result = await super().send_voucher_template(**kwargs)
@@ -447,13 +467,119 @@ async def test_pay_and_deliver_honour_the_same_stop_rules(
     transports.use(reader=reader, sender=sender)
     offer = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
     assert offer["ready"], offer["reasons"]
-    await _confirm(ui_client, offer)
+    assert (await _confirm(ui_client, offer))[0] == 200
     finished = await worker_module.run_once(session_maker, owner="test-executor")
-    assert finished is not None
+    assert finished is not None and finished.outcome_code == "stopped"
+
     assert sender.calls == 1
     items = await _items(session_maker, batch_id)
     assert items[1].status == "provider_accepted"
     assert items[1].send_attempt_count == 1
+    assert items[1].reconciliation_required is False
+    # The slots behind it were never claimed, and nothing about them is in doubt.
+    assert [items[slot].status for slot in (2, 3)] == ["paid", "paid"]
+    assert all(items[slot].send_attempt_count == 0 for slot in (2, 3))
+    assert all(items[slot].reconciliation_required is False for slot in (2, 3))
+    # The stop is terminal, so there is no second DELIVER for the two paid slots.
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+    again = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
+    assert not again["ready"]
+    assert "voucher_production_stop_terminal" in again["reasons"]
+
+
+async def test_a_stop_during_an_unknown_send_leaves_the_unknown_unknown(
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+):
+    """§45.4. A stop is not an answer about the request that was already in flight.
+
+    Meta's reply never arrived for slot 1 and the operator stopped. The terminal stop
+    must not turn that into a safe "not sent": the slot stays unresolved and
+    reconcilable, its one attempt is spent, and no second attempt exists anywhere.
+    """
+    count = 3
+    run_id, batch_id, reader = await _paid(ui_client, session_maker, transports, count=count)
+
+    class StoppingUnknownSender(FakeSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            await ui_client.post(STOP_URL, json={"batch_id": batch_id})
+            return await super().send_voucher_template(**kwargs)
+
+    sender = StoppingUnknownSender(outcomes=[unknown_outcome()])
+    transports.use(reader=reader, sender=sender)
+    offer = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
+    assert offer["ready"], offer["reasons"]
+    assert (await _confirm(ui_client, offer))[0] == 200
+    finished = await worker_module.run_once(session_maker, owner="test-executor")
+    assert finished is not None
+
+    assert sender.calls == 1
+    items = await _items(session_maker, batch_id)
+    # Unknown stays unknown: not sent, not unsent, and flagged for a human.
+    assert items[1].send_attempt_count == 1
+    assert items[1].reconciliation_required is True
+    assert items[1].status not in ("paid", "refunded")
+    # The slots behind it were never claimed, so nothing about THEM is in doubt.
+    assert [items[slot].status for slot in (2, 3)] == ["paid", "paid"]
+    assert all(items[slot].send_attempt_count == 0 for slot in (2, 3))
+    assert all(items[slot].reconciliation_required is False for slot in (2, 3))
+    # And no retry is reachable: the stop is terminal and the unknown blocks anyway.
+    again = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
+    assert not again["ready"]
+    assert sender.calls == 1
+
+
+async def test_delivery_webhooks_still_land_after_a_terminal_stop(
+    session_maker,
+    production_configuration,
+    binding_key,
+    executor_enabled,
+    ui_client,
+    transports,
+):
+    """§45.4. Stopping execution does not stop the truth arriving afterwards.
+
+    Slot 1 was accepted by Meta before the stop. The `delivered` and `read` callbacks
+    for it land afterwards and are recorded — a stopped batch must not start lying
+    about what happened to a message that really went out.
+    """
+    count = 2
+    run_id, batch_id, reader = await _paid(ui_client, session_maker, transports, count=count)
+
+    class StoppingSender(FakeSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            result = await super().send_voucher_template(**kwargs)
+            await ui_client.post(STOP_URL, json={"batch_id": batch_id})
+            return result
+
+    sender = StoppingSender()
+    transports.use(reader=reader, sender=sender)
+    offer = await _plan(ui_client, stage="deliver", preview_run_id=run_id, batch_id=batch_id)
+    assert (await _confirm(ui_client, offer))[0] == 200
+    assert await worker_module.run_once(session_maker, owner="test-executor") is not None
+    assert sender.calls == 1
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).terminal is True
+
+    for status in ("delivered", "read"):
+        outcome = await ledger_module.record_webhook_transition(
+            session_maker, provider_message_id=PROVIDER_MESSAGE_IDS[0], status=status
+        )
+        assert outcome.applied is True, (status, outcome)
+
+    items = await _items(session_maker, batch_id)
+    assert items[1].status == "read"
+    assert items[1].send_attempt_count == 1
+    # The unsent slot is untouched by any of it, and still not resumable.
+    assert items[2].status == "paid"
+    body = (await ui_client.get(f"{STATUS_URL}?batch_id={batch_id}")).json()
+    assert body["stop_terminal"] is True
+    assert body["batch"]["webhook_delivered_count"] == 1
+    assert body["batch"]["webhook_read_count"] == 1
 
 
 # ===========================================================================
@@ -465,11 +591,9 @@ async def test_a_reconcile_during_an_active_send_does_not_lose_the_success(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """The reported scenario: reconcile mid-send, then Meta answers successfully.
 
@@ -523,11 +647,9 @@ async def test_a_displaced_row_still_absorbs_the_providers_success(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """Belt and braces: even if a row IS parked, the acceptance is not thrown away.
 
@@ -571,11 +693,9 @@ async def test_a_lost_ledger_write_is_never_reported_as_success(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """If the acceptance genuinely cannot be recorded, say so — do not claim success.
 
@@ -618,7 +738,6 @@ async def test_reconcile_stays_available_after_a_genuine_interruption(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -656,11 +775,9 @@ async def test_a_reconcile_racing_a_worker_claim_cannot_park_a_live_row(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
-    synthetic_validity_proven,
 ):
     """The write-time guard, not just the admission one.
 

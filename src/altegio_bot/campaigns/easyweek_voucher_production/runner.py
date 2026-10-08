@@ -120,6 +120,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     STAGE_FREEZE,
     STAGE_PAY,
     STAGE_REFUND,
+    STOP_TERMINAL,
     STOPPED_BY_OPERATOR,
     TEMPLATE_PARAMETERS_UNPROVEN,
     UNKNOWN_STAGE,
@@ -791,6 +792,12 @@ async def _item_order_preconditions(
         )
     elif stage == STAGE_DELIVER:
         if contract.request_schema_version == "3":
+            # §45.4, boundary one of two. EasyWeek owns the term, so a voucher
+            # that carries no activation or expiry date passes here — that is the
+            # ordinary shape of a correct artifact. What still refuses is the
+            # provider having SAID the voucher is unusable. Boundary two is the
+            # identical question asked again in ``run_deliver`` against the final
+            # read before the send claim; neither is a proof of a term.
             validity_reason = issued_voucher_validity_reason(payload, now=utcnow())
             if validity_reason is not None:
                 reasons.append(validity_reason)
@@ -1001,6 +1008,17 @@ async def build_stage_plan(
             reasons.append(BATCH_PREVIEW_MISMATCH)
 
     batch_id = snapshot.batch_id if snapshot.exists else None
+    # §45.4. A terminally stopped €10 batch is refused where a stage is PLANNED,
+    # not only where it is claimed, so an operator is never offered a continuation
+    # the executor would refuse per slot — and so a confirmation cannot queue one.
+    #
+    # Read from the batch the id resolved to, which is where the schema lives: the
+    # request's own ``schema_version`` is deliberately not consulted, so a payload
+    # naming schema 1 or 2 cannot turn a stopped new-contract batch back into a
+    # resumable one. A REFUND is exempt by design — money must still come back.
+    if batch_id is not None and stage != STAGE_REFUND:
+        if await ledger_module.terminal_stop_active(session_maker, batch_id=batch_id):
+            reasons.append(STOP_TERMINAL)
     # Which preview the composition is read from. Before the freeze it is the
     # one the operator named; afterwards it is the one the batch is bound to, so
     # a later stage cannot be pointed at a different snapshot by a typo.
@@ -2164,6 +2182,10 @@ async def run_deliver(
             halted = True
             continue
         if contract.request_schema_version == "3":
+            # §45.4, boundary two of two, against the read this send will use —
+            # the same question and the same answer as at plan time, so an
+            # artifact EasyWeek marked unusable in between still refuses, and a
+            # missing optional date still is not a refusal here either.
             validity_reason = issued_voucher_validity_reason(payload, now=utcnow())
             if validity_reason is not None:
                 results.append(SlotResult(slot=slot, outcome="refused", reasons=[validity_reason]))

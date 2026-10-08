@@ -36,7 +36,6 @@ from altegio_bot.models.models import (
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
-    model_issued_validity_capability,
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
@@ -47,24 +46,10 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
 from altegio_bot.utils import utcnow
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
 
-
-@pytest.fixture
-def issued_validity_capability(monkeypatch):
-    """§45.2 (a) modelled as answered, so a stage of the new contract may buy.
-
-    This module's subject is what a crash, a restart or a race may leave behind.
-    With the real default the fixed €10 contract refuses CREATE and PAY
-    outright, before any order exists. That refusal is proven WITHOUT this
-    fixture in ``test_easyweek_voucher_10eur_lifecycle.py``; nothing here
-    weakens it. This models question (a) only — whether any issued term could
-    be proven at all — and never question (b) about one particular voucher.
-    """
-    model_issued_validity_capability(monkeypatch)
-
-
 PLAN_URL = "/ops/voucher-mailings/api/plan"
 CONFIRM_URL = "/ops/voucher-mailings/api/confirm"
 STOP_URL = "/ops/voucher-mailings/api/stop"
+RECONCILE_URL = "/ops/voucher-mailings/api/reconcile"
 
 
 def _ok(index: int) -> VoucherMutationResponse:
@@ -135,7 +120,6 @@ async def test_many_concurrent_confirmations_of_one_offer_make_one_operation(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -167,7 +151,6 @@ async def test_two_executors_cannot_claim_the_same_operation(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -290,6 +273,124 @@ async def test_a_stop_racing_a_claim_never_lets_one_more_slot_through(
 
 
 # ===========================================================================
+# §45.4 — the terminal stop is durable, and only execution is terminal
+# ===========================================================================
+
+
+async def test_a_terminal_stop_outlives_a_restart_a_reconcile_and_a_refund(
+    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+):
+    """§45.4. Nothing in the recovery surface reopens a terminally stopped batch.
+
+    The stop is derived from rows, not from anything held in a process, so the whole
+    point is that it cannot be lost: a fresh executor, a readback and an allowed
+    refund all run here and the batch is still closed to CREATE, PAY and DELIVER
+    afterwards. The three of them staying AVAILABLE is the other half — a stop takes
+    away spending, not access to what already happened.
+    """
+    count = 2
+    run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
+    transports.use(reader=reader, mutator=FakeMutator(create_sequence=[_ok(index) for index in range(count)]))
+    await _confirm(ui_client, await _offer(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id))
+    assert await worker_module.run_once(session_maker, owner="first-executor") is not None
+    settles = await marker_orders(session_maker, batch_id=batch_id, status="paid")
+    transports.use(
+        reader=reader,
+        mutator=FakeMutator(pay_sequence=[_ok(index) for index in range(count)], reader=reader, settles=settles),
+    )
+    await _confirm(ui_client, await _offer(ui_client, stage="pay", preview_run_id=run_id, batch_id=batch_id))
+    assert await worker_module.run_once(session_maker, owner="first-executor") is not None
+
+    stop = (await ui_client.post(STOP_URL, json={"batch_id": batch_id})).json()
+    assert stop["stop_active"] is True and stop["stop_terminal"] is True
+
+    # A different executor process, with none of the first one's memory.
+    assert await worker_module.run_once(session_maker, owner="restarted-executor") is None
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).terminal is True
+
+    # A readback. It resolves what it can and opens nothing.
+    transports.use(reader=reader)
+    answer = await ui_client.post(RECONCILE_URL, json={"batch_id": batch_id, "preview_run_id": run_id})
+    assert answer.status_code == 200, answer.text
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is True
+
+    # An allowed pre-send refund of one slot: separately confirmed, and permitted.
+    refunded = await marker_orders(session_maker, batch_id=batch_id, status="refunded")
+    refunder = FakeMutator(refund=_ok(0), reader=reader, settles=refunded)
+    transports.use(reader=reader, mutator=refunder)
+    await _confirm(ui_client, await _offer(ui_client, stage="refund", preview_run_id=run_id, batch_id=batch_id, slot=1))
+    finished = await worker_module.run_once(session_maker, owner="restarted-executor")
+    assert finished is not None and finished.status == "completed", finished.result
+    assert refunder.calls.count("refund") == 1
+
+    # After all three, every spending stage is still refused.
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is True and state.terminal is True
+    for stage in ("create", "pay", "deliver"):
+        offer = (
+            await ui_client.post(PLAN_URL, json={"stage": stage, "preview_run_id": run_id, "batch_id": batch_id})
+        ).json()
+        assert not offer["ready"], stage
+        assert "voucher_production_stop_terminal" in offer["reasons"], stage
+    # The second slot was never sent and is not pretended to be anything else.
+    rows = await _items(session_maker, batch_id)
+    assert rows[2].status == "paid"
+    assert rows[2].send_attempt_count == 0
+
+
+async def test_closing_the_browser_is_not_a_stop(
+    session_maker, production_configuration, binding_key, executor_enabled, ui_client, transports
+):
+    """§45.4. Only the explicit press stops a mailing.
+
+    A confirmed stage is durable precisely so that the tab can go away, and that
+    must not have become a way to cancel a batch by accident. No client is involved
+    in the executor pass below, which is as close to "the browser is gone" as a
+    server-side test gets.
+    """
+    count = 2
+    run_id, batch_id, reader = await _frozen(ui_client, session_maker, transports, count=count)
+    mutator = FakeMutator(create_sequence=[_ok(index) for index in range(count)])
+    transports.use(reader=reader, mutator=mutator)
+    await _confirm(ui_client, await _offer(ui_client, stage="create", preview_run_id=run_id, batch_id=batch_id))
+
+    # Nobody is watching any more; the work still happens and no stop appeared.
+    finished = await worker_module.run_once(session_maker, owner="test-executor")
+    assert finished is not None and finished.outcome_code == "applied"
+    assert mutator.calls.count("create") == count
+    state = await ledger_module.stop_state(session_maker, batch_id=batch_id)
+    assert state.active is False and state.terminal is False
+    assert all(row.status == "created" for row in (await _items(session_maker, batch_id)).values())
+
+
+async def test_a_historical_batch_keeps_the_resumable_stop(session_maker, production_configuration, binding_key):
+    """§45.4 changes schema 3 only; schemas 1 and 2 keep the §43.6 pause.
+
+    Asserted at the ledger, because the browser only ever creates the new contract:
+    a €15 batch's stop is not terminal, and the confirm path's helper still lifts it.
+    """
+    from altegio_bot.tests import easyweek_voucher_production_fixtures as legacy
+    from altegio_bot.tests.test_easyweek_voucher_production_mailing import _freeze
+
+    run_id, _ = await legacy.seed_production_preview(session_maker, count=1)
+    await seed_template_and_sender(session_maker)
+    frozen = await _freeze(session_maker, legacy.FakeReader(count=1), legacy.production_request(run_id=run_id), count=1)
+    assert frozen.outcome == "frozen", frozen.reasons
+    batch_id = int(frozen.batch["batch_id"])
+    assert frozen.batch["schema_version"] == "2"
+
+    state = await ledger_module.request_stop(session_maker, batch_id=batch_id, requested_by="ops")
+    assert state.active is True and state.terminal is False
+    assert (await ledger_module.terminal_stop_active(session_maker, batch_id=batch_id)) is False
+
+    # The §43.6 continuation still works: a confirmation lifts this stop.
+    async with session_maker() as session, session.begin():
+        lifted = await ledger_module.clear_stop_locked(session, batch_id=batch_id, cleared_by="ops", now=utcnow())
+    assert lifted is True
+    assert (await ledger_module.stop_state(session_maker, batch_id=batch_id)).active is False
+
+
+# ===========================================================================
 # Crash, at each of the four moments that matter
 # ===========================================================================
 
@@ -298,7 +399,6 @@ async def test_a_crash_before_any_claim_leaves_nothing_to_recover(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -327,7 +427,6 @@ async def test_a_crash_after_a_claim_reads_as_may_have_happened(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -376,7 +475,6 @@ async def test_a_crash_after_the_external_effect_but_before_the_answer_is_not_re
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -439,7 +537,6 @@ async def test_a_restart_never_returns_an_operation_to_the_queue(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -468,7 +565,6 @@ async def test_an_expired_lease_interrupts_rather_than_retries(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -491,7 +587,6 @@ async def test_a_live_executor_is_not_swept(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -516,7 +611,6 @@ async def test_a_finished_operation_is_never_overwritten(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -547,7 +641,6 @@ async def test_approvals_and_audit_survive_a_crash(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -587,7 +680,6 @@ async def test_the_database_refuses_a_second_operation_for_one_approval(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
@@ -628,7 +720,6 @@ async def test_a_queued_operation_cannot_hold_a_lease(
     session_maker,
     production_configuration,
     binding_key,
-    issued_validity_capability,
     executor_enabled,
     ui_client,
     transports,
