@@ -31,13 +31,14 @@ and discarded. Everything else is read from the approval row the SERVER wrote.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -60,6 +61,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     APPROVAL_EXPOSURE_MISSING,
     APPROVAL_NOT_READY,
     COMPOSITION_DUPLICATE_CUSTOMER,
+    COMPOSITION_READ_TIMEOUT,
     DATABASE_UNAVAILABLE,
     EXECUTION_INTERRUPTED,
     EXECUTOR_UNAVAILABLE,
@@ -257,6 +259,50 @@ def _refused_offer(stage: str, reasons: tuple[str, ...]) -> StageOffer:
     return StageOffer(stage=stage, ready=False, reasons=reasons, approval=None)
 
 
+# How long the composition READ may take, and why those numbers.
+#
+# The read path is sequential and per recipient, because it shares one
+# ``AsyncSession``: parallelising it would mean using that session from several
+# tasks at once, which is exactly what it must not do. So the budget has to scale
+# with the audience rather than being one flat number.
+#
+# What one recipient costs, counted from the code rather than guessed:
+#   * manual — ``prove_customer`` is two reads by construction, a full workspace
+#     listing walk (every page it claims to have) plus a direct GET of the UUID;
+#   * manual under the zero-booking policy — one more read, the booking history,
+#     paginated at ``CUSTOMER_BOOKINGS_PER_PAGE``;
+#   * earned — the source customer, the source booking, and then the same two
+#     reads of ``prove_customer``, so four.
+# Four to five provider reads per recipient is therefore the realistic ceiling,
+# and each of those reads is itself bounded by the client: a 15 s read timeout,
+# at most 3 attempts, backoff capped at 8 s and ``Retry-After`` capped at 10 s.
+#
+# Measured against that: thirty-four manual recipients, sixty-eight successful
+# reads at 350 ms each, answered in 24.73 s. The per-recipient allowance below is
+# four times that observed cost, so a slow-but-healthy provider is not cut off,
+# and the fixed part covers the once-per-check reads the plan does anyway —
+# product baseline, Meta template, workspace, locations, accounts, staffers.
+#
+# The ceiling is what keeps this bounded rather than merely large. An operator
+# gets an answer, or a named timeout, and never an open-ended wait.
+COMPOSITION_FIXED_BUDGET_SECONDS: Final = 20
+COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS: Final = 3
+COMPOSITION_READ_BUDGET_CEILING_SECONDS: Final = 180
+
+
+def composition_read_budget_seconds(active_recipients: int) -> int:
+    """The bound this phase gives one composition read, for *active_recipients*.
+
+    One function, used by the read itself and by the page that waits for it, so
+    the two cannot drift into disagreeing — which is the defect this replaces: the
+    browser gave up at 20 s on a read that legitimately took 24.73 s, and the
+    operator was shown a lost connection for a check that had succeeded.
+    """
+    counted = max(0, int(active_recipients))
+    budget = COMPOSITION_FIXED_BUDGET_SECONDS + COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS * counted
+    return min(budget, COMPOSITION_READ_BUDGET_CEILING_SECONDS)
+
+
 # The three states one row of a checked composition can be in. Strings rather than
 # booleans: "not proven" and "not checked" are different answers and a pair of
 # booleans invites reading one as the other.
@@ -417,6 +463,9 @@ class CompositionView:
     # screen comparing only numbers would present a stale list as the confirmed one.
     # It is a digest over slots and preview rows — no name, number or secret.
     composition_digest: str | None = None
+    # The bound this read was given, in seconds, so the page that waits for it
+    # waits for the same policy rather than a constant of its own.
+    read_budget_seconds: int = 0
 
     @property
     def proven_line_count(self) -> int:
@@ -449,6 +498,7 @@ class CompositionView:
             "total_exposure_minor": self.total_exposure_minor,
             "unit_price_minor": self.unit_price_minor,
             "composition_digest": self.composition_digest,
+            "read_budget_seconds": self.read_budget_seconds,
             "recipients": [line.as_ui_dict() for line in self.lines],
             "earned_recipient_count": sum(line.recipient_basis == "earned_first_visit" for line in self.lines),
             "manual_recipient_count": sum(line.recipient_basis == "operator_manual_selection" for line in self.lines),
@@ -491,20 +541,45 @@ async def inspect_composition(
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
+            # No read was attempted, so the smallest budget this policy has is the
+            # honest number to report rather than one derived from an audience
+            # nobody looked at.
+            read_budget_seconds=composition_read_budget_seconds(0),
             blockers=(PRODUCTION_DISABLED,),
         )
+    # The bound, from the audience this read is actually about. Counted first and
+    # cheaply, from the database, so the budget describes the work rather than a
+    # guess about it — and so the answer can carry the number the page should wait.
+    budget = composition_read_budget_seconds(await active_recipient_count(session_maker, preview_run_id))
     carrier = transports or Transports()
     try:
         async with carrier.reader() as reader:
             async with session_maker() as session:
-                composition = await prove_production_composition(
-                    session,
-                    preview_run_id=preview_run_id,
-                    client_reader=reader,
-                    now=utcnow(),
-                    approval=None,
-                    schema_version=CURRENT_PRODUCTION_CONTRACT.request_schema_version,
-                )
+                async with asyncio.timeout(budget):
+                    composition = await prove_production_composition(
+                        session,
+                        preview_run_id=preview_run_id,
+                        client_reader=reader,
+                        now=utcnow(),
+                        approval=None,
+                        schema_version=CURRENT_PRODUCTION_CONTRACT.request_schema_version,
+                    )
+    except TimeoutError:
+        # The read did not finish inside its own bound. A refusal with no audience
+        # in it, like the other three below: the composition is UNKNOWN, not empty,
+        # and the operator is told to look again rather than shown a mailing with
+        # nobody in it. Nothing was written and nothing was sent — this is a read.
+        return CompositionView(
+            proven=False,
+            reasons=(COMPOSITION_READ_TIMEOUT,),
+            campaign_period=None,
+            recipient_count=0,
+            total_exposure_minor=0,
+            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            known=False,
+            blockers=(COMPOSITION_READ_TIMEOUT,),
+            read_budget_seconds=budget,
+        )
     except EasyWeekConfigError:
         return CompositionView(
             proven=False,
@@ -515,6 +590,7 @@ async def inspect_composition(
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
+            read_budget_seconds=budget,
             blockers=(RUNTIME_IDENTITY_UNUSABLE,),
         )
     except EasyWeekError:
@@ -527,6 +603,7 @@ async def inspect_composition(
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
+            read_budget_seconds=budget,
             blockers=(API_UNAVAILABLE,),
         )
     except SQLAlchemyError:
@@ -539,6 +616,7 @@ async def inspect_composition(
             unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
+            read_budget_seconds=budget,
             blockers=(DATABASE_UNAVAILABLE,),
         )
 
@@ -567,7 +645,34 @@ async def inspect_composition(
         known=True,
         observed_active=composition.observed_active or composition.recipient_count,
         blockers=blockers,
+        read_budget_seconds=budget,
     )
+
+
+async def active_recipient_count(
+    session_maker: async_sessionmaker[AsyncSession],
+    preview_run_id: int,
+) -> int:
+    """How many rows this read will have to prove. One cheap count, no provider.
+
+    A failure to count answers zero, which gives the read its smallest budget
+    rather than its largest: a database this read cannot reach is about to refuse
+    anyway, and the refusal should not be preceded by a three-minute wait.
+    """
+    from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient
+
+    try:
+        async with session_maker() as session:
+            found = await session.scalar(
+                select(func.count())
+                .select_from(CampaignRecipient)
+                .where(CampaignRecipient.campaign_run_id == preview_run_id)
+                .where(CampaignRecipient.provider == PROVIDER_EASYWEEK)
+                .where(CampaignRecipient.status == composition_module.ACTIVE_RECIPIENT_STATUS)
+            )
+    except SQLAlchemyError:
+        return 0
+    return int(found or 0)
 
 
 async def _composition_lines(
@@ -587,10 +692,28 @@ async def _composition_lines(
     composition refused BEFORE the live reads — an unusable run, a mixed basis, an
     approval mismatch — there are no members at all, and the rows are listed from the
     local preview as UNCHECKED so the screen can still say how many there are.
+
+    A row whose proof refused early has no proven customer to name, and the operator
+    still has to be able to FIND it. The name the operator curated is in the preview
+    row, so it is read from there — once, for the whole list, for display only. It
+    never substitutes for an identity proof: ``name_from_preview`` says which source
+    was used, the row stays refused, and no proof, binding, eligibility or digest is
+    touched by it.
     """
     if not composition.members:
         return await _unchecked_lines(session_maker, preview_run_id=preview_run_id)
     duplicates = _duplicate_slots(composition)
+    # The fallback names, in one query, for the rows that will need them. Scoped to
+    # THIS preview and this provider, so a row id that belongs to another run cannot
+    # lend its name to a row here.
+    unnamed = [
+        member.campaign_recipient_id
+        for member in composition.members
+        if not (member.proof.client_display_name or "").strip()
+    ]
+    preview_names = await _preview_display_names(
+        session_maker, preview_run_id=preview_run_id, campaign_recipient_ids=unnamed
+    )
     lines: list[RecipientLine] = []
     for member in composition.members:
         reasons = [composition_module.translate_reason(reason) for reason in member.proof.reasons]
@@ -601,21 +724,68 @@ async def _composition_lines(
             # of this preview are named — no customer UUID, and nothing about any
             # other campaign's people.
             reasons.append(COMPOSITION_DUPLICATE_CUSTOMER)
-        name = (member.proof.client_display_name or "").strip()
+        proven_name = (member.proof.client_display_name or "").strip()
+        fallback = preview_names.get(member.campaign_recipient_id, "") if not proven_name else ""
         lines.append(
             RecipientLine(
                 slot=member.slot,
                 campaign_recipient_id=member.campaign_recipient_id,
-                display_name=name or f"без имени (строка preview {member.campaign_recipient_id})",
+                display_name=proven_name
+                or fallback
+                # Only when there is genuinely no usable name anywhere. A blank cell
+                # would be indistinguishable from a bug.
+                or f"без имени (строка preview {member.campaign_recipient_id})",
                 preview_run_id=preview_run_id,
                 recipient_basis=member.recipient_basis,
                 manual_policy=member.manual_policy,
                 state=LINE_PROVEN if member.proof.proven and not reasons else LINE_REFUSED,
                 reasons=tuple(dict.fromkeys(reasons)),
-                name_from_preview=not name,
+                # Honest about the source: true only when the shown name really did
+                # come from the preview, and false for the placeholder, which came
+                # from nowhere.
+                name_from_preview=bool(fallback),
             )
         )
     return tuple(lines)
+
+
+async def _preview_display_names(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    preview_run_id: int,
+    campaign_recipient_ids: list[int],
+) -> dict[int, str]:
+    """``{recipient id: curated name}`` for these rows of THIS preview. Display only.
+
+    One query for the whole list rather than one per row: the read path already
+    spends a provider round trip per recipient, and this is a local lookup that has
+    no business adding to it.
+
+    Both the preview and the provider are in the WHERE clause. Without them a row id
+    from another run would match and put somebody else's name on this screen, which
+    is worse than the placeholder it would be replacing.
+    """
+    if not campaign_recipient_ids:
+        return {}
+    from altegio_bot.models.models import PROVIDER_EASYWEEK, CampaignRecipient
+
+    try:
+        async with session_maker() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(CampaignRecipient.id, CampaignRecipient.display_name)
+                        .where(CampaignRecipient.id.in_(campaign_recipient_ids))
+                        .where(CampaignRecipient.campaign_run_id == preview_run_id)
+                        .where(CampaignRecipient.provider == PROVIDER_EASYWEEK)
+                    )
+                ).all()
+            )
+    except SQLAlchemyError:
+        # A name is a convenience. Failing to read one must not turn a composition
+        # that WAS read into an error, so the rows fall back to the placeholder.
+        return {}
+    return {int(row[0]): (row[1] or "").strip() for row in rows if (row[1] or "").strip()}
 
 
 def _duplicate_slots(composition: composition_module.ProductionComposition) -> frozenset[int]:
@@ -670,20 +840,25 @@ async def _unchecked_lines(
     except SQLAlchemyError:
         # The audience is simply unknown then, which the caller already reports.
         return ()
-    return tuple(
-        RecipientLine(
-            slot=index,
-            campaign_recipient_id=int(row[0]),
-            display_name=(row[1] or "").strip() or f"без имени (строка preview {int(row[0])})",
-            preview_run_id=preview_run_id,
-            recipient_basis=str(row[2]) if row[2] else None,
-            manual_policy=str(row[3]) if row[3] else None,
-            state=LINE_UNCHECKED,
-            reasons=(),
-            name_from_preview=True,
+    lines: list[RecipientLine] = []
+    for index, row in enumerate(rows, start=1):
+        curated = (row[1] or "").strip()
+        lines.append(
+            RecipientLine(
+                slot=index,
+                campaign_recipient_id=int(row[0]),
+                display_name=curated or f"без имени (строка preview {int(row[0])})",
+                preview_run_id=preview_run_id,
+                recipient_basis=str(row[2]) if row[2] else None,
+                manual_policy=str(row[3]) if row[3] else None,
+                state=LINE_UNCHECKED,
+                reasons=(),
+                # False for the placeholder: it came from nowhere, and claiming the
+                # preview supplied it would be a claim about data nobody has.
+                name_from_preview=bool(curated),
+            )
         )
-        for index, row in enumerate(rows, start=1)
-    )
+    return tuple(lines)
 
 
 async def offer_stage(

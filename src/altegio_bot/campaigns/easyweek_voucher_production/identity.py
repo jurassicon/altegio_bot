@@ -200,6 +200,13 @@ ISSUER_SUPPLIED_BY_CLIENT: Final = "voucher_production_issuer_supplied_by_client
 # claimed and nothing about them is in doubt.
 STOPPED_BY_OPERATOR: Final = "voucher_production_stopped_by_operator"
 
+# -- the composition read's own bound ----------------------------------------
+# The live proof of the audience did not finish inside the budget this phase gives
+# it (see ``dispatch.composition_read_budget_seconds``). Its own code, because it is
+# not a statement about the audience: nothing was established, so the composition is
+# UNKNOWN rather than empty or refused, and the next step is to look again.
+COMPOSITION_READ_TIMEOUT: Final = "voucher_production_composition_read_timeout"
+
 # -- excluding one recipient from the preview being checked -------------------
 # The soft removal refused: the snapshot is no longer editable, a voucher batch is
 # already frozen onto it, a canary holds it, the row belongs to another run, or the

@@ -2351,3 +2351,300 @@ async def test_an_exclusion_whose_answer_is_lost_claims_nothing(
     assert await page.is_hidden("#confirm-panel")
     await page.unroute("**/api/exclude-recipient")
     assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F1 — a check slower than the old constant still reaches the operator
+# ===========================================================================
+
+
+async def test_a_check_slower_than_the_old_twenty_second_constant_still_lands(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F1, in the browser. The reported list took 24.73 s; the page gave up at 20.
+
+    The answer is held past the old constant and then released. The page must still
+    be waiting, still say so, and then show the proven composition — without the
+    operator pressing anything a second time.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+
+    # The page's own wait, read off the page, must now exceed that constant.
+    assert await page.evaluate("() => compositionReadTimeoutMs()") > 20_000
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-progress")
+    # The operator is told roughly how long this may take, rather than left guessing.
+    assert "может занять" in await page.inner_text("#composition-progress")
+
+    # Past the old deadline, and still waiting rather than reporting a lost answer.
+    await page.wait_for_timeout(21_000)
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "true"
+    assert "Ответ не получен" not in await page.inner_text("#alert-area")
+
+    release.set()
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=20_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count)
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F2 — a late FREEZE plan may not re-arm a confirmation
+# ===========================================================================
+
+
+async def test_a_late_freeze_plan_cannot_rearm_the_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2, the reported sequence, with a real unfinished ``/api/plan``.
+
+    A proven composition; a freeze plan started and held; the screen state moved on;
+    the plan then comes back ``ready=true``. It used to arm the confirmation anyway —
+    an enabled «Подтвердить» over a composition marked stale and unfreezable.
+
+    The state is moved on through ``invalidateShownComposition``, the one function
+    every state change on this page goes through. Starting a competing check by hand
+    is no longer possible, which is the other half of the fix and is asserted below.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/plan", held)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    # The screen moves on while the plan is on the wire.
+    await page.evaluate("() => { invalidateShownComposition(); }")
+    release.set()
+    await page.wait_for_timeout(700)
+    await page.unroute("**/api/plan")
+
+    # The ready plan armed nothing.
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert_no_page_errors(page)
+
+
+async def test_a_ready_plan_arriving_during_a_failed_recheck_arms_nothing(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2, the exact response ordering from the report, 503 and all.
+
+    The freeze plan answers ready while the audience is being re-read, and the
+    re-read then fails with a 503. Both halves have to hold: the plan is about a
+    screen that moved on, and the 503 leaves the old list stale rather than empty.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    before = await _composition_on_screen(page)
+
+    plan_release = asyncio.Event()
+
+    async def held_plan(route):
+        await plan_release.wait()
+        await route.fallback()
+
+    async def dead_check(route):
+        await route.fulfill(status=503, content_type="application/json", body="{}")
+
+    await page.route("**/api/plan", held_plan)
+    await page.route("**/api/composition", dead_check)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    # The state moves on, then the ready plan lands, then the re-read fails.
+    await page.evaluate("() => { invalidateShownComposition(); }")
+    plan_release.set()
+    await page.wait_for_timeout(500)
+    await page.click("#btn-load")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ сервера не распознан'); }",
+        timeout=20_000,
+    )
+
+    # No permission anywhere, and the list is stale rather than zeroed.
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await _composition_on_screen(page) == before
+    await page.wait_for_selector("#composition-stale")
+    await page.unroute("**/api/plan")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_check_cannot_start_while_a_freeze_plan_is_being_prepared(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. Preparing a step takes the same lock a check does.
+
+    Two answers about the audience must not be in flight at once, because the order
+    they land in is the network's choice and not the operator's.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+
+    release = asyncio.Event()
+    checks: list[str] = []
+
+    async def held_plan(route):
+        await release.wait()
+        await route.fallback()
+
+    async def counted_check(route):
+        checks.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/plan", held_plan)
+    await page.route("**/api/composition", counted_check)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    assert await page.get_attribute("#btn-load", "disabled") is not None
+    await page.evaluate("() => { inspectComposition(); }")
+    await page.wait_for_timeout(300)
+    assert checks == [], checks
+
+    release.set()
+    await page.wait_for_selector("#confirm-panel:not(.d-none)", timeout=20_000)
+    await page.unroute("**/api/plan")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_stale_composition_stops_the_confirmation_before_it_is_sent(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. The check that matters sits next to the request, not on the button.
+
+    An armed freeze confirmation, then the shown audience is invalidated. Pressing
+    confirm — or calling it directly, past the disabled attribute — must not send
+    ``/api/confirm`` at all.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    sent: list[str] = []
+
+    async def counted(route):
+        sent.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/confirm", counted)
+    await page.evaluate("() => { markCompositionStale('тест'); }")
+    await page.evaluate("() => { confirmStage(); }")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Нет актуального плана'); }"
+    )
+    assert sent == [], sent
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+
+    # And a fresh check plus a fresh plan is a working freeze again.
+    await page.unroute("**/api/confirm")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+    assert await _drain(session_maker) is not None
+    assert_no_page_errors(page)
+
+
+async def test_an_excluded_recipient_invalidates_a_prepared_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. An exclusion is a state change, so a plan prepared before it is void."""
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    async with session_maker() as session, session.begin():
+        recipient = await session.scalar(
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .order_by(CampaignRecipient.id.asc())
+            .limit(1)
+        )
+        victim = recipient.id
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Получатель исключён'); }",
+        timeout=20_000,
+    )
+
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    sent: list[str] = []
+
+    async def counted(route):
+        sent.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/confirm", counted)
+    await page.evaluate("() => { confirmStage(); }")
+    await page.wait_for_timeout(300)
+    assert sent == [], sent
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+    await page.unroute("**/api/confirm")
+    assert_no_page_errors(page)

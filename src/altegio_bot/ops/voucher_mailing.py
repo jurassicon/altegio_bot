@@ -890,6 +890,15 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
     stop_is_terminal = schema_version == "3"
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
+    # The read budget this preview's own audience earns, from the same function the
+    # read uses. Rendered so the first press already waits for the right bound; every
+    # answer afterwards carries the current one.
+    try:
+        initial_read_budget = dispatch_module.composition_read_budget_seconds(
+            await dispatch_module.active_recipient_count(SessionLocal, preview_run_id)
+        )
+    except SQLAlchemyError:
+        initial_read_budget = dispatch_module.composition_read_budget_seconds(0)
     body = f"""
 <h1 class="h4 mb-3">Подготовка рассылки — preview #{preview_run_id}</h1>
 {_issuer_banner()}
@@ -975,6 +984,7 @@ const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
 const STOP_IS_TERMINAL = {json.dumps(stop_is_terminal)};
+const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {int(initial_read_budget)};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -1136,6 +1146,9 @@ const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {preview_run_id};
 const BATCH_ID = {batch_id};
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
+/* The shared page script defines its composition wait from this. A mailing page has
+   no composition panel, so it only ever needs the constant to exist. */
+const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {dispatch_module.composition_read_budget_seconds(0)};
 /* §45.4, from the batch's own durable schema — never from anything the browser
    could send back. It decides only what this page SAYS; the server refuses a
    terminally stopped stage whatever a payload claims. */
@@ -1346,37 +1359,60 @@ function mayRefund(item) {
 async function postJson(path, payload, options) {
   const timeoutMs = (options && options.timeoutMs) || 0;
   const controller = timeoutMs > 0 && typeof AbortController === "function" ? new AbortController() : null;
+  /* The deadline covers the HEADERS AND THE BODY. Clearing it after the headers
+     arrived left a response whose body never finished with no bound at all: the
+     spinner stayed, the controls stayed disabled, and the operator had nothing to
+     press. ``fetch`` resolves as soon as the status line is in, so the body read is
+     where a stalled stream actually shows up — and it is the same abort signal, so
+     one timer covers both halves and is cleared once, in the outer `finally`. */
   const timer = controller ? setTimeout(function () { controller.abort(); }, timeoutMs) : null;
-  let response = null;
+  const abortedByUs = function () {
+    return controller !== null && controller.signal.aborted;
+  };
   try {
-    response = await fetch(path, {
-      method: "POST",
-      headers: {"Content-Type": "application/json", "X-Ops-CSRF": CSRF},
-      credentials: "same-origin",
-      body: JSON.stringify(payload),
-      signal: controller ? controller.signal : undefined
-    });
-  } catch (err) {
-    const timedOut = controller !== null && controller.signal.aborted;
-    return {status: 0, transport: true, undecided: true, structured: false, timedOut: timedOut, data: {}};
+    let response = null;
+    try {
+      response = await fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-Ops-CSRF": CSRF},
+        credentials: "same-origin",
+        body: JSON.stringify(payload),
+        signal: controller ? controller.signal : undefined
+      });
+    } catch (err) {
+      return {status: 0, transport: true, undecided: true, structured: false, timedOut: abortedByUs(), data: {}};
+    }
+    let data = null;
+    let readable = true;
+    let bodyTimedOut = false;
+    try {
+      data = await response.json();
+    } catch (err) {
+      readable = false;
+      /* An abort while the body was still arriving is the deadline, not a malformed
+         payload — and specifically not a successful check or an empty audience. It is
+         reported as the same undecided timeout the headers case produces, because
+         what the server did with the request is in neither of them. */
+      bodyTimedOut = abortedByUs();
+    }
+    if (bodyTimedOut) {
+      return {status: 0, transport: true, undecided: true, structured: false, timedOut: true, data: {}};
+    }
+    const structured = readable && data !== null && typeof data === "object" && !Array.isArray(data);
+    /* A 5xx is the server failing, never its decision about this request, so it is
+       undecided even when it happens to carry a JSON body. */
+    const undecided = !structured || response.status >= 500;
+    return {
+      status: response.status,
+      transport: false,
+      undecided: undecided,
+      structured: structured,
+      timedOut: false,
+      data: structured ? data : {}
+    };
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
-  let data = null;
-  let readable = true;
-  try { data = await response.json(); } catch (err) { readable = false; }
-  const structured = readable && data !== null && typeof data === "object" && !Array.isArray(data);
-  /* A 5xx is the server failing, never its decision about this request, so it is
-     undecided even when it happens to carry a JSON body. */
-  const undecided = !structured || response.status >= 500;
-  return {
-    status: response.status,
-    transport: false,
-    undecided: undecided,
-    structured: structured,
-    timedOut: false,
-    data: structured ? data : {}
-  };
 }
 
 /* WHY the result is undecided, in the operator's words. Two different situations,
@@ -1466,10 +1502,59 @@ let COMPOSITION_FREEZABLE = false;
 let COMPOSITION_EPOCH = 0;
 let COMPOSITION_BUSY = false;
 
-/* A read, so it may be given up on. 20 seconds is longer than the live proof of a
-   realistic list and short enough that a hung connection does not leave an operator
-   watching a spinner with no way out. */
-const COMPOSITION_READ_TIMEOUT_MS = 20000;
+/* What the armed offer is for, and which state generation it was built in. A FREEZE
+   offer only means anything against the audience that was on screen when it was
+   prepared; a CREATE/PAY/DELIVER/REFUND offer is about a frozen batch and has no
+   composition behind it at all, so the two are not held to the same test. */
+let OFFER_STAGE = null;
+let OFFER_EPOCH = -1;
+
+/* Drop the armed offer and everything that identified it, in one place, so no exit
+   path can leave a stamp behind for a later check to trust. */
+function forgetOffer() {
+  OFFER = null;
+  OFFER_STAGE = null;
+  OFFER_EPOCH = -1;
+  hideConfirm();
+}
+
+/* May this offer still be confirmed? Read immediately before the request, never
+   inferred from what the screen looks like.
+
+   Only a FREEZE is tested against the composition, because only a freeze is an
+   approval OF a composition. The stages of an existing batch are deliberately
+   exempt: their page has no composition panel, and holding them to one would break
+   every mailing that already exists. The server re-proves all of them regardless —
+   this is the page refusing to even ask. */
+function offerStillFresh() {
+  if (!OFFER || !OFFER.approval || !OFFER.targets) return false;
+  if (OFFER_EPOCH !== COMPOSITION_EPOCH) return false;
+  if (OFFER_STAGE !== "freeze") return true;
+  return COMPOSITION !== null && COMPOSITION_FREEZABLE && !COMPOSITION_STALE;
+}
+
+/* How long this page waits for the composition read.
+ *
+ * NOT a constant of its own. The server bounds that read with
+ * ``composition_read_budget_seconds``, scaled to the audience it is about, and the
+ * page waits for THAT bound plus a transport margin. One policy, one place, so the
+ * two cannot disagree — which is the defect this replaces: the page gave up at 20
+ * seconds on a read of thirty-four recipients that legitimately took 24.73, and an
+ * operator was shown a lost connection for a check that had succeeded.
+ *
+ * The starting value is rendered from the preview's current audience. Every answer
+ * carries the budget it used, so a check after an exclusion, or after the list grew
+ * in another tab, waits for the current one. The margin covers the request and the
+ * response on the wire; the server always answers inside its own budget, so this
+ * only ever has to outlast that. */
+const COMPOSITION_READ_MARGIN_MS = 15000;
+let COMPOSITION_READ_BUDGET_SECONDS = INITIAL_COMPOSITION_READ_BUDGET_SECONDS;
+
+function compositionReadTimeoutMs() {
+  const seconds = Number(COMPOSITION_READ_BUDGET_SECONDS);
+  const bounded = Number.isFinite(seconds) && seconds > 0 ? seconds : INITIAL_COMPOSITION_READ_BUDGET_SECONDS;
+  return bounded * 1000 + COMPOSITION_READ_MARGIN_MS;
+}
 
 function compositionDigest() {
   return (COMPOSITION && COMPOSITION.composition_digest) || null;
@@ -1514,8 +1599,7 @@ function invalidateShownComposition() {
   COMPOSITION_EPOCH += 1;
   COMPOSITION_FREEZABLE = false;
   COMPOSITION_STALE = COMPOSITION !== null;
-  OFFER = null;
-  hideConfirm();
+  forgetOffer();
   const panel = document.getElementById("freeze-panel");
   if (panel) panel.classList.add("d-none");
   const hint = document.getElementById("approval-hint");
@@ -1534,12 +1618,17 @@ async function inspectComposition() {
      confirmation dialog goes away. An operator must never be able to confirm against
      a list that is currently being re-read. */
   const epoch = invalidateShownComposition();
-  setCompositionBusy(true, "Проверяем состав…");
-  setAlert("secondary", "Проверяем состав…");
+  /* The audience is re-proven against EasyWeek one recipient at a time, so on a
+     real list this is tens of seconds. Saying so is the difference between a
+     working check and one an operator gives up on and presses again. */
+  const label = "Проверяем состав… это может занять до "
+    + Math.ceil(Number(COMPOSITION_READ_BUDGET_SECONDS) || 0) + " с";
+  setCompositionBusy(true, label);
+  setAlert("secondary", label);
   let result = null;
   try {
     result = await postJson("/ops/voucher-mailings/api/composition",
-      {preview_run_id: PREVIEW_RUN_ID}, {timeoutMs: COMPOSITION_READ_TIMEOUT_MS});
+      {preview_run_id: PREVIEW_RUN_ID}, {timeoutMs: compositionReadTimeoutMs()});
   } finally {
     /* Whatever happened — success, refusal, 429, 5xx, unreadable body, lost network,
        timeout — the screen stops saying it is working. Only the check that still owns
@@ -1571,6 +1660,13 @@ async function inspectComposition() {
     return;
   }
   const data = result.data || {};
+  /* The server's own bound for THIS preview, as it just used it. Taken from every
+     decided answer — including a refusal and its own timeout — so the next press
+     waits for the current audience rather than for the one the page was rendered
+     with. */
+  if (Number.isFinite(Number(data.read_budget_seconds)) && Number(data.read_budget_seconds) > 0) {
+    COMPOSITION_READ_BUDGET_SECONDS = Number(data.read_budget_seconds);
+  }
   if (data.composition_known === false) {
     /* The fence is shut, or EasyWeek or the database could not be reached. The
        answer contains no audience, so it must not replace the one on screen. */
@@ -1640,6 +1736,14 @@ function prefillApprovalFields(data) {
 }
 
 async function planStage(stage, options) {
+  /* Preparing a step is a competing action, so it takes the same lock a check does.
+     Without it an operator could re-read the audience while a freeze plan was still
+     on the wire, and the two answers would land on one screen in whichever order
+     the network chose. */
+  if (COMPOSITION_BUSY) return;
+  /* WHICH state this preparation belongs to. The answer is only allowed to arm
+     anything if that state is still the current one — see `renderOffer`. */
+  const epoch = COMPOSITION_EPOCH;
   const payload = {stage: stage, preview_run_id: PREVIEW_RUN_ID};
   if (BATCH_ID !== null) payload.batch_id = BATCH_ID;
   if (options && options.slot !== undefined) payload.slot = options.slot;
@@ -1647,17 +1751,28 @@ async function planStage(stage, options) {
     payload.expected_recipient_count = options.count;
     payload.approved_exposure_minor = options.minor;
   }
-  const result = await postJson("/ops/voucher-mailings/api/plan", payload);
-  renderOffer(stage, result, options || {});
+  setCompositionBusy(true, "Готовим шаг…");
+  let result = null;
+  try {
+    result = await postJson("/ops/voucher-mailings/api/plan", payload);
+  } finally {
+    if (epoch === COMPOSITION_EPOCH) setCompositionBusy(false);
+  }
+  renderOffer(stage, result, options || {}, epoch);
 }
 
-function renderOffer(stage, result, options) {
+function renderOffer(stage, result, options, epoch) {
+  /* An answer about a screen that has moved on arms nothing and says nothing.
+     The reported sequence: a freeze plan still in flight, the audience re-read, the
+     plan comes back ready, and the re-read then fails — which used to leave an
+     enabled confirmation button over a composition marked stale and unfreezable.
+     The plan's own readiness is not the question; WHICH list it was about is. */
+  if (epoch !== undefined && epoch !== COMPOSITION_EPOCH) return;
   const data = result.data || {};
   if (result.undecided) {
     /* The plan answer carries no decision, so nothing is armed — and for a freeze
        the list on screen is no longer known to be current. */
-    OFFER = null;
-    hideConfirm();
+    forgetOffer();
     if (stage === "freeze") {
       markCompositionStale(undecidedLabel(result) + ". Проверьте состав заново.");
     } else {
@@ -1666,8 +1781,7 @@ function renderOffer(stage, result, options) {
     return;
   }
   if (!data.ready) {
-    OFFER = null;
-    hideConfirm();
+    forgetOffer();
     const reasons = (data.reasons || []).map(reasonLabel).join(", ");
     const text = reasons
       ? "Действие недоступно: " + reasons
@@ -1693,13 +1807,17 @@ function renderOffer(stage, result, options) {
     const planned = plannedComposition(data);
     const shown = compositionDigest();
     if (planned && shown && planned.frozen_digest && planned.frozen_digest !== shown) {
-      OFFER = null;
-      hideConfirm();
+      forgetOffer();
       markCompositionStale("Состав изменился после проверки. Проверьте список заново.");
       return;
     }
   }
   OFFER = data;
+  /* What this offer is for, and which state it belongs to. Both are read again
+     immediately before the confirmation is sent: a disabled button is a
+     convenience, and the check that matters is the one next to the request. */
+  OFFER_STAGE = stage;
+  OFFER_EPOCH = COMPOSITION_EPOCH;
   const summary = document.getElementById("confirm-summary");
   if (summary) {
     summary.innerHTML = "<b>" + escapeHtml(stageLabel(stage)) + "</b><pre class=\"mb-0\">" +
@@ -1971,13 +2089,17 @@ function hideConfirm() {
 }
 
 function cancelConfirm() {
-  OFFER = null;
-  hideConfirm();
+  forgetOffer();
 }
 
 async function confirmStage() {
-  if (!OFFER || !OFFER.approval || !OFFER.targets) {
-    setAlert("warning", "Нет актуального плана. Подготовьте шаг заново.");
+  if (COMPOSITION_BUSY) return;
+  if (!offerStillFresh()) {
+    /* Checked HERE, next to the request, rather than trusted from the button's
+       state: a stale or unproven composition means `/api/confirm` is not sent at
+       all. The offer is dropped with it, so there is nothing left to press. */
+    forgetOffer();
+    setAlert("warning", "Нет актуального плана. Проверьте состав и подготовьте шаг заново.");
     return;
   }
   const button = document.getElementById("btn-confirm");
@@ -1990,8 +2112,7 @@ async function confirmStage() {
   /* The approval is spent either way, so the offer is dropped before anything
      else: a second press must not be able to send the same id again. The server
      would answer with the same operation anyway — this just stops asking. */
-  OFFER = null;
-  hideConfirm();
+  forgetOffer();
   if (button) button.disabled = false;
   const verdict = confirmVerdict(result);
   if (verdict === "unknown") {

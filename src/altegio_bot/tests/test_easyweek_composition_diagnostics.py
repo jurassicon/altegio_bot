@@ -19,12 +19,14 @@ production constants.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid as uuid_module
 
 from sqlalchemy import select
 
 from altegio_bot.campaigns import easyweek_manual_identity as manual
+from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.models.models import CampaignRecipient, CampaignRun, Client
 from altegio_bot.tests import easyweek_voucher_10eur_fixtures as new
@@ -727,3 +729,314 @@ async def test_a_hostile_display_name_is_carried_as_data_not_markup(
     page = await ui_client.get(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
     assert page.status_code == 200
     assert hostile not in page.text
+
+
+# ===========================================================================
+# F1 — the browser's wait and the server's read have to be the same policy
+# ===========================================================================
+
+
+def test_the_read_budget_covers_the_measured_cost_of_a_real_list():
+    """F1. The 20-second constant was shorter than the read it was waiting for.
+
+    Reported: thirty-four manual recipients, sixty-eight successful reads at 350 ms,
+    ``composition_proven=true`` after 24.73 s — and a browser that stopped listening
+    at 20. The budget is now derived from the audience, and the numbers it has to
+    cover are asserted here rather than left to a comment.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
+
+    # The reported case, with room for a provider slower than the one measured.
+    measured_seconds = 24.73
+    assert dispatch_module.composition_read_budget_seconds(34) > measured_seconds
+    assert dispatch_module.composition_read_budget_seconds(34) >= 2 * measured_seconds
+
+    # It scales with the audience, so a one-person preview does not inherit a
+    # three-minute wait and a large one is not cut off.
+    assert dispatch_module.composition_read_budget_seconds(1) < dispatch_module.composition_read_budget_seconds(34)
+    assert dispatch_module.composition_read_budget_seconds(34) < dispatch_module.composition_read_budget_seconds(100)
+
+    # Bounded, never open ended, whatever is asked of it.
+    ceiling = dispatch_module.COMPOSITION_READ_BUDGET_CEILING_SECONDS
+    assert dispatch_module.composition_read_budget_seconds(10_000) == ceiling
+    assert dispatch_module.composition_read_budget_seconds(0) > 0
+    assert dispatch_module.composition_read_budget_seconds(-5) == dispatch_module.composition_read_budget_seconds(0)
+
+
+async def test_a_realistic_thirty_four_recipient_check_answers_inside_its_budget(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F1, end to end: the reported list, with the reported per-read latency.
+
+    Thirty-four recipients, every provider read delayed, and the answer still
+    reaches the UI with ``composition_proven=true`` — once, without a second press.
+    The delay is scaled down from the reported 350 ms so the suite stays usable; what
+    the test pins is that the BUDGET exceeds the measured cost, which the unit test
+    above asserts against the real numbers.
+    """
+    count = 34
+    run_id, _recipient_ids, reader = await _preview(session_maker, count=count)
+    reads: list[str] = []
+    per_read_seconds = 0.01
+
+    class SlowReader(type(reader)):  # type: ignore[misc]
+        async def list_customers(self, *, params):
+            reads.append("list")
+            await asyncio.sleep(per_read_seconds)
+            return await super().list_customers(params=params)
+
+        async def get_customer(self, customer_uuid):
+            reads.append("get")
+            await asyncio.sleep(per_read_seconds)
+            return await super().get_customer(customer_uuid)
+
+    slow = SlowReader(count=count)
+    transports.use(reader=slow)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    assert body["composition_proven"] is True, body["reasons"]
+    assert body["recipient_count"] == count
+    assert body["proven_count"] == count
+    assert body["total_exposure_minor"] == count * 1000
+    # Two provider reads per manual recipient, which is what the budget is built on.
+    assert len(reads) == 2 * count, len(reads)
+    # And the answer tells the page which bound it was given, so the page waits for
+    # the same policy instead of a constant of its own.
+    assert body["read_budget_seconds"] == dispatch_module.composition_read_budget_seconds(count)
+
+
+async def test_a_mixed_earned_and_manual_check_answers_inside_its_budget(
+    session_maker, production_configuration, binding_key, ui_client, transports, monkeypatch
+):
+    """F1, the heavier read path: earned proof plus a manual zero-booking policy.
+
+    Earned costs four reads — the source customer, the source booking, and the two
+    of ``prove_customer`` — and the manual policy adds a history read. That is the
+    shape the budget's per-recipient allowance has to cover, so it is exercised
+    rather than assumed.
+    """
+    from altegio_bot.tests.test_easyweek_voucher_10eur_lifecycle import _mixed_preview
+
+    run_id, reader = await _mixed_preview(session_maker, monkeypatch)
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200, body
+    assert body["composition_known"] is True
+    assert body["recipient_count"] == 2
+    assert body["proven_count"] == 2, body["recipients"]
+    assert body["composition_proven"] is True, body["reasons"]
+    assert {row["recipient_basis"] for row in body["recipients"]} == {
+        "earned_first_visit",
+        "operator_manual_selection",
+    }
+    assert body["read_budget_seconds"] == dispatch_module.composition_read_budget_seconds(2)
+
+
+async def test_a_read_that_never_finishes_returns_control_with_a_named_timeout(
+    session_maker, production_configuration, binding_key, ui_client, transports, monkeypatch
+):
+    """F1. A genuinely hung provider is bounded, and says so.
+
+    The budget is squeezed for the test; what matters is that exceeding it produces
+    a structured answer rather than an open-ended wait — the composition is UNKNOWN,
+    not empty, nothing was written, and the operator can press again.
+    """
+    run_id, _recipient_ids, reader = await _preview(session_maker, count=2)
+
+    class HangingReader(type(reader)):  # type: ignore[misc]
+        async def list_customers(self, *, params):
+            await asyncio.sleep(30)
+            return await super().list_customers(params=params)
+
+    transports.use(reader=HangingReader(count=2))
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_FIXED_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_READ_BUDGET_CEILING_SECONDS", 1)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    assert body["composition_known"] is False
+    assert body["composition_proven"] is False
+    assert "voucher_production_composition_read_timeout" in body["blockers"]
+    # No audience is claimed either way, and no batch was created by a read.
+    assert body["recipients"] == []
+    assert await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id) is not None
+    assert (await ledger_module.load_for_preview(session_maker, campaign_run_id=run_id)).exists is False
+    # The rows are untouched: a timeout is not a quiet narrowing of the audience.
+    assert await dispatch_module.active_recipient_count(session_maker, run_id) == 2
+
+
+async def test_the_preparation_page_renders_the_budget_its_audience_earns(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F1. The page's first wait is the server's own bound, not a hard-coded one."""
+    count = 4
+    run_id, _recipient_ids, reader = await _preview(session_maker, count=count)
+    transports.use(reader=reader)
+
+    page = await ui_client.get(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    assert page.status_code == 200
+    expected = dispatch_module.composition_read_budget_seconds(count)
+    assert f"const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {expected};" in page.text
+    # The constant the defect lived in is gone, not merely enlarged.
+    assert "COMPOSITION_READ_TIMEOUT_MS = 20000" not in page.text
+
+
+# ===========================================================================
+# F3 — an early refusal still names the person the operator curated
+# ===========================================================================
+
+
+async def test_an_early_opt_out_refusal_shows_the_name_from_the_preview(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. The row refused before any live read, so the proof carries no name.
+
+    It used to print «без имени (строка preview …)» and claim
+    ``name_from_preview=true`` without having read the preview at all. The curated
+    name is now read from the preview row — for display only — so the operator can
+    tell which person to act on.
+    """
+    run_id, recipient_ids, reader = await _preview(session_maker, count=3)
+    async with session_maker() as session, session.begin():
+        recipient = await session.get(CampaignRecipient, recipient_ids[1])
+        recipient.display_name = "Куратор Назвал Это Имя"
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    row = _row(body, recipient_ids[1])
+    assert row["state"] == "refused"
+    assert row["display_name"] == "Куратор Назвал Это Имя"
+    assert row["name_from_preview"] is True
+    assert "voucher_production_recipient_opted_out" in row["reasons"]
+    assert row["campaign_recipient_id"] == recipient_ids[1]
+    # The proven rows keep the name the identity proof established.
+    for recipient_id in (recipient_ids[0], recipient_ids[2]):
+        other = _row(body, recipient_id)
+        assert other["name_from_preview"] is False
+        assert other["display_name"] != "Куратор Назвал Это Имя"
+
+
+async def test_several_early_refusals_do_not_swap_their_names(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. One query for the fallbacks, and every row still gets its own."""
+    run_id, recipient_ids, reader = await _preview(session_maker, count=3)
+    names = {recipient_ids[0]: "Первая Строка", recipient_ids[1]: "Вторая Строка"}
+    async with session_maker() as session, session.begin():
+        for recipient_id, name in names.items():
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            recipient.display_name = name
+            client = await session.get(Client, recipient.client_id)
+            client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    assert body["refused_count"] == 2
+    for recipient_id, name in names.items():
+        row = _row(body, recipient_id)
+        assert row["display_name"] == name, row
+        assert row["name_from_preview"] is True
+
+
+async def test_a_row_with_no_name_anywhere_gets_an_honest_placeholder(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. The placeholder stays for the case it was written for, and says so.
+
+    ``name_from_preview`` is false then: the shown text came from neither the proof
+    nor the preview, and claiming the preview supplied it would be a claim about
+    data nobody has.
+    """
+    run_id, recipient_ids, reader = await _preview(session_maker, count=1)
+    async with session_maker() as session, session.begin():
+        recipient = await session.get(CampaignRecipient, recipient_ids[0])
+        recipient.display_name = "   "
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    row = _row(body, recipient_ids[0])
+    assert row["state"] == "refused"
+    assert row["display_name"] == f"без имени (строка preview {recipient_ids[0]})"
+    assert row["name_from_preview"] is False
+
+
+async def test_a_fallback_name_never_comes_from_another_preview(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. The fallback query is scoped to this preview and this provider.
+
+    A row id that belongs to another run must not lend its name to a row here —
+    showing the wrong person's name is worse than the placeholder it replaces.
+    """
+    run_id, recipient_ids, reader = await _preview(session_maker, count=1)
+    other_run, other_ids = await old.seed_production_preview(session_maker, count=1, offset=6)
+    async with session_maker() as session, session.begin():
+        stranger = await session.get(CampaignRecipient, other_ids[0])
+        stranger.display_name = "Чужая Кампания"
+        recipient = await session.get(CampaignRecipient, recipient_ids[0])
+        recipient.display_name = ""
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    assert other_run != run_id
+    row = _row(body, recipient_ids[0])
+    assert row["display_name"] == f"без имени (строка preview {recipient_ids[0]})"
+    assert "Чужая Кампания" not in json.dumps(body, ensure_ascii=False)
+
+
+async def test_a_hostile_preview_name_is_carried_as_data_in_the_fallback(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. The fallback is a name like any other: data, escaped by the page."""
+    hostile = '<script>alert("preview")</script>'
+    run_id, recipient_ids, reader = await _preview(session_maker, count=1)
+    async with session_maker() as session, session.begin():
+        recipient = await session.get(CampaignRecipient, recipient_ids[0])
+        recipient.display_name = hostile
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    status, body = await _check(ui_client, run_id)
+    assert status == 200
+    assert _row(body, recipient_ids[0])["display_name"] == hostile
+    page = await ui_client.get(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    assert hostile not in page.text
+
+
+async def test_the_fallback_name_stays_out_of_every_safe_report(
+    session_maker, production_configuration, binding_key, ui_client, transports
+):
+    """F3. Display only: the preview name reaches the screen and nothing else."""
+    from altegio_bot.models.models import EasyWeekVoucherProductionAudit
+
+    curated = "Только Для Экрана"
+    run_id, recipient_ids, reader = await _preview(session_maker, count=2)
+    async with session_maker() as session, session.begin():
+        recipient = await session.get(CampaignRecipient, recipient_ids[0])
+        recipient.display_name = curated
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+    transports.use(reader=reader)
+
+    _status, body = await _check(ui_client, run_id)
+    assert _row(body, recipient_ids[0])["display_name"] == curated
+
+    status, _outcome = await _exclude(ui_client, run_id, recipient_ids[0])
+    assert status == 200
+    async with session_maker() as session:
+        rows = list((await session.scalars(select(EasyWeekVoucherProductionAudit))).all())
+    assert curated not in json.dumps([row.detail for row in rows], default=str)

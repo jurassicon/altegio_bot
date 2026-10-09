@@ -491,32 +491,57 @@ copied anywhere.
 On the preparation page:
 
 1. Press **«Проверить состав»**. The page immediately shows a spinner and
-   *«Проверяем состав…»* — the check re-proves every recipient against EasyWeek, so
-   on a real list it takes a few seconds. While it runs, the other controls are
-   disabled and any previous result stops counting: a confirmation prepared earlier
-   disappears, because it described a list that is being re-read. A second press
-   does nothing; there is one check in flight at a time.
-2. The check always ends — on success, on a refusal, on an authorisation error, on
+   *«Проверяем состав… это может занять до N с»*, with the bound this preview's own
+   audience earns. The check re-proves every recipient against EasyWeek one at a
+   time — two provider reads for a manual row, three under the zero-booking policy,
+   four for an earned one — so on a list of thirty-odd people it is tens of seconds,
+   not a moment. Thirty-four manual recipients were measured at 24.73 s.
+
+   While it runs, the other controls are disabled and any previous result stops
+   counting: a confirmation prepared earlier disappears, because it described a list
+   that is being re-read. A second press does nothing; there is one check in flight
+   at a time, and preparing a step takes the same lock.
+2. The server bounds that read itself — a fixed allowance plus a per-recipient one,
+   capped so the wait is never open-ended — and the page waits for exactly that
+   bound plus a transport margin. The two are one policy, so a check that the server
+   completes is never reported to the operator as a lost connection.
+3. The check always ends — on success, on a refusal, on an authorisation error, on
    a server error, on an unreadable answer, on a lost connection, and on a wait that
-   ran out. Each says what happened and leaves **«Проверить состав»** pressable
-   again. A wait that ran out means this browser stopped listening; it does not
-   mean the server stopped, so nothing is claimed about what it did.
-3. On success the page shows the campaign period, the exact number of recipients,
+   ran out. The deadline covers the whole answer, headers and body, so a response
+   that stops half way through ends the wait too. Each outcome says what happened and
+   leaves **«Проверить состав»** pressable again; nothing re-checks by itself.
+
+   A wait that ran out means this browser stopped listening. It does not mean the
+   server stopped, so nothing is claimed about what it did: the previous list stays
+   on screen marked stale, no confirmation is available, and the next step is to
+   press the check again. `voucher_production_composition_read_timeout` is the
+   server's own version of the same answer — the read did not finish inside its
+   budget, so the composition is **unknown** rather than empty.
+4. On success the page shows the campaign period, the exact number of recipients,
    €10 each for a new mailing, the total, and **who each recipient is** — name and
-   the preview row they came from. Checking the list is a read: it never arms the
+   the preview row they came from. A row that refused before its identity could be
+   proven is still named, from the preview the operator curated, and the screen says
+   that is where the name came from. Checking the list is a read: it never arms the
    confirmation and never creates anything.
-4. Read the period. It is the campaign wave, not the month of sending. Manual additions
+5. Read the period. It is the campaign wave, not the month of sending. Manual additions
    retain their own operator rationale rather than claiming an earned first visit.
-5. Read the message and the voucher's terms, shown lower on the page. The voucher
+6. Read the message and the voucher's terms, shown lower on the page. The voucher
    code is an explicit placeholder (`XXXX-XXXX-XXXX`); a real code is never
    displayed anywhere, at any stage.
-6. If the list is wrong, go back to the preview editor and change it there, or
+7. If the list is wrong, go back to the preview editor and change it there, or
    exclude a single problematic recipient from this page — see §6.1. After the
    freeze the composition cannot change.
-7. Type the number of recipients and the total in euro, exactly as shown, and
+8. Type the number of recipients and the total in euro, exactly as shown, and
    press **«Проверить и зафиксировать»**. The server compares both against the
    live snapshot and refuses the whole freeze on any mismatch.
-8. A confirmation panel states what will happen. Press **«Подтвердить»**.
+9. A confirmation panel states what will happen. Press **«Подтвердить»**.
+
+   A confirmation only applies to the audience that was on screen when it was
+   prepared. If the list is re-read, a recipient is excluded, or the plan is refused
+   in between, the confirmation goes away and pressing it sends nothing — the page
+   asks for a fresh check and a fresh plan instead. That is checked at the moment of
+   confirming, not merely by greying the button out, and the server re-proves
+   everything regardless.
 
 The freeze writes the batch locally. **No money moves and no message is sent.**
 

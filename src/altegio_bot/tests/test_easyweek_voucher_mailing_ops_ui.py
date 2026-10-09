@@ -1052,6 +1052,7 @@ _COMPOSITION_FUNCTIONS = (
     "excludeCell",
     "basisLabel",
     "renderOffer",
+    "forgetOffer",
     "renderComposition",
     "plannedComposition",
     "compositionDigest",
@@ -1074,6 +1075,9 @@ let COMPOSITION_NOTE = null;
 let COMPOSITION_STALE = false;
 let COMPOSITION_FREEZABLE = true;
 let COMPOSITION_BUSY = false;
+let COMPOSITION_EPOCH = 0;
+let OFFER_STAGE = null;
+let OFFER_EPOCH = -1;
 const PANELS = {};
 globalThis.document = {
   getElementById: (id) => (PANELS[id] = PANELS[id] || {
@@ -1469,3 +1473,107 @@ console.log(JSON.stringify(verdicts));
         "an_array": False,
         "nothing": False,
     }, verdicts
+
+
+# ===========================================================================
+# F4 — the read deadline has to cover the body, not only the headers
+# ===========================================================================
+
+_TRANSPORT_FUNCTIONS = ("postJson", "undecidedLabel", "refusalLabel")
+
+
+async def _transport(ui_client, ops_credentials) -> str:
+    """The shipped request helper of the real preparation page, ready for node."""
+    page = await ui_client.get("/ops/voucher-mailings/prepare?preview_run_id=1")
+    assert page.status_code == 200
+    script = _page_script(page.text)
+    return "const CSRF = 'synthetic-csrf';\n" + "\n".join(
+        _function_source(script, name) for name in _TRANSPORT_FUNCTIONS
+    )
+
+
+@needs_node
+async def test_a_stalled_response_body_is_bounded_by_the_read_deadline(ui_client, ops_credentials) -> None:
+    """F4. Headers in, body never finishes — and the timer had already been cleared.
+
+    ``fetch`` resolves as soon as the status line arrives, so the reviewed code
+    cleared its deadline before the half that actually stalls. A browser cannot be
+    made to hold a body open from a route handler, so the shipped ``postJson`` is
+    executed directly against a ``fetch`` whose body promise only ever settles when
+    the abort signal fires. Without the fix this driver never returns.
+
+    The answer has to be the undecided timeout: not a successful check, not an empty
+    audience, and not a malformed body — nothing here establishes what the server
+    did with the request.
+    """
+    source = await _transport(ui_client, ops_credentials)
+    driver = """
+    let aborted = false;
+    globalThis.fetch = (path, init) => {
+      /* Headers arrive at once. The body is a promise that only settles when this
+         request is aborted, which is exactly the shape the defect survived in. */
+      return Promise.resolve({
+        status: 200,
+        json: () => new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(new Error("The operation was aborted"));
+          });
+        })
+      });
+    };
+    const started = Date.now();
+    const result = await postJson("/api/composition", {preview_run_id: 1}, {timeoutMs: 120});
+    console.log(JSON.stringify({
+      result: result,
+      aborted: aborted,
+      elapsed_under_a_second: Date.now() - started < 1000,
+      undecided_label: undecidedLabel(result),
+      refusal_label: refusalLabel(result)
+    }));
+    """
+    answer = _run_node(source, driver)
+
+    assert answer["aborted"] is True, "the body read was never bounded"
+    assert answer["elapsed_under_a_second"] is True
+    assert answer["result"]["timedOut"] is True
+    assert answer["result"]["undecided"] is True
+    assert answer["result"]["structured"] is False
+    assert answer["result"]["data"] == {}
+    # Reported as a deadline, and specifically not as a decision the server made.
+    assert "за отведённое время" in answer["undecided_label"]
+    assert answer["refusal_label"] is None
+
+
+@needs_node
+async def test_the_read_deadline_does_not_fire_after_a_complete_answer(ui_client, ops_credentials) -> None:
+    """F4. The timer is cleared once the whole bounded wait is over, not before.
+
+    A body that arrives normally must not be left with a live timer that could abort
+    something later, and a malformed body must still read as malformed rather than as
+    a timeout.
+    """
+    source = await _transport(ui_client, ops_credentials)
+    driver = """
+    const make = (body) => (path, init) => Promise.resolve({
+      status: 200,
+      json: () => body === null
+        ? Promise.reject(new Error("Unexpected token"))
+        : Promise.resolve(body)
+    });
+    globalThis.fetch = make({composition_proven: true});
+    const good = await postJson("/api/composition", {}, {timeoutMs: 50});
+    globalThis.fetch = make(null);
+    const bad = await postJson("/api/composition", {}, {timeoutMs: 50});
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    console.log(JSON.stringify({good: good, bad: bad}));
+    """
+    answer = _run_node(source, driver)
+
+    assert answer["good"]["undecided"] is False
+    assert answer["good"]["timedOut"] is False
+    assert answer["good"]["data"] == {"composition_proven": True}
+    # Malformed is undecided, and it is NOT the timeout: the deadline never fired.
+    assert answer["bad"]["undecided"] is True
+    assert answer["bad"]["structured"] is False
+    assert answer["bad"]["timedOut"] is False
