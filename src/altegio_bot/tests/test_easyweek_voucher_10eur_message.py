@@ -55,10 +55,14 @@ def test_exact_named_body_parameter_order_and_historical_contract_are_separate()
     assert "15 €" in historical.VOUCHER_TEMPLATE_BODY
     assert "10 €" not in historical.VOUCHER_TEMPLATE_BODY
     assert current.for_schema("3") is current
+    # The free gift certificate keeps the customer wording of the paid one, so it
+    # resolves to the same module. That is the point: the nominal and the terms the
+    # customer reads did not change, only who pays for the issue.
+    assert current.for_schema("4") is current
     assert current.for_schema("1") is historical
     assert current.for_schema("2") is historical
     with pytest.raises(ValueError):
-        current.for_schema("4")
+        current.for_schema("5")
 
 
 def test_exact_live_approved_passes():

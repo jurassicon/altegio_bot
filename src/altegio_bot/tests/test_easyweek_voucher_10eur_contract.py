@@ -51,20 +51,30 @@ def product_payload(**changes):
 def test_historical_versions_keep_original_product(schema):
     contract = production_contract(schema)
     assert contract is LEGACY_PRODUCTION_CONTRACT
-    assert contract.unit_price_minor == 1500 and contract.validity_months is None
+    assert contract.face_value_minor == 1500 and contract.validity_months is None
+    # The historical product was SOLD, so its two sums are the same number.
+    assert contract.issue_price_minor == 1500 and not contract.free_issue
     with pytest.raises(ValueError, match="contract_unproven"):
         production_contract(schema, contract_version=CURRENT.version)
 
 
-@pytest.mark.parametrize("schema", ["0", "4", "v3", None, 3])
+@pytest.mark.parametrize("schema", ["0", "5", "v3", None, 3, "", "3 ", True])
 def test_unknown_schema_never_selects_the_current_contract(schema):
+    """A version nobody minted resolves to nothing, including the next number up.
+
+    ``"4"`` used to be in this list and is now a real contract, so the property is
+    re-stated against ``"5"``: being adjacent to a known version is not a way in,
+    and neither is a bool, an empty string or whitespace around a real one.
+    """
     with pytest.raises(ValueError, match="contract_unproven"):
         production_contract(schema)
 
 
 def test_fixed_new_product_and_message_are_signed_as_one_contract():
     contract = production_contract("3", contract_version=CURRENT.version)
-    assert contract.unit_price_minor == 1000
+    assert contract.face_value_minor == 1000
+    # The PAID product: nominal and price are the same 1000, and it is not free.
+    assert contract.issue_price_minor == 1000 and not contract.free_issue
     assert contract.quantity == 1 and contract.validity_months == 1
     material = contract.digest_material()
     assert material["template_facts"]["is_single_charge"] is True
@@ -222,7 +232,7 @@ def test_a_report_with_no_named_baseline_states_the_contract_new_mailings_use(ba
     assert payload["voucher_unit_price_minor"] == 1000
     assert payload["approval_arithmetic"] == CURRENT_ARITHMETIC
     assert payload["default_voucher_unit_price_minor"] == 1000
-    assert payload["default_product_contract_version"] == CURRENT.version
+    assert payload["default_product_contract_version"] == "easyweek-production-gift-10eur-v1"
 
 
 @pytest.mark.parametrize(
@@ -245,7 +255,7 @@ def test_the_nominal_and_the_arithmetic_always_describe_the_same_subject(batch, 
     # And the default never moves with the subject: a €15 batch is not evidence
     # that a new mailing costs €15.
     assert payload["default_voucher_unit_price_minor"] == 1000
-    assert payload["default_product_contract_version"] == CURRENT.version
+    assert payload["default_product_contract_version"] == "easyweek-production-gift-10eur-v1"
 
 
 async def test_status_on_an_empty_production_ledger_states_the_new_contract(session_maker):

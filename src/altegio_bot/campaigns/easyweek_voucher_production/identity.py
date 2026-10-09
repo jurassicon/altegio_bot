@@ -35,7 +35,11 @@ import hashlib
 import json
 from typing import Final
 
-from altegio_bot.easyweek_voucher_production_contract import production_contract
+from altegio_bot.easyweek_voucher_production_contract import (
+    BOUND_SCHEMA_VERSIONS,
+    is_current_fixed_contract,
+    production_contract,
+)
 from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_CAMPAIGN_CODE,
     VOUCHER_PRODUCTION_COMPANY_ID,
@@ -338,7 +342,11 @@ def binding_material(
     legacy = f"{PRODUCTION_SCOPE}:{batch_id}:{slot}"
     if schema_version == "1":
         return legacy
-    if schema_version not in ("2", "3") or not frozen_digest or not recipient_basis or not customer_uuid:
+    # Every version that binds a slot to its recipient and snapshot, which is all
+    # of them except the schema 1 legacy domain returned above. Listed centrally so
+    # a new fixed product inherits the bound domain instead of falling off the end
+    # of a literal tuple and refusing every voucher it issues.
+    if schema_version not in BOUND_SCHEMA_VERSIONS or not frozen_digest or not recipient_basis or not customer_uuid:
         raise ValueError("voucher_production_binding_identity_unproven")
     material = {
         "schema_version": schema_version,
@@ -348,7 +356,7 @@ def binding_material(
         "source_proof_digest": source_proof_digest,
         "customer_uuid": customer_uuid,
     }
-    if schema_version == "3":
+    if is_current_fixed_contract(schema_version):
         material["product_contract"] = contract.digest_material()
     return legacy + f":v{schema_version}:" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 

@@ -275,7 +275,9 @@ async def test_new_account_requires_exact_pin_and_complete_unique_membership(mon
     reader = SimpleNamespace(list_location_accounts=AsyncMock(return_value=payload))
     # Production's expected pin is fixed; synthetic identity is admitted only
     # by patching the same narrow pure boundary used by issuer tests.
-    monkeypatch.setattr(account, "expected_account_fingerprint", lambda: account.account_fingerprint(CUSTOMER))
+    monkeypatch.setattr(
+        account, "expected_account_fingerprint", lambda contract=None: account.account_fingerprint(CUSTOMER)
+    )
     assert (
         await account.prove_current_account(reader, account_uuid=CUSTOMER, location_uuid=KARLSRUHE_LOCATION_UUID)
         is expected
@@ -427,7 +429,7 @@ async def test_stage_preparation_answers_a_structured_refusal_not_a_500(
             "stage": "freeze",
             "preview_run_id": run_id,
             "expected_recipient_count": 1,
-            "approved_exposure_minor": CONTRACT.unit_price_minor,
+            "approved_exposure_minor": CONTRACT.face_value_minor,
         },
     )
     assert answer.status_code == 409, answer.text

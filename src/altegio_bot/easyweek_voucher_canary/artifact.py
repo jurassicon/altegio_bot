@@ -429,6 +429,7 @@ def observe_artifact(
     expected_customer_uuid: str,
     expected_template_uuid: str,
     expected_price_minor: int,
+    expected_value_minor: int | None = None,
 ) -> ArtifactObservation:
     """Project one response or readback into safe, comparable facts.
 
@@ -470,6 +471,7 @@ def observe_artifact(
         order,
         expected_template_uuid=expected_template_uuid,
         expected_price_minor=expected_price_minor,
+        expected_value_minor=expected_value_minor,
     )
     voucher_line_proven = line_proof.proven
     voucher_line_shape_unknown = not line_proof.shape_recognised

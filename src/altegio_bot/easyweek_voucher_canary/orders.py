@@ -238,6 +238,10 @@ def classify_order(payload: object, *, expected_price_minor: int = SUPPORTED_VOU
     settled invoice under an ``open`` status. Guessing "probably open" there is
     how an unknown state becomes a payment.
 
+    ``expected_price_minor`` of zero is a free issue, and there the amounts prove
+    nothing at all: see the comment on ``settled`` below. Such an order is PAID only
+    when it says so.
+
     Refund and cancellation are read before payment. A refunded order WAS paid,
     so those two are not a contradiction; anything else that overlaps is.
     """
@@ -259,7 +263,20 @@ def classify_order(payload: object, *, expected_price_minor: int = SUPPORTED_VOU
     invoice = invoice if isinstance(invoice, dict) else order
     amount_due = _exact_int(invoice.get("amount_due"))
     amount_paid = _exact_int(invoice.get("amount_paid"))
-    settled = amount_due == 0 and amount_paid == expected_price_minor
+    # The amounts-only payment proof, and why it is switched off at a zero price.
+    #
+    # At a positive price "nothing left to pay, and exactly the price paid" is real
+    # evidence: somebody moved that money. At a price of ZERO the same two
+    # comparisons are satisfied by an order nobody has touched — a freshly created
+    # free order publishes ``amount_due: 0`` and ``amount_paid: 0`` — so they would
+    # turn every OPEN free order into a PAID one, before the ``open`` label is even
+    # read. Zero amounts say that no money is owed, which is not the same statement
+    # as "this order has been settled".
+    #
+    # So a free contract is settled by an explicit supported paid status and by
+    # nothing else. ``_exact_int`` already keeps ``True``, ``None``, ``"0"``, a
+    # missing key and ``0.0`` out of this: none of them is integer 0.
+    settled = expected_price_minor > 0 and amount_due == 0 and amount_paid == expected_price_minor
 
     # Refund wins over payment; a refunded order having been paid is expected.
     # Reverted AND cancelled at once is not, and is not a state to act on.
@@ -272,6 +289,19 @@ def classify_order(payload: object, *, expected_price_minor: int = SUPPORTED_VOU
         if paid_flag or settled or open_flag:
             return ORDER_UNKNOWN, PAYMENT_PROOF_NONE
         return ORDER_CANCELLED, PAYMENT_PROOF_NONE
+
+    if expected_price_minor == 0:
+        # A zero-priced draft has the same totals as a settled gift. It needs
+        # an explicit recognised status, and contradictory boolean flags cannot
+        # override that status (or manufacture it when absent).
+        for key in ("is_paid", "is_reverted", "is_refunded", "is_canceled", "is_cancelled"):
+            if key in order and type(order[key]) is not bool:
+                return ORDER_UNKNOWN, PAYMENT_PROOF_NONE
+        if status_slug in _PAID_STATUSES and order.get("is_paid") is not False:
+            return ORDER_PAID, PAYMENT_PROOF_STATUS
+        if open_flag and not paid_flag:
+            return ORDER_OPEN, PAYMENT_PROOF_NONE
+        return ORDER_UNKNOWN, PAYMENT_PROOF_NONE
 
     # Evidence of a payment outranks an "open" label. The two disagreeing is a
     # body we do not fully understand, but the safe reading of it is not the
@@ -316,6 +346,10 @@ def paid_order_amounts_proven(payload: object, *, expected_price_minor: int) -> 
     invoice is not invented: the observed POS response may expose subtotal and
     status only. Every published amount must agree; account_paid_amount is not
     evidence. Without a paid status the existing settled-invoice proof applies.
+
+    At a zero price this still demands the paid STATUS, because ``classify_order``
+    no longer accepts zero amounts as a settlement — so a free order's totals being
+    zero is necessary here and never sufficient.
     """
     order = order_object(payload)
     if order is None:
@@ -325,6 +359,8 @@ def paid_order_amounts_proven(payload: object, *, expected_price_minor: int) -> 
     levels = _total_levels(order)
     if levels is None:
         return False
+    if expected_price_minor == 0 and not _free_issue_adjustments_proven(levels):
+        return False
     totals = [level[key] for level in levels for key in _TOTAL_KEYS if key != "amount_due" and key in level]
     if not totals or any(_exact_int(value) != expected_price_minor for value in totals):
         return False
@@ -333,6 +369,21 @@ def paid_order_amounts_proven(payload: object, *, expected_price_minor: int) -> 
         if any(_exact_int(value) != expected for value in values):
             return False
     return True
+
+
+def _free_issue_adjustments_proven(levels: list[dict[str, Any]]) -> bool:
+    """Free issue is a zero price, not a discounted or voucher-funded sale.
+
+    Check only published fields; their absence is not invented evidence. A
+    nonzero account amount contradicts this zero-cash contract; a zero amount
+    still does not prove settlement. Positive-price historical paths are unchanged.
+    """
+    return all(
+        _exact_int(level[key]) == 0
+        for level in levels
+        for key in ("discount_amount", "promocode_discount_amount", "voucher_paid_amount", "account_paid_amount")
+        if key in level
+    )
 
 
 def _order_total_reasons(order: dict[str, Any], *, expected_price_minor: int) -> tuple[str, ...]:
@@ -348,12 +399,16 @@ def _order_total_reasons(order: dict[str, Any], *, expected_price_minor: int) ->
     defaulted. "Conflicting totals" needs no separate rule: values that disagree
     cannot all be the nominal, so one of them already fails.
 
-    ``amount_paid`` and ``account_paid_amount`` are deliberately not consulted.
+    ``amount_paid`` is not settlement evidence here. For a free issue, published
+    account/adjustment amounts must be zero; that is a contradiction check, not
+    proof of payment.
     What was paid is not what is owed, and only the second may authorise a
     payment.
     """
     levels = _total_levels(order)
     if levels is None:
+        return (CANARY_ORDER_TOTAL_UNPROVEN,)
+    if expected_price_minor == 0 and not _free_issue_adjustments_proven(levels):
         return (CANARY_ORDER_TOTAL_UNPROVEN,)
 
     published = [level[key] for level in levels for key in _TOTAL_KEYS if key in level]
@@ -379,6 +434,7 @@ def payable_order_reasons(
     *,
     expected_template_uuid: str,
     expected_price_minor: int,
+    expected_value_minor: int | None = None,
 ) -> tuple[str, ...]:
     """Why this order is NOT the exact one-voucher order we may pay for.
 
@@ -396,6 +452,10 @@ def payable_order_reasons(
     This gates the PAYMENT only. A refund never consults it: an already-paid
     order must stay refundable even when its voucher body turns out to be
     something nobody expected.
+
+    ``expected_price_minor`` is what the ORDER must total — zero for a free issue —
+    and ``expected_value_minor`` is what the voucher must be WORTH. They default to
+    the same number, which is what every paid product means by both.
     """
     order = order_object(payload)
     if order is None:
@@ -407,6 +467,7 @@ def payable_order_reasons(
         order,
         expected_template_uuid=expected_template_uuid,
         expected_price_minor=expected_price_minor,
+        expected_value_minor=expected_value_minor,
     ).proven:
         reasons.append(CANARY_VOUCHER_LINE_UNPROVEN)
 

@@ -49,6 +49,7 @@ from datetime import timedelta
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from altegio_bot.campaigns import easyweek_voucher_owner_test as owner_test
 from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.db import SessionLocal
@@ -102,6 +103,10 @@ async def run_once(
     """
     claimed = await operations_module.claim_next_operation(session_maker, owner=owner)
     if claimed is None:
+        # The isolated gift test uses the same dedicated process but never a
+        # production batch or Meta transport. A queued test remains durable even
+        # when its browser closes; its singleton can never replenish an attempt.
+        await owner_test.execute_next(session_maker)
         return None
 
     logger.info(
@@ -163,6 +168,7 @@ async def run_worker(
     # Before any new work. See the module docstring: with one executor in the
     # supported topology, a `running` row at start-up is a dead process's.
     abandoned = await operations_module.interrupt_abandoned(maker, include_all_running=True)
+    await owner_test.interrupt_running(maker)
     for entry in abandoned:
         logger.warning(
             "voucher production operation=%s was running at start-up and is now interrupted; "

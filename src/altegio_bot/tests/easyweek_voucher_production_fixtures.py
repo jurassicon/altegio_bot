@@ -82,6 +82,9 @@ STAFFER_UUID = "dddddddd-4444-4444-8444-dddddddddddd"
 # every other check in this phase and is still the wrong answer.
 OTHER_STAFFER_UUID = "dddddddd-4444-4444-8444-dddddddddd99"
 ACCOUNT_UUID = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+# The free gift certificate settles through a different till, so the fixtures need a
+# second synthetic account: one that is NOT the paid one, which is the whole point.
+GIFT_ACCOUNT_UUID = "eeeeeeee-6666-4666-8666-eeeeeeeeeeee"
 SENDER_PHONE_NUMBER_ID = "SYNTHETIC_PRODUCTION_PHONE_NUMBER_ID"
 
 # The fingerprint the synthetic issuer above has, computed the same way runtime
@@ -187,13 +190,24 @@ def production_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", True, raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_staffer_uuid", STAFFER_UUID, raising=False)
-    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_account_uuid", ACCOUNT_UUID, raising=False)
+    # The till a correctly configured deployment points at TODAY, which is the
+    # one the current new-mailing product settles through. §43/§44 requests name
+    # their own historical account explicitly and are unaffected.
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_account_uuid", GIFT_ACCOUNT_UUID, raising=False)
     pin_synthetic_issuer(monkeypatch)
     # The same synthetic deployment also backs explicit §45 tests. Historical
     # requests never consult this new-product account proof.
     from altegio_bot.campaigns.easyweek_voucher_production import account
 
-    monkeypatch.setattr(account, "expected_account_fingerprint", lambda: account.account_fingerprint(ACCOUNT_UUID))
+    monkeypatch.setattr(
+        account,
+        "expected_account_fingerprint",
+        # Synthetic, and per contract: the till pin is now a property of the
+        # product, so the stub has to take the contract the real one takes.
+        lambda contract=None: account.account_fingerprint(
+            GIFT_ACCOUNT_UUID if contract is not None and contract.free_issue else ACCOUNT_UUID
+        ),
+    )
 
 
 def production_request(*, run_id: int, batch_id: int | None = None) -> ProductionRequest:

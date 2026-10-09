@@ -1,7 +1,10 @@
-# Production EasyWeek voucher mailing — runbook (§45 fixed €10 product)
+# Production EasyWeek voucher mailing — runbook (fixed €10 gift product)
 
 The working mode for new mailings: a real operator-curated list, **one €10 voucher per
-recipient**, one WhatsApp message each. Every stage is confirmed separately, in
+recipient**, issued for **€0 through Aktionsgutscheine**, one WhatsApp message each.
+New mailings use schema `4`; existing schema `1`–`3` retain their original prices,
+accounts, authorizations and bindings. See §15 for the owner-approved free-issue
+change and the isolated browser test. Every stage is confirmed separately, in
 the browser. There is no control that runs two stages, and there will not be one.
 
 The voucher is single use, valid for one month **from activation**, with any
@@ -20,7 +23,7 @@ mailing.
 * **What the application does NOT do.** It does not prove the activation instant
   or the expiry boundary of an individual issued code, and it never reports that
   it did. Reports name the responsible party instead:
-  `issued_voucher_validity: provider_managed` for schema 3, `not_applicable` for
+  `issued_voucher_validity: provider_managed` for schema 3/4, `not_applicable` for
   the historical €15 contracts, `not_required_for_refund` for a refund. The old
   `issued_validity_capability_proven` boolean is gone rather than set to `true`.
 * **What an artifact without dates means now.** A correct issued voucher that
@@ -77,8 +80,10 @@ Read `docs/easyweek/INTEGRATION_PLAN.md` §§42–45 before the first action.
 
 | | |
 | --- | --- |
-| Value per recipient | New schema 3: €10 (1000 minor units); historical schema 1/2: €15 (1500) |
-| Total exposure | Actual eligible `recipient_count × contract unit price`, equal to what the operator confirmed |
+| Value per recipient | New schema 4: €10 (1000 minor units); historical schema 3: €10; historical schema 1/2: €15 |
+| Issue price per recipient | New schema 4: €0; historical schema 3: €10; historical schema 1/2: €15 |
+| Total nominal exposure | Actual eligible `recipient_count × face value`, equal to what the operator confirmed; **not a cash receipt** |
+| Total issue price | New schema 4: €0, separately displayed and bound to authorization |
 | Maximum Meta messages | one per slot, one attempt each, for the lifetime of the row |
 
 **There is no recipient ceiling, and the operator states the size.** A ceiling
@@ -137,9 +142,9 @@ are not changed between mailings.
 
 | Variable | Meaning |
 | --- | --- |
-| `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED` | the fence. False ⇒ every acting stage refuses before any HTTP request, the read-only plan included |
+| `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED` | the production fence. False ⇒ production stages refuse before any HTTP request, the read-only plan included. The separately fenced isolated owner test in §15 requires this fence to stay false |
 | `EASYWEEK_VOUCHER_PRODUCTION_MAILING_STAFFER_UUID` | **the one approved issuer** — see §2 |
-| `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ACCOUNT_UUID` | which POS account is charged, and which one a refund returns to |
+| `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ACCOUNT_UUID` | the approved POS account: Aktionsgutscheine for new schema 4, Card for historical schema 3. A mismatched account refuses; no fallback or name-based selection |
 | `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY` | ≥32 bytes; binds each issued code to its batch and slot |
 | `EASYWEEK_VOUCHER_DELIVERY_HMAC_KEY_ID` | names which key produced a stored MAC |
 | `EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED` | this deployment runs the dedicated executor — see §3 |
@@ -809,7 +814,8 @@ it is ABOUT from the default:
 | Field | What it means |
 | --- | --- |
 | `voucher_unit_price_minor`, `approval_arithmetic` | the subject of this report: a named batch's own frozen amount, or, with no batch named, the current contract |
-| `default_voucher_unit_price_minor`, `default_product_contract_version` | what a **new** mailing costs — always the €10 contract, whatever this report is about |
+| `default_voucher_unit_price_minor`, `default_product_contract_version` | the **nominal value** and version for a new mailing — €10, whatever this report is about |
+| `voucher_issue_price_minor`, `default_voucher_issue_price_minor` | subject/default issue price, distinct from nominal value; new schema 4 is zero |
 | each row of `batches[]` | that batch's own `voucher_unit_price_minor` and `total_exposure_minor` |
 
 So a named historical batch reads €15 in the subject and €10 in the default; a
@@ -1185,6 +1191,11 @@ they do not override the §44 data-preservation guard.
 
 ## 14. Scoped §45 rollout: new €10 single-use monthly product
 
+**Historical paid schema 3 rollout.** The following configuration and diagnostic
+describe `cost=value=1000` through Card. They remain relevant to existing schema 3
+records, not to new free gifts. For new schema 4 deployment follow §15; do not
+change the live product back to €10 cost to satisfy a historical diagnostic.
+
 This section supersedes the €15 product examples above **only for new schema 3
 production mailings**. Historical schema 1/2 remain €15, with their original
 message and byte-for-byte HMAC material. Product version
@@ -1367,3 +1378,152 @@ models a capability as answered and nothing replaces the validity boundary with
 a function that returns success — so the positive path is the ordinary artifact,
 dates and all absent. Tests with mocked APIs still prove wiring only: they do
 not establish that a real mailing was sent and are not a readiness claim.
+
+## 15. Free €10 gifts and the isolated owner test
+
+The owner approved this follow-up on 09.10.2026. It differs from the paid
+contract in canonical plan §45.1: new requests use schema `4`, product contract
+`easyweek-production-gift-10eur-v1`, issue price **0**, face value **1000** minor
+units and the approved **Aktionsgutscheine** account. The canonical plan is not
+silently rewritten; its additive amendment requires separate owner approval.
+Existing schema 1/2/3 retain their original contract and recovery semantics.
+
+The same EasyWeek product UUID, Julia Müller issuer, sender, Meta template
+`kitilash_ka_new_client_voucher_10eur_v2` and local template
+`new_client_voucher_10eur_v2` remain in use. Single use, one month from activation,
+forfeited remainder and provider-managed validity are unchanged. Account names
+are display labels, never identity proof: the configured canonical UUID must
+match the approved pin and occur exactly once in the branch's live account list.
+
+### 15.1 Two amounts, not a discount or an accounting promise
+
+| Fact | New gift contract |
+| --- | --- |
+| Voucher face value | €10 per recipient |
+| Voucher issue price / POS voucher line price | €0, exact integer zero |
+| Approved nominal exposure | Actual recipient count × €10 |
+| Total issue price | €0, independently bound to the batch and approval |
+| Approved account for issuance | Aktionsgutscheine |
+
+For 33 recipients this is **€330 nominal and €0 issue price**, not a €330 cash
+receipt. The count is not a constant: it is checked again against the actual
+composition. Zero issue price never permits an empty audience or zero nominal
+confirmation. Amount, issuer, customer and account cannot be overridden by the
+browser. No negative price, synthetic discount or compensating transaction is
+introduced.
+
+The owner's manual UI test and supplied read-only evidence demonstrate a voucher
+issued for €0 and redeemed against a €10 service, with €0 paid to the account.
+They do **not** demonstrate an application API issuance. The service invoice still
+has a €10 total and a €10 voucher payment: this is not a €0-priced service, nor
+proof of unchanged revenue, commission, tax or accounting reports. Review those
+reports with the salon's accounting owner before rollout; this PR only separates
+issuance price from nominal and pins the appropriate account.
+
+### 15.2 Administrator deployment, with sending closed
+
+1. Preserve the environment and database backups. Stop API and the dedicated
+   executor for the coordinated migration/deployment; do not use rolling versions.
+   Keep `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED=false` and
+   `EASYWEEK_VOUCHER_OWNER_TEST_ENABLED=false` in both containers.
+2. Upgrade to the one Alembic head. Migration `b4d7f1c90ae2` separates the issue
+   price from nominal, backfilling historical rows with their original paid
+   amounts. `c9e7a34d6210` adds the isolated singleton test record. Neither migration
+   edits previews, recipients, historical signed material or HMACs.
+3. Set `EASYWEEK_VOUCHER_PRODUCTION_MAILING_ACCOUNT_UUID` to the approved
+   Aktionsgutscheine UUID from the owner's verified diagnostics. Do not use the
+   dashboard's numeric account id or infer identity from its name. Keep the Julia
+   issuer setting and existing HMAC key/id unchanged. Recovery of older contracts
+   still needs their original account, not a replacement pin.
+4. Recreate both services so their environment is actually re-read. Exactly one
+   executor is supported. A plain `restart` does not load changed environment.
+5. Check revisions and service state; these commands do not issue anything:
+
+```bash
+cd /opt/altegio_bot
+git log -1 --format='%H %s'
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml ps altegio-api altegio-easyweek-voucher-executor postgres
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-api /app/.venv/bin/alembic heads
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-api /app/.venv/bin/alembic current
+docker compose -f docker-compose.yml -f docker-compose.chatwoot-internal.yml exec -T altegio-api /app/.venv/bin/python -m altegio_bot.scripts.easyweek_voucher_production_mailing status
+```
+
+Expected head/current: `c9e7a34d6210`. The default report has nominal 1000, issue
+price 0 and the gift product version. An empty batch placeholder or an explicitly
+selected historical batch is not the new default product. Check preview #44 is
+still editable and its period, automatic/manual basis and recipient rows are
+unchanged. Do not freeze it merely to smoke-test deployment.
+
+### 15.3 One real application test, entirely through Ops
+
+The test is **one-ever for this installation**, not one per configured UUID. It
+has an isolated durable row and no campaign, entitlement, recipient or delivery
+row. Changing configuration, reopening a page, restarting containers or repeated
+clicks cannot replenish a consumed CREATE/PAY attempt. Do not delete its evidence
+to test again.
+
+After the owner explicitly approves this real one-customer test, the administrator
+sets the following in `easyweek.env`, identically for API and executor:
+
+```dotenv
+EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED=false
+EASYWEEK_VOUCHER_PRODUCTION_EXECUTOR_ENABLED=true
+EASYWEEK_VOUCHER_OWNER_TEST_ENABLED=true
+EASYWEEK_VOUCHER_OWNER_TEST_CUSTOMER_UUID=<verified-owner-test-customer-uuid>
+```
+
+Replace the placeholder privately with the exact approved test customer's UUID,
+not a phone or a production audience member. Existing issuer/account configuration
+must also be correct. Never paste `.env`, a bearer token or a voucher code into a
+report. Recreate both containers; no secret generation or HMAC rotation is needed.
+
+1. Log into Ops, open **Ваучеры**, follow **Тест бесплатного сертификата**
+   (`/ops/voucher-gift-test`). It displays one certificate, nominal €10, issue price
+   €0, Aktionsgutscheine and Julia Müller. There is no customer selector or DELIVER.
+2. Press **Подготовить CREATE**. The loading indicator means live read checks are
+   running; this does not create a voucher. Read the amounts, then separately
+   press **Подтвердить только этот шаг**. Only the dedicated executor may perform
+   the one CREATE. Wait for `open`; the next stage does not run automatically.
+3. Press **Подготовить PAY**, read the separate confirmation and confirm only
+   this step. The executor sends the one payment request to the pinned account
+   and reads the exact order back. Success is `paid` with code presence confirmed,
+   not merely a zero balance. No code is displayed or logged and no Meta message
+   is sent.
+4. In EasyWeek inspect this test customer's issued voucher and order. Verify
+   nominal €10, issue price €0, correct issuer/account, valid voucher and no false
+   positive cash receipt. If needed, perform the separately approved manual
+   redemption against a test booking and inspect both the service invoice and
+   finance reports. Do not use a real mailing recipient for the test.
+5. Close `EASYWEEK_VOUCHER_OWNER_TEST_ENABLED` and recreate both services after
+   the test. Production mailing stays false until a separate decision to send.
+
+**Refusals and ambiguity.** A zero-priced `open` order is not paid. Unknown,
+contradictory, reverted or cancelled state, missing nominal/code, nonzero funding
+or discount and unreadable results cannot count as success. An unexpectedly
+already-paid CREATE is blocked: the approved account binding has not been proven
+and a second PAY must not be forced. A timeout/crash preserves an unknown outcome,
+never triggers automatic repetition and never grants another CREATE. Use
+**Сверить с EasyWeek** for bounded GET-only reconciliation; this records evidence
+but does not reissue or repay anything. If reconciliation cannot prove the exact
+order, keep the test blocked and investigate; no delete/reset workaround.
+
+**Остановить тест навсегда** is terminal, including before a queued mutation starts.
+A request already in flight can still finish and its truthful result remains
+visible. Read-only reconciliation stays available after STOP. There is no test
+refund, automatic cancellation or replacement certificate.
+
+### 15.4 Production and rollback boundary
+
+A green isolated test is not authorization for a real audience. Only after owner
+acceptance, with the isolated test closed, may the administrator separately open
+the production fence. Recheck the existing preview in Ops, check nominal and zero
+issue totals, then confirm FREEZE → CREATE → PAY → DELIVER individually. All
+identity, opt-out, exact APPROVED Meta template, entitlement, HMAC, one-attempt and
+terminal STOP checks still apply. Generic send-real, Outbox and follow-up remain
+closed; no other provider or branch is opened.
+
+Downgrades refuse before destructive DDL if either new gift batches/approvals or
+the singleton test record exist. An unconsumed approval and a test stopped before
+issuance are still evidence. Close the fences, retain the records and use a
+reviewed forward fix. Do not convert zero to a paid price, delete rows or rotate
+keys to force rollback.

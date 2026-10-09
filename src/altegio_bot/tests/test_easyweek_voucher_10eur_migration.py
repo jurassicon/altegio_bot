@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from altegio_bot.campaigns.easyweek_voucher_production.operations import OpsPrincipal, StageTargets, store_approval
 from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT as CURRENT
 from altegio_bot.models.models import VOUCHER_PRODUCTION_SCOPE
 from altegio_bot.tests.easyweek_voucher_delivery_fixtures import seed_recipient
@@ -82,6 +80,38 @@ async def _current_batch(db, *, run_id, count):
         },
     )
     return (await _fetch(db, f"SELECT id FROM {BATCH} WHERE campaign_run_id = :run", {"run": run_id}))[0][0]
+
+
+async def _historical_approval(db, *, run_id):
+    """Seed revision e7's physical schema, independent of future ORM columns."""
+    await _execute(
+        db,
+        f"""
+        INSERT INTO {APPROVAL} (
+            batch_scope, request_schema_version, product_contract_version, provider, company_id, stage,
+            principal, session_fingerprint, identification_limit, campaign_run_id, target_slots, target_slot_count,
+            stage_target_count, stage_amount_minor, batch_recipient_count, batch_exposure_minor,
+            campaign_period_start, campaign_period_end, plan_digest, plan_issued_at, expires_at,
+            issuer_pinned, issuer_membership_proven, runtime_identity_bound, baseline_version, frozen_digest, status
+        ) VALUES (
+            :scope, '3', :product, 'easyweek', 322579, 'freeze',
+            'synthetic-operator', :fingerprint, 'shared_ops_account', :run, '[1]'::jsonb, 1,
+            1, 1000, 1, 1000, '2026-10-07T00:00:00+00', '2026-10-08T00:00:00+00',
+            :digest, '2026-10-07T00:00:00+00', '2026-10-07T00:30:00+00',
+            true, true, true, :baseline, :frozen, 'pending'
+        )
+    """,
+        {
+            "scope": VOUCHER_PRODUCTION_SCOPE,
+            "product": CURRENT.version,
+            "fingerprint": "b" * 64,
+            "run": run_id,
+            "digest": "c" * 64,
+            "baseline": CURRENT.baseline_version,
+            "frozen": "d" * 64,
+        },
+    )
+    return (await _fetch(db, f"SELECT id FROM {APPROVAL} WHERE campaign_run_id=:run", {"run": run_id}))[0][0]
 
 
 async def test_upgrade_preserves_16_earned_18_manual_preview_and_all_historical_bytes(product_migration_db):
@@ -221,41 +251,16 @@ async def test_unconsumed_new_approval_alone_blocks_lossy_downgrade(product_migr
     db = product_migration_db
     _alembic_ok("upgrade", REVISION, db_url=db)
     run, _recipients = await _seed_run_and_recipients(db, count=1)
-    now = datetime(2026, 10, 7, tzinfo=timezone.utc)
-    engine = create_async_engine(db)
-    try:
-        approval = await store_approval(
-            async_sessionmaker(engine, expire_on_commit=False),
-            principal=OpsPrincipal("synthetic-operator", "b" * 64),
-            stage="freeze",
-            campaign_run_id=run,
-            batch_id=None,
-            targets=StageTargets((1,), 1, 1000, 1, 1000),
-            plan_digest="c" * 64,
-            plan_issued_at=now,
-            ttl=timedelta(minutes=30),
-            campaign_period_start=now,
-            campaign_period_end=now + timedelta(days=1),
-            issuer_pinned=True,
-            issuer_membership_proven=True,
-            runtime_identity_bound=True,
-            baseline_version=CURRENT.baseline_version,
-            frozen_digest="d" * 64,
-            request_schema_version="3",
-            product_contract_version=CURRENT.version,
-        )
-    finally:
-        await engine.dispose()
-    assert approval.request_schema_version == "3" and approval.product_contract_version == CURRENT.version
+    approval_id = await _historical_approval(db, run_id=run)
     before = await _rows(db, APPROVAL)
     assert "ck_ew_voucher_production_approval_product" in await _refused(
         db,
         f"UPDATE {APPROVAL} SET product_contract_version='easyweek-production-15eur-v1' WHERE id=:id",
-        {"id": approval.id},
+        {"id": approval_id},
     )
     for change in ("batch_exposure_minor=1500", "stage_amount_minor=1500", "batch_recipient_count=2"):
         assert "ck_ew_voucher_production_approval_product_amount" in await _refused(
-            db, f"UPDATE {APPROVAL} SET {change} WHERE id=:id", {"id": approval.id}
+            db, f"UPDATE {APPROVAL} SET {change} WHERE id=:id", {"id": approval_id}
         )
     result = _run_alembic("downgrade", PARENT, db_url=db)
     assert result.returncode != 0 and "10 EUR downgrade refused" in result.stderr

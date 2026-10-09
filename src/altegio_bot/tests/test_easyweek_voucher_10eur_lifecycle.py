@@ -35,7 +35,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.validity import (
     VOUCHER_EXPIRED,
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationUnknown
-from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT as CONTRACT
+from altegio_bot.easyweek_voucher_production_contract import new_mailing_contract
 from altegio_bot.models.models import CampaignRecipient, EasyWeekVoucherProductionBatchAttempt, MessageTemplate
 from altegio_bot.settings import settings
 from altegio_bot.tests import easyweek_voucher_10eur_fixtures as new
@@ -43,6 +43,9 @@ from altegio_bot.tests import easyweek_voucher_delivery_fixtures as earned
 from altegio_bot.tests import easyweek_voucher_production_fixtures as old
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import ui_confirm, ui_execute, ui_frozen, ui_plan
 from altegio_bot.tests.test_easyweek_voucher_production_mailing import _apply, _ok_response, _plan
+
+# The product a NEW mailing issues, which is what this lifecycle is.
+CONTRACT = new_mailing_contract()
 
 
 async def prepared(session_maker, *, paid=False, reader=None, count=1):
@@ -58,7 +61,9 @@ async def prepared(session_maker, *, paid=False, reader=None, count=1):
     create = old.FakeMutator(create_sequence=[_ok_response(index) for index in range(count)])
     created = await _apply(session_maker, reader, stage=STAGE_CREATE, request=request, mutator=create)
     assert created.outcome == "applied", created.reasons
-    assert all(call["price_minor"] == 1000 for call in create.create_calls)
+    # The MONEY the order charges, which is the issue price and not the nominal.
+    assert all(call["price_minor"] == CONTRACT.issue_price_minor for call in create.create_calls)
+    assert all(type(call["price_minor"]) is int for call in create.create_calls)
     assert all(call["voucher_template_uuid"] == CONTRACT.template_uuid for call in create.create_calls)
     assert all(call["product_contract_version"] == CONTRACT.version for call in create.create_calls)
     if paid:
@@ -83,7 +88,9 @@ async def test_new_lifecycle_uses_exact_product_and_scoped_message_with_mocked_e
     delivered = await _apply(session_maker, reader, stage=STAGE_DELIVER, request=request, sender=sender)
     assert delivered.outcome == "applied"
     assert delivered.batch["total_exposure_minor"] == 2000
+    # The nominal, unchanged by a free issue; the money sits in its own column.
     assert delivered.batch["voucher_unit_price_minor"] == 1000
+    assert delivered.batch["voucher_issue_price_minor"] == CONTRACT.issue_price_minor
     assert sender.calls == 2
     assert set(reader.product_reads) == {CONTRACT.template_uuid}
     assert reader.meta_reads >= 4
@@ -112,7 +119,7 @@ async def test_an_artifact_without_provider_dates_completes_the_whole_lifecycle(
 
     Everything else about the contract is still proven here, on the real functions:
     the exact product, the exact nominal, one voucher and one payment per recipient,
-    one Meta attempt per recipient, and the money being N × 1000 and nothing else.
+    one Meta attempt per recipient, and the nominal being N × 1000 and nothing else.
     """
     run_id, _ = await old.seed_production_preview(session_maker, count=2)
     await new.seed_template_and_sender(session_maker)
@@ -150,9 +157,13 @@ async def test_an_artifact_without_provider_dates_completes_the_whole_lifecycle(
     assert not pay.refund_calls
     # The exact product and the exact nominal, on every call.
     assert {call["voucher_template_uuid"] for call in create.create_calls} == {CONTRACT.template_uuid}
-    assert {call["price_minor"] for call in create.create_calls} == {1000}
+    # The two sums, separately: what the orders CHARGE and what the batch is WORTH.
+    assert {call["price_minor"] for call in create.create_calls} == {CONTRACT.issue_price_minor}
     assert delivered.batch["total_exposure_minor"] == 2 * 1000
+    assert delivered.batch["total_issue_price_minor"] == 2 * CONTRACT.issue_price_minor
+    # The nominal, unchanged by a free issue; the money sits in its own column.
     assert delivered.batch["voucher_unit_price_minor"] == 1000
+    assert delivered.batch["voucher_issue_price_minor"] == CONTRACT.issue_price_minor
     # One Meta attempt per recipient, under the new contract's own message code.
     async with session_maker() as session:
         attempts = list((await session.scalars(select(EasyWeekVoucherProductionBatchAttempt))).all())
@@ -202,8 +213,8 @@ async def test_a_mixed_earned_and_manual_audience_completes_the_new_contract(
 
     The two slots are proven in different ways — one by a live booking, one by an
     operator's attested manual decision — and neither of them carries an issued
-    voucher date. Both complete, each costs exactly 1000 minor units, and the money
-    is N × 1000 and nothing else.
+    voucher date. Both complete, each is worth exactly 1000 minor units, and the
+    nominal is N × 1000 and nothing else.
 
     It also proves the thing no report may ever contain: the voucher code goes to
     Meta and appears nowhere else — not in the stage report, not in the ledger
@@ -216,6 +227,7 @@ async def test_a_mixed_earned_and_manual_audience_completes_the_new_contract(
     assert frozen.batch["recipient_basis"] == "mixed"
     assert frozen.batch["earned_recipient_count"] == frozen.batch["manual_recipient_count"] == 1
     assert frozen.batch["voucher_unit_price_minor"] == 1000
+    assert frozen.batch["voucher_issue_price_minor"] == CONTRACT.issue_price_minor
     assert frozen.as_safe_dict()["delivery_blockers"] == []
 
     request = replace(request, batch_id=frozen.batch["batch_id"])
@@ -235,8 +247,10 @@ async def test_a_mixed_earned_and_manual_audience_completes_the_new_contract(
 
     assert delivered.outcome == "applied", delivered.reasons
     assert len(create.create_calls) == len(pay.pay_calls) == sender.calls == 2
-    assert {call["price_minor"] for call in create.create_calls} == {1000}
+    # The two sums, separately: what the orders CHARGE and what the batch is WORTH.
+    assert {call["price_minor"] for call in create.create_calls} == {CONTRACT.issue_price_minor}
     assert delivered.batch["total_exposure_minor"] == 2 * 1000
+    assert delivered.batch["total_issue_price_minor"] == 2 * CONTRACT.issue_price_minor
     assert delivered.batch["provider_accepted_count"] == 2
     # Both messages carried a real code to Meta...
     assert sender.saw_codes == [True, True]

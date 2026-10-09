@@ -804,6 +804,7 @@ def _run_node(source: str, driver: str) -> Any:
 
 _DECISION_FUNCTIONS = (
     "moneyLabel",
+    "hasNumber",
     "euroToMinor",
     "stageLabel",
     "confirmSummary",
@@ -1053,6 +1054,7 @@ _COMPOSITION_FUNCTIONS = (
     "basisLabel",
     "renderOffer",
     "forgetOffer",
+    "hasNumber",
     "renderComposition",
     "plannedComposition",
     "compositionDigest",
@@ -1087,6 +1089,8 @@ globalThis.document = {
   })
 };
 const UNIT_PRICE_MINOR = 1500;
+const ISSUE_PRICE_MINOR = 1500;
+const PAYMENT_ACCOUNT_LABEL = "Card";
 const read = {composition_proven: true, campaign_period: "2026-08-01..2026-08-31",
               recipient_count: 2, total_exposure_minor: 3000, unit_price_minor: 1500,
               composition_digest: "digest-of-these-two-people",

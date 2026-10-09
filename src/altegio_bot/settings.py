@@ -958,6 +958,12 @@ class Settings(BaseSettings):
     # an operation sitting in `queued` on the mailing page.
     easyweek_voucher_production_executor_enabled: bool = False
 
+    # An isolated, one-ever free certificate test. It cannot send messages and
+    # runs only while the production mailing fence is closed. Changing the
+    # configured customer never resets its durable single-use grant.
+    easyweek_voucher_owner_test_enabled: bool = False
+    easyweek_voucher_owner_test_customer_uuid: str = ""
+
     # How long the executor sleeps when the operation queue is empty. Bounded in
     # the validator below, like every other worker interval.
     easyweek_voucher_production_executor_poll_sec: float = 2.0

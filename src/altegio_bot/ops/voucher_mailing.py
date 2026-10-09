@@ -73,7 +73,12 @@ from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
-from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT, production_contract
+from altegio_bot.easyweek_voucher_production_contract import (
+    NEW_MAILING_SCHEMA_VERSION,
+    is_current_fixed_contract,
+    new_mailing_contract,
+    production_contract,
+)
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -243,7 +248,7 @@ def _executor_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _readiness(schema_version: str = "3") -> dict[str, Any]:
+async def _readiness(schema_version: str = NEW_MAILING_SCHEMA_VERSION) -> dict[str, Any]:
     """Why a mailing could or could not act, without naming a single secret."""
     from altegio_bot.campaigns.easyweek_voucher_production.readiness import prove_prerequisites
 
@@ -272,7 +277,7 @@ async def _readiness(schema_version: str = "3") -> dict[str, Any]:
     return facts
 
 
-def _message_preview(schema_version: str = "3") -> dict[str, str]:
+def _message_preview(schema_version: str = NEW_MAILING_SCHEMA_VERSION) -> dict[str, str]:
     """The approved message and the voucher's terms, with a PLACEHOLDER code.
 
     Rendered from the repository's own named body — the contract the Meta template
@@ -281,6 +286,7 @@ def _message_preview(schema_version: str = "3") -> dict[str, str]:
     one, because a real one only exists between a paid order read and one POST.
     """
     message_contract = template_contract.for_schema(schema_version)
+    contract = production_contract(schema_version)
     registry = configured_easyweek_locations()
     location = registry.locations.get(production_runner.KARLSRUHE_COMPANY_ID) if registry.ready else None
     booking_link = (location.booking_page_url or "").strip() if location is not None else ""
@@ -297,9 +303,16 @@ def _message_preview(schema_version: str = "3") -> dict[str, str]:
         "terms": (
             "10 EUR. Одноразовый ваучер. Срок действия — один календарный месяц с активации, "
             "а не с получения WhatsApp-сообщения. Неиспользованный остаток сгорает."
-            if schema_version == "3"
+            if is_current_fixed_contract(schema_version)
             else "Исторический ваучер 15 EUR. Исходные условия сохранены."
         ),
+        # The customer's terms are identical for both 10 EUR contracts — same face
+        # value, same month, same single use. What differs is what issuing costs us,
+        # and that is an operator's fact, never part of the message.
+        "face_value_minor": contract.face_value_minor,
+        "issue_price_minor": contract.issue_price_minor,
+        "free_issue": contract.free_issue,
+        "payment_account_label": contract.payment_account_label,
     }
 
 
@@ -857,6 +870,7 @@ async def page_index(request: Request) -> str:
 
     body = f"""
 <h1 class="h4 mb-3">Ваучерные рассылки</h1>
+<p><a href="/ops/voucher-gift-test">Изолированный тест бесплатного сертификата</a></p>
 {_issuer_banner()}
 {_readiness_block(await _readiness())}
 <h2 class="h5 mt-4">Рассылки</h2>
@@ -868,9 +882,12 @@ async def page_index(request: Request) -> str:
 </p>
 {candidate_table}
 <div class="alert alert-secondary small mt-4">
-  Новые рассылки: один ваучер {_esc(_money(CURRENT_PRODUCTION_CONTRACT.unit_price_minor))} на получателя,
-  одноразовый, срок — один календарный месяц с активации. Потолка получателей нет:
-  количество и сумму оператор подтверждает явно перед фиксацией списка.
+  Новые рассылки: подарочный сертификат номиналом
+  {_esc(_money(new_mailing_contract().face_value_minor))} на получателя,
+  цена выпуска {_esc(_money(new_mailing_contract().issue_price_minor))},
+  касса {_esc(new_mailing_contract().payment_account_label)}.
+  Одноразовый, срок — один календарный месяц с активации. Потолка получателей нет:
+  количество и номинальную сумму оператор подтверждает явно перед фиксацией списка.
   Массовая отправка не разрешена: <code>campaign_send_authorized=false</code>.
 </div>
 """
@@ -886,8 +903,8 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
         existing = await ledger_module.load_for_preview(SessionLocal, campaign_run_id=preview_run_id)
     except SQLAlchemyError:
         return _page("Состояние недоступно", "Не удалось прочитать состояние preview. Обновите страницу.")
-    schema_version = existing.schema_version if existing.exists else "3"
-    stop_is_terminal = schema_version == "3"
+    schema_version = existing.schema_version if existing.exists else NEW_MAILING_SCHEMA_VERSION
+    stop_is_terminal = is_current_fixed_contract(schema_version)
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
     body = f"""
@@ -924,8 +941,10 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
   <div class="card-header">Подтверждение количества и суммы</div>
   <div class="card-body">
     <p class="mb-2">
-      Введите количество получателей и общую сумму так, как они показаны выше.
-      Сервер сравнит их с фактическим составом и откажет при расхождении.
+      Введите количество получателей и общую НОМИНАЛЬНУЮ сумму так, как они показаны
+      выше. Сервер сравнит их с фактическим составом и откажет при расхождении.
+      Номинал подтверждается всегда — в том числе когда цена выпуска равна нулю:
+      бесплатный выпуск не отменяет проверку количества и состава.
     </p>
     <div class="row g-2 align-items-end">
       <div class="col-auto">
@@ -936,7 +955,7 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
         <div class="small text-muted" id="approval-hint"></div>
       </div>
       <div class="col-auto">
-        <label class="form-label small mb-1" for="f-euro">Общая сумма, €</label>
+        <label class="form-label small mb-1" for="f-euro">Общая номинальная сумма, €</label>
         <input id="f-euro" type="text" class="form-control form-control-sm" placeholder="например 30.00">
       </div>
       <div class="col-auto">
@@ -973,7 +992,10 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
 const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
-const UNIT_PRICE_MINOR = {contract.unit_price_minor};
+const UNIT_PRICE_MINOR = {contract.face_value_minor};
+/* The two sums, kept apart in the page as they are on the server. */
+const ISSUE_PRICE_MINOR = {contract.issue_price_minor};
+const PAYMENT_ACCOUNT_LABEL = {json.dumps(contract.payment_account_label)};
 const STOP_IS_TERMINAL = {json.dumps(stop_is_terminal)};
 /* The page's own waiting limit, from the server's single policy. Deliberately not
    derived from this preview's audience: an audience can change in another tab, and a
@@ -1049,7 +1071,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
     schema_version = str(batch.get("schema_version") or "1")
     # §45.4 applies to the fixed €10 contract alone; a historical €15 mailing keeps
     # the §43.6 pause, and this page keeps saying so.
-    stop_is_terminal = schema_version == "3"
+    stop_is_terminal = is_current_fixed_contract(schema_version)
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
     header_rows = [
@@ -1139,7 +1161,10 @@ async def page_mailing(request: Request, batch_id: int) -> str:
 const CSRF = {json.dumps(csrf)};
 const PREVIEW_RUN_ID = {preview_run_id};
 const BATCH_ID = {batch_id};
-const UNIT_PRICE_MINOR = {contract.unit_price_minor};
+const UNIT_PRICE_MINOR = {contract.face_value_minor};
+/* The two sums, kept apart in the page as they are on the server. */
+const ISSUE_PRICE_MINOR = {contract.issue_price_minor};
+const PAYMENT_ACCOUNT_LABEL = {json.dumps(contract.payment_account_label)};
 /* The shared page script defines its composition wait from this. A mailing page has
    no composition panel, so it only ever needs the constant to exist. */
 const COMPOSITION_BROWSER_WAIT_SECONDS = {dispatch_module.composition_browser_wait_seconds()};
@@ -1210,28 +1235,52 @@ function confirmSummary(offer) {
   if (!offer || !offer.targets) return "";
   const t = offer.targets;
   const stage = offer.stage;
+  /* ``stage_amount_minor`` is the NOMINAL the operator confirms;
+     ``stage_issue_price_minor`` is what the step actually charges. For the paid
+     contracts the two are the same number and every sentence below reads as it
+     always did. For the free gift certificate they differ, and saying only one of
+     them would either ask somebody to approve paying 330 EUR for a giveaway or
+     claim the giveaway is worth nothing. The zero money NEVER replaces the count:
+     a free step still states how many vouchers it is about. */
+  const charged = hasNumber(t.stage_issue_price_minor) ? t.stage_issue_price_minor : t.stage_amount_minor;
+  const free = hasNumber(t.stage_issue_price_minor) && t.stage_issue_price_minor !== t.stage_amount_minor;
   const lines = [];
   if (stage === "freeze") {
     lines.push("Зафиксировать " + t.stage_target_count +
-               " получателей на " + moneyLabel(t.stage_amount_minor) + ".");
+               " получателей на " + moneyLabel(t.stage_amount_minor) + (free ? " номинала." : "."));
+    if (free) lines.push("Цена выпуска: " + moneyLabel(charged) + ".");
     lines.push("Деньги не списываются и сообщения не отправляются.");
   } else if (stage === "create") {
     lines.push("Будет создано ваучеров: " + t.stage_target_count + ".");
-    lines.push("На сумму " + moneyLabel(t.stage_amount_minor) + " (оплаты на этом шаге нет).");
+    lines.push(free
+      ? "Номинал " + moneyLabel(t.stage_amount_minor) + ", цена выпуска " + moneyLabel(charged) +
+        " (оплаты на этом шаге нет)."
+      : "На сумму " + moneyLabel(t.stage_amount_minor) + " (оплаты на этом шаге нет).");
   } else if (stage === "pay") {
     lines.push("Будет оплачено ваучеров: " + t.stage_target_count + ".");
-    lines.push("Списание " + moneyLabel(t.stage_amount_minor) + " — необратимо после отправки.");
+    lines.push(free
+      ? "Списание " + moneyLabel(charged) + " при номинале " + moneyLabel(t.stage_amount_minor) +
+        ": бесплатный выпуск, деньги не списываются."
+      : "Списание " + moneyLabel(charged) + " — необратимо после отправки.");
   } else if (stage === "deliver") {
     lines.push("Будет отправлено сообщений: " + t.stage_target_count + ".");
     lines.push("Одна попытка на получателя, повторной не будет.");
   } else if (stage === "refund") {
     const slot = (t.target_slots && t.target_slots.length === 1) ? t.target_slots[0] : null;
-    lines.push("Возврат " + moneyLabel(t.stage_amount_minor) + " — " +
+    lines.push("Возврат " + moneyLabel(charged) + " — " +
       (slot === null ? "по одному получателю." : refundSubject(slot) + "."));
+    if (free) lines.push("Выпуск стоил " + moneyLabel(charged) + ": номинал не возвращается.");
   }
   if (stage !== "freeze") {
-    lines.push("Вся рассылка: " + t.batch_recipient_count +
-               " получателей, " + moneyLabel(t.batch_exposure_minor) + ".");
+    const batchCharged = hasNumber(t.batch_issue_price_minor) ? t.batch_issue_price_minor : t.batch_exposure_minor;
+    /* The second figure is printed only when it is a DIFFERENT number. For a paid
+       contract the nominal IS the money, and repeating it would add an amount to a
+       confirmation screen for no reason. */
+    lines.push(batchCharged === t.batch_exposure_minor
+      ? "Вся рассылка: " + t.batch_recipient_count + " получателей, " +
+        moneyLabel(t.batch_exposure_minor) + "."
+      : "Вся рассылка: " + t.batch_recipient_count + " получателей, номинал " +
+        moneyLabel(t.batch_exposure_minor) + ", денежная сумма выпуска " + moneyLabel(batchCharged) + ".");
   }
   return lines.join("\n");
 }
@@ -1845,17 +1894,17 @@ function renderComposition() {
     : "";
   const problems = Number(data.refused_count || 0) + Number(data.unchecked_count || 0);
   if (summary) {
-    /* The money for what is SHOWN, labelled as such. A problematic composition has
-       a cost on screen and that cost is not an approved amount: the freeze takes the
-       operator's own statement and re-proves the whole audience first. */
-    const moneyRow = problems > 0
-      ? "<tr><th>Сумма показанного состава</th><td id=\"c-total\">" +
-        escapeHtml(moneyLabel(data.total_exposure_minor)) +
-        "</td></tr><tr><th></th><td class=\"small text-muted\" id=\"c-total-note\">" +
-        "Это не разрешённая сумма: зафиксировать можно только состав, прошедший проверку полностью." +
-        "</td></tr>"
-      : "<tr><th>Общая сумма</th><td id=\"c-total\">" +
-        escapeHtml(moneyLabel(data.total_exposure_minor)) + "</td></tr>";
+    /* The NOMINAL for what is SHOWN, labelled as such. A problematic composition has
+       a figure on screen and that figure is not an approved amount: the freeze takes
+       the operator's own statement and re-proves the whole audience first. */
+    const nominalLabel = problems > 0 ? "Номинальная сумма показанного состава" : "Общая номинальная сумма";
+    const moneyRow = "<tr><th>" + nominalLabel + "</th><td id=\"c-total\">" +
+      escapeHtml(moneyLabel(data.total_exposure_minor)) + "</td></tr>" +
+      (problems > 0
+        ? "<tr><th></th><td class=\"small text-muted\" id=\"c-total-note\">" +
+          "Это не разрешённая сумма: зафиксировать можно только состав, прошедший проверку полностью." +
+          "</td></tr>"
+        : "");
     summary.innerHTML = stale +
       "<table class=\"table table-sm w-auto\">" +
       "<tr><th>Период кампании</th><td id=\"c-period\">" +
@@ -1869,8 +1918,21 @@ function renderComposition() {
       "<tr><th>Не прошли / не проверены</th><td id=\"c-problems\">" +
       Number(data.refused_count || 0) + " / " + Number(data.unchecked_count || 0) + "</td></tr>" +
       moneyRow +
-      "<tr><th>На одного</th><td>" +
-      escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td></tr>" +
+      /* The two sums, never merged into one "amount". For the gift certificate the
+         nominal is what the recipients get and the issue price is what it costs us:
+         a single figure here would either read as a bill for the giveaway or as the
+         giveaway being worth nothing. */
+      "<tr><th>Номинал одного сертификата</th><td id=\"c-face\">" +
+      escapeHtml(moneyLabel(hasNumber(data.unit_price_minor) ? data.unit_price_minor : UNIT_PRICE_MINOR)) +
+      "</td></tr>" +
+      "<tr><th>Цена выпуска одного</th><td id=\"c-issue\">" +
+      escapeHtml(moneyLabel(hasNumber(data.issue_price_minor) ? data.issue_price_minor : ISSUE_PRICE_MINOR)) +
+      "</td></tr>" +
+      "<tr><th>Денежная сумма выпуска</th><td id=\"c-issue-total\">" +
+      escapeHtml(moneyLabel(hasNumber(data.total_issue_price_minor) ? data.total_issue_price_minor : 0)) +
+      "</td></tr>" +
+      "<tr><th>Касса</th><td id=\"c-account\">" +
+      escapeHtml(data.payment_account_label || PAYMENT_ACCOUNT_LABEL) + "</td></tr>" +
       "</table>" + compositionBlockers(data);
   }
   if (slotsArea) {
@@ -1885,13 +1947,14 @@ function renderComposition() {
         "<a href=\"/ops/campaigns/" + encodeURIComponent(person.preview_run_id) +
         "/recipients\" target=\"_blank\">#" + escapeHtml(person.campaign_recipient_id) + "</a></td><td>" +
         escapeHtml(basisLabel(person)) + "</td><td>" + stateCell(person) + "</td><td>" +
-        escapeHtml(moneyLabel(data.unit_price_minor || UNIT_PRICE_MINOR)) + "</td><td>" +
+        escapeHtml(moneyLabel(hasNumber(data.unit_price_minor) ? data.unit_price_minor : UNIT_PRICE_MINOR)) +
+        "</td><td>" +
         excludeCell(person) + "</td></tr>";
     }
     slotsArea.innerHTML = rows
       ? "<table class=\"table table-sm w-auto\" id=\"composition-table\"><thead><tr><th>№</th>" +
         "<th>Клиент</th><th>Строка preview</th><th>Основание / политика</th>" +
-        "<th>Состояние</th><th>Сумма</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>"
+        "<th>Состояние</th><th>Номинал</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>"
       : "<p class=\"text-muted\">Состав пуст.</p>";
   }
 }
@@ -2065,6 +2128,12 @@ function compositionReasonLabel(code) {
     "Эту строку нельзя исключить: состав уже зафиксирован или preview недоступен для правки"
 };
   return labels[code] || reasonLabel(code);
+}
+
+/* A published zero is a number, and ``0 || fallback`` is how a zero price silently
+   becomes a paid one. Every money field on this page goes through here. */
+function hasNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function basisLabel(person) {
