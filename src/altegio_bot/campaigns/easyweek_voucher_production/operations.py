@@ -128,6 +128,19 @@ class StageTargets:
     stage_amount_minor: int
     batch_recipient_count: int
     batch_exposure_minor: int
+    # What this stage and this batch will actually CHARGE, beside the nominal the
+    # operator confirms. Zero for the free gift certificate; equal to the nominal
+    # for every paid contract, which is why the old fields keep their meaning.
+    stage_issue_price_minor: int | None = None
+    batch_issue_price_minor: int | None = None
+
+    def __post_init__(self) -> None:
+        # Historical callers provided only the nominal: it was also their price.
+        # Explicit zero belongs to the gift and must not trigger this fallback.
+        if self.stage_issue_price_minor is None:
+            object.__setattr__(self, "stage_issue_price_minor", self.stage_amount_minor)
+        if self.batch_issue_price_minor is None:
+            object.__setattr__(self, "batch_issue_price_minor", self.batch_exposure_minor)
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +149,9 @@ class StageTargets:
             "stage_amount_minor": self.stage_amount_minor,
             "batch_recipient_count": self.batch_recipient_count,
             "batch_exposure_minor": self.batch_exposure_minor,
+            "stage_issue_price_minor": self.stage_issue_price_minor,
+            "batch_issue_price_minor": self.batch_issue_price_minor,
+            "free_issue": self.stage_issue_price_minor == 0 and self.batch_issue_price_minor == 0,
         }
 
 
@@ -155,6 +171,8 @@ class StoredApproval:
     stage_amount_minor: int
     batch_recipient_count: int
     batch_exposure_minor: int
+    stage_issue_price_minor: int
+    batch_issue_price_minor: int
     plan_digest: str
     plan_issued_at: datetime
     expires_at: datetime
@@ -184,6 +202,8 @@ class StoredApproval:
             "stage_amount_minor": self.stage_amount_minor,
             "batch_recipient_count": self.batch_recipient_count,
             "batch_exposure_minor": self.batch_exposure_minor,
+            "stage_issue_price_minor": self.stage_issue_price_minor,
+            "batch_issue_price_minor": self.batch_issue_price_minor,
             "plan_expires_at": self.expires_at.isoformat(),
             **OpsPrincipal(
                 account=self.principal,
@@ -257,6 +277,8 @@ def _approval(row: EasyWeekVoucherProductionApproval) -> StoredApproval:
         stage_amount_minor=int(row.stage_amount_minor),
         batch_recipient_count=int(row.batch_recipient_count),
         batch_exposure_minor=int(row.batch_exposure_minor),
+        stage_issue_price_minor=int(row.stage_issue_price_minor),
+        batch_issue_price_minor=int(row.batch_issue_price_minor),
         plan_digest=str(row.plan_digest),
         plan_issued_at=row.plan_issued_at,
         expires_at=row.expires_at,
@@ -377,6 +399,8 @@ async def store_approval(
                 stage_amount_minor=targets.stage_amount_minor,
                 batch_recipient_count=targets.batch_recipient_count,
                 batch_exposure_minor=targets.batch_exposure_minor,
+                stage_issue_price_minor=targets.stage_issue_price_minor,
+                batch_issue_price_minor=targets.batch_issue_price_minor,
                 campaign_period_start=campaign_period_start,
                 campaign_period_end=campaign_period_end,
                 plan_digest=plan_digest,
@@ -837,6 +861,7 @@ def stage_targets_for(
     unit_price_minor: int,
     batch_recipient_count: int,
     batch_exposure_minor: int,
+    issue_price_minor: int | None = None,
 ) -> StageTargets:
     """What an operator is about to approve for THIS stage.
 
@@ -850,21 +875,35 @@ def stage_targets_for(
     * ``deliver`` — no money at all. A message is not a purchase, and showing a
       sum beside a send button would invite an operator to think it was.
     * ``refund`` — €15 coming back for one named slot.
+
+    ``unit_price_minor`` is the NOMINAL per slot — what the operator confirms — and
+    ``issue_price_minor`` is what the same slots will actually charge. They default
+    to the same number, which is what every paid contract means by both; the free
+    gift certificate is the case where the second is zero while the first is not,
+    and a stage that reported only one of them would either ask somebody to approve
+    paying for a gift or let a 330 EUR giveaway be confirmed as nothing.
     """
     ordered = tuple(sorted(int(value) for value in slots))
     count = len(ordered)
+    price = unit_price_minor if issue_price_minor is None else issue_price_minor
+    batch_issue_price = batch_exposure_minor if issue_price_minor is None else price * batch_recipient_count
     if stage == STAGE_FREEZE:
         amount = batch_exposure_minor
+        charged = batch_issue_price
     elif stage in ("create", "pay", STAGE_REFUND):
         amount = count * unit_price_minor
+        charged = count * price
     else:
         amount = 0
+        charged = 0
     return StageTargets(
         slots=ordered,
         stage_target_count=count,
         stage_amount_minor=amount,
         batch_recipient_count=batch_recipient_count,
         batch_exposure_minor=batch_exposure_minor,
+        stage_issue_price_minor=charged,
+        batch_issue_price_minor=batch_issue_price,
     )
 
 

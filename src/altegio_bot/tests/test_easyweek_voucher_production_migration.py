@@ -394,6 +394,28 @@ _BATCH_INSERT = (
     " 'digest', :count, :price, :total, :approved_count, :approved_total, 'frozen', now(), '{}'::jsonb)"
 )
 
+
+async def _batch_insert_sql(db_url: str) -> str:
+    """Seed schema 1 on either its original revision or the current head.
+
+    At head the separately stored issue price is mandatory. Supplying the old
+    paid amounts lets the tests reach their intended financial CHECK rather
+    than fail earlier on a missing new column. Old-revision seeds stay exact.
+    """
+    has_issue_price = await _fetch(
+        db_url,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+        "WHERE table_name='easyweek_voucher_production_batches' "
+        "AND column_name='voucher_issue_price_minor')",
+    )
+    if not has_issue_price[0][0]:
+        return _BATCH_INSERT
+    return _BATCH_INSERT.replace(
+        " status, frozen_at, evidence)",
+        " voucher_issue_price_minor, total_issue_price_minor, status, frozen_at, evidence)",
+    ).replace(":approved_total, 'frozen'", ":approved_total, :price, :total, 'frozen'")
+
+
 _ITEM_INSERT = (
     "INSERT INTO easyweek_voucher_production_batch_items "
     "(batch_id, batch_recipient_count, slot, provider, company_id, campaign_code, recipient_basis, "
@@ -418,7 +440,7 @@ async def _seed_batch(
     total = VOUCHER_PRODUCTION_UNIT_PRICE_MINOR * recipient_count
     await _execute(
         db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -478,7 +500,7 @@ async def test_an_approved_count_that_does_not_match_is_refused(temp_db_url: str
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -501,7 +523,7 @@ async def test_an_approved_exposure_that_does_not_match_is_refused(temp_db_url: 
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -523,7 +545,7 @@ async def test_a_total_that_is_not_the_product_is_refused(temp_db_url: str) -> N
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -545,7 +567,7 @@ async def test_a_zero_recipient_batch_is_refused(temp_db_url: str) -> None:
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -620,7 +642,7 @@ async def test_a_second_batch_on_one_preview_is_refused(temp_db_url: str) -> Non
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": VOUCHER_PRODUCTION_SCOPE,
             "run": run_id,
@@ -642,7 +664,7 @@ async def test_a_foreign_scope_literal_is_refused(temp_db_url: str) -> None:
 
     message = await _refused(
         temp_db_url,
-        _BATCH_INSERT,
+        await _batch_insert_sql(temp_db_url),
         {
             "scope": "easyweek_voucher_production_mailing_v2",
             "run": run_id,

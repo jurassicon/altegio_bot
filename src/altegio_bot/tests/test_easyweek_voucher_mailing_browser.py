@@ -59,6 +59,173 @@ from altegio_bot.workers import easyweek_voucher_production_worker as worker_mod
 _MAILING_URL = re.compile(r"/ops/voucher-mailings/\d+$")
 
 
+async def test_owner_gift_real_browser_backend_worker_lifecycle(page, monkeypatch, session_maker):
+    """Real queue/approvals/worker; only EasyWeek transports use synthetic data."""
+    from altegio_bot.campaigns import easyweek_voucher_owner_test as owner_test
+    from altegio_bot.ops import voucher_gift_test as gift_ui
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.test_easyweek_voucher_owner_test import (
+        OwnerTestReader,
+        OwnerTestWriter,
+        configure_owner_test,
+    )
+
+    original_user, original_secret = settings.ops_user, settings.ops_secret
+    configure_owner_test(monkeypatch)
+    # Keep the already-authenticated browser's signing key and account.
+    monkeypatch.setattr(settings, "ops_user", original_user)
+    monkeypatch.setattr(settings, "ops_secret", original_secret)
+    monkeypatch.setattr(gift_ui, "SessionLocal", session_maker)
+    reader = OwnerTestReader()
+    writer = OwnerTestWriter(reader)
+
+    @contextlib.asynccontextmanager
+    async def read_transport(*args, **kwargs):
+        yield reader
+
+    @contextlib.asynccontextmanager
+    async def write_transport(*args, **kwargs):
+        yield writer
+
+    monkeypatch.setattr(owner_test, "_reader", read_transport)
+    monkeypatch.setattr(owner_test, "_writer", write_transport)
+    await page.goto("/ops/voucher-gift-test")
+    await page.wait_for_selector("#gift-create:not([disabled])")
+    await page.click("#gift-create")
+    await page.wait_for_selector("#gift-confirm-panel:not(.d-none)")
+    assert writer.creates == writer.pays == 0
+    await page.click("#gift-confirm")
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'create_queued'")
+    assert writer.creates == 0
+    await worker_module.run_once(session_maker, owner="owner-gift-browser")
+    await page.wait_for_selector("#gift-pay:not([disabled])")
+    assert writer.creates == 1 and writer.pays == 0
+    await page.click("#gift-pay")
+    await page.wait_for_selector("#gift-confirm-panel:not(.d-none)")
+    await page.click("#gift-confirm")
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'pay_queued'")
+    await worker_module.run_once(session_maker, owner="owner-gift-browser")
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'paid'")
+    assert writer.creates == writer.pays == 1
+    assert await page.is_disabled("#gift-create") and await page.is_disabled("#gift-pay")
+    await page.reload()
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'paid'")
+    await worker_module.run_once(session_maker, owner="owner-gift-browser-restarted")
+    assert writer.creates == writer.pays == 1
+    assert_no_page_errors(page)
+
+
+async def test_owner_gift_test_shows_wait_and_separate_confirmations(page, monkeypatch, session_maker):
+    """Real browser controls; backend queue contract is independently tested."""
+    from altegio_bot.campaigns import easyweek_voucher_owner_test as owner_test
+    from altegio_bot.ops import voucher_gift_test as gift_ui
+    from altegio_bot.tests.test_easyweek_voucher_gift_test_ui import safe_state
+
+    monkeypatch.setattr(gift_ui, "SessionLocal", session_maker)
+    state = safe_state()
+    entered, release = asyncio.Event(), asyncio.Event()
+    confirmations = []
+
+    async def status(*args):
+        return dict(state)
+
+    async def offer(*args, stage, **kwargs):
+        entered.set()
+        await release.wait()
+        return {
+            "ready": True,
+            "stage": stage,
+            "approval_id": "synthetic-" + stage,
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+
+    async def confirm(*args, **kwargs):
+        confirmations.append(kwargs)
+        stage = kwargs["approval_id"].removeprefix("synthetic-")
+        state.update(
+            state="open" if stage == "create" else "paid",
+            order_observed=True,
+            code_present=stage == "pay",
+            available_actions=["pay", "reconcile", "stop"] if stage == "create" else ["reconcile", "stop"],
+        )
+        return {"accepted": True}
+
+    async def stop(*args, **kwargs):
+        state.update(stopped=True, available_actions=["reconcile"])
+        return {"accepted": True}
+
+    monkeypatch.setattr(owner_test, "get_status", status)
+    monkeypatch.setattr(owner_test, "offer", offer)
+    monkeypatch.setattr(owner_test, "confirm", confirm)
+    monkeypatch.setattr(owner_test, "stop", stop)
+
+    await page.goto("/ops/voucher-gift-test")
+    await page.wait_for_selector("#gift-create:not([disabled])")
+    assert await page.is_disabled("#gift-pay")
+    assert not await page.locator("#gift-deliver").count()
+    await page.click("#gift-create")
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    assert await page.is_visible("#gift-loading")
+    assert await page.is_disabled("#gift-create")
+    assert await page.is_hidden("#gift-confirm-panel")
+    assert confirmations == []
+    release.set()
+    await page.wait_for_selector("#gift-confirm-panel:not(.d-none)")
+    assert "CREATE" in await page.inner_text("#gift-confirm-summary")
+    await page.click("#gift-confirm")
+    await page.wait_for_selector("#gift-pay:not([disabled])")
+    assert len(confirmations) == 1
+    assert confirmations[0]["confirmed_issue_minor"] == 0
+    assert confirmations[0]["confirmed_nominal_minor"] == 1000
+    await page.click("#gift-pay")
+    await page.wait_for_selector("#gift-confirm-panel:not(.d-none)")
+    assert "PAY" in await page.inner_text("#gift-confirm-summary")
+    assert len(confirmations) == 1
+    await page.click("#gift-confirm")
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'paid'")
+    assert len(confirmations) == 2
+    await page.reload()
+    await page.wait_for_function("document.querySelector('#gift-status').textContent === 'paid'")
+    assert await page.is_disabled("#gift-create")
+    assert await page.is_disabled("#gift-pay")
+    page.once("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.click("#gift-stop")
+    await page.wait_for_function("document.querySelector('#gift-facts').textContent.includes('Остановлен: да')")
+    assert await page.is_disabled("#gift-stop")
+    assert await page.is_enabled("#gift-reconcile")
+    assert_no_page_errors(page)
+
+
+async def test_owner_gift_test_failed_check_clears_wait_without_enabling_retry(page, monkeypatch, session_maker):
+    from altegio_bot.campaigns import easyweek_voucher_owner_test as owner_test
+    from altegio_bot.ops import voucher_gift_test as gift_ui
+    from altegio_bot.tests.test_easyweek_voucher_gift_test_ui import safe_state
+
+    monkeypatch.setattr(gift_ui, "SessionLocal", session_maker)
+
+    async def status(*args):
+        return safe_state()
+
+    async def offer(*args, **kwargs):
+        raise owner_test.OwnerTestError("owner_test_live_read_failed")
+
+    monkeypatch.setattr(owner_test, "get_status", status)
+    monkeypatch.setattr(owner_test, "offer", offer)
+    await page.goto("/ops/voucher-gift-test")
+    await page.wait_for_selector("#gift-create:not([disabled])")
+    await page.click("#gift-create")
+    await page.wait_for_function(
+        "document.querySelector('#gift-message').textContent.includes('owner_test_live_read_failed')"
+    )
+    assert await page.is_hidden("#gift-loading")
+    assert await page.is_hidden("#gift-confirm-panel")
+    assert await page.is_disabled("#gift-create")
+    assert await page.is_disabled("#gift-confirm")
+    await page.click("#gift-refresh")
+    await page.wait_for_selector("#gift-create:not([disabled])")
+    assert_no_page_errors(page)
+
+
 def _ok(index: int) -> VoucherMutationResponse:
     return VoucherMutationResponse(http_status=200, envelope={"uuid": ORDER_UUIDS[index]})
 

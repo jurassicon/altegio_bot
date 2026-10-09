@@ -91,6 +91,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
 from altegio_bot.easyweek_voucher_production_contract import (
     LEGACY_PRODUCTION_CONTRACT,
     ProductionVoucherContract,
+    is_current_fixed_contract,
     production_contract,
 )
 from altegio_bot.models.models import (
@@ -376,8 +377,13 @@ class BatchSnapshot:
     voucher_template_uuid: str | None = None
     frozen_digest: str | None = None
     recipient_count: int = 0
+    # The FACE VALUE and the nominal total, as they were frozen. For every paid
+    # contract they are also the money.
     voucher_unit_price_minor: int = UNIT_PRICE_MINOR
     total_exposure_minor: int = 0
+    # What issuing this batch costs: zero for the free gift certificate.
+    voucher_issue_price_minor: int = UNIT_PRICE_MINOR
+    total_issue_price_minor: int = 0
     approved_recipient_count: int | None = None
     approved_exposure_minor: int | None = None
     reconciliation_required: bool = False
@@ -445,7 +451,7 @@ class BatchSnapshot:
                     "product_contract_version": self.product_contract_version,
                     "message_contract_code": self.message_contract_code,
                 }
-                if self.schema_version == "3"
+                if is_current_fixed_contract(self.schema_version)
                 else {}
             ),
             "earned_recipient_count": sum(entry.recipient_basis == RECIPIENT_BASIS_EARNED for entry in self.items),
@@ -461,6 +467,14 @@ class BatchSnapshot:
             "recipient_count": self.recipient_count,
             "voucher_unit_price_minor": self.voucher_unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
+            **(
+                {
+                    "voucher_issue_price_minor": self.voucher_issue_price_minor,
+                    "total_issue_price_minor": self.total_issue_price_minor,
+                }
+                if self.schema_version == "4"
+                else {}
+            ),
             # What a human actually agreed to, kept beside what was frozen. The
             # CHECK constraints mean these cannot disagree; printing both is how
             # an operator sees that for themselves.
@@ -612,6 +626,8 @@ async def _snapshot(session: AsyncSession, row: EasyWeekVoucherProductionBatch |
         recipient_count=int(row.recipient_count),
         voucher_unit_price_minor=int(row.voucher_unit_price_minor),
         total_exposure_minor=int(row.total_exposure_minor),
+        voucher_issue_price_minor=int(row.voucher_issue_price_minor),
+        total_issue_price_minor=int(row.total_issue_price_minor),
         approved_recipient_count=int(row.approved_recipient_count),
         approved_exposure_minor=int(row.approved_exposure_minor),
         reconciliation_required=bool(row.reconciliation_required),
@@ -652,10 +668,13 @@ class BatchHeadline:
     total_exposure_minor: int
     reconciliation_required: bool
     frozen_at: str | None
-    # The amount THIS batch was frozen under. A listing holds both contract
-    # versions at once, so a row that printed only its total would leave a
+    # The amount THIS batch was frozen under. A listing holds every contract
+    # version at once, so a row that printed only its total would leave a
     # reader to divide one by the other and guess which nominal applied.
     voucher_unit_price_minor: int = UNIT_PRICE_MINOR
+    # And what it cost, which for the free certificate is not its nominal.
+    voucher_issue_price_minor: int = UNIT_PRICE_MINOR
+    total_issue_price_minor: int = 0
 
     def as_safe_dict(self) -> dict[str, Any]:
         period = None
@@ -670,6 +689,8 @@ class BatchHeadline:
             "recipient_count": self.recipient_count,
             "voucher_unit_price_minor": self.voucher_unit_price_minor,
             "total_exposure_minor": self.total_exposure_minor,
+            "voucher_issue_price_minor": self.voucher_issue_price_minor,
+            "total_issue_price_minor": self.total_issue_price_minor,
             "reconciliation_required": self.reconciliation_required,
             "frozen_at": self.frozen_at,
         }
@@ -709,6 +730,8 @@ async def list_batches(
             reconciliation_required=bool(row.reconciliation_required),
             frozen_at=_iso(row.frozen_at),
             voucher_unit_price_minor=int(row.voucher_unit_price_minor),
+            voucher_issue_price_minor=int(row.voucher_issue_price_minor),
+            total_issue_price_minor=int(row.total_issue_price_minor),
         )
         for row in rows
     )
@@ -812,8 +835,10 @@ class BatchIdentity:
             and row.baseline_version == self.baseline_version
             and row.frozen_digest == self.frozen_digest
             and int(row.recipient_count) == self.recipient_count
-            and int(row.voucher_unit_price_minor) == self.contract.unit_price_minor
-            and int(row.total_exposure_minor) == self.contract.unit_price_minor * self.recipient_count
+            and int(row.voucher_unit_price_minor) == self.contract.face_value_minor
+            and int(row.total_exposure_minor) == self.contract.face_value_minor * self.recipient_count
+            and int(row.voucher_issue_price_minor) == self.contract.issue_price_minor
+            and int(row.total_issue_price_minor) == self.contract.issue_price_minor * self.recipient_count
         )
 
     def matches_item(self, row: EasyWeekVoucherProductionBatchItem) -> bool:
@@ -829,7 +854,7 @@ class BatchIdentity:
             and row.manual_policy == expected.manual_policy
             and _text(row.source_booking_uuid) == expected.source_booking_uuid
             and row.source_proof_digest == expected.source_proof_digest
-            and int(row.voucher_value_minor) == self.contract.unit_price_minor
+            and int(row.voucher_value_minor) == self.contract.face_value_minor
             and int(row.voucher_quantity) == 1
         )
 
@@ -860,8 +885,10 @@ class BatchIdentity:
             or snapshot.baseline_version != self.baseline_version
             or snapshot.frozen_digest != self.frozen_digest
             or snapshot.recipient_count != self.recipient_count
-            or snapshot.voucher_unit_price_minor != self.contract.unit_price_minor
-            or snapshot.total_exposure_minor != self.contract.unit_price_minor * self.recipient_count
+            or snapshot.voucher_unit_price_minor != self.contract.face_value_minor
+            or snapshot.total_exposure_minor != self.contract.face_value_minor * self.recipient_count
+            or snapshot.voucher_issue_price_minor != self.contract.issue_price_minor
+            or snapshot.total_issue_price_minor != self.contract.issue_price_minor * self.recipient_count
         ):
             return False
         stored = {entry.slot: entry for entry in snapshot.items}
@@ -877,7 +904,7 @@ class BatchIdentity:
                 or row.manual_policy != entry.manual_policy
                 or row.source_booking_uuid != entry.source_booking_uuid
                 or row.source_proof_digest != entry.source_proof_digest
-                or row.voucher_value_minor != self.contract.unit_price_minor
+                or row.voucher_value_minor != self.contract.face_value_minor
                 or row.voucher_quantity != 1
             ):
                 return False
@@ -1066,7 +1093,7 @@ async def freeze_batch(
             count = identity.recipient_count
             if (
                 approved_recipient_count != count
-                or approved_exposure_minor != identity.contract.unit_price_minor * count
+                or approved_exposure_minor != identity.contract.face_value_minor * count
             ):
                 return FreezeOutcome(False, FREEZE_REFUSED_APPROVAL, BatchSnapshot(exists=False))
 
@@ -1090,8 +1117,10 @@ async def freeze_batch(
                 voucher_template_uuid=uuid_module.UUID(identity.voucher_template_uuid),
                 frozen_digest=identity.frozen_digest,
                 recipient_count=count,
-                voucher_unit_price_minor=identity.contract.unit_price_minor,
-                total_exposure_minor=identity.contract.unit_price_minor * count,
+                voucher_unit_price_minor=identity.contract.face_value_minor,
+                total_exposure_minor=identity.contract.face_value_minor * count,
+                voucher_issue_price_minor=identity.contract.issue_price_minor,
+                total_issue_price_minor=identity.contract.issue_price_minor * count,
                 approved_recipient_count=approved_recipient_count,
                 approved_exposure_minor=approved_exposure_minor,
                 status=VOUCHER_PRODUCTION_FROZEN,
@@ -1124,7 +1153,7 @@ async def freeze_batch(
                         easyweek_customer_uuid=uuid_module.UUID(entry.easyweek_customer_uuid),
                         campaign_period_start=identity.campaign_period_start,
                         campaign_period_end=identity.campaign_period_end,
-                        voucher_value_minor=identity.contract.unit_price_minor,
+                        voucher_value_minor=identity.contract.face_value_minor,
                         voucher_quantity=1,
                         reconciliation_marker=entry.reconciliation_marker,
                         status=VOUCHER_PRODUCTION_ITEM_PLANNED,
@@ -1297,9 +1326,13 @@ async def _stop_is_terminal_schema(session: AsyncSession, *, batch_id: int) -> b
     at freeze time and never afterwards. That is the point: the answer belongs to
     the durable batch, so no request field, browser payload or re-planned stage can
     make a schema-3 mailing answer as a schema-2 one to get its slots back.
+
+    Every current fixed product answers yes, so a new one inherits the terminal
+    stop at the moment it is introduced rather than when somebody remembers to
+    add its number here.
     """
     header = await _header_by_id(session, batch_id)
-    return header is not None and str(header.request_schema_version) == "3"
+    return header is not None and is_current_fixed_contract(str(header.request_schema_version))
 
 
 async def _stop_is_active_locked(session: AsyncSession, *, batch_id: int) -> bool:
@@ -1423,7 +1456,7 @@ async def admission_locked(session: AsyncSession, *, batch_id: int) -> BatchAdmi
         in_flight_operation_id=in_flight,
         stop_active=active,
         stop_generation=generation,
-        stop_is_terminal=str(header.request_schema_version) == "3",
+        stop_is_terminal=is_current_fixed_contract(str(header.request_schema_version)),
     )
 
 

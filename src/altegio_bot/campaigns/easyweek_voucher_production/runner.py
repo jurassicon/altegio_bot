@@ -161,6 +161,8 @@ from altegio_bot.easyweek_voucher_production_contract import (
     CURRENT_PRODUCTION_CONTRACT,
     LEGACY_PRODUCTION_CONTRACT,
     ProductionVoucherContract,
+    is_current_fixed_contract,
+    new_mailing_contract,
     production_contract,
 )
 from altegio_bot.models.models import (
@@ -344,7 +346,11 @@ class StageReport:
         version = (self.baseline or {}).get("baseline_version")
         if version == LEGACY_PRODUCTION_CONTRACT.baseline_version:
             return LEGACY_PRODUCTION_CONTRACT
-        return CURRENT_PRODUCTION_CONTRACT
+        if version == CURRENT_PRODUCTION_CONTRACT.baseline_version:
+            return CURRENT_PRODUCTION_CONTRACT
+        if self.batch.get("exists") and self.batch.get("schema_version") is not None:
+            return production_contract(self.batch["schema_version"])
+        return new_mailing_contract()
 
     def as_safe_dict(self) -> dict[str, Any]:
         batch = dict(self.batch)
@@ -355,9 +361,9 @@ class StageReport:
         # mailing costs, and it does not move with the subject: a report about a
         # historical €15 batch must not be readable as "new mailings are €15".
         unit_price_minor = (
-            int(batch.get("voucher_unit_price_minor", contract.unit_price_minor))
+            int(batch.get("voucher_unit_price_minor", contract.face_value_minor))
             if batch.get("exists")
-            else contract.unit_price_minor
+            else contract.face_value_minor
         )
         return {
             "mode": "voucher_production_stage",
@@ -402,13 +408,15 @@ class StageReport:
             "recipient_basis": batch.get("recipient_basis"),
             "first_visit_proof": batch.get("first_visit_proof"),
             "voucher_unit_price_minor": unit_price_minor,
+            "voucher_issue_price_minor": contract.issue_price_minor,
             "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {unit_price_minor}",
             # What a new mailing costs, beside what this report is about. A
             # reader looking at a historical batch, or at a list holding both
             # versions, can see the two apart instead of inferring one from the
             # other.
-            "default_voucher_unit_price_minor": CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
-            "default_product_contract_version": CURRENT_PRODUCTION_CONTRACT.version,
+            "default_voucher_unit_price_minor": new_mailing_contract().face_value_minor,
+            "default_voucher_issue_price_minor": new_mailing_contract().issue_price_minor,
+            "default_product_contract_version": new_mailing_contract().version,
             # Known blockers to delivering this batch, whether or not they
             # refused this stage. Never empty-by-omission: a stage that did not
             # ask reports nothing here, and a stage that asked reports what it
@@ -454,7 +462,8 @@ def _voucher_code(payload: object, *, contract: ProductionVoucherContract = LEGA
     proof = prove_voucher_line(
         order,
         expected_template_uuid=contract.template_uuid,
-        expected_price_minor=contract.unit_price_minor,
+        expected_price_minor=contract.issue_price_minor,
+        expected_value_minor=contract.face_value_minor,
     )
     if not proof.proven:
         return None
@@ -610,7 +619,7 @@ def _runtime_identity_matches(
         production_contract(snapshot.schema_version).version == contract.version
         and snapshot.product_contract_version == contract.version
         and snapshot.message_contract_code == contract.message_code
-        and snapshot.voucher_unit_price_minor == contract.unit_price_minor
+        and snapshot.voucher_unit_price_minor == contract.face_value_minor
         and request.voucher_template_uuid == contract.template_uuid
         and snapshot.location_uuid == request.location_uuid
         and snapshot.payment_account_uuid == request.payment_account_uuid
@@ -696,13 +705,19 @@ async def _baseline_now(
 async def _production_environment_now(
     order_reader: Any, *, request: ProductionRequest
 ) -> tuple[dict[str, bool], tuple[str, ...]]:
-    """Prove the workspace currency and issue location from documented GETs.
+    """Prove the workspace currency, the issue location and the approved till.
 
     The product's own fields cannot establish the denomination's currency or
     which workspace the configured credentials actually selected. This runs
     only for new issuance/send stages; cleanup uses the frozen order bindings.
+
+    The till is proven against THIS request's contract, not against a single
+    approved account: the paid product settles through the Card account and the
+    free gift certificate through Aktionsgutscheine, so a deployment configured
+    with one of them refuses the other rather than quietly charging it.
     """
-    expected = CURRENT_PRODUCTION_CONTRACT.digest_material()
+    contract = production_contract(request.schema_version)
+    expected = contract.digest_material()
     try:
         payload = await order_reader.get_workspace()
         workspace = order_object(payload) or {}
@@ -723,7 +738,10 @@ async def _production_environment_now(
     except Exception:  # noqa: BLE001 - no invented membership on a failed GET
         location_proven = False
     account_proven = await prove_current_account(
-        order_reader, account_uuid=request.payment_account_uuid, location_uuid=request.location_uuid
+        order_reader,
+        account_uuid=request.payment_account_uuid,
+        location_uuid=request.location_uuid,
+        contract=contract,
     )
     facts = {
         "workspace_proven": workspace_proven,
@@ -758,13 +776,14 @@ async def _item_order_preconditions(
         return [order_reason], None, observations
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
+    state, _ = classify_order(payload, expected_price_minor=contract.issue_price_minor)
     observation = observe_artifact(
         payload,
         stage=f"{stage}_plan_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
         expected_template_uuid=contract.template_uuid,
-        expected_price_minor=contract.unit_price_minor,
+        expected_price_minor=contract.issue_price_minor,
+        expected_value_minor=contract.face_value_minor,
     )
     observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -787,11 +806,12 @@ async def _item_order_preconditions(
             for _ in payable_order_reasons(
                 payload,
                 expected_template_uuid=contract.template_uuid,
-                expected_price_minor=contract.unit_price_minor,
+                expected_price_minor=contract.issue_price_minor,
+                expected_value_minor=contract.face_value_minor,
             )
         )
     elif stage == STAGE_DELIVER:
-        if contract.request_schema_version == "3":
+        if is_current_fixed_contract(contract.request_schema_version):
             # §45.4, boundary one of two. EasyWeek owns the term, so a voucher
             # that carries no activation or expiry date passes here — that is the
             # ordinary shape of a correct artifact. What still refuses is the
@@ -802,8 +822,8 @@ async def _item_order_preconditions(
             if validity_reason is not None:
                 reasons.append(validity_reason)
         if state != ORDER_PAID or (
-            contract.request_schema_version == "3"
-            and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+            is_current_fixed_contract(contract.request_schema_version)
+            and not paid_order_amounts_proven(payload, expected_price_minor=contract.issue_price_minor)
         ):
             reasons.append(ORDER_NOT_PAID)
     elif stage == STAGE_REFUND:
@@ -942,7 +962,7 @@ async def build_stage_plan(
         reasons.append(IDENTITY_BINDING_MISMATCH)
     observations: list[dict[str, Any]] = []
     environment: dict[str, bool] | None = None
-    if request.schema_version == "3" and stage != STAGE_REFUND:
+    if is_current_fixed_contract(request.schema_version) and stage != STAGE_REFUND:
         environment, environment_reasons = await _production_environment_now(order_reader, request=request)
         reasons.extend(environment_reasons)
         if request.location_uuid != KARLSRUHE_LOCATION_UUID or request.company_id != KARLSRUHE_COMPANY_ID:
@@ -972,7 +992,7 @@ async def build_stage_plan(
 
     live_meta_proof = (
         await prove_live_meta_template(reader=order_reader)
-        if request.schema_version == "3" and stage != STAGE_REFUND
+        if is_current_fixed_contract(request.schema_version) and stage != STAGE_REFUND
         else None
     )
     prerequisites = await prove_prerequisites(
@@ -1183,8 +1203,11 @@ async def build_stage_plan(
         "batch_id": snapshot.batch_id,
         "location_uuid": request.location_uuid,
         "voucher_template_uuid": request.voucher_template_uuid,
-        "voucher_unit_price_minor": contract.unit_price_minor,
-        "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.unit_price_minor}",
+        "voucher_unit_price_minor": contract.face_value_minor,
+        "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.face_value_minor}",
+        # What that approval actually charges. Zero for the free gift certificate,
+        # and the nominal for every paid contract.
+        **({"voucher_issue_price_minor": contract.issue_price_minor} if contract.free_issue else {}),
         "target_slots": sorted(target_slots),
         "prerequisites": prerequisites.as_safe_dict(),
         "composition": composition.as_safe_dict(),
@@ -1221,7 +1244,7 @@ async def build_stage_plan(
         "batch": snapshot.as_safe_dict(),
     }
 
-    if request.schema_version == "3":
+    if is_current_fixed_contract(request.schema_version):
         snapshot_facts["product_contract"] = contract.digest_material()
         if environment is not None:
             snapshot_facts["environment"] = environment
@@ -1520,8 +1543,14 @@ async def run_create(
                 customer_uuid=customer,
                 staffer_uuid=identity.staffer_uuid,
                 voucher_template_uuid=identity.voucher_template_uuid,
-                price_minor=contract.unit_price_minor,
-                **({"product_contract_version": contract.version} if snapshot.schema_version == "3" else {}),
+                price_minor=contract.issue_price_minor,
+                # Naming the contract is what pins the price on the wire: the
+                # mutation client allows exactly this product's own issue price.
+                **(
+                    {"product_contract_version": contract.version}
+                    if is_current_fixed_contract(snapshot.schema_version)
+                    else {}
+                ),
                 marker=item.reconciliation_marker,
             )
         except EasyWeekVoucherMutationUnknown:
@@ -1661,13 +1690,14 @@ async def _verify_created(
         return SlotResult(slot=slot, outcome="unknown", reasons=[order_reason], external_effect_attempted=True)
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
+    state, _ = classify_order(payload, expected_price_minor=contract.issue_price_minor)
     observation = observe_artifact(
         payload,
         stage="create_readback",
         expected_customer_uuid=customer_uuid,
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=contract.unit_price_minor,
+        expected_price_minor=contract.issue_price_minor,
+        expected_value_minor=contract.face_value_minor,
     )
     proven = (
         order.get("comment") == item.reconciliation_marker
@@ -1675,11 +1705,12 @@ async def _verify_created(
         and observation.voucher_line_proven
         and state == ORDER_OPEN
         and (
-            contract.request_schema_version != "3"
+            not is_current_fixed_contract(contract.request_schema_version)
             or not payable_order_reasons(
                 payload,
                 expected_template_uuid=contract.template_uuid,
-                expected_price_minor=contract.unit_price_minor,
+                expected_price_minor=contract.issue_price_minor,
+                expected_value_minor=contract.face_value_minor,
             )
         )
     )
@@ -1881,12 +1912,13 @@ async def run_pay(
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[order_reason]))
             halted = True
             continue
-        if contract.request_schema_version == "3" and (
-            classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] != ORDER_OPEN
+        if is_current_fixed_contract(contract.request_schema_version) and (
+            classify_order(payload, expected_price_minor=contract.issue_price_minor)[0] != ORDER_OPEN
             or payable_order_reasons(
                 payload,
                 expected_template_uuid=contract.template_uuid,
-                expected_price_minor=contract.unit_price_minor,
+                expected_price_minor=contract.issue_price_minor,
+                expected_value_minor=contract.face_value_minor,
             )
         ):
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[ORDER_NOT_PAYABLE]))
@@ -2004,10 +2036,12 @@ async def _verify_paid(
     """
     assert item.target_order_uuid is not None
     payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
-    state = classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] if order_reason is None else None
+    state = (
+        classify_order(payload, expected_price_minor=contract.issue_price_minor)[0] if order_reason is None else None
+    )
     if state != ORDER_PAID or (
-        contract.request_schema_version == "3"
-        and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+        is_current_fixed_contract(contract.request_schema_version)
+        and not paid_order_amounts_proven(payload, expected_price_minor=contract.issue_price_minor)
     ):
         await ledger_module.record_item_outcome(
             session_maker,
@@ -2031,7 +2065,8 @@ async def _verify_paid(
         stage="pay_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=contract.unit_price_minor,
+        expected_price_minor=contract.issue_price_minor,
+        expected_value_minor=contract.face_value_minor,
     )
     order = order_object(payload) or {}
     identity_proven = (
@@ -2181,7 +2216,7 @@ async def run_deliver(
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[order_reason]))
             halted = True
             continue
-        if contract.request_schema_version == "3":
+        if is_current_fixed_contract(contract.request_schema_version):
             # §45.4, boundary two of two, against the read this send will use —
             # the same question and the same answer as at plan time, so an
             # artifact EasyWeek marked unusable in between still refuses, and a
@@ -2191,9 +2226,9 @@ async def run_deliver(
                 results.append(SlotResult(slot=slot, outcome="refused", reasons=[validity_reason]))
                 halted = True
                 continue
-        if classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] != ORDER_PAID or (
-            contract.request_schema_version == "3"
-            and not paid_order_amounts_proven(payload, expected_price_minor=contract.unit_price_minor)
+        if classify_order(payload, expected_price_minor=contract.issue_price_minor)[0] != ORDER_PAID or (
+            is_current_fixed_contract(contract.request_schema_version)
+            and not paid_order_amounts_proven(payload, expected_price_minor=contract.issue_price_minor)
         ):
             results.append(SlotResult(slot=slot, outcome="refused", reasons=[ORDER_NOT_PAID]))
             halted = True
@@ -2498,7 +2533,9 @@ async def run_refund(
     else:
         payload, order_reason = await _exact_order(order_reader, item.target_order_uuid)
         state = (
-            classify_order(payload, expected_price_minor=contract.unit_price_minor)[0] if order_reason is None else None
+            classify_order(payload, expected_price_minor=contract.issue_price_minor)[0]
+            if order_reason is None
+            else None
         )
         if state == ORDER_REFUNDED:
             await ledger_module.record_item_outcome(
@@ -2604,13 +2641,14 @@ async def _recover_unknown_create(
         return [order_reason], None, observations
 
     order = order_object(payload) or {}
-    state, _ = classify_order(payload, expected_price_minor=contract.unit_price_minor)
+    state, _ = classify_order(payload, expected_price_minor=contract.issue_price_minor)
     observation = observe_artifact(
         payload,
         stage="create_recovery_readback",
         expected_customer_uuid=item.easyweek_customer_uuid or "",
         expected_template_uuid=voucher_template_uuid,
-        expected_price_minor=contract.unit_price_minor,
+        expected_price_minor=contract.issue_price_minor,
+        expected_value_minor=contract.face_value_minor,
     )
     observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -2620,11 +2658,12 @@ async def _recover_unknown_create(
         or not observation.voucher_line_proven
         or state != ORDER_OPEN
         or (
-            contract.request_schema_version == "3"
+            is_current_fixed_contract(contract.request_schema_version)
             and payable_order_reasons(
                 payload,
                 expected_template_uuid=contract.template_uuid,
-                expected_price_minor=contract.unit_price_minor,
+                expected_price_minor=contract.issue_price_minor,
+                expected_value_minor=contract.face_value_minor,
             )
         )
     ):
@@ -2800,14 +2839,15 @@ async def run_reconcile(
             if order_reason is not None:
                 slot_reasons.append(order_reason)
             else:
-                state = classify_order(payload, expected_price_minor=contract.unit_price_minor)[0]
+                state = classify_order(payload, expected_price_minor=contract.issue_price_minor)[0]
                 order = order_object(payload) or {}
                 observation = observe_artifact(
                     payload,
                     stage="reconcile_readback",
                     expected_customer_uuid=item.easyweek_customer_uuid or "",
                     expected_template_uuid=contract.template_uuid,
-                    expected_price_minor=contract.unit_price_minor,
+                    expected_price_minor=contract.issue_price_minor,
+                    expected_value_minor=contract.face_value_minor,
                 )
                 observations.append({"slot": item.slot, **observation.as_safe_dict()})
 
@@ -2829,9 +2869,9 @@ async def run_reconcile(
                         )
                         del code
                 proven = identity_proven and binding_proven
-                if state == ORDER_PAID and contract.request_schema_version == "3":
+                if state == ORDER_PAID and is_current_fixed_contract(contract.request_schema_version):
                     proven = proven and paid_order_amounts_proven(
-                        payload, expected_price_minor=contract.unit_price_minor
+                        payload, expected_price_minor=contract.issue_price_minor
                     )
                 # Complained about only where it would decide something. A slot
                 # that is already settled — cleaned, refunded, sent — is read

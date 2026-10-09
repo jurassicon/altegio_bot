@@ -3999,7 +3999,7 @@ class EasyWeekVoucherProductionBatch(Base):
         ),
         CheckConstraint(
             "(request_schema_version = '1' AND recipient_basis = 'operator_manual_selection') OR "
-            "(request_schema_version IN ('2', '3') AND recipient_basis IN "
+            "(request_schema_version IN ('2', '3', '4') AND recipient_basis IN "
             "('earned_first_visit', 'operator_manual_selection', 'mixed'))",
             name="ck_ew_voucher_production_batch_basis",
         ),
@@ -4018,12 +4018,39 @@ class EasyWeekVoucherProductionBatch(Base):
             "AND product_contract_version = 'easyweek-production-10eur-v1' "
             "AND message_contract_code = 'new_client_voucher_10eur_v2' "
             "AND voucher_template_uuid = '0ffb0346-57b8-475e-9c22-152dd23e25ca'::uuid "
-            "AND voucher_unit_price_minor = 1000)",
+            "AND voucher_unit_price_minor = 1000) OR "
+            # The free gift certificate. Same template and same message as the paid
+            # 10 EUR product, same face value — and an issue price of exactly zero,
+            # which is the one thing that makes it a different contract.
+            "(request_schema_version = '4' "
+            "AND product_contract_version = 'easyweek-production-gift-10eur-v1' "
+            "AND message_contract_code = 'new_client_voucher_10eur_v2' "
+            "AND voucher_template_uuid = '0ffb0346-57b8-475e-9c22-152dd23e25ca'::uuid "
+            "AND voucher_unit_price_minor = 1000 "
+            "AND voucher_issue_price_minor = 0)",
             name="ck_ew_voucher_production_batch_unit_price",
         ),
         CheckConstraint(
             "total_exposure_minor = voucher_unit_price_minor * recipient_count",
             name="ck_ew_voucher_production_batch_exposure_matches",
+        ),
+        # The money side of the same arithmetic, kept apart from the nominal one.
+        # ``voucher_unit_price_minor`` and ``total_exposure_minor`` are the FACE
+        # VALUE and the nominal total — equal to the money for every paid contract,
+        # which is why their historical rows and digests are untouched. These two
+        # are what issuing actually costs.
+        CheckConstraint(
+            "total_issue_price_minor = voucher_issue_price_minor * recipient_count",
+            name="ck_ew_voucher_production_batch_issue_price_matches",
+        ),
+        # A paid contract's two sums are the same number; only the free one may
+        # differ, and only by being zero. This is what stops a schema 3 batch from
+        # being written as if it had cost nothing.
+        CheckConstraint(
+            "(request_schema_version IN ('1', '2', '3') "
+            "AND voucher_issue_price_minor = voucher_unit_price_minor) OR "
+            "(request_schema_version = '4' AND voucher_issue_price_minor = 0)",
+            name="ck_ew_voucher_production_batch_issue_price_contract",
         ),
         CheckConstraint(
             "approved_recipient_count = recipient_count",
@@ -4083,8 +4110,15 @@ class EasyWeekVoucherProductionBatch(Base):
     # -- the frozen composition --------------------------------------------
     frozen_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The FACE VALUE of one voucher, and the nominal total. Named as they were
+    # written, because for every paid contract they are also the money, and every
+    # historical row and signature already means exactly that.
     voucher_unit_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     total_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    # What issuing actually costs: zero for the free certificate, and the face
+    # value for every paid contract.
+    voucher_issue_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_issue_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # -- what the operator explicitly approved, kept for the record ---------
     # Not validation leftovers. These are the two numbers a human agreed to
@@ -4588,15 +4622,34 @@ class EasyWeekVoucherProductionApproval(Base):
     __table_args__ = (
         CheckConstraint(
             "(request_schema_version IN ('1', '2') AND product_contract_version = 'easyweek-production-15eur-v1') "
-            "OR (request_schema_version = '3' AND product_contract_version = 'easyweek-production-10eur-v1')",
+            "OR (request_schema_version = '3' AND product_contract_version = 'easyweek-production-10eur-v1') "
+            "OR (request_schema_version = '4' "
+            "AND product_contract_version = 'easyweek-production-gift-10eur-v1')",
             name="ck_ew_voucher_production_approval_product",
         ),
+        # What the operator confirmed, for both of the 10 EUR contracts. The sums in
+        # ``stage_amount_minor``/``batch_exposure_minor`` are NOMINAL — the size of
+        # the giveaway — which is also the money for the paid contract, so schema 3's
+        # rule is reproduced verbatim and schema 4 is held to the same arithmetic.
+        # A free issue does not get to skip confirming how many vouchers, or how
+        # much they are worth; what it changes is only what is charged.
         CheckConstraint(
-            "request_schema_version <> '3' OR (batch_recipient_count >= 1 "
+            "request_schema_version NOT IN ('3', '4') OR (batch_recipient_count >= 1 "
             "AND batch_exposure_minor = batch_recipient_count * 1000 "
             "AND stage_amount_minor = CASE WHEN stage = 'freeze' THEN batch_exposure_minor "
             "WHEN stage IN ('create', 'pay', 'refund') THEN stage_target_count * 1000 ELSE 0 END)",
             name="ck_ew_voucher_production_approval_product_amount",
+        ),
+        # And the money side, stored beside it rather than instead of it. Zero for
+        # the free contract, the nominal for every paid one — so an approval can
+        # never claim a free batch cost something, or a paid batch cost nothing.
+        CheckConstraint(
+            "(request_schema_version IN ('1', '2', '3') "
+            "AND stage_issue_price_minor = stage_amount_minor "
+            "AND batch_issue_price_minor = batch_exposure_minor) OR "
+            "(request_schema_version = '4' "
+            "AND stage_issue_price_minor = 0 AND batch_issue_price_minor = 0)",
+            name="ck_ew_voucher_production_approval_issue_price",
         ),
         CheckConstraint("provider = 'easyweek'", name="ck_ew_voucher_production_approval_provider"),
         CheckConstraint(
@@ -4630,6 +4683,10 @@ class EasyWeekVoucherProductionApproval(Base):
         # move €15 per slot they are about to touch.
         CheckConstraint("stage_target_count >= 1", name="ck_ew_voucher_production_approval_targets"),
         CheckConstraint("stage_amount_minor >= 0", name="ck_ew_voucher_production_approval_amount"),
+        CheckConstraint(
+            "stage_issue_price_minor >= 0 AND batch_issue_price_minor >= 0",
+            name="ck_ew_voucher_production_approval_issue_price_sign",
+        ),
         CheckConstraint("expires_at > plan_issued_at", name="ck_ew_voucher_production_approval_ttl"),
         # Every stage after the freeze is about one existing batch, by id. A row
         # without one could only be a freeze, which is the stage that creates it.
@@ -4680,7 +4737,12 @@ class EasyWeekVoucherProductionApproval(Base):
     target_slots: Mapped[list] = mapped_column(JSONB, nullable=False)
     target_slot_count: Mapped[int] = mapped_column(Integer, nullable=False)
     stage_target_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The NOMINAL the operator confirmed for this stage. For every paid contract
+    # that is also the money, which is why historical rows keep their meaning.
     stage_amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    # What this stage will actually charge, and what the whole batch will.
+    stage_issue_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_issue_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     batch_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
     batch_exposure_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     campaign_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -5007,6 +5069,37 @@ class ChatwootOutboundMirror(Base):
     company_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekVoucherOwnerTest(Base):
+    """One-ever isolated gift issuance; not a campaign or customer entitlement."""
+
+    __tablename__ = "easyweek_voucher_owner_test"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_ew_owner_test_singleton"),
+        CheckConstraint(
+            "state IN ('new', 'create_queued', 'create_running', 'open', "
+            "'pay_queued', 'pay_running', 'paid', 'unknown', 'blocked')",
+            name="ck_ew_owner_test_state",
+        ),
+        CheckConstraint("NOT pay_attempted OR create_attempted", name="ck_ew_owner_test_attempts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    binding_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    marker: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    stopped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    create_attempted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pay_attempted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    order_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    code_present: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    approval: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    audit: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EasyWeekManualRecipientPlan(Base):

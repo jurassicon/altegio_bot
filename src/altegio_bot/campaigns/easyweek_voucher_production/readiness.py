@@ -66,7 +66,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
 )
 from altegio_bot.campaigns.easyweek_voucher_production.validity import PROVIDER_MANAGED_VALIDITY
 from altegio_bot.easyweek_locations import configured_easyweek_locations
-from altegio_bot.easyweek_voucher_production_contract import production_contract
+from altegio_bot.easyweek_voucher_production_contract import (
+    is_current_fixed_contract,
+    production_contract,
+)
 from altegio_bot.models.models import PROVIDER_EASYWEEK, MessageTemplate, WhatsAppSender
 from altegio_bot.settings import settings
 
@@ -242,8 +245,16 @@ class ProductionPrerequisites:
             # Repeated on every report so a green stage can never read as a
             # campaign permission. There is no recipient ceiling in this phase;
             # what bounds the money is the arithmetic the operator approved.
-            "voucher_unit_price_minor": contract.unit_price_minor,
-            "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.unit_price_minor}",
+            # The two sums, named apart. A screen or a ticket that saw only one of
+            # them would either ask somebody to approve paying for a gift or claim
+            # the gift is worth nothing.
+            "voucher_unit_price_minor": contract.face_value_minor,
+            **(
+                {"voucher_issue_price_minor": contract.issue_price_minor, "free_issue": True}
+                if contract.free_issue
+                else {}
+            ),
+            "approval_arithmetic": f"approved_exposure_minor = expected_recipient_count * {contract.face_value_minor}",
             "reasons": list(self.reasons),
         }
 
@@ -275,7 +286,7 @@ async def prove_prerequisites(
     # §45.4, for the fixed €10 contract only. The historical €15 contracts are not
     # re-described: their terms were settled when they were frozen and restating
     # them now would only confuse their own recovery.
-    provider_managed_validity = schema_version == "3"
+    provider_managed_validity = is_current_fixed_contract(schema_version)
     account_uuid = _canonical(settings.easyweek_voucher_production_mailing_account_uuid)
     account_reason = None if account_uuid else ACCOUNT_UNCONFIGURED
 
@@ -344,7 +355,7 @@ async def prove_prerequisites(
         and live_meta_proof.meta_template_name == message.VOUCHER_META_TEMPLATE_NAME
         and live_meta_proof.language == message.VOUCHER_TEMPLATE_LANGUAGE
     )
-    if schema_version == "3" and require_live_meta and not live_meta_verified:
+    if is_current_fixed_contract(schema_version) and require_live_meta and not live_meta_verified:
         template_reason = TEMPLATE_UNPROVEN
 
     sender = (

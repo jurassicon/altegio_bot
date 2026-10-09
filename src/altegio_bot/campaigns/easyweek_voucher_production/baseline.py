@@ -49,6 +49,7 @@ from altegio_bot.easyweek_voucher_canary.plan import (
 from altegio_bot.easyweek_voucher_production_contract import (
     LEGACY_PRODUCTION_CONTRACT,
     ProductionVoucherContract,
+    is_current_fixed_contract,
 )
 
 # This phase's own baseline label. The VALUE matches §41's because the catalogue
@@ -106,7 +107,7 @@ def prove_production_baseline(
     # literals. A baseline edited on one line and not the other would otherwise
     # pass field-by-field and describe a template nobody approved.
     template = template_payload if isinstance(template_payload, dict) else {}
-    if contract.request_schema_version == "3":
+    if is_current_fixed_contract(contract.request_schema_version):
         # An omitted activation setting is unknown, even when the required
         # value is null. Historical baselines retain their original semantics.
         mismatched.extend(name for name in contract.template_facts() if name not in template and name not in mismatched)

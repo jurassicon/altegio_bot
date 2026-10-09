@@ -141,12 +141,22 @@ def prove_voucher_line(
     *,
     expected_template_uuid: str,
     expected_price_minor: int,
+    expected_value_minor: int | None = None,
 ) -> VoucherLineProof:
     """Prove — or refuse to prove — one voucher of the approved template.
 
     Never assumes a missing field. Every accepted path is listed in the module
     docstring, and both of them are about something the response actually said.
+
+    ``price`` and ``value`` are two different numbers: what issuing this voucher
+    cost, and what its holder may spend. They are equal for the paid products, so
+    ``expected_value_minor`` defaults to ``expected_price_minor`` and every
+    existing caller keeps its exact behaviour. The free gift certificate is where
+    they part — a price of zero and a value of 1000 — and checking one against the
+    other would refuse the correct artifact while accepting a 10 EUR order issued
+    for free, or a worthless voucher issued for 10 EUR.
     """
+    expected_value = expected_price_minor if expected_value_minor is None else expected_value_minor
     if not isinstance(order, dict):
         return _UNPROVEN
 
@@ -170,10 +180,16 @@ def prove_voucher_line(
         )
 
     # A value or a code that is present must be right, on either path.
-    if value_present and value != expected_price_minor:
+    if value_present and value != expected_value:
         return VoucherLineProof(False, QUANTITY_PROOF_UNPROVEN, True)
     if code_present and not _nonempty_str(line.get("code")):
         return VoucherLineProof(False, QUANTITY_PROOF_UNPROVEN, True)
+    if expected_value != expected_price_minor and code_present:
+        # A draft with an explicit quantity can omit the value. Once a response
+        # claims an issued gift code, its independent nominal must be published;
+        # the zero price cannot prove that the holder received any value.
+        if not value_present or not str(line["code"]).strip():
+            return VoucherLineProof(False, QUANTITY_PROOF_UNPROVEN, True)
 
     if "quantity" in line:
         # The field exists, so it — and nothing else — decides the count.
@@ -183,8 +199,9 @@ def prove_voucher_line(
 
     # No quantity key at all. The only thing that may stand in for it is the
     # cardinality of a list of ISSUED artifacts: one element, one code, the
-    # confirmed template, and both money fields exactly at the nominal.
-    if from_collection and _nonempty_str(line.get("code")) and value == expected_price_minor:
+    # confirmed template, and both money fields exactly as the contract says —
+    # the price at the issue price, the value at the face value.
+    if from_collection and _nonempty_str(line.get("code")) and value == expected_value:
         return VoucherLineProof(True, QUANTITY_PROOF_SINGLETON, True)
 
     return VoucherLineProof(False, QUANTITY_PROOF_UNPROVEN, True)

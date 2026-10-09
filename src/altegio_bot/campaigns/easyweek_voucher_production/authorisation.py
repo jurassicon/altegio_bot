@@ -62,6 +62,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     PRODUCTION_SCHEMA_VERSION,
     PRODUCTION_SCOPE,
 )
+from altegio_bot.easyweek_voucher_production_contract import (
+    CURRENT_SCHEMA_VERSIONS,
+    production_contract,
+)
 from altegio_bot.utils import utcnow
 
 # Short on purpose. Long enough for a human to read a plan and decide, short
@@ -116,13 +120,38 @@ def stage_digest(
     return _digest_over(
         {
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": "3" if snapshot.get("product_contract") is not None else PRODUCTION_SCHEMA_VERSION,
+            "schema_version": _schema_version_of(snapshot),
             "stage": stage,
             "snapshot": snapshot,
             "ledger_state": ledger_state,
             "plan_issued_at": issued_at.isoformat(),
         }
     )
+
+
+def _schema_version_of(snapshot: dict[str, Any]) -> str:
+    """Which request schema this plan's snapshot belongs to.
+
+    Read from the product contract's OWN version, not from the fact that a
+    ``product_contract`` key exists. Presence used to be enough to mean "schema 3",
+    because schema 3 was the only version that published one — and the moment a
+    second fixed contract did, that inference would have labelled a free gift batch
+    as a paid one, in the bytes that authorise a stage.
+
+    Schema 3 still answers "3" here, so every digest already signed over this field
+    keeps its exact value; a snapshot with no product contract still answers with
+    the historical default.
+    """
+    material = snapshot.get("product_contract")
+    if not isinstance(material, dict):
+        return PRODUCTION_SCHEMA_VERSION
+    version = material.get("product_contract_version")
+    for schema in sorted(CURRENT_SCHEMA_VERSIONS):
+        if isinstance(version, str) and production_contract(schema).version == version:
+            return schema
+    # A product contract we cannot name. Refusing to guess is the point: the
+    # historical default is the one answer that cannot over-claim.
+    return PRODUCTION_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -186,7 +215,7 @@ class StagePlan:
         return {
             "mode": "voucher_production_stage_plan",
             "batch_scope": PRODUCTION_SCOPE,
-            "schema_version": "3" if self.snapshot.get("product_contract") is not None else PRODUCTION_SCHEMA_VERSION,
+            "schema_version": _schema_version_of(self.snapshot),
             "stage": self.stage,
             "ready": self.ready,
             "reasons": list(self.reasons),

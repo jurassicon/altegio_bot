@@ -27,7 +27,8 @@ must describe the full active snapshot exactly:
 
 * the count must be greater than zero;
 * the count must equal the number of active recipients actually found;
-* the exposure must equal ``count * contract.unit_price_minor``.
+* the exposure must equal ``count * contract.face_value_minor`` — the NOMINAL,
+  which for every paid contract is also the money.
 
 A missing number and a wrong number are different refusals, deliberately: one
 means the operator has not told us, the other means what they told us does not
@@ -101,7 +102,10 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     production_marker,
 )
 from altegio_bot.campaigns.easyweek_voucher_production.read_sessions import release_reads_before_http
-from altegio_bot.easyweek_voucher_production_contract import production_contract
+from altegio_bot.easyweek_voucher_production_contract import (
+    is_current_fixed_contract,
+    production_contract,
+)
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -189,7 +193,7 @@ class BatchApproval:
 
         if exposure is None or exposure <= 0:
             reasons.append(APPROVAL_EXPOSURE_MISSING)
-        elif count is None or count <= 0 or exposure != count * production_contract(schema_version).unit_price_minor:
+        elif count is None or count <= 0 or exposure != count * production_contract(schema_version).face_value_minor:
             # Compared against what the OPERATOR said, not against what was
             # observed. Two wrong numbers that are consistent with each other
             # are still caught, because the count itself is compared above.
@@ -204,7 +208,21 @@ class BatchApproval:
             "approval_supplied": self.supplied,
             "approval_arithmetic": (
                 "approved_exposure_minor = expected_recipient_count * "
-                f"{production_contract(schema_version).unit_price_minor}"
+                f"{production_contract(schema_version).face_value_minor}"
+            ),
+            # What the same approval will actually charge. Zero for a free issue,
+            # and equal to the nominal for every paid contract — reported beside it
+            # so no screen and no report can show one as the other.
+            **(
+                {
+                    "approved_issue_price_minor": (
+                        None
+                        if self.expected_recipient_count is None
+                        else self.expected_recipient_count * production_contract(schema_version).issue_price_minor
+                    )
+                }
+                if production_contract(schema_version).free_issue
+                else {}
             ),
         }
 
@@ -262,7 +280,12 @@ class ProductionMember:
             "slot": self.slot,
             "campaign_recipient_id": self.campaign_recipient_id,
             "reconciliation_marker": self.marker(preview_run_id=preview_run_id),
-            "voucher_value_minor": production_contract(schema_version).unit_price_minor,
+            "voucher_value_minor": production_contract(schema_version).face_value_minor,
+            **(
+                {"voucher_issue_price_minor": production_contract(schema_version).issue_price_minor}
+                if production_contract(schema_version).free_issue
+                else {}
+            ),
             "voucher_quantity": 1,
             **proof,
         }
@@ -304,7 +327,13 @@ class ProductionComposition:
 
     @property
     def total_exposure_minor(self) -> int:
-        return production_contract(self.schema_version).unit_price_minor * self.recipient_count
+        """The NOMINAL total: what this audience is worth to the people in it."""
+        return production_contract(self.schema_version).face_value_minor * self.recipient_count
+
+    @property
+    def total_issue_price_minor(self) -> int:
+        """What issuing all of them costs. Zero for the free gift certificate."""
+        return production_contract(self.schema_version).issue_price_minor * self.recipient_count
 
     def digest(self) -> str:
         """The immutable fingerprint of this exact composition.
@@ -337,7 +366,7 @@ class ProductionComposition:
             if self.campaign_period_end is not None
             else None,
             "recipient_count": self.recipient_count,
-            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
+            "voucher_unit_price_minor": production_contract(self.schema_version).face_value_minor,
             "total_exposure_minor": self.total_exposure_minor,
             "approved_recipient_count": self.approval.expected_recipient_count,
             "approved_exposure_minor": self.approval.approved_exposure_minor,
@@ -352,7 +381,7 @@ class ProductionComposition:
                 for member in self.members
             ],
         }
-        if self.schema_version == "3":
+        if is_current_fixed_contract(self.schema_version):
             material["product_contract"] = production_contract(self.schema_version).digest_material()
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -385,7 +414,7 @@ class ProductionComposition:
             if self.campaign_period_end is not None
             else None,
             "recipient_count": self.recipient_count,
-            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
+            "voucher_unit_price_minor": production_contract(self.schema_version).face_value_minor,
             "total_exposure_minor": self.total_exposure_minor,
             "slots": [
                 {
@@ -398,7 +427,7 @@ class ProductionComposition:
                 for member in self.members
             ],
         }
-        if self.schema_version == "3":
+        if is_current_fixed_contract(self.schema_version):
             material["product_contract"] = production_contract(self.schema_version).digest_material()
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -441,8 +470,19 @@ class ProductionComposition:
             "recipient_count": self.recipient_count,
             "earned_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_EARNED for member in self.members),
             "manual_recipient_count": sum(member.recipient_basis == RECIPIENT_BASIS_MANUAL for member in self.members),
-            "voucher_unit_price_minor": production_contract(self.schema_version).unit_price_minor,
+            # The two sums, side by side and never one standing for the other: the
+            # nominal is what this audience is worth, the issue price is what
+            # putting it in their hands costs.
+            "voucher_unit_price_minor": production_contract(self.schema_version).face_value_minor,
             "total_exposure_minor": self.total_exposure_minor,
+            **(
+                {
+                    "voucher_issue_price_minor": production_contract(self.schema_version).issue_price_minor,
+                    "total_issue_price_minor": self.total_issue_price_minor,
+                }
+                if production_contract(self.schema_version).free_issue
+                else {}
+            ),
             # Stated rather than implied: this phase has no recipient ceiling,
             # and a report must not leave a reader guessing whether one applied.
             "max_recipients": None,
@@ -450,7 +490,7 @@ class ProductionComposition:
             **self.approval.as_safe_dict(schema_version=self.schema_version),
             **(
                 {"product_contract": production_contract(self.schema_version).digest_material()}
-                if self.schema_version == "3"
+                if is_current_fixed_contract(self.schema_version)
                 else {}
             ),
             "frozen_digest": self.composition_digest() if self.proven else None,

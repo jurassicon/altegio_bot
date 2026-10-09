@@ -93,7 +93,8 @@ from altegio_bot.easyweek_voucher_identity import (
 )
 from altegio_bot.easyweek_voucher_mutation import EasyWeekVoucherMutationClient
 from altegio_bot.easyweek_voucher_production_contract import (
-    CURRENT_PRODUCTION_CONTRACT,
+    NEW_MAILING_SCHEMA_VERSION,
+    new_mailing_contract,
     production_contract,
 )
 from altegio_bot.models.models import (
@@ -179,7 +180,7 @@ def _request_for(
     preview_run_id: int,
     batch_id: int | None,
     frozen_staffer_uuid: str | None,
-    schema_version: str = "3",
+    schema_version: str = NEW_MAILING_SCHEMA_VERSION,
     product_contract_version: str | None = None,
 ) -> tuple[runner_module.ProductionRequest | None, tuple[str, ...]]:
     """The frozen identity for this action, or the reasons it is unusable.
@@ -461,7 +462,14 @@ class CompositionView:
     campaign_period: str | None
     recipient_count: int
     total_exposure_minor: int
+    # The FACE VALUE of one voucher, and what issuing one costs. Separate fields
+    # because a screen showing a single "amount" for the free certificate would
+    # either ask for 330 EUR to be approved or claim the gift is worth nothing.
     unit_price_minor: int
+    issue_price_minor: int = 0
+    total_issue_price_minor: int = 0
+    # The till this contract settles through, by name, for recognition only.
+    payment_account_label: str = ""
     lines: tuple[RecipientLine, ...] = ()
     # Whether this answer describes the audience AT ALL. ``False`` when the fence is
     # shut or EasyWeek or the database could not be reached: there is no composition
@@ -517,10 +525,15 @@ class CompositionView:
             "proven_count": self.proven_line_count,
             "refused_count": self.refused_line_count,
             "unchecked_count": self.unchecked_line_count,
-            # The money for what is SHOWN. Never an approved amount: the freeze
+            # The NOMINAL for what is SHOWN. Never an approved amount: the freeze
             # takes the operator's own statement and re-proves the whole audience.
             "total_exposure_minor": self.total_exposure_minor,
             "unit_price_minor": self.unit_price_minor,
+            # And what issuing it costs, which is zero for the gift certificate.
+            "issue_price_minor": self.issue_price_minor,
+            "total_issue_price_minor": self.total_issue_price_minor,
+            "free_issue": self.issue_price_minor == 0,
+            "payment_account_label": self.payment_account_label,
             "composition_digest": self.composition_digest,
             "read_budget_seconds": self.read_budget_seconds,
             "recipients": [line.as_ui_dict() for line in self.lines],
@@ -562,7 +575,9 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            unit_price_minor=new_mailing_contract().face_value_minor,
+            issue_price_minor=new_mailing_contract().issue_price_minor,
+            payment_account_label=new_mailing_contract().payment_account_label,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
             # No read was attempted, so the smallest budget this policy has is the
@@ -586,7 +601,7 @@ async def inspect_composition(
                         client_reader=reader,
                         now=utcnow(),
                         approval=None,
-                        schema_version=CURRENT_PRODUCTION_CONTRACT.request_schema_version,
+                        schema_version=new_mailing_contract().request_schema_version,
                     )
     except TimeoutError:
         # The read did not finish inside its own bound. A refusal with no audience
@@ -599,7 +614,9 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            unit_price_minor=new_mailing_contract().face_value_minor,
+            issue_price_minor=new_mailing_contract().issue_price_minor,
+            payment_account_label=new_mailing_contract().payment_account_label,
             known=False,
             blockers=(COMPOSITION_READ_TIMEOUT,),
             read_budget_seconds=budget,
@@ -611,7 +628,9 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            unit_price_minor=new_mailing_contract().face_value_minor,
+            issue_price_minor=new_mailing_contract().issue_price_minor,
+            payment_account_label=new_mailing_contract().payment_account_label,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
             read_budget_seconds=budget,
@@ -624,7 +643,9 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            unit_price_minor=new_mailing_contract().face_value_minor,
+            issue_price_minor=new_mailing_contract().issue_price_minor,
+            payment_account_label=new_mailing_contract().payment_account_label,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
             read_budget_seconds=budget,
@@ -637,7 +658,9 @@ async def inspect_composition(
             campaign_period=None,
             recipient_count=0,
             total_exposure_minor=0,
-            unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+            unit_price_minor=new_mailing_contract().face_value_minor,
+            issue_price_minor=new_mailing_contract().issue_price_minor,
+            payment_account_label=new_mailing_contract().payment_account_label,
             # Not an audience of nobody: an answer that contains no audience.
             known=False,
             read_budget_seconds=budget,
@@ -660,7 +683,10 @@ async def inspect_composition(
         campaign_period=composition.period_label,
         recipient_count=composition.recipient_count,
         total_exposure_minor=composition.total_exposure_minor,
-        unit_price_minor=CURRENT_PRODUCTION_CONTRACT.unit_price_minor,
+        unit_price_minor=new_mailing_contract().face_value_minor,
+        issue_price_minor=new_mailing_contract().issue_price_minor,
+        total_issue_price_minor=composition.total_issue_price_minor,
+        payment_account_label=new_mailing_contract().payment_account_label,
         # The same digest a freeze plan carries in its signed snapshot, so the two
         # are comparable at all. Only for a proven audience: there is no identity to
         # report for a composition that could not be established.
@@ -924,7 +950,9 @@ async def offer_stage(
         preview_run_id=preview_run_id,
         batch_id=batch_id,
         frozen_staffer_uuid=frozen_staffer,
-        schema_version=frozen.schema_version if frozen is not None and frozen.exists else "3",
+        # A frozen batch answers for itself; without one this is a NEW mailing,
+        # which means the current product rather than the previous one.
+        schema_version=frozen.schema_version if frozen is not None and frozen.exists else NEW_MAILING_SCHEMA_VERSION,
         product_contract_version=frozen.product_contract_version if frozen is not None and frozen.exists else None,
     )
     if request is None:
@@ -981,9 +1009,10 @@ async def offer_stage(
     targets = operations_module.stage_targets_for(
         stage=stage,
         slots=plan.authorised_slots,
-        unit_price_minor=production_contract(request.schema_version).unit_price_minor,
+        unit_price_minor=production_contract(request.schema_version).face_value_minor,
         batch_recipient_count=batch_count,
         batch_exposure_minor=batch_exposure,
+        issue_price_minor=production_contract(request.schema_version).issue_price_minor,
     )
     if not targets.slots:
         return StageOffer(stage=stage, ready=False, reasons=(APPROVAL_NOT_READY,), approval=None, plan=safe_plan)
@@ -1299,7 +1328,9 @@ async def reconcile_batch(
         preview_run_id=preview_run_id,
         batch_id=batch_id,
         frozen_staffer_uuid=frozen_staffer,
-        schema_version=frozen.schema_version if frozen is not None and frozen.exists else "3",
+        # A frozen batch answers for itself; without one this is a NEW mailing,
+        # which means the current product rather than the previous one.
+        schema_version=frozen.schema_version if frozen is not None and frozen.exists else NEW_MAILING_SCHEMA_VERSION,
         product_contract_version=frozen.product_contract_version if frozen is not None and frozen.exists else None,
     )
     if request is None:

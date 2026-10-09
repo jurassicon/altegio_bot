@@ -15,7 +15,10 @@ from typing import Any, Final, Sequence
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     TEMPLATE_UNPROVEN,
 )
-from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_META_BODY
+from altegio_bot.easyweek_voucher_production_contract import (
+    CURRENT_PRODUCTION_META_BODY,
+    is_current_fixed_contract,
+)
 
 TEMPLATE_MISMATCH: Final = TEMPLATE_UNPROVEN
 
@@ -202,7 +205,7 @@ def for_schema(schema_version: str) -> ModuleType:
     from altegio_bot.campaigns.easyweek_voucher_delivery import template_contract as legacy
 
     contract = contracts.production_contract(schema_version)
-    return sys.modules[__name__] if contract.request_schema_version == "3" else legacy
+    return sys.modules[__name__] if is_current_fixed_contract(contract.request_schema_version) else legacy
 
 
 __all__ = [

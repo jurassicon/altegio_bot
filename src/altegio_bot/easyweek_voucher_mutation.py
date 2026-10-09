@@ -84,7 +84,10 @@ from altegio_bot.easyweek_voucher_identity import (
     SUPPORTED_VOUCHER_PRICE_MINOR,
     SUPPORTED_VOUCHER_QUANTITY,
 )
-from altegio_bot.easyweek_voucher_production_contract import CURRENT_PRODUCTION_CONTRACT
+from altegio_bot.easyweek_voucher_production_contract import (
+    CURRENT_PRODUCTION_CONTRACT,
+    GIFT_PRODUCTION_CONTRACT,
+)
 from altegio_bot.settings import settings
 
 logger = logging.getLogger("easyweek_voucher_mutation")
@@ -196,16 +199,21 @@ def _pinned(value: object, *, expected: str, label: str, operation: str) -> str:
 
 
 def _pinned_price(value: object, *, operation: str, expected_price_minor: int = SUPPORTED_VOUCHER_PRICE_MINOR) -> int:
-    """Accept only the exact supported nominal, as an exact ``int``.
+    """Accept only this contract's exact issue price, as an exact ``int``.
 
     ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` to
     ``isinstance`` and would become a one-cent order. Floats and numeric strings
     are refused too — money that survived a float is money we cannot prove.
+
+    Zero is a legitimate price for the free gift certificate and is pinned exactly
+    like any other: the caller must ASK for 0, and asking for anything else — a
+    negative price, 1000, ``None``, ``False``, ``"0"`` or ``0.0`` — is refused
+    before the request is built.
     """
     if type(value) is not int:
         raise EasyWeekPermanentError("price_minor must be an exact integer", operation=operation)
     if value != expected_price_minor:
-        raise EasyWeekPermanentError("price_minor is not the supported voucher nominal", operation=operation)
+        raise EasyWeekPermanentError("price_minor is not this contract's issue price", operation=operation)
     return expected_price_minor
 
 
@@ -511,12 +519,21 @@ class EasyWeekVoucherMutationClient:
         expected_template = EASYWEEK_VOUCHER_TEMPLATE_UUID
         expected_price = SUPPORTED_VOUCHER_PRICE_MINOR
         if product_contract_version is not None:
-            if product_contract_version != CURRENT_PRODUCTION_CONTRACT.version:
+            # An allowlist of exactly the two production contracts, each with its
+            # own template and its own ISSUE PRICE. The free certificate's price is
+            # an explicit integer 0 on the wire: not an omitted field hoping for a
+            # provider default, not 1000 with a discount, and never negative.
+            approved = {
+                CURRENT_PRODUCTION_CONTRACT.version: CURRENT_PRODUCTION_CONTRACT,
+                GIFT_PRODUCTION_CONTRACT.version: GIFT_PRODUCTION_CONTRACT,
+            }
+            contract = approved.get(product_contract_version)
+            if contract is None:
                 raise EasyWeekPermanentError("unsupported product contract", operation=CREATE_OPERATION)
             if self._workspace_slug != "kitilash":
                 raise EasyWeekPermanentError("unsupported production workspace", operation=CREATE_OPERATION)
-            expected_template = CURRENT_PRODUCTION_CONTRACT.template_uuid
-            expected_price = CURRENT_PRODUCTION_CONTRACT.unit_price_minor
+            expected_template = contract.template_uuid
+            expected_price = contract.issue_price_minor
         pinned_location = _pinned(
             location_uuid, expected=KARLSRUHE_LOCATION_UUID, label="location_uuid", operation=CREATE_OPERATION
         )
