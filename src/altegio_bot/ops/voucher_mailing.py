@@ -890,15 +890,6 @@ async def page_prepare(request: Request, preview_run_id: int) -> str:
     stop_is_terminal = schema_version == "3"
     contract = production_contract(schema_version)
     message = _message_preview(schema_version)
-    # The read budget this preview's own audience earns, from the same function the
-    # read uses. Rendered so the first press already waits for the right bound; every
-    # answer afterwards carries the current one.
-    try:
-        initial_read_budget = dispatch_module.composition_read_budget_seconds(
-            await dispatch_module.active_recipient_count(SessionLocal, preview_run_id)
-        )
-    except SQLAlchemyError:
-        initial_read_budget = dispatch_module.composition_read_budget_seconds(0)
     body = f"""
 <h1 class="h4 mb-3">Подготовка рассылки — preview #{preview_run_id}</h1>
 {_issuer_banner()}
@@ -984,7 +975,10 @@ const PREVIEW_RUN_ID = {int(preview_run_id)};
 const BATCH_ID = null;
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
 const STOP_IS_TERMINAL = {json.dumps(stop_is_terminal)};
-const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {int(initial_read_budget)};
+/* The page's own waiting limit, from the server's single policy. Deliberately not
+   derived from this preview's audience: an audience can change in another tab, and a
+   deadline that went stale with it could not be recovered from without a reload. */
+const COMPOSITION_BROWSER_WAIT_SECONDS = {dispatch_module.composition_browser_wait_seconds()};
 let OFFER = null;
 let COMPOSITION = null;
 let RECIPIENTS = {{}};
@@ -1148,7 +1142,7 @@ const BATCH_ID = {batch_id};
 const UNIT_PRICE_MINOR = {contract.unit_price_minor};
 /* The shared page script defines its composition wait from this. A mailing page has
    no composition panel, so it only ever needs the constant to exist. */
-const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {dispatch_module.composition_read_budget_seconds(0)};
+const COMPOSITION_BROWSER_WAIT_SECONDS = {dispatch_module.composition_browser_wait_seconds()};
 /* §45.4, from the batch's own durable schema — never from anything the browser
    could send back. It decides only what this page SAYS; the server refuses a
    terminally stopped stage whatever a payload claims. */
@@ -1535,25 +1529,26 @@ function offerStillFresh() {
 
 /* How long this page waits for the composition read.
  *
- * NOT a constant of its own. The server bounds that read with
- * ``composition_read_budget_seconds``, scaled to the audience it is about, and the
- * page waits for THAT bound plus a transport margin. One policy, one place, so the
- * two cannot disagree — which is the defect this replaces: the page gave up at 20
- * seconds on a read of thirty-four recipients that legitimately took 24.73, and an
- * operator was shown a lost connection for a check that had succeeded.
+ * NOT a constant of its own, and NOT the budget of any particular composition.
+ * ``COMPOSITION_BROWSER_WAIT_SECONDS`` is rendered from the server's own
+ * ``composition_browser_wait_seconds`` — the policy's ceiling plus its transport
+ * margin — so there is one place the numbers live and nothing here to drift.
  *
- * The starting value is rendered from the preview's current audience. Every answer
- * carries the budget it used, so a check after an exclusion, or after the list grew
- * in another tab, waits for the current one. The margin covers the request and the
- * response on the wire; the server always answers inside its own budget, so this
- * only ever has to outlast that. */
-const COMPOSITION_READ_MARGIN_MS = 15000;
-let COMPOSITION_READ_BUDGET_SECONDS = INITIAL_COMPOSITION_READ_BUDGET_SECONDS;
-
+ * Why the ceiling rather than this preview's own budget. The page used to wait for
+ * the budget it had last been told about, and it was only ever told by a final
+ * answer. Open the page at sixteen recipients (68 s, so an 83 s wait), let somebody
+ * add eighteen more in the preview editor, and the server's bound for the real
+ * audience becomes 122 s — but the page still gives up at 83, receives no answer,
+ * therefore learns no new budget, and gives up at 83 again on every retry. Pressing
+ * the check could not get the operator out of it; only reloading the page could.
+ *
+ * The ceiling depends on nothing the audience can change, so it cannot go stale.
+ * The READ stays bounded by the budget of the composition in front of it, which is
+ * what keeps a small preview answering quickly; this only has to outlast whatever
+ * that bound can be. */
 function compositionReadTimeoutMs() {
-  const seconds = Number(COMPOSITION_READ_BUDGET_SECONDS);
-  const bounded = Number.isFinite(seconds) && seconds > 0 ? seconds : INITIAL_COMPOSITION_READ_BUDGET_SECONDS;
-  return bounded * 1000 + COMPOSITION_READ_MARGIN_MS;
+  const seconds = Number(COMPOSITION_BROWSER_WAIT_SECONDS);
+  return (Number.isFinite(seconds) && seconds > 0 ? seconds : 1) * 1000;
 }
 
 function compositionDigest() {
@@ -1618,11 +1613,14 @@ async function inspectComposition() {
      confirmation dialog goes away. An operator must never be able to confirm against
      a list that is currently being re-read. */
   const epoch = invalidateShownComposition();
-  /* The audience is re-proven against EasyWeek one recipient at a time, so on a
-     real list this is tens of seconds. Saying so is the difference between a
-     working check and one an operator gives up on and presses again. */
-  const label = "Проверяем состав… это может занять до "
-    + Math.ceil(Number(COMPOSITION_READ_BUDGET_SECONDS) || 0) + " с";
+  /* The audience is re-proven against EasyWeek one recipient at a time, so on a real
+     list this is tens of seconds; saying so is the difference between a working
+     check and one an operator gives up on and presses again.
+     What is stated is the page's OWN limit — the one number here that is true
+     whatever the audience turned out to be. A per-composition estimate would be a
+     promise about a list that may already have changed in another tab. */
+  const label = "Проверяем состав… проверка идёт на сервере, ожидание не более "
+    + Math.ceil(Number(COMPOSITION_BROWSER_WAIT_SECONDS) || 0) + " с";
   setCompositionBusy(true, label);
   setAlert("secondary", label);
   let result = null;
@@ -1660,13 +1658,9 @@ async function inspectComposition() {
     return;
   }
   const data = result.data || {};
-  /* The server's own bound for THIS preview, as it just used it. Taken from every
-     decided answer — including a refusal and its own timeout — so the next press
-     waits for the current audience rather than for the one the page was rendered
-     with. */
-  if (Number.isFinite(Number(data.read_budget_seconds)) && Number(data.read_budget_seconds) > 0) {
-    COMPOSITION_READ_BUDGET_SECONDS = Number(data.read_budget_seconds);
-  }
+  /* ``data.read_budget_seconds`` says which bound the server gave this read. It is
+     deliberately not fed back into this page's deadline: a deadline learned from
+     answers is exactly what cannot survive the answer going missing. */
   if (data.composition_known === false) {
     /* The fence is shut, or EasyWeek or the database could not be reached. The
        answer contains no audience, so it must not replace the one on screen. */

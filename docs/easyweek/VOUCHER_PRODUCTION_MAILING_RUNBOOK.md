@@ -491,20 +491,28 @@ copied anywhere.
 On the preparation page:
 
 1. Press **«Проверить состав»**. The page immediately shows a spinner and
-   *«Проверяем состав… это может занять до N с»*, with the bound this preview's own
-   audience earns. The check re-proves every recipient against EasyWeek one at a
-   time — two provider reads for a manual row, three under the zero-booking policy,
-   four for an earned one — so on a list of thirty-odd people it is tens of seconds,
-   not a moment. Thirty-four manual recipients were measured at 24.73 s.
+   *«Проверяем состав… проверка идёт на сервере, ожидание не более N с»*, where N is
+   the page's own limit. The check re-proves every recipient against EasyWeek one at
+   a time — two provider reads for a manual row, three under the zero-booking
+   policy, four for an earned one — so on a list of thirty-odd people it is tens of
+   seconds, not a moment. Thirty-four manual recipients were measured at 24.73 s.
+
+   N is a ceiling on the WAIT, not an estimate of how long this list will take, and
+   it is deliberately not derived from the audience. A number derived from the
+   audience would be wrong the moment somebody edited the preview in another tab,
+   and the page would have no way to learn the new one.
 
    While it runs, the other controls are disabled and any previous result stops
    counting: a confirmation prepared earlier disappears, because it described a list
    that is being re-read. A second press does nothing; there is one check in flight
    at a time, and preparing a step takes the same lock.
-2. The server bounds that read itself — a fixed allowance plus a per-recipient one,
-   capped so the wait is never open-ended — and the page waits for exactly that
-   bound plus a transport margin. The two are one policy, so a check that the server
-   completes is never reported to the operator as a lost connection.
+2. The server bounds the read itself, scaled to the audience in front of it: a fixed
+   allowance plus a per-recipient one, capped so it is never open-ended. The page
+   waits for that cap plus a transport margin, which is one number from the same
+   policy and covers every bound the server can choose. So **editing the preview in
+   another tab needs no page reload**: add or remove recipients, press the check
+   again, and the wait already covers the new audience. A check the server completes
+   is never reported to the operator as a lost connection.
 3. The check always ends — on success, on a refusal, on an authorisation error, on
    a server error, on an unreadable answer, on a lost connection, and on a wait that
    ran out. The deadline covers the whole answer, headers and body, so a response

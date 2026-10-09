@@ -868,20 +868,32 @@ async def test_a_read_that_never_finishes_returns_control_with_a_named_timeout(
     assert await dispatch_module.active_recipient_count(session_maker, run_id) == 2
 
 
-async def test_the_preparation_page_renders_the_budget_its_audience_earns(
+async def test_the_preparation_page_renders_one_waiting_policy_and_no_duplicates(
     session_maker, production_configuration, binding_key, ui_client, transports
 ):
-    """F1. The page's first wait is the server's own bound, not a hard-coded one."""
+    """The page's wait comes from the server's policy, and from nowhere else.
+
+    It is the CEILING plus the transport margin, not this preview's own budget:
+    a number derived from the audience would go stale the moment somebody edited
+    the preview in another tab, and the page could not learn the new one without a
+    reload. Asserted against the policy function rather than a literal, so the two
+    cannot be changed apart.
+    """
     count = 4
     run_id, _recipient_ids, reader = await _preview(session_maker, count=count)
     transports.use(reader=reader)
 
     page = await ui_client.get(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
     assert page.status_code == 200
-    expected = dispatch_module.composition_read_budget_seconds(count)
-    assert f"const INITIAL_COMPOSITION_READ_BUDGET_SECONDS = {expected};" in page.text
-    # The constant the defect lived in is gone, not merely enlarged.
+    expected = dispatch_module.composition_browser_wait_seconds()
+    assert f"const COMPOSITION_BROWSER_WAIT_SECONDS = {expected};" in page.text
+    # It covers every bound the read policy can produce, for any audience.
+    assert expected > dispatch_module.composition_read_budget_seconds(10_000)
+    # The constants the two earlier defects lived in are gone, not merely enlarged.
     assert "COMPOSITION_READ_TIMEOUT_MS = 20000" not in page.text
+    assert "INITIAL_COMPOSITION_READ_BUDGET_SECONDS" not in page.text
+    # And the margin is not a second, independent number in the page script.
+    assert "COMPOSITION_READ_MARGIN_MS" not in page.text
 
 
 # ===========================================================================

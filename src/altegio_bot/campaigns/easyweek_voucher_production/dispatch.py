@@ -288,19 +288,41 @@ def _refused_offer(stage: str, reasons: tuple[str, ...]) -> StageOffer:
 COMPOSITION_FIXED_BUDGET_SECONDS: Final = 20
 COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS: Final = 3
 COMPOSITION_READ_BUDGET_CEILING_SECONDS: Final = 180
+# What the page adds on top of the server's bound: the request and the response on
+# the wire. Part of the policy rather than a number in the page script, so there is
+# one place to read and no pair of constants that can drift apart.
+COMPOSITION_TRANSPORT_MARGIN_SECONDS: Final = 15
 
 
 def composition_read_budget_seconds(active_recipients: int) -> int:
     """The bound this phase gives one composition read, for *active_recipients*.
 
-    One function, used by the read itself and by the page that waits for it, so
-    the two cannot drift into disagreeing — which is the defect this replaces: the
-    browser gave up at 20 s on a read that legitimately took 24.73 s, and the
-    operator was shown a lost connection for a check that had succeeded.
+    Scaled to the audience the read is actually about, so a one-person preview does
+    not inherit a three-minute allowance and a large one is not cut off. Bounded by
+    the ceiling, so the read is always finite.
     """
     counted = max(0, int(active_recipients))
     budget = COMPOSITION_FIXED_BUDGET_SECONDS + COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS * counted
     return min(budget, COMPOSITION_READ_BUDGET_CEILING_SECONDS)
+
+
+def composition_browser_wait_seconds() -> int:
+    """The longest a page may wait for a composition read, whatever the audience is.
+
+    The CEILING plus the transport margin, deliberately not the budget of any
+    particular composition. That is the fix for a race the per-composition number
+    could not survive: a page opened at sixteen recipients learned a 68-second
+    budget, somebody added eighteen more in the preview editor, the server's bound
+    for the real audience became 122 seconds, and the page still gave up at 83 —
+    then gave up at 83 again on every retry, because the only way it ever learned a
+    new budget was from a final answer it never received.
+
+    This number depends on nothing the audience can change, so it cannot go stale.
+    The read itself stays bounded by :func:`composition_read_budget_seconds` for the
+    composition in front of it, which is what keeps a small preview answering fast;
+    the page simply promises to outlast any bound that function can return.
+    """
+    return COMPOSITION_READ_BUDGET_CEILING_SECONDS + COMPOSITION_TRANSPORT_MARGIN_SECONDS
 
 
 # The three states one row of a checked composition can be in. Strings rather than
@@ -463,8 +485,10 @@ class CompositionView:
     # screen comparing only numbers would present a stale list as the confirmed one.
     # It is a digest over slots and preview rows — no name, number or secret.
     composition_digest: str | None = None
-    # The bound this read was given, in seconds, so the page that waits for it
-    # waits for the same policy rather than a constant of its own.
+    # The bound this read was actually given, in seconds. Reported as a fact about
+    # what happened — it belongs in a diagnostic and in a ticket — and deliberately
+    # NOT what the page builds its own deadline from: a page that learned its
+    # deadline from answers has no deadline for the answer that never arrives.
     read_budget_seconds: int = 0
 
     @property

@@ -24,6 +24,7 @@ import re
 import pytest
 from sqlalchemy import select
 
+from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
@@ -2384,8 +2385,12 @@ async def test_a_check_slower_than_the_old_twenty_second_constant_still_lands(
     await page.route("**/api/composition", held)
     await page.click("#btn-load")
     await page.wait_for_selector("#composition-progress")
-    # The operator is told roughly how long this may take, rather than left guessing.
-    assert "может занять" in await page.inner_text("#composition-progress")
+    # The operator is told the page's own limit, rather than left guessing. It is a
+    # bound on the WAIT and not an estimate for this list: an estimate derived from
+    # the audience would be wrong as soon as the preview was edited elsewhere.
+    progress = await page.inner_text("#composition-progress")
+    assert "ожидание не более" in progress
+    assert str(dispatch_module.composition_browser_wait_seconds()) in progress
 
     # Past the old deadline, and still waiting rather than reporting a lost answer.
     await page.wait_for_timeout(21_000)
@@ -2647,4 +2652,219 @@ async def test_an_excluded_recipient_invalidates_a_prepared_confirmation(
     assert sent == [], sent
     assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
     await page.unroute("**/api/confirm")
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# A preview that grew after the page opened: the wait must still cover the read
+# ===========================================================================
+
+
+def _shrink_read_policy(monkeypatch, *, per_recipient: int, ceiling: int, margin: int) -> None:
+    """Scale the SERVER's waiting policy down so a real race fits in a test.
+
+    The policy is scaled, never the page's number: the page derives its deadline
+    from these same constants, so shrinking them exercises the real derivation
+    instead of hiding the defect behind a hand-edited browser budget.
+    """
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_FIXED_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS", per_recipient)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_READ_BUDGET_CEILING_SECONDS", ceiling)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_TRANSPORT_MARGIN_SECONDS", margin)
+
+
+async def _grow_preview(session_maker, reader, *, run_id: int, already: int, extra: int) -> None:
+    """Add *extra* new people to this preview, as the preview editor would.
+
+    Seeded as real rows and then pointed at the run under test, which is what an
+    operator adding contacts in another tab leaves behind. The reader is taught the
+    new customers so the live proof can succeed for them.
+    """
+    _other_run, extra_ids = await seed_production_preview(session_maker, count=extra, offset=already)
+    async with session_maker() as session, session.begin():
+        for recipient_id in extra_ids:
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            recipient.campaign_run_id = run_id
+    reader.teach(list(range(already, already + extra)))
+
+
+async def test_a_preview_that_grew_after_the_page_opened_is_still_waited_for(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The reported race, with the policy scaled down so it fits in a test.
+
+    The page is opened at sixteen recipients; eighteen more are added in the preview
+    editor; the successful answer then arrives LATER than the deadline the page used
+    to hold — the one derived from the sixteen-recipient budget — and EARLIER than
+    the server's bound for the real audience of thirty-four.
+
+    Before the fix the page aborted at the stale deadline, received no answer,
+    therefore learned no new budget, and aborted at the same point on every retry;
+    only reloading the page could get the operator out of it. The wait now comes
+    from the policy's ceiling, which no audience change can move.
+    """
+    # per=1, ceiling=40, margin=2. So: sixteen recipients → a 16 s read budget and
+    # the 31 s deadline the old page would have held (16 + its own 15 s margin);
+    # thirty-four → a 34 s budget; and the page's own wait is 42 s.
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=2)
+    start = 16
+    run_id, reader = await _seed(session_maker, count=start)
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    stale_deadline_ms = dispatch_module.composition_read_budget_seconds(start) * 1000 + 15_000
+    assert await page.evaluate("() => compositionReadTimeoutMs()") > stale_deadline_ms
+
+    # Another tab's editor: the audience doubles while this page sits open.
+    await _grow_preview(session_maker, reader, run_id=run_id, already=start, extra=18)
+    grown = start + 18
+    assert await dispatch_module.active_recipient_count(session_maker, run_id) == grown
+    current_server_limit_ms = dispatch_module.composition_read_budget_seconds(grown) * 1000
+    assert stale_deadline_ms < current_server_limit_ms
+
+    # The answer arrives after the stale deadline and before the real server bound.
+    held_for_ms = (stale_deadline_ms + current_server_limit_ms) // 2
+
+    async def late_but_in_time(route):
+        await asyncio.sleep(held_for_ms / 1000)
+        await route.fallback()
+
+    await page.route("**/api/composition", late_but_in_time)
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-progress")
+    # The spinner states the page's own limit, which is the only number here that
+    # cannot be stale — not an estimate for an audience that may have changed.
+    progress = await page.inner_text("#composition-progress")
+    assert "ожидание не более" in progress
+    assert str(dispatch_module.composition_browser_wait_seconds()) in progress
+
+    # No reload anywhere: the answer lands on the page that was already open.
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=60_000)
+    assert (await page.inner_text("#c-count")).strip() == str(grown)
+    assert (await page.inner_text("#c-observed")).strip() == str(grown)
+    assert (await page.inner_text("#c-proven")).strip() == str(grown)
+    assert f"{grown * 1000 / 100:.2f}" in await page.inner_text("#c-total")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    assert "Ответ не получен" not in await page.inner_text("#alert-area")
+
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_the_page_wait_covers_every_bound_the_read_policy_can_produce(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The invariant the fix rests on, asserted against the live page.
+
+    A page's deadline is fixed when it is rendered, so the only way it can be
+    correct for an audience that changes afterwards is to cover EVERY bound the read
+    policy can produce. The old per-composition deadline did not: a page opened at
+    two recipients carried a wait far below the budget a large audience earns, and
+    nothing short of a reload could raise it.
+
+    Checked from the page itself, for the smallest and the largest audience the
+    policy admits, so a future change to either side has to keep them consistent.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=1)
+    run_id, reader = await _seed(session_maker, count=2)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+
+    page_wait_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+    for audience in (0, 1, 2, 34, 1000, 10_000):
+        bound_ms = dispatch_module.composition_read_budget_seconds(audience) * 1000
+        assert page_wait_ms > bound_ms, (audience, page_wait_ms, bound_ms)
+    # Bounded, not merely large: the wait is the policy's own number and nothing more.
+    assert page_wait_ms == dispatch_module.composition_browser_wait_seconds() * 1000
+    assert_no_page_errors(page)
+
+
+async def test_a_retry_after_a_real_timeout_is_not_stuck_on_a_stale_deadline(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """A genuine timeout returns control, and the next press is not degraded.
+
+    This is the half the old «Повторите проверку» could not deliver: the page only
+    ever learned a deadline from a final answer, so a timeout left it with the old
+    number and the retry hit the same wall. The deadline is now independent of
+    answers, so it is identical before and after — asserted, not assumed — and the
+    retry succeeds.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=2, margin=1)
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    before_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+
+    forever = asyncio.Event()
+
+    async def never_answers(route):
+        await forever.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", never_answers)
+    await page.click("#btn-load")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ не получен'); }",
+        timeout=30_000,
+    )
+    # Control is back, and a timeout permits nothing.
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert await page.get_attribute("#btn-load", "disabled") is None
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.is_hidden("#freeze-panel")
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == before_ms
+
+    forever.set()
+    await page.unroute("**/api/composition")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=30_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count)
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == before_ms
+    assert_no_page_errors(page)
+
+
+async def test_an_exclusion_that_shrinks_the_audience_still_checks_and_freezes(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The opposite direction, and the one the operator actually drives.
+
+    Excluding a recipient makes the audience smaller, so the server's own bound
+    shrinks with it. The page's wait does not depend on that number, so nothing
+    needs to be relearned — and the shrunk composition still checks, still shows the
+    new sum, and is still freezable. No external mutation happens at any point.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=2)
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    mutator = FakeMutator(create_sequence=[_ok(index) for index in range(count)])
+    sender = FakeSender()
+    transports.use(reader=reader, mutator=mutator, sender=sender)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    victim = int((await page.inner_text("#composition-table tbody tr:first-child td:nth-child(3)")).lstrip("#"))
+    wait_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Получатель исключён'); }",
+        timeout=30_000,
+    )
+
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=30_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count - 1)
+    assert f"{(count - 1) * 1000 / 100:.2f}" in await page.inner_text("#c-total")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    # The page's limit is a property of the policy, not of this audience.
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == wait_ms
+    # Reading and excluding reach no provider mutation and send nothing.
+    assert mutator.calls == []
+    assert sender.calls == 0
     assert_no_page_errors(page)
