@@ -2679,12 +2679,35 @@ async def lock_editable_preview(session: AsyncSession, run_id: int) -> CampaignR
             f"Preview run {run_id} используется controlled voucher delivery canary — "
             "редактирование и удаление запрещены."
         )
+
+    # And the §42/§43 production lock, for the same reason and under the same row
+    # lock. A frozen voucher batch addresses every slot by (run id, recipient id)
+    # and re-proves the whole composition before each external step, so editing the
+    # snapshot underneath it does not undo a created or paid voucher — it makes the
+    # delivery and the refund unprovable and strands real money.
+    #
+    # Checked HERE rather than in each caller: the Ops pages already displayed this
+    # lock, and a display is not an enforcement. Every writer reaches a snapshot
+    # through this function, so this is the one place where the answer cannot be
+    # stale by the time the write happens.
+    from altegio_bot.campaigns.easyweek_voucher_production.ledger import production_batch_id_for_preview
+
+    frozen_batch_id = await production_batch_id_for_preview(session, campaign_run_id=run_id)
+    if frozen_batch_id is not None:
+        raise ValueError(
+            f"Preview run {run_id} уже зафиксирован в рассылке ваучеров #{frozen_batch_id} — "
+            "редактирование и удаление запрещены."
+        )
     return run
 
 
 async def remove_recipient_from_preview(
     run_id: int,
     recipient_id: int,
+    *,
+    expect_provider: str | None = None,
+    expect_company_id: int | None = None,
+    expect_campaign_code: str | None = None,
 ) -> CampaignRecipient:
     """Мягко исключить получателя из preview snapshot.
 
@@ -2697,12 +2720,27 @@ async def remove_recipient_from_preview(
     - recipient должен принадлежать указанному run.
     - Повторный вызов на уже excluded получателе — idempotent.
 
+    ``expect_provider``/``expect_company_id``/``expect_campaign_code`` — optional
+    scope the caller requires of this run, re-verified under the run's row lock
+    rather than read beforehand. A narrowly scoped caller — the voucher mailing
+    page, which may only touch its own Karlsruhe preview — states what it expects
+    here instead of checking it in a separate transaction, where the answer would
+    describe a moment that has already passed. ``None`` keeps the previous
+    behaviour for existing callers exactly.
+
     Raises:
         ValueError: при нарушении правил.
     """
     async with SessionLocal() as session:
         async with session.begin():
             run = await lock_editable_preview(session, run_id)
+
+            if expect_provider is not None and run.provider != expect_provider:
+                raise ValueError(f"Preview run {run_id} относится к другому провайдеру.")
+            if expect_company_id is not None and expect_company_id not in (run.company_ids or []):
+                raise ValueError(f"Preview run {run_id} относится к другому филиалу.")
+            if expect_campaign_code is not None and run.campaign_code != expect_campaign_code:
+                raise ValueError(f"Preview run {run_id} относится к другой кампании.")
 
             recipient = await session.get(CampaignRecipient, recipient_id)
             if recipient is None:

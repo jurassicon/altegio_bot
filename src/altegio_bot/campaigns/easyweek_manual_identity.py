@@ -3,6 +3,11 @@
 Workspace customer lookup does not prove a branch. A new identity can only be
 assigned explicitly to Karlsruhe, and never moves an existing EasyWeek card.
 A matching opt-out anywhere in the local database vetoes the operation.
+
+One function answers this for every caller — the composition read, the freeze, the
+per-item claim, the manual Add and the batch Add — on purpose. A rule relaxed in one
+of them and left standing in another would show an operator a checked list that the
+freeze then refuses, which is worse than either answer on its own.
 """
 
 from __future__ import annotations
@@ -51,8 +56,12 @@ async def local_identity(
 ) -> tuple[Client | None, str | None]:
     """Read all matching identities. ``None, None`` means creation is possible.
 
-    Altegio rows are only read for opt-out and ambiguity: they never provide an
-    EasyWeek numeric ID, branch proof, visit proof, or template name.
+    Altegio rows are read for ONE thing: an opt-out anywhere vetoes the operation.
+    They never provide an EasyWeek numeric ID, a branch proof, a visit proof or a
+    template name — and their NUMBER proves nothing at all, so it decides nothing
+    here. Every refusal below is about the EasyWeek side: an ambiguous identity, a
+    card that belongs to another branch, a phone that does not match, or a
+    numeric-only card that cannot be shown to be somebody else.
     """
     identity = uuid.UUID(customer_uuid) if customer_uuid else None
     where = Client.phone_e164 == phone
@@ -70,9 +79,20 @@ async def local_identity(
         numeric_ids = {row.altegio_client_id for row in easyweek if row.altegio_client_id is not None}
         if None in identities or len(identities) != 1 or len(numeric_ids) > 1:
             return None, CLIENT_AMBIGUOUS
-    # Several legacy identities for the same phone cannot establish one person.
-    if len([row for row in rows if row.provider != "easyweek"]) > 1:
-        return None, IDENTITY_CONFLICT
+    # Legacy Altegio cards are deliberately NOT counted here.
+    #
+    # Counting them used to refuse outright: more than one non-EasyWeek row on the
+    # phone was read as "several identities, so this cannot be one person". That is
+    # a false conflict. The owner states the rule — one person may hold several
+    # Altegio cards across branches and several inside one branch — and a count was
+    # never evidence either way: a card number is not a visit, a branch proof or an
+    # EasyWeek identity, and two cards do not become one person by sharing a phone.
+    #
+    # Nothing takes its place. There is no ceiling on how many legacy cards are
+    # tolerable, because the number says nothing; what decides this function is the
+    # EasyWeek side, which is checked above and below. The Altegio rows keep the one
+    # job this module ever gave them: a matching opt-out on ANY of them vetoes the
+    # operation, which is the check immediately above and is unchanged.
     if not easyweek:
         # An unaddressable numeric card cannot be proven to be a different
         # person. Refuse a second manual card until an ordinary captured phone

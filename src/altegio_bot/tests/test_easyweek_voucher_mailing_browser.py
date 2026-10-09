@@ -21,10 +21,15 @@ import asyncio
 import contextlib
 import re
 
+import pytest
+from sqlalchemy import select
+
+from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
+from altegio_bot.models.models import CampaignRecipient, Client
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
@@ -36,10 +41,14 @@ from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (
     watch_for_errors,
 )
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (
+    CUSTOMER_UUIDS,
     ORDER_UUIDS,
+    PHONES,
     VOUCHER_CODE_SENTINELS,
     FakeMutator,
     FakeSender,
+    customer_payload,
+    customers_page,
     seed_production_preview,
     unknown_outcome,
 )
@@ -1820,4 +1829,1042 @@ async def test_a_voucher_easyweek_calls_expired_stays_paid_and_unsent_in_browser
     assert snapshot.items[0].send_attempt_count == 0
     # The money is still recoverable: the slot still offers its refund.
     assert await page.locator("#slots-table button[data-slot='1']").count() == 1
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# Checking the list: the running state, and what a late answer may not do
+# ===========================================================================
+
+
+async def test_the_check_shows_a_running_indicator_before_the_answer_arrives(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Pressing «Проверить состав» must visibly do something immediately.
+
+    The reviewed page showed nothing until the answer came back, which on a real
+    list of thirty-four people reads as a dead button. The indicator is asserted
+    while the read is deliberately held, so a version that paints it only after the
+    response cannot pass.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+
+    # Text, not only a spinner, and announced through role=status.
+    await page.wait_for_selector("#composition-progress")
+    assert "Проверяем состав" in await page.inner_text("#composition-progress")
+    status_area = page.locator("#composition-status")
+    assert await status_area.get_attribute("role") == "status"
+    assert await status_area.get_attribute("aria-live") == "polite"
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "true"
+    # Competing actions are shut while the audience is being decided.
+    assert await page.get_attribute("#btn-load", "disabled") is not None
+
+    release.set()
+    await page.wait_for_selector("#composition-table")
+    # And the running state ends on success.
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert await page.inner_text("#composition-status") == ""
+    assert await page.get_attribute("#btn-load", "disabled") is None
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_double_click_on_the_check_sends_one_request(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Two presses while the first is deciding are one check, not two."""
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def counted(route):
+        seen.append(route.request.url)
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", counted)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-progress")
+    # The button is disabled, so the press has to be forced to prove the guard is
+    # in the code and not only in the attribute.
+    await page.dispatch_event("#btn-load", "click")
+    await page.evaluate("() => { inspectComposition(); }")
+    assert len(seen) == 1, seen
+
+    release.set()
+    await page.wait_for_selector("#composition-table")
+    assert len(seen) == 1, seen
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_an_old_confirmation_is_unavailable_while_a_new_check_runs(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A prepared confirmation must not survive into a re-read of the audience.
+
+    It is dropped as the check STARTS, before any answer is waited for: a dialog
+    still on screen beside a running check is a dialog an operator can press.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    # Started, not awaited: the point is what the page looks like WHILE the check is
+    # still in flight, and returning the promise would make Playwright wait for it.
+    await page.evaluate("() => { inspectComposition(); }")
+    await page.wait_for_selector("#composition-progress")
+
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.get_attribute("#btn-confirm", "disabled") is not None
+
+    release.set()
+    await page.wait_for_selector("#composition-table")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+@pytest.mark.parametrize(
+    ("failure", "needle"),
+    [
+        ("network", "Ответ не получен"),
+        ("auth", "Сессия Ops недействительна"),
+        ("rate", "Слишком много запросов"),
+        ("server", "Ответ сервера не распознан"),
+        ("garbage", "Ответ сервера не распознан"),
+    ],
+)
+async def test_every_failed_check_ends_the_running_state_and_offers_a_retry(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, failure, needle
+):
+    """Success is not the only exit. Each of these must stop the spinner and explain.
+
+    A loading state that survives its own failure is the worst outcome: the
+    operator cannot tell whether the check is slow or dead, and the only control
+    that would tell them is the one still disabled.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+
+    async def broken(route):
+        if failure == "network":
+            await route.abort()
+        elif failure == "auth":
+            await route.fulfill(status=401, content_type="application/json", body='{"error":"ops_session_invalid"}')
+        elif failure == "rate":
+            await route.fulfill(status=429, content_type="application/json", body="{}")
+        elif failure == "server":
+            await route.fulfill(status=503, content_type="application/json", body="{}")
+        else:
+            await route.fulfill(status=200, content_type="application/json", body="{not json at all")
+
+    await page.route("**/api/composition", broken)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+
+    await page.wait_for_function(
+        "(needle) => { const el = document.querySelector('#alert-area'); return el && el.innerText.includes(needle); }",
+        arg=needle,
+        timeout=20_000,
+    )
+    # The running state is over, and the check can be pressed again.
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert await page.inner_text("#composition-status") == ""
+    assert await page.get_attribute("#btn-load", "disabled") is None
+    # Nothing was armed by a failure.
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+
+    await page.unroute("**/api/composition")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    assert_no_page_errors(page)
+
+
+async def test_a_refused_check_shows_every_row_with_its_own_reason(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """The reported defect, from the screen: one bad row must not hide the rest.
+
+    Three people, one opted out. The operator sees all three, the failing one
+    marked and explained in Russian with its code beside it, the other two marked
+    checked — and no freeze offered for any of it.
+    """
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    async with session_maker() as session, session.begin():
+        recipient = await session.scalar(
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .order_by(CampaignRecipient.id.asc())
+            .limit(1)
+        )
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+        blocked_id = recipient.id
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+
+    assert await page.locator("#composition-table tbody tr").count() == count
+    assert (await page.inner_text("#c-observed")).strip() == str(count)
+    assert (await page.inner_text("#c-proven")).strip() == str(count - 1)
+    assert (await page.inner_text("#c-problems")).strip() == "1 / 0"
+    table = await page.inner_text("#composition-table")
+    assert "Не прошёл проверку" in table
+    assert "Клиент отказался от сообщений WhatsApp" in table
+    assert "voucher_production_recipient_opted_out" in table
+    assert "Проверен" in table
+    # The money on screen is labelled as not being an approved amount.
+    assert "не разрешённая сумма" in await page.inner_text("#c-total-note")
+    # And there is no way forward from a refused list.
+    assert await page.is_hidden("#freeze-panel")
+    assert await page.locator(f"button[data-exclude-recipient='{blocked_id}']").count() == 1
+    assert_no_page_errors(page)
+
+
+async def test_a_hostile_name_is_shown_as_text_in_the_browser(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A stored name is data. The real DOM is what proves the escaping holds."""
+    hostile = '<img src=x onerror="window.__xss=1">'
+    count = 1
+    run_id, reader = await _seed(session_maker, count=count)
+    reader.customers[CUSTOMER_UUIDS[0]] = customer_payload(0, first_name=hostile)
+    reader.customer_pages[PHONES[0]] = [customers_page([customer_payload(0, first_name=hostile)])]
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+
+    assert hostile in await page.inner_text("#composition-table")
+    assert await page.locator("#composition-table img").count() == 0
+    assert await page.evaluate("() => window.__xss === undefined") is True
+    assert_no_page_errors(page)
+
+
+async def test_a_successful_check_stops_being_a_permission_after_a_failed_recheck(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A proven audience followed by a lost re-read must not stay confirmable.
+
+    This is the dangerous shape: the screen still shows a list and a filled-in
+    count, and the only thing that changed is that nobody knows whether it still
+    holds. The freeze refuses on the state, not on the appearance.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    before = await _composition_on_screen(page)
+
+    async def dead(route):
+        await route.abort()
+
+    await page.route("**/api/composition", dead)
+    await page.click("#btn-load")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ не получен'); }"
+    )
+
+    # The list is still on screen, with its real numbers, and marked stale.
+    assert await _composition_on_screen(page) == before
+    await page.wait_for_selector("#composition-stale")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.is_hidden("#freeze-panel")
+
+    # And a freeze attempted anyway is refused by the page, not by luck.
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Сначала проверьте состав'); }"
+    )
+    assert await page.is_hidden("#confirm-panel")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_late_answer_cannot_repaint_a_screen_that_has_moved_on(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """The race the epoch counter exists for, driven deterministically.
+
+    A check is started and held. The screen then moves on — which is what an
+    exclusion, or a newer check, does to it — and the held answer arrives
+    afterwards, describing the audience as it was. It must be dropped entirely:
+    applying it would put the old list, the old count, the old money and the old
+    confirmation back, and one of those is a permission.
+
+    The state change is made through the page's own ``invalidateShownComposition``,
+    which is the single function both the exclusion and a new check call. Driving it
+    directly is what makes the ordering certain — an exclusion cannot be clicked
+    during a check, because this page deliberately disables competing actions while
+    the audience is being decided, and that is asserted separately.
+    """
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    await page.evaluate("() => { inspectComposition(); }")
+    await page.wait_for_selector("#composition-progress")
+    # Whatever the answer turns out to say, it is already about a past screen.
+    epoch_before = await page.evaluate("() => COMPOSITION_EPOCH")
+    await page.evaluate("() => { invalidateShownComposition(); }")
+    assert await page.evaluate("() => COMPOSITION_EPOCH") == epoch_before + 1
+
+    release.set()
+    # Give the dropped answer every chance to land.
+    await page.wait_for_timeout(500)
+    await page.unroute("**/api/composition")
+
+    # It did not re-arm anything, and it did not clear the newer state's own
+    # running flag either.
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.is_hidden("#freeze-panel")
+    assert await page.is_hidden("#confirm-panel")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Сначала проверьте состав'); }"
+    )
+    # And a real check still works afterwards.
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    assert (await page.inner_text("#c-count")).strip() == str(count)
+    assert_no_page_errors(page)
+
+
+async def test_an_exclusion_is_refused_while_a_check_is_still_running(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """Competing actions are shut while the audience is being decided.
+
+    An exclusion accepted mid-check would be answered against a list the operator
+    is no longer looking at, and the check's own answer would then describe an
+    audience that changed under it. So the button is disabled AND the function
+    refuses, because a disabled button is a convenience and not a control.
+    """
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    victim = int((await page.inner_text("#composition-table tbody tr:first-child td:nth-child(3)")).lstrip("#"))
+
+    release = asyncio.Event()
+    attempts: list[str] = []
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    async def counted(route):
+        attempts.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    await page.route("**/api/exclude-recipient", counted)
+    await page.evaluate("() => { inspectComposition(); }")
+    await page.wait_for_selector("#composition-progress")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+    await page.wait_for_timeout(300)
+    assert attempts == [], attempts
+    async with session_maker() as session:
+        assert (await session.get(CampaignRecipient, victim)).status == "candidate"
+
+    release.set()
+    await page.wait_for_selector("#composition-table")
+    await page.unroute("**/api/composition")
+    await page.unroute("**/api/exclude-recipient")
+    assert_no_page_errors(page)
+
+
+async def test_excluding_a_problem_row_from_the_browser_needs_a_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """The whole operator loop in a real browser, including the dialog's wording.
+
+    Three people, one opted out. The operator reads the reason on that row,
+    presses «Исключить из этого preview», is told what it does and does NOT do,
+    confirms — and then has to check the list again before anything may be frozen.
+    """
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    async with session_maker() as session, session.begin():
+        recipient = await session.scalar(
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .order_by(CampaignRecipient.id.asc())
+            .limit(1)
+        )
+        client = await session.get(Client, recipient.client_id)
+        client.wa_opted_out = True
+        blocked_id = recipient.id
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    assert await page.is_hidden("#freeze-panel")
+
+    # A cancelled dialog changes nothing at all.
+    dismissed: list[str] = []
+
+    async def decline(dialog):
+        dismissed.append(dialog.message)
+        await dialog.dismiss()
+
+    page.on("dialog", decline)
+    await page.click(f"button[data-exclude-recipient='{blocked_id}']")
+    await page.wait_for_timeout(300)
+    assert dismissed and f"#{blocked_id}" in dismissed[0]
+    assert "не удаляется" in dismissed[0]
+    assert "заново проверить состав" in dismissed[0]
+    async with session_maker() as session:
+        assert (await session.get(CampaignRecipient, blocked_id)).status == "candidate"
+
+    # Confirmed, it is a soft removal and the screen says the result is stale.
+    page.remove_listener("dialog", decline)
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.click(f"button[data-exclude-recipient='{blocked_id}']")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Получатель исключён'); }",
+        timeout=20_000,
+    )
+    async with session_maker() as session:
+        row = await session.get(CampaignRecipient, blocked_id)
+        assert row.status == "skipped" and row.excluded_reason == "manual_removed"
+        # The client card itself is untouched.
+        assert await session.get(Client, row.client_id) is not None
+
+    # Nothing may be frozen until the rest is checked again.
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Сначала проверьте состав'); }"
+    )
+
+    # The fresh check: two people, and the money follows.
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    assert (await page.inner_text("#c-count")).strip() == str(count - 1)
+    assert f"{(count - 1) * 1000 / 100:.2f}" in await page.inner_text("#c-total")
+    assert await page.locator(f"button[data-exclude-recipient='{blocked_id}']").count() == 0
+    assert_no_page_errors(page)
+
+
+async def test_an_exclusion_whose_answer_is_lost_claims_nothing(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """A mutation with no readable answer is an unknown, and is reported as one.
+
+    It may well have been applied — it is applied here — so the page must not say
+    it failed, must not retry it, and must send the operator to re-read the list.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-table")
+    victim = int((await page.inner_text("#composition-table tbody tr:first-child td:nth-child(3)")).lstrip("#"))
+
+    attempts: list[str] = []
+
+    async def swallow_the_answer(route):
+        attempts.append(route.request.url)
+        await route.fetch()
+        await route.abort()
+
+    await page.route("**/api/exclude-recipient", swallow_the_answer)
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    # The proven rows carry no button, so this one is invoked the way the page
+    # would invoke it — with the preview row id and nothing else.
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('неизвестно, применено ли исключение'); }",
+        timeout=20_000,
+    )
+    # One attempt, no blind repeat.
+    assert len(attempts) == 1, attempts
+    # The server did apply it, which is exactly why no failure was claimed.
+    async with session_maker() as session:
+        assert (await session.get(CampaignRecipient, victim)).status == "skipped"
+    # And nothing is confirmable on the strength of the old result.
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.is_hidden("#confirm-panel")
+    await page.unroute("**/api/exclude-recipient")
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F1 — a check slower than the old constant still reaches the operator
+# ===========================================================================
+
+
+async def test_a_check_slower_than_the_old_twenty_second_constant_still_lands(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F1, in the browser. The reported list took 24.73 s; the page gave up at 20.
+
+    The answer is held past the old constant and then released. The page must still
+    be waiting, still say so, and then show the proven composition — without the
+    operator pressing anything a second time.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+
+    # The page's own wait, read off the page, must now exceed that constant.
+    assert await page.evaluate("() => compositionReadTimeoutMs()") > 20_000
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", held)
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-progress")
+    # The operator is told the page's own limit, rather than left guessing. It is a
+    # bound on the WAIT and not an estimate for this list: an estimate derived from
+    # the audience would be wrong as soon as the preview was edited elsewhere.
+    progress = await page.inner_text("#composition-progress")
+    assert "ожидание не более" in progress
+    assert str(dispatch_module.composition_browser_wait_seconds()) in progress
+
+    # Past the old deadline, and still waiting rather than reporting a lost answer.
+    await page.wait_for_timeout(21_000)
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "true"
+    assert "Ответ не получен" not in await page.inner_text("#alert-area")
+
+    release.set()
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=20_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count)
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# F2 — a late FREEZE plan may not re-arm a confirmation
+# ===========================================================================
+
+
+async def test_a_late_freeze_plan_cannot_rearm_the_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2, the reported sequence, with a real unfinished ``/api/plan``.
+
+    A proven composition; a freeze plan started and held; the screen state moved on;
+    the plan then comes back ``ready=true``. It used to arm the confirmation anyway —
+    an enabled «Подтвердить» over a composition marked stale and unfreezable.
+
+    The state is moved on through ``invalidateShownComposition``, the one function
+    every state change on this page goes through. Starting a competing check by hand
+    is no longer possible, which is the other half of the fix and is asserted below.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+
+    release = asyncio.Event()
+
+    async def held(route):
+        await release.wait()
+        await route.fallback()
+
+    await page.route("**/api/plan", held)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    # The screen moves on while the plan is on the wire.
+    await page.evaluate("() => { invalidateShownComposition(); }")
+    release.set()
+    await page.wait_for_timeout(700)
+    await page.unroute("**/api/plan")
+
+    # The ready plan armed nothing.
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert_no_page_errors(page)
+
+
+async def test_a_ready_plan_arriving_during_a_failed_recheck_arms_nothing(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2, the exact response ordering from the report, 503 and all.
+
+    The freeze plan answers ready while the audience is being re-read, and the
+    re-read then fails with a 503. Both halves have to hold: the plan is about a
+    screen that moved on, and the 503 leaves the old list stale rather than empty.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    before = await _composition_on_screen(page)
+
+    plan_release = asyncio.Event()
+
+    async def held_plan(route):
+        await plan_release.wait()
+        await route.fallback()
+
+    async def dead_check(route):
+        await route.fulfill(status=503, content_type="application/json", body="{}")
+
+    await page.route("**/api/plan", held_plan)
+    await page.route("**/api/composition", dead_check)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    # The state moves on, then the ready plan lands, then the re-read fails.
+    await page.evaluate("() => { invalidateShownComposition(); }")
+    plan_release.set()
+    await page.wait_for_timeout(500)
+    await page.click("#btn-load")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ сервера не распознан'); }",
+        timeout=20_000,
+    )
+
+    # No permission anywhere, and the list is stale rather than zeroed.
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await _composition_on_screen(page) == before
+    await page.wait_for_selector("#composition-stale")
+    await page.unroute("**/api/plan")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_check_cannot_start_while_a_freeze_plan_is_being_prepared(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. Preparing a step takes the same lock a check does.
+
+    Two answers about the audience must not be in flight at once, because the order
+    they land in is the network's choice and not the operator's.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+
+    release = asyncio.Event()
+    checks: list[str] = []
+
+    async def held_plan(route):
+        await release.wait()
+        await route.fallback()
+
+    async def counted_check(route):
+        checks.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/plan", held_plan)
+    await page.route("**/api/composition", counted_check)
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.evaluate("() => { planFreeze(); }")
+    await page.wait_for_function("() => COMPOSITION_BUSY === true")
+
+    assert await page.get_attribute("#btn-load", "disabled") is not None
+    await page.evaluate("() => { inspectComposition(); }")
+    await page.wait_for_timeout(300)
+    assert checks == [], checks
+
+    release.set()
+    await page.wait_for_selector("#confirm-panel:not(.d-none)", timeout=20_000)
+    await page.unroute("**/api/plan")
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_a_stale_composition_stops_the_confirmation_before_it_is_sent(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. The check that matters sits next to the request, not on the button.
+
+    An armed freeze confirmation, then the shown audience is invalidated. Pressing
+    confirm — or calling it directly, past the disabled attribute — must not send
+    ``/api/confirm`` at all.
+    """
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    sent: list[str] = []
+
+    async def counted(route):
+        sent.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/confirm", counted)
+    await page.evaluate("() => { markCompositionStale('тест'); }")
+    await page.evaluate("() => { confirmStage(); }")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Нет актуального плана'); }"
+    )
+    assert sent == [], sent
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+
+    # And a fresh check plus a fresh plan is a working freeze again.
+    await page.unroute("**/api/confirm")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+    await _press_confirm(page)
+    assert await _drain(session_maker) is not None
+    assert_no_page_errors(page)
+
+
+async def test_an_excluded_recipient_invalidates_a_prepared_confirmation(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports
+):
+    """F2. An exclusion is a state change, so a plan prepared before it is void."""
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    async with session_maker() as session, session.begin():
+        recipient = await session.scalar(
+            select(CampaignRecipient)
+            .where(CampaignRecipient.campaign_run_id == run_id)
+            .order_by(CampaignRecipient.id.asc())
+            .limit(1)
+        )
+        victim = recipient.id
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    await page.fill("#f-count", str(count))
+    await page.fill("#f-euro", f"{count * 1000 / 100:.2f}")
+    await page.click("#btn-plan-freeze")
+    await page.wait_for_selector("#confirm-panel:not(.d-none)")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Получатель исключён'); }",
+        timeout=20_000,
+    )
+
+    assert await page.evaluate("() => OFFER") is None
+    assert await page.is_hidden("#confirm-panel")
+    sent: list[str] = []
+
+    async def counted(route):
+        sent.append(route.request.url)
+        await route.fallback()
+
+    await page.route("**/api/confirm", counted)
+    await page.evaluate("() => { confirmStage(); }")
+    await page.wait_for_timeout(300)
+    assert sent == [], sent
+    assert await operations_module.list_operations(session_maker, campaign_run_id=run_id) == []
+    await page.unroute("**/api/confirm")
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# A preview that grew after the page opened: the wait must still cover the read
+# ===========================================================================
+
+
+def _shrink_read_policy(monkeypatch, *, per_recipient: int, ceiling: int, margin: int) -> None:
+    """Scale the SERVER's waiting policy down so a real race fits in a test.
+
+    The policy is scaled, never the page's number: the page derives its deadline
+    from these same constants, so shrinking them exercises the real derivation
+    instead of hiding the defect behind a hand-edited browser budget.
+    """
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_FIXED_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_PER_RECIPIENT_BUDGET_SECONDS", per_recipient)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_READ_BUDGET_CEILING_SECONDS", ceiling)
+    monkeypatch.setattr(dispatch_module, "COMPOSITION_TRANSPORT_MARGIN_SECONDS", margin)
+
+
+async def _grow_preview(session_maker, reader, *, run_id: int, already: int, extra: int) -> None:
+    """Add *extra* new people to this preview, as the preview editor would.
+
+    Seeded as real rows and then pointed at the run under test, which is what an
+    operator adding contacts in another tab leaves behind. The reader is taught the
+    new customers so the live proof can succeed for them.
+    """
+    _other_run, extra_ids = await seed_production_preview(session_maker, count=extra, offset=already)
+    async with session_maker() as session, session.begin():
+        for recipient_id in extra_ids:
+            recipient = await session.get(CampaignRecipient, recipient_id)
+            recipient.campaign_run_id = run_id
+    reader.teach(list(range(already, already + extra)))
+
+
+async def test_a_preview_that_grew_after_the_page_opened_is_still_waited_for(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The reported race, with the policy scaled down so it fits in a test.
+
+    The page is opened at sixteen recipients; eighteen more are added in the preview
+    editor; the successful answer then arrives LATER than the deadline the page used
+    to hold — the one derived from the sixteen-recipient budget — and EARLIER than
+    the server's bound for the real audience of thirty-four.
+
+    Before the fix the page aborted at the stale deadline, received no answer,
+    therefore learned no new budget, and aborted at the same point on every retry;
+    only reloading the page could get the operator out of it. The wait now comes
+    from the policy's ceiling, which no audience change can move.
+    """
+    # per=1, ceiling=40, margin=2. So: sixteen recipients → a 16 s read budget and
+    # the 31 s deadline the old page would have held (16 + its own 15 s margin);
+    # thirty-four → a 34 s budget; and the page's own wait is 42 s.
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=2)
+    start = 16
+    run_id, reader = await _seed(session_maker, count=start)
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    stale_deadline_ms = dispatch_module.composition_read_budget_seconds(start) * 1000 + 15_000
+    assert await page.evaluate("() => compositionReadTimeoutMs()") > stale_deadline_ms
+
+    # Another tab's editor: the audience doubles while this page sits open.
+    await _grow_preview(session_maker, reader, run_id=run_id, already=start, extra=18)
+    grown = start + 18
+    assert await dispatch_module.active_recipient_count(session_maker, run_id) == grown
+    current_server_limit_ms = dispatch_module.composition_read_budget_seconds(grown) * 1000
+    assert stale_deadline_ms < current_server_limit_ms
+
+    # The answer arrives after the stale deadline and before the real server bound.
+    held_for_ms = (stale_deadline_ms + current_server_limit_ms) // 2
+
+    async def late_but_in_time(route):
+        await asyncio.sleep(held_for_ms / 1000)
+        await route.fallback()
+
+    await page.route("**/api/composition", late_but_in_time)
+    await page.click("#btn-load")
+    await page.wait_for_selector("#composition-progress")
+    # The spinner states the page's own limit, which is the only number here that
+    # cannot be stale — not an estimate for an audience that may have changed.
+    progress = await page.inner_text("#composition-progress")
+    assert "ожидание не более" in progress
+    assert str(dispatch_module.composition_browser_wait_seconds()) in progress
+
+    # No reload anywhere: the answer lands on the page that was already open.
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=60_000)
+    assert (await page.inner_text("#c-count")).strip() == str(grown)
+    assert (await page.inner_text("#c-observed")).strip() == str(grown)
+    assert (await page.inner_text("#c-proven")).strip() == str(grown)
+    assert f"{grown * 1000 / 100:.2f}" in await page.inner_text("#c-total")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    assert "Ответ не получен" not in await page.inner_text("#alert-area")
+
+    await page.unroute("**/api/composition")
+    assert_no_page_errors(page)
+
+
+async def test_the_page_wait_covers_every_bound_the_read_policy_can_produce(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The invariant the fix rests on, asserted against the live page.
+
+    A page's deadline is fixed when it is rendered, so the only way it can be
+    correct for an audience that changes afterwards is to cover EVERY bound the read
+    policy can produce. The old per-composition deadline did not: a page opened at
+    two recipients carried a wait far below the budget a large audience earns, and
+    nothing short of a reload could raise it.
+
+    Checked from the page itself, for the smallest and the largest audience the
+    policy admits, so a future change to either side has to keep them consistent.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=1)
+    run_id, reader = await _seed(session_maker, count=2)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+
+    page_wait_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+    for audience in (0, 1, 2, 34, 1000, 10_000):
+        bound_ms = dispatch_module.composition_read_budget_seconds(audience) * 1000
+        assert page_wait_ms > bound_ms, (audience, page_wait_ms, bound_ms)
+    # Bounded, not merely large: the wait is the policy's own number and nothing more.
+    assert page_wait_ms == dispatch_module.composition_browser_wait_seconds() * 1000
+    assert_no_page_errors(page)
+
+
+async def test_a_retry_after_a_real_timeout_is_not_stuck_on_a_stale_deadline(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """A genuine timeout returns control, and the next press is not degraded.
+
+    This is the half the old «Повторите проверку» could not deliver: the page only
+    ever learned a deadline from a final answer, so a timeout left it with the old
+    number and the retry hit the same wall. The deadline is now independent of
+    answers, so it is identical before and after — asserted, not assumed — and the
+    retry succeeds.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=2, margin=1)
+    count = 2
+    run_id, reader = await _seed(session_maker, count=count)
+    transports.use(reader=reader)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    before_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+
+    forever = asyncio.Event()
+
+    async def never_answers(route):
+        await forever.wait()
+        await route.fallback()
+
+    await page.route("**/api/composition", never_answers)
+    await page.click("#btn-load")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Ответ не получен'); }",
+        timeout=30_000,
+    )
+    # Control is back, and a timeout permits nothing.
+    assert await page.get_attribute("#composition-panel", "aria-busy") == "false"
+    assert await page.get_attribute("#btn-load", "disabled") is None
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is False
+    assert await page.is_hidden("#freeze-panel")
+    assert await page.is_hidden("#confirm-panel")
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == before_ms
+
+    forever.set()
+    await page.unroute("**/api/composition")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=30_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count)
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == before_ms
+    assert_no_page_errors(page)
+
+
+async def test_an_exclusion_that_shrinks_the_audience_still_checks_and_freezes(
+    session_maker, production_configuration, binding_key, executor_enabled, page, transports, monkeypatch
+):
+    """The opposite direction, and the one the operator actually drives.
+
+    Excluding a recipient makes the audience smaller, so the server's own bound
+    shrinks with it. The page's wait does not depend on that number, so nothing
+    needs to be relearned — and the shrunk composition still checks, still shows the
+    new sum, and is still freezable. No external mutation happens at any point.
+    """
+    _shrink_read_policy(monkeypatch, per_recipient=1, ceiling=40, margin=2)
+    count = 3
+    run_id, reader = await _seed(session_maker, count=count)
+    mutator = FakeMutator(create_sequence=[_ok(index) for index in range(count)])
+    sender = FakeSender()
+    transports.use(reader=reader, mutator=mutator, sender=sender)
+    await page.goto(f"/ops/voucher-mailings/prepare?preview_run_id={run_id}")
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)")
+    victim = int((await page.inner_text("#composition-table tbody tr:first-child td:nth-child(3)")).lstrip("#"))
+    wait_ms = await page.evaluate("() => compositionReadTimeoutMs()")
+
+    page.on("dialog", lambda dialog: asyncio.ensure_future(dialog.accept()))
+    await page.evaluate("(id) => { excludeRecipient(id); }", victim)
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#alert-area');"
+        " return el && el.innerText.includes('Получатель исключён'); }",
+        timeout=30_000,
+    )
+
+    await page.click("#btn-load")
+    await page.wait_for_selector("#freeze-panel:not(.d-none)", timeout=30_000)
+    assert (await page.inner_text("#c-count")).strip() == str(count - 1)
+    assert f"{(count - 1) * 1000 / 100:.2f}" in await page.inner_text("#c-total")
+    assert await page.evaluate("() => COMPOSITION_FREEZABLE") is True
+    # The page's limit is a property of the policy, not of this audience.
+    assert await page.evaluate("() => compositionReadTimeoutMs()") == wait_ms
+    # Reading and excluding reach no provider mutation and send nothing.
+    assert mutator.calls == []
+    assert sender.calls == 0
     assert_no_page_errors(page)
