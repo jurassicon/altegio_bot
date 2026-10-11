@@ -655,6 +655,47 @@ the read counter means somebody has seen their voucher. Webhooks keep arriving
 after a step ends and after the fence is closed, so read these again the next day
 before drawing conclusions.
 
+### 7.1 The compact report, and who booked afterwards
+
+**«Отчёт»** — next to each mailing in the list, and linked from the top of the
+mailing page — opens a compact screen with six numbers and one row per recipient.
+Everything technical is folded into **«Подробности»** on each row. It is a read:
+it reaches neither EasyWeek nor Meta, it writes nothing, and pressing «Обновить»
+twenty times does the same nothing. The steps, the stop, **«Сверить с EasyWeek»**
+and the per-recipient refund stay on the mailing page, unchanged.
+
+The full contract is `docs/easyweek/VOUCHER_MAILING_BOOKING_REPORT.md`. What an
+operator needs to know while reading the screen:
+
+* **«Записался после отправки»** means one thing only: a new booking was created
+  somewhere in this EasyWeek workspace after a send the application can prove
+  left it. It is **not** proof that the advert worked, that the person came, that
+  anything was paid, or that the voucher was used.
+* **Any service, any branch of the workspace.** The mailing's own geography is
+  unchanged — this is the analytics scope, not a wider mailing.
+* **The window is 30 days from the attempted send**, and only when that same send
+  has Meta's acceptance or a delivered/read webhook. An attempt with no
+  acceptance reads «недостаточно данных», never zero.
+* **A late acceptance callback does not move the start of the window.**
+* **Accepted, delivered and read overlap.** A read message was also delivered and
+  also accepted. They are not parts of a total.
+* **No read callback is not "unread"**, and a delivery or read time is when the
+  confirmation was recorded, not when the customer acted.
+* **A cancellation does not erase the fact.** The row keeps «записался» and shows
+  the booking's current state: активна / отменена / завершена / неизвестно. One
+  `booking-created` never means the customer visited.
+* **Four different answers**, told apart on purpose: запись найдена; записей не
+  обнаружено по доступным данным; недостаточно данных; отправки ещё не было. The
+  absence of a webhook is not proof that there was no booking.
+* **The coverage block** says how many new bookings were observed per configured
+  branch and over which period. A zero means "nothing observed here", not a
+  proven absence. Branch coverage beyond Karlsruhe is not yet proven, so read
+  that block before drawing conclusions about the other branches.
+* **Before a freeze, or before a send**, the page says so instead of drawing the
+  preview as a completed mailing.
+* Times are in the salon's zone (`OPS_LOCAL_TZ`, `Europe/Berlin`), named once at
+  the top. No voucher code, UUID or raw payload is on the screen.
+
 ---
 
 ## 8. Operator: stopping

@@ -828,7 +828,9 @@ async def page_index(request: Request) -> str:
         f"<td><code>{_esc(str(entry.get('status') or '—'))}</code></td>"
         f"<td>{_esc('да' if entry.get('reconciliation_required') else 'нет')}</td>"
         f"<td><a class='btn btn-sm btn-outline-primary' "
-        f"href='/ops/voucher-mailings/{int(entry.get('batch_id') or 0)}'>Открыть</a></td>"
+        f"href='/ops/voucher-mailings/{int(entry.get('batch_id') or 0)}'>Открыть</a> "
+        f"<a class='btn btn-sm btn-outline-secondary' "
+        f"href='/ops/voucher-mailings/report?batch_id={int(entry.get('batch_id') or 0)}'>Отчёт</a></td>"
         "</tr>"
         for entry in batches
     )
@@ -857,12 +859,16 @@ async def page_index(request: Request) -> str:
                 else "<td><span class='text-muted small'>Есть неподдерживаемое основание (например, test)</span></td>"
             )
         )
+        + (
+            "<td><a class='btn btn-sm btn-outline-secondary' "
+            f"href='/ops/voucher-mailings/report?preview_run_id={entry['run_id']}'>Отчёт</a></td>"
+        )
         + "</tr>"
         for entry in candidates
     )
     candidate_table = (
         "<table class='table table-sm align-middle'>"
-        "<thead><tr><th>Preview</th><th>Период</th><th>Активных получателей</th><th></th></tr></thead>"
+        "<thead><tr><th>Preview</th><th>Период</th><th>Активных получателей</th><th></th><th></th></tr></thead>"
         f"<tbody>{candidate_rows}</tbody></table>"
         if candidate_rows
         else "<p class='text-muted'>Нет завершённых preview с активными получателями.</p>"
@@ -1095,6 +1101,7 @@ async def page_mailing(request: Request, batch_id: int) -> str:
 <p class="text-muted small mb-3">
   Preview <a href="/ops/campaigns/{preview_run_id}">#{preview_run_id}</a>.
   Период кампании — это волна, за которую положен ваучер, а не месяц отправки.
+  <a href="/ops/voucher-mailings/report?batch_id={batch_id}">Компактный отчёт и записи после отправки</a>.
 </p>
 {_issuer_banner()}
 {_readiness_block(await _readiness(schema_version))}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
@@ -30,6 +31,7 @@ from altegio_bot.campaigns.easyweek_voucher_production import operations as oper
 from altegio_bot.campaigns.easyweek_voucher_production import runner as production_runner
 from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import CampaignRecipient, Client
+from altegio_bot.tests import easyweek_booking_report_fixtures as report_fixtures
 from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     FakeReader,
     marker_orders,
@@ -52,11 +54,17 @@ from altegio_bot.tests.easyweek_voucher_production_fixtures import (
     seed_production_preview,
     unknown_outcome,
 )
+from altegio_bot.tests.easyweek_voucher_production_fixtures import FakeReader as ProductionReader
 from altegio_bot.workers import easyweek_voucher_production_worker as worker_module
 
 # Only the numeric mailing page. A glob would also match the prepare screen the
 # browser is already on, and `wait_for_url` would return without navigating.
 _MAILING_URL = re.compile(r"/ops/voucher-mailings/\d+$")
+
+# The booking report group below works with instants in the PAST, because the
+# served routes read the real clock and cannot be handed one.
+_REPORT_SENT = report_fixtures.utc(2026, 9, 1, 9, 0)
+_REPORT_NUMERIC = 774001
 
 
 async def test_owner_gift_real_browser_backend_worker_lifecycle(page, monkeypatch, session_maker):
@@ -3034,4 +3042,210 @@ async def test_an_exclusion_that_shrinks_the_audience_still_checks_and_freezes(
     # Reading and excluding reach no provider mutation and send nothing.
     assert mutator.calls == []
     assert sender.calls == 0
+    assert_no_page_errors(page)
+
+
+# ===========================================================================
+# The compact booking report, in the browser
+# ===========================================================================
+# Its own group because the report is a different product from the stages: it
+# acts on nothing, and what it is judged on is whether a human can read it —
+# six numbers, one row per person, the technical facts folded away, filters
+# that work, and a refresh that says when it last succeeded and when it failed.
+
+
+async def _report_batch(session_maker, *, count: int = 2):
+    """A delivered batch with one captured booking inside the window.
+
+    Seeded rather than clicked: the stages already have their own browser tests
+    above, and what this group is about starts after a mailing has been sent.
+    """
+    reader = ProductionReader(count=count)
+    _run_id, batch_id, _request = await report_fixtures.delivered_batch(session_maker, reader, count=count)
+    for slot in range(1, count + 1):
+        await report_fixtures.set_send_times(
+            session_maker,
+            batch_id=batch_id,
+            slot=slot,
+            attempted_at=_REPORT_SENT,
+            accepted_at=_REPORT_SENT,
+        )
+        await report_fixtures.bind_numeric(
+            session_maker, batch_id=batch_id, slot=slot, customer_id=_REPORT_NUMERIC + slot - 1
+        )
+    # One booking for the first recipient, in another branch of the workspace.
+    await report_fixtures.capture(
+        session_maker,
+        payload=report_fixtures.booking_payload(
+            booking_uuid="7a1c4e9b-2d63-4f10-8a21-000000000001",
+            customer_id=_REPORT_NUMERIC,
+            created_at=report_fixtures.iso(_REPORT_SENT + timedelta(days=3)),
+            company_id=report_fixtures.DURLACH_COMPANY_ID,
+        ),
+        received_at=_REPORT_SENT + timedelta(days=3),
+    )
+    return batch_id
+
+
+async def test_the_booking_report_is_compact_expandable_and_filterable(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """The operator reaches it by a link and reads it without scrolling sideways."""
+    batch_id = await _report_batch(session_maker)
+    transports.use(reader=ProductionReader(count=2))
+
+    await page.goto(f"/ops/voucher-mailings/{batch_id}")
+    await page.click(f"a[href='/ops/voucher-mailings/report?batch_id={batch_id}']")
+    await page.wait_for_url(re.compile(r"/ops/voucher-mailings/report\?batch_id=\d+$"))
+    await page.wait_for_selector("#report-rows tr[data-slot]")
+
+    # The compact summary, with the overlap stated rather than implied.
+    summary = await page.inner_text("#report-summary")
+    for title in ("Получателей", "Принято Meta", "Доставлено", "Прочитано", "Записались после отправки"):
+        assert title in summary, summary
+    assert "пересекаются" in summary
+
+    # The main table is five columns, and none of them is a UUID, an attempt
+    # count, a reason code, a basis or a technical timestamp.
+    headers = await page.locator("#report-table thead th").all_inner_texts()
+    assert len(headers) == 5
+    assert [value.strip() for value in headers[:4]] == [
+        "Клиент",
+        "Сообщение",
+        "Запись после отправки",
+        "Ближайшая подходящая запись",
+    ]
+
+    rows = page.locator("#report-rows tr[data-slot]")
+    assert await rows.count() == 2
+    first = await rows.nth(0).inner_text()
+    assert "Synthetic Production" in first
+    assert "записался" in first
+    assert "durlach" in first
+
+    # The technical facts exist, folded away until asked for.
+    details = page.locator('[data-details-for="1"]')
+    assert await details.is_hidden()
+    await page.click('[data-details-toggle="1"]')
+    await details.wait_for(state="visible")
+    body = await details.inner_text()
+    for needle in ("Слот", "Строка preview", "Окно учёта", "Identity", "Подходящие записи"):
+        assert needle in body, body
+    assert "момент регистрации подтверждения" in body
+
+    # The filters really filter.
+    await page.select_option("#filter-booking", "booking_not_observed")
+    await page.wait_for_function(
+        "() => document.querySelectorAll('#report-rows tr[data-slot]:not(.d-none)').length === 1"
+    )
+    assert "Показано строк: 1" in await page.inner_text("#filter-count")
+    await page.select_option("#filter-message", "not_sent")
+    await page.wait_for_function(
+        "() => document.querySelectorAll('#report-rows tr[data-slot]:not(.d-none)').length === 0"
+    )
+    assert await page.is_visible("#report-empty")
+    await page.select_option("#filter-message", "")
+    await page.select_option("#filter-booking", "")
+    await page.wait_for_function(
+        "() => document.querySelectorAll('#report-rows tr[data-slot]:not(.d-none)').length === 2"
+    )
+
+    # The stage actions are not here, and the page says where they are.
+    assert await page.locator("#btn-stage-create").count() == 0
+    assert await page.is_visible(f"a[href='/ops/voucher-mailings/{batch_id}']")
+    assert_no_page_errors(page)
+
+
+async def test_the_booking_report_says_when_it_updated_and_when_it_failed(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """A refresh shows progress, states its time, and never fails silently."""
+    batch_id = await _report_batch(session_maker, count=1)
+    transports.use(reader=ProductionReader(count=1))
+
+    await page.goto(f"/ops/voucher-mailings/report?batch_id={batch_id}")
+    await page.wait_for_selector("#report-rows tr[data-slot]")
+    updated = await page.inner_text("#report-updated")
+    assert "Обновлено:" in updated and "Europe/" in updated
+    assert await page.is_hidden("#report-spinner")
+
+    # Now make the read fail, slowly, so the loading state is observable.
+    # Held long enough that the loading state is observable rather than raced:
+    # "the screen says it is working" is the behaviour under test.
+    async def refuse(route):
+        await asyncio.sleep(1.5)
+        await route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"report_known": false, "reasons": ["voucher_production_database_unavailable"]}',
+        )
+
+    await page.route(
+        re.compile(r"/ops/voucher-mailings/api/booking-report\?"),
+        lambda route: asyncio.ensure_future(refuse(route)),
+    )
+    await page.click("#btn-refresh")
+    await page.wait_for_selector("#report-spinner:not(.d-none)")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#report-error'); return el && el.innerText.trim().length > 0; }",
+        timeout=30_000,
+    )
+    assert "не прочитан" in await page.inner_text("#report-error")
+    # The spinner stops and the button is usable again: the screen is not stuck.
+    await page.wait_for_selector("#report-spinner", state="hidden")
+    assert await page.is_enabled("#btn-refresh")
+    # The rows that were already read are still on screen rather than blanked.
+    assert await page.locator("#report-rows tr[data-slot]").count() == 1
+    assert_no_page_errors(page)
+
+
+async def test_the_booking_report_fits_a_phone_and_a_desktop(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """Compact at 390px and at 1280px, with no sideways scrolling of the page."""
+    batch_id = await _report_batch(session_maker)
+    transports.use(reader=ProductionReader(count=2))
+
+    for width, height in ((390, 844), (1280, 900)):
+        await page.set_viewport_size({"width": width, "height": height})
+        await page.goto(f"/ops/voucher-mailings/report?batch_id={batch_id}")
+        await page.wait_for_selector("#report-rows tr[data-slot]")
+        overflow = await page.evaluate(
+            "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+        )
+        assert overflow <= 1, f"the page scrolls sideways at {width}px: {overflow}"
+        # On a phone the widest column folds into the details instead.
+        nearest_visible = await page.evaluate(
+            "() => { const cell = document.querySelector('#report-rows tr[data-slot] td:nth-child(4)');"
+            " return cell ? cell.getClientRects().length > 0 : false; }"
+        )
+        assert nearest_visible is (width >= 768)
+        # The details stay reachable at both widths.
+        await page.click('[data-details-toggle="1"]')
+        await page.locator('[data-details-for="1"]').wait_for(state="visible")
+        assert "Подходящие записи" in await page.inner_text('[data-details-for="1"]')
+        assert_no_page_errors(page)
+    await page.set_viewport_size({"width": 1280, "height": 900})
+
+
+async def test_a_preview_without_a_batch_is_not_drawn_as_a_sent_mailing(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """The report of an unfrozen preview says so, in the browser, in words."""
+    run_id, reader = await _seed(session_maker, count=2)
+    transports.use(reader=reader)
+
+    await page.goto("/ops/voucher-mailings")
+    await page.click(f"a[href='/ops/voucher-mailings/report?preview_run_id={run_id}']")
+    await page.wait_for_url(re.compile(r"/ops/voucher-mailings/report\?preview_run_id=\d+$"))
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#report-stage');"
+        " return el && el.innerText.includes('зафиксирована'); }"
+    )
+
+    stage = await page.inner_text("#report-stage")
+    assert "ещё не зафиксирована" in stage
+    assert "отправки не было" in stage
+    assert await page.locator("#report-rows tr[data-slot]").count() == 0
+    assert "Записались после отправки" in await page.inner_text("#report-summary")
     assert_no_page_errors(page)
