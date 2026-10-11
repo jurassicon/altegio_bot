@@ -47,6 +47,7 @@ from altegio_bot.easyweek_voucher_mutation import VoucherMutationResponse
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     CampaignRecipient,
+    CampaignRun,
     Client,
     EasyWeekEvent,
     EasyWeekVoucherProductionBatchItem,
@@ -397,6 +398,21 @@ async def set_send_times(
             )
 
 
+async def set_run_window(session_maker, *, run_id: int, days: int) -> None:
+    """Give one campaign its own attribution window.
+
+    Written directly because the column is set when a run is CREATED and
+    nothing in the project updates it afterwards — which is exactly the
+    property the report relies on. A test that needs a different window is
+    therefore describing a differently created campaign.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                update(CampaignRun).where(CampaignRun.id == run_id).values(attribution_window_days=days)
+            )
+
+
 async def slot_customer_uuid(session_maker, *, batch_id: int, slot: int) -> str:
     async with session_maker() as session:
         found = await session.scalar(
@@ -527,6 +543,7 @@ __all__ = [
     "mixed_delivered_batch",
     "provider_message_id",
     "set_card_uuid",
+    "set_run_window",
     "set_send_times",
     "slot_customer_uuid",
     "utc",

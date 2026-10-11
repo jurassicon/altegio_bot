@@ -33,11 +33,22 @@ the window forward and retroactively disqualify bookings already inside it.
 
 Reproducibility
 ---------------
-The window and the policy are code constants, printed next to the report. They
-are not read from settings and cannot be changed by an environment variable,
-because a mailing's report has to keep meaning the same thing tomorrow. A
-change to them is a code change, reviewed like any other, and the report names
-the version that produced the numbers it shows.
+The POLICY is a code constant, printed next to the report. It is not read from
+settings and cannot be changed by an environment variable, because a mailing's
+report has to keep meaning the same thing tomorrow.
+
+The WINDOW is not a constant and never was one: it belongs to the campaign.
+Every run stores its own ``attribution_window_days``, written once when the run
+is created and never updated afterwards, so a report of an old mailing keeps
+the window that mailing was created with however the current default moves.
+Thirty days is what the campaign API uses when an operator states nothing — the
+default of today's mailings, not the contract. A stored value outside the bounds
+the campaign API itself enforces is reported as unusable; it is never replaced
+by a convenient number, because that would make the report state something
+nobody decided.
+
+The report names the window, its source and the policy version beside the
+numbers, and nothing here rewrites a signed batch fact or an HMAC binding.
 
 Identity, from proofs that already exist
 ----------------------------------------
@@ -92,6 +103,7 @@ from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
     VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN,
     CampaignRecipient,
+    CampaignRun,
     Client,
     EasyWeekEvent,
     EasyWeekVoucherProductionBatch,
@@ -102,13 +114,30 @@ from altegio_bot.utils import utcnow
 # ---------------------------------------------------------------------------
 # The policy, as constants a report can name
 # ---------------------------------------------------------------------------
-# Printed beside every answer. Not a setting: see "Reproducibility" above.
+# Printed beside every answer, and never read from a setting: see
+# "Reproducibility" above. The POLICY is a code constant; the WINDOW is not,
+# because it belongs to the campaign rather than to the application.
 ATTRIBUTION_POLICY_VERSION: Final = "easyweek-booking-report-v1"
-ATTRIBUTION_WINDOW_DAYS: Final = 30
-# A duration from an instant, not a calendar step: thirty times twenty-four
-# hours. A DST change inside the window therefore moves no boundary, while the
-# LOCAL rendering of both boundaries shifts exactly as the clock did.
-ATTRIBUTION_WINDOW: Final = timedelta(days=ATTRIBUTION_WINDOW_DAYS)
+
+# Where the window comes from. ``CampaignRun.attribution_window_days`` is
+# written once, when the run is created, and nothing in this project ever
+# updates it, so a frozen batch keeps the window its own campaign was created
+# with however the global default moves afterwards. The report names this
+# source beside the number.
+WINDOW_SOURCE_CAMPAIGN_RUN: Final = "campaign_run"
+
+# The bounds the stored value has to fall inside to be usable at all. They are
+# the same bounds the campaign API enforces when a run is created; a row that
+# got its value some other way and sits outside them is reported as unusable
+# rather than quietly replaced by a convenient number.
+MIN_ATTRIBUTION_WINDOW_DAYS: Final = 1
+MAX_ATTRIBUTION_WINDOW_DAYS: Final = 365
+
+# What the campaign API uses when an operator states nothing, and therefore
+# what today's mailings carry. It is the DEFAULT, never a fallback this module
+# applies: a missing or unusable stored window is an answer ("недостаточно
+# данных"), not an invitation to assume thirty days.
+DEFAULT_ATTRIBUTION_WINDOW_DAYS: Final = 30
 
 # How far BEFORE the earliest anchor the capture scan starts. A webhook is
 # received after the booking it describes was created, but not instantly, and
@@ -163,6 +192,9 @@ BOOKING_ACTIVE: Final = "active"
 BOOKING_CANCELLED: Final = "cancelled"
 BOOKING_COMPLETED: Final = "completed"
 BOOKING_STATE_UNKNOWN: Final = "unknown"
+# Both a cancellation and a completion were observed for one booking and
+# nothing in the captured data orders them. Reported instead of a guess.
+STATE_ORDER_UNPROVEN: Final = "lifecycle_order_unproven"
 
 # Why a captured delivery could not be used as a positive fact. Aggregated into
 # counts; never attached to a person.
@@ -176,6 +208,9 @@ REJECT_CREATED_AT: Final = "booking_created_at_unusable"
 REJECT_CONFLICTING_CREATION: Final = "conflicting_creation_events"
 
 REGISTRY_UNAVAILABLE: Final = "easyweek_location_registry_unavailable"
+# The campaign stores no usable attribution window, so there is no window to
+# check a booking against. Never replaced by a default.
+WINDOW_UNUSABLE: Final = "attribution_window_unusable"
 BATCH_UNKNOWN: Final = "voucher_production_batch_unknown"
 
 # The item statuses that are an execution FAILURE rather than a stage not yet
@@ -232,11 +267,18 @@ class ObservedBooking:
     customer_id: int
     booking_created_at: datetime
     state: str = BOOKING_ACTIVE
-    # A later delivery named a DIFFERENT customer for this booking. The booking
-    # was still created by the customer its creation event named — that is the
-    # historical fact — but the current owner is somebody else, and a report
-    # that hid that would be inviting a wrong conclusion.
-    customer_changed_later: bool = False
+    # Why the state is what it is, when that needs saying. Empty for the
+    # ordinary cases; set when the state is ``unknown`` because two terminal
+    # facts were observed and nothing proves which of them is the later one.
+    state_reason: str | None = None
+    # Another delivery of THIS booking names a different customer than its
+    # creation did. The creation stays attributed to the customer its own
+    # creation delivery named — that is the historical fact — but the booking
+    # has been moved, and a report that hid that would invite a wrong
+    # conclusion. Deliberately not phrased as "later": webhook arrival order is
+    # not proof of business order, so all this says is that the deliveries
+    # disagree.
+    customer_reassigned: bool = False
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -244,23 +286,67 @@ class ObservedBooking:
             "branch_company_id": self.company_id,
             "booking_created_at": _iso(self.booking_created_at),
             "state": self.state,
-            "customer_changed_later": self.customer_changed_later,
+            "state_reason": self.state_reason,
+            "customer_reassigned": self.customer_reassigned,
         }
 
 
 @dataclass
 class _BookingDraft:
-    """Accumulator for one booking UUID while the capture is being read."""
+    """Accumulator for one booking UUID while the capture is being read.
+
+    Creation evidence and lifecycle evidence are kept APART on purpose. A
+    delivery order is not a business order: EasyWeek may deliver a cancellation
+    before the creation it cancels, and the earlier version of this code read
+    the creation as "and now it is active again", which silently turned a
+    cancelled booking into a live one.
+
+    So the creation half only ever answers "was this booking created, by whom,
+    where and when", and the state half is derived at the end from the SET of
+    distinct lifecycle facts observed — never from whichever delivery happened
+    to be read last.
+    """
 
     booking_uuid: uuid_module.UUID
+    # -- the creation, as its own delivery stated it ------------------------
     company_id: int | None = None
     branch_name: str = ""
     customer_id: int | None = None
     booking_created_at: datetime | None = None
-    state: str = BOOKING_STATE_UNKNOWN
-    customer_changed_later: bool = False
-    conflicting: bool = False
     seen_creation: bool = False
+    conflicting: bool = False
+    # -- lifecycle facts, as a set of DISTINCT deliveries -------------------
+    # Keyed by the capture's own content identity (``payload_hash``), so an
+    # identical Resend of a delivery already seen adds nothing. A row whose
+    # body was not JSON has no hash; such a delivery is keyed by its own id
+    # instead, which is the honest answer — it cannot be proven identical to
+    # anything.
+    cancelled_signals: set[str] = field(default_factory=set)
+    completed_signals: set[str] = field(default_factory=set)
+    # Every customer id any delivery of this booking named, creation included.
+    customer_ids: set[int] = field(default_factory=set)
+
+    def resolved_state(self) -> tuple[str, str | None]:
+        """The current state, or ``unknown`` with the reason there is none.
+
+        One kind of terminal fact decides the state whenever the creation it
+        belongs to was also observed, because a booking is always created
+        before it can be cancelled or completed — that ordering is a property
+        of the business, not of the delivery sequence, so it holds however the
+        two arrived.
+
+        Both kinds at once cannot be ordered from anything this report can see:
+        the confirmed payload shape carries no per-change timestamp, and the
+        arrival order proves nothing. That is reported as unknown with a
+        reason rather than resolved by guessing.
+        """
+        if self.cancelled_signals and self.completed_signals:
+            return BOOKING_STATE_UNKNOWN, STATE_ORDER_UNPROVEN
+        if self.cancelled_signals:
+            return BOOKING_CANCELLED, None
+        if self.completed_signals:
+            return BOOKING_COMPLETED, None
+        return BOOKING_ACTIVE, None
 
 
 @dataclass(frozen=True)
@@ -303,10 +389,21 @@ class SendAnchor:
     def confirmed(self) -> bool:
         return self.state == SEND_CONFIRMED and self.anchor is not None
 
-    def window(self) -> tuple[datetime, datetime] | None:
-        if not self.confirmed or self.anchor is None:
+    def window(self, window_days: int | None) -> tuple[datetime, datetime] | None:
+        """The attribution window of ONE slot, or ``None``.
+
+        Takes the campaign's own window rather than reading a module constant:
+        a thirty-day default is what today's mailings happen to carry, not the
+        contract. ``None`` here means the window could not be established, and
+        no window is the same answer as no anchor — nothing is attributed.
+
+        A duration from an instant, not a calendar step. A DST change inside
+        the window therefore moves no boundary, while the LOCAL rendering of
+        both ends shifts exactly as the clock did.
+        """
+        if not self.confirmed or self.anchor is None or window_days is None:
             return None
-        return self.anchor, self.anchor + ATTRIBUTION_WINDOW
+        return self.anchor, self.anchor + timedelta(days=window_days)
 
 
 def resolve_send_anchor(item: EasyWeekVoucherProductionBatchItem) -> SendAnchor:
@@ -590,9 +687,15 @@ async def scan_capture(
     rows = (
         await session.execute(
             select(
+                EasyWeekEvent.id,
                 EasyWeekEvent.event_hint,
                 EasyWeekEvent.payload,
                 EasyWeekEvent.body_truncated,
+                # The capture's own content identity: the sha256 of the
+                # canonicalised JSON body. This is what makes an identical
+                # Resend recognisable as the same delivery without replaying
+                # anything.
+                EasyWeekEvent.payload_hash,
             )
             .where(EasyWeekEvent.event_hint.in_(LIFECYCLE_HINTS))
             .where(EasyWeekEvent.received_at >= floor)
@@ -609,7 +712,7 @@ async def scan_capture(
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
-    for event_hint, payload, body_truncated in rows:
+    for event_id, event_hint, payload, body_truncated, payload_hash in rows:
         facts, reason = _validate_delivery(
             event_hint=event_hint,
             payload=payload,
@@ -623,6 +726,12 @@ async def scan_capture(
 
         booking_uuid = facts["booking_uuid"]
         draft = drafts.setdefault(booking_uuid, _BookingDraft(booking_uuid=booking_uuid))
+        # Every delivery of this booking contributes whatever customer it named,
+        # whether it arrived before or after the creation. The earlier version
+        # compared against the creation's customer at read time and therefore
+        # lost the evidence entirely whenever the lifecycle delivery came first.
+        if facts["customer_id"] is not None:
+            draft.customer_ids.add(int(facts["customer_id"]))
 
         if event_hint == CREATED_HINT:
             if not draft.seen_creation:
@@ -631,7 +740,6 @@ async def scan_capture(
                 draft.branch_name = facts["branch_name"]
                 draft.customer_id = facts["customer_id"]
                 draft.booking_created_at = facts["booking_created_at"]
-                draft.state = BOOKING_ACTIVE
                 branch_observed[facts["company_id"]] = branch_observed.get(facts["company_id"], 0) + 1
             elif (
                 draft.customer_id != facts["customer_id"]
@@ -643,44 +751,55 @@ async def scan_capture(
                 # in neither branch of this check.
                 draft.conflicting = True
                 rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            # A creation states WHAT WAS CREATED. It is never also a statement
+            # that the booking is live now: a cancellation of it may already
+            # have been delivered, and reading the creation as "active" is
+            # exactly how a cancelled booking used to turn back into a live one.
             continue
 
         # A lifecycle change. It never creates a booking — a rescheduled or
-        # updated appointment is the same appointment — and it decides only the
-        # CURRENT state.
-        if facts["customer_id"] is not None and draft.customer_id is not None:
-            if facts["customer_id"] != draft.customer_id:
-                draft.customer_changed_later = True
+        # updated appointment is the same appointment — and it contributes one
+        # FACT to the set the state is derived from at the end.
+        #
+        # Keyed by content identity so an identical Resend is not a second
+        # fact. A delivery whose body was not JSON has no hash and is keyed by
+        # its own row id, because nothing proves it identical to another.
+        signal = payload_hash or f"event:{event_id}"
         if event_hint == CANCELLED_HINT:
-            draft.state = BOOKING_CANCELLED
+            draft.cancelled_signals.add(signal)
         elif event_hint == SUCCEEDED_HINT:
-            draft.state = BOOKING_COMPLETED
-        elif draft.state in (BOOKING_ACTIVE, BOOKING_STATE_UNKNOWN) and draft.seen_creation:
-            # An ordinary edit or a reschedule of a live appointment. It does
-            # NOT revive a cancellation and does not undo a completed visit:
-            # neither of those transitions has been proven for this provider,
-            # and inventing one would turn an edit into a claim about the
-            # salon's day.
-            draft.state = BOOKING_ACTIVE
+            draft.completed_signals.add(signal)
+        # An ordinary edit or a reschedule says nothing about cancellation or
+        # completion, so it contributes no state fact at all. It does NOT
+        # revive a cancellation and does not undo a completed visit: neither
+        # transition has been proven for this provider, and inventing one
+        # would turn an edit into a claim about the salon's day.
 
-    bookings = tuple(
-        ObservedBooking(
-            booking_uuid=draft.booking_uuid,
-            company_id=int(draft.company_id or 0),
-            branch_name=draft.branch_name,
-            customer_id=int(draft.customer_id or 0),
-            booking_created_at=created_at,
-            state=draft.state,
-            customer_changed_later=draft.customer_changed_later,
+    bookings: list[ObservedBooking] = []
+    for draft in drafts.values():
+        # A booking with no proven creation is not a booking this report can
+        # speak about, however many lifecycle deliveries it has.
+        if not draft.seen_creation or draft.conflicting:
+            continue
+        if draft.customer_id is None or draft.booking_created_at is None:
+            continue
+        state, state_reason = draft.resolved_state()
+        bookings.append(
+            ObservedBooking(
+                booking_uuid=draft.booking_uuid,
+                company_id=int(draft.company_id or 0),
+                branch_name=draft.branch_name,
+                customer_id=int(draft.customer_id),
+                booking_created_at=draft.booking_created_at,
+                state=state,
+                state_reason=state_reason,
+                # Any delivery of this booking naming a customer other than
+                # the one its creation named.
+                customer_reassigned=bool(draft.customer_ids - {draft.customer_id}),
+            )
         )
-        for draft in drafts.values()
-        if draft.seen_creation
-        and not draft.conflicting
-        and draft.customer_id is not None
-        and (created_at := draft.booking_created_at) is not None
-    )
     return CaptureScan(
-        bookings=bookings,
+        bookings=tuple(bookings),
         scanned_events=len(rows),
         truncated=truncated,
         scan_from=floor,
@@ -712,6 +831,10 @@ class RecipientRow:
     reconciliation_required: bool = False
     manual_cleanup_required: bool = False
     send_attempt_count: int = 0
+    # The campaign's own window, as this row was judged against it. Carried per
+    # row rather than read from a constant so the window a report SHOWS and the
+    # window it USED cannot drift apart.
+    attribution_window_days: int | None = None
 
     @property
     def booked(self) -> bool:
@@ -723,7 +846,7 @@ class RecipientRow:
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Slot, codes, states and dates. Never a name, a phone or a UUID."""
-        window = self.send_anchor.window()
+        window = self.send_anchor.window(self.attribution_window_days)
         return {
             "slot": self.slot,
             "campaign_recipient_id": self.campaign_recipient_id,
@@ -736,6 +859,7 @@ class RecipientRow:
             "send_attempted_at": _iso(self.send_anchor.anchor),
             "send_evidence": list(self.send_anchor.evidence),
             "send_attempt_count": self.send_attempt_count,
+            "attribution_window_days": self.attribution_window_days,
             "window_start": _iso(window[0]) if window else None,
             "window_end": _iso(window[1]) if window else None,
             "attribution_state": self.attribution_state,
@@ -767,6 +891,12 @@ class BookingReport:
     branches: tuple[dict[str, Any], ...] = ()
     generated_at: datetime | None = None
     reasons: tuple[str, ...] = ()
+    # The campaign's stored window, when it is usable, and where it came from.
+    # ``None`` means the campaign has no usable window: that is an answer, and
+    # the rows say "insufficient data" rather than being judged against a
+    # number nobody stored.
+    attribution_window_days: int | None = None
+    attribution_window_source: str | None = None
 
     @property
     def any_send_confirmed(self) -> bool:
@@ -800,7 +930,8 @@ class BookingReport:
             "report_known": self.report_known,
             "reasons": list(self.reasons),
             "policy_version": ATTRIBUTION_POLICY_VERSION,
-            "attribution_window_days": ATTRIBUTION_WINDOW_DAYS,
+            "attribution_window_days": self.attribution_window_days,
+            "attribution_window_source": self.attribution_window_source,
             "batch_id": self.batch_id,
             "preview_run_id": self.preview_run_id,
             "batch_exists": self.batch_exists,
@@ -830,6 +961,7 @@ def _attribute(
     anchor: SendAnchor,
     identity: RecipientIdentity,
     by_customer: dict[int, list[ObservedBooking]],
+    window_days: int | None,
 ) -> tuple[str, tuple[str, ...], tuple[ObservedBooking, ...]]:
     """The four answers section D asks to be told apart, and never a fifth."""
     if anchor.state == SEND_NOT_ATTEMPTED:
@@ -841,8 +973,11 @@ def _attribute(
     if identity.state != IDENTITY_PROVEN or identity.customer_id is None:
         return INSUFFICIENT_DATA, (identity.state,), ()
 
-    window = anchor.window()
-    assert window is not None
+    window = anchor.window(window_days)
+    if window is None:
+        # A proven send and a proven person, and still no window to judge them
+        # against. Answered as missing data, never as "no booking".
+        return INSUFFICIENT_DATA, (WINDOW_UNUSABLE,), ()
     start, end = window
     matched = tuple(
         sorted(
@@ -862,6 +997,29 @@ def _attribute(
     # Nothing was OBSERVED. That is weaker than "there was no booking", and the
     # code says so: the absence of a webhook is not proof of absence.
     return BOOKING_NOT_OBSERVED, (), ()
+
+
+def resolve_attribution_window(run: CampaignRun | None) -> int | None:
+    """The campaign's own stored window, when it is usable.
+
+    Read from the run the batch was frozen from. That column is written once,
+    when the run is created, and nothing in this project updates it afterwards,
+    so it is a durable per-campaign fact: a report of an old mailing keeps the
+    window that mailing was created with, whatever the current default is.
+
+    ``None`` for a value outside the bounds the campaign API itself enforces.
+    A row that got there another way is reported as unusable rather than
+    silently replaced by the default, because a convenient number would make
+    the report say something nobody decided.
+    """
+    if run is None:
+        return None
+    stored = getattr(run, "attribution_window_days", None)
+    if isinstance(stored, bool) or not isinstance(stored, int):
+        return None
+    if not (MIN_ATTRIBUTION_WINDOW_DAYS <= stored <= MAX_ATTRIBUTION_WINDOW_DAYS):
+        return None
+    return stored
 
 
 def _branch_rows(registry: EasyWeekLocationRegistry, scan: CaptureScan) -> tuple[dict[str, Any], ...]:
@@ -917,7 +1075,9 @@ async def build_report(
             # names nothing — reported as exactly that, and never as a mailing
             # that happens to be empty.
             preview_active = 0
+            preview_run = None
             if preview_run_id is not None:
+                preview_run = await session.get(CampaignRun, preview_run_id)
                 preview_active = int(
                     await session.scalar(
                         select(func.count())
@@ -930,15 +1090,24 @@ async def build_report(
                     )
                     or 0
                 )
+            window_days = resolve_attribution_window(preview_run)
             return BookingReport(
                 report_known=True,
                 preview_run_id=preview_run_id,
                 batch_exists=False,
+                # The preview's real size. The summary shows THIS as the
+                # recipient count while there is no batch, so a curated list of
+                # thirty-three people is not drawn as a mailing of nobody.
+                recipient_count=preview_active,
                 preview_active_count=preview_active,
                 registry_ready=registry.ready,
                 branches=_branch_rows(registry, CaptureScan()),
                 generated_at=moment,
-                reasons=registry_reasons + ((BATCH_UNKNOWN,) if batch_id is not None else ()),
+                reasons=registry_reasons
+                + ((BATCH_UNKNOWN,) if batch_id is not None else ())
+                + ((WINDOW_UNUSABLE,) if preview_run is not None and window_days is None else ()),
+                attribution_window_days=window_days,
+                attribution_window_source=WINDOW_SOURCE_CAMPAIGN_RUN if window_days is not None else None,
             )
 
         items = list(
@@ -950,6 +1119,11 @@ async def build_report(
                 )
             ).all()
         )
+        # The campaign this batch was frozen from owns the window. Read here,
+        # inside the same session as everything else, so a report is one
+        # consistent answer or a failure.
+        run = await session.get(CampaignRun, int(header.campaign_run_id))
+        window_days = resolve_attribution_window(run)
         anchors = [resolved.anchor for item in items if (resolved := resolve_send_anchor(item)).confirmed]
         identities = await resolve_identities(session, items=items)
         scan = await scan_capture(
@@ -964,7 +1138,9 @@ async def build_report(
     for item in items:
         anchor = resolve_send_anchor(item)
         identity = identities.get(int(item.slot), RecipientIdentity(IDENTITY_NUMERIC_MISSING))
-        state, reasons, matched = _attribute(anchor=anchor, identity=identity, by_customer=by_customer)
+        state, reasons, matched = _attribute(
+            anchor=anchor, identity=identity, by_customer=by_customer, window_days=window_days
+        )
         if not registry.ready and state in (BOOKING_NOT_OBSERVED, BOOKING_FOUND):
             # Without a proven branch registry there is no workspace to look
             # in, so neither a positive nor a negative answer is available.
@@ -986,6 +1162,7 @@ async def build_report(
                 reconciliation_required=bool(item.reconciliation_required),
                 manual_cleanup_required=bool(item.manual_cleanup_required),
                 send_attempt_count=int(item.send_attempt_count or 0),
+                attribution_window_days=window_days,
             )
         )
 
@@ -1001,6 +1178,8 @@ async def build_report(
         batch_status=str(header.status),
         schema_version=str(header.request_schema_version),
         campaign_period=period,
+        # A frozen batch is its own composition: the preview may have been
+        # edited since, and the mailing is what was frozen.
         recipient_count=len(items),
         preview_active_count=len(items),
         rows=tuple(rows),
@@ -1008,14 +1187,17 @@ async def build_report(
         registry_ready=registry.ready,
         branches=_branch_rows(registry, scan),
         generated_at=moment,
-        reasons=registry_reasons,
+        reasons=registry_reasons + ((WINDOW_UNUSABLE,) if window_days is None else ()),
+        attribution_window_days=window_days,
+        attribution_window_source=WINDOW_SOURCE_CAMPAIGN_RUN if window_days is not None else None,
     )
 
 
 __all__ = [
     "ATTRIBUTION_POLICY_VERSION",
-    "ATTRIBUTION_WINDOW",
-    "ATTRIBUTION_WINDOW_DAYS",
+    "DEFAULT_ATTRIBUTION_WINDOW_DAYS",
+    "MAX_ATTRIBUTION_WINDOW_DAYS",
+    "MIN_ATTRIBUTION_WINDOW_DAYS",
     "BATCH_UNKNOWN",
     "BOOKING_ACTIVE",
     "BOOKING_CANCELLED",
@@ -1036,6 +1218,8 @@ __all__ = [
     "MESSAGE_READ",
     "MESSAGE_REFUNDED",
     "REGISTRY_UNAVAILABLE",
+    "WINDOW_SOURCE_CAMPAIGN_RUN",
+    "WINDOW_UNUSABLE",
     "REJECT_CONFLICTING_CREATION",
     "REJECT_CREATED_AT",
     "REJECT_CUSTOMER_ID",
@@ -1043,6 +1227,7 @@ __all__ = [
     "REJECT_INVALID_PAYLOAD",
     "REJECT_LOCATION_MISMATCH",
     "REJECT_TRUNCATED",
+    "STATE_ORDER_UNPROVEN",
     "SEND_ATTEMPT_UNCONFIRMED",
     "SEND_CONFIRMED",
     "SEND_NOT_ATTEMPTED",
@@ -1055,6 +1240,7 @@ __all__ = [
     "RecipientRow",
     "SendAnchor",
     "build_report",
+    "resolve_attribution_window",
     "has_execution_error",
     "message_state",
     "resolve_identities",

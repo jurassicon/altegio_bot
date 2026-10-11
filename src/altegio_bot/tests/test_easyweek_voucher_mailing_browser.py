@@ -3113,7 +3113,8 @@ async def test_the_booking_report_is_compact_expandable_and_filterable(
         "Клиент",
         "Сообщение",
         "Запись после отправки",
-        "Ближайшая подходящая запись",
+        # A CREATION column, not a promise about the next visit.
+        "Созданные записи",
     ]
 
     rows = page.locator("#report-rows tr[data-slot]")
@@ -3122,6 +3123,10 @@ async def test_the_booking_report_is_compact_expandable_and_filterable(
     assert "Synthetic Production" in first
     assert "записался" in first
     assert "durlach" in first
+    # The date is labelled as a creation, in the row the operator reads.
+    assert "Создана:" in first
+    # And the window the page used is stated, from the campaign's own value.
+    assert "Окно учёта записей: 30 дн." in await page.inner_text("#report-window")
 
     # The technical facts exist, folded away until asked for.
     details = page.locator('[data-details-for="1"]')
@@ -3129,9 +3134,10 @@ async def test_the_booking_report_is_compact_expandable_and_filterable(
     await page.click('[data-details-toggle="1"]')
     await details.wait_for(state="visible")
     body = await details.inner_text()
-    for needle in ("Слот", "Строка preview", "Окно учёта", "Identity", "Подходящие записи"):
+    for needle in ("Слот", "Строка preview", "Окно учёта", "Identity", "Созданные записи в окне"):
         assert needle in body, body
     assert "момент регистрации подтверждения" in body
+    assert "не дата визита" in body
 
     # The filters really filter.
     await page.select_option("#filter-booking", "booking_not_observed")
@@ -3223,7 +3229,7 @@ async def test_the_booking_report_fits_a_phone_and_a_desktop(
         # The details stay reachable at both widths.
         await page.click('[data-details-toggle="1"]')
         await page.locator('[data-details-for="1"]').wait_for(state="visible")
-        assert "Подходящие записи" in await page.inner_text('[data-details-for="1"]')
+        assert "Созданные записи в окне" in await page.inner_text('[data-details-for="1"]')
         assert_no_page_errors(page)
     await page.set_viewport_size({"width": 1280, "height": 900})
 
@@ -3248,4 +3254,73 @@ async def test_a_preview_without_a_batch_is_not_drawn_as_a_sent_mailing(
     assert "отправки не было" in stage
     assert await page.locator("#report-rows tr[data-slot]").count() == 0
     assert "Записались после отправки" in await page.inner_text("#report-summary")
+    assert_no_page_errors(page)
+
+
+async def test_the_booking_report_never_shows_a_creation_as_the_next_visit(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """Review fix: the first created booking is cancelled, another is active.
+
+    The compact line must label its date as a creation and must not read as the
+    customer's next appointment — the report has no confirmed appointment time.
+    """
+    batch_id = await _report_batch(session_maker, count=1)
+    transports.use(reader=ProductionReader(count=1))
+    # A booking created EARLIER than the one `_report_batch` seeded, and
+    # cancelled afterwards, so the earliest creation is the cancelled one.
+    cancelled_at = _REPORT_SENT + timedelta(days=1)
+    payload = report_fixtures.booking_payload(
+        booking_uuid="7a1c4e9b-2d63-4f10-8a21-000000000002",
+        customer_id=_REPORT_NUMERIC,
+        created_at=report_fixtures.iso(cancelled_at),
+    )
+    await report_fixtures.capture(session_maker, payload=payload, received_at=cancelled_at)
+    await report_fixtures.capture(
+        session_maker,
+        payload=payload,
+        event_hint="booking-canceled",
+        received_at=cancelled_at + timedelta(hours=1),
+    )
+
+    await page.goto(f"/ops/voucher-mailings/report?batch_id={batch_id}")
+    await page.wait_for_selector("#report-rows tr[data-slot]")
+
+    row = await page.locator("#report-rows tr[data-slot]").nth(0).inner_text()
+    assert "записался" in row
+    # The earliest CREATION is the cancelled booking, and the line says both.
+    assert "Создана:" in row
+    assert "отменена" in row
+    assert "ещё записей: 1" in row
+
+    await page.click('[data-details-toggle="1"]')
+    details = page.locator('[data-details-for="1"]')
+    await details.wait_for(state="visible")
+    body = await details.inner_text()
+    assert "Созданные записи в окне" in body
+    assert "отменена" in body and "активна" in body
+    assert "не дата визита" in body
+    assert_no_page_errors(page)
+
+
+async def test_the_booking_report_shows_a_previews_real_size(
+    session_maker, production_configuration, workspace_branches, binding_key, executor_enabled, page, transports
+):
+    """Review fix: an unfrozen preview of five people shows five, not zero."""
+    run_id, reader = await _seed(session_maker, count=5)
+    transports.use(reader=reader)
+
+    await page.goto(f"/ops/voucher-mailings/report?preview_run_id={run_id}")
+    await page.wait_for_function(
+        "() => { const el = document.querySelector('#report-summary');"
+        " return el && el.innerText.includes('Получателей'); }"
+    )
+
+    summary = await page.inner_text("#report-summary")
+    assert "5" in summary
+    assert "активных в preview" in summary
+    assert "Записались после отправки" in summary
+    stage = await page.inner_text("#report-stage")
+    assert "ещё не зафиксирована" in stage
+    assert await page.locator("#report-rows tr[data-slot]").count() == 0
     assert_no_page_errors(page)

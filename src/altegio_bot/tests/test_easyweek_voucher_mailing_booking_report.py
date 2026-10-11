@@ -53,6 +53,7 @@ from altegio_bot.tests.easyweek_booking_report_fixtures import (
     mixed_delivered_batch,
     provider_message_id,
     set_card_uuid,
+    set_run_window,
     set_send_times,
     slot_customer_uuid,
     utc,
@@ -72,7 +73,8 @@ REPORT_URL = "/ops/voucher-mailings/api/booking-report"
 CLIENTS_URL = "/ops/voucher-mailings/api/booking-report/clients"
 PAGE_URL = "/ops/voucher-mailings/report"
 
-# The window the owner approved, named once here so a test reads like the rule.
+# The window the seeded campaigns carry. It is the campaign API's default, and
+# the tests below that care about other windows set them on the run itself.
 WINDOW = timedelta(days=30)
 
 # A send and a reading moment that are both in the PAST, so the HTTP routes —
@@ -145,9 +147,10 @@ async def test_a_preview_without_a_batch_is_not_shown_as_a_mailing(
     assert report.report_known is True
     assert report.batch_exists is False
     assert report.batch_id is None
-    assert report.recipient_count == 0
-    # The preview's own size is still reported, so the screen is not blank.
+    # The preview's own size, so the screen is not a mailing of nobody.
+    assert report.recipient_count == 3
     assert report.preview_active_count == 3
+    assert report.summary()["recipients"] == 3
     assert report.rows == ()
     assert report.any_send_confirmed is False
     assert report.summary()["booked_after_send"] == 0
@@ -232,7 +235,7 @@ async def test_a_late_acceptance_callback_does_not_move_the_window_start(
     row = _row(await _report(session_maker, batch_id=batch_id))
 
     assert row.send_anchor.anchor == SENT
-    window = row.send_anchor.window()
+    window = row.send_anchor.window(row.attribution_window_days)
     assert window is not None and window[0] == SENT and window[1] == SENT + WINDOW
     assert row.attribution_state == attribution.BOOKING_FOUND
 
@@ -558,7 +561,7 @@ async def test_a_dst_change_moves_the_local_clock_and_not_the_boundary(
     await _booking(session_maker, created_at=sent + WINDOW)
 
     row = _row(await _report(session_maker, batch_id=batch_id, now=utc(2026, 5, 1)))
-    window = row.send_anchor.window()
+    window = row.send_anchor.window(row.attribution_window_days)
 
     assert window is not None
     assert window[1] - window[0] == WINDOW
@@ -700,7 +703,7 @@ async def test_a_reassigned_booking_is_never_credited_to_the_new_client(
     # is visible rather than hidden.
     first = _row(report, 1)
     assert first.attribution_state == attribution.BOOKING_FOUND
-    assert first.bookings[0].customer_changed_later is True
+    assert first.bookings[0].customer_reassigned is True
     assert report.summary()["booked_after_send"] == 1
 
 
@@ -1211,8 +1214,14 @@ def test_the_tracked_contract_states_the_claim_the_window_and_the_limits():
     contract = CONTRACT_DOC.read_text(encoding="utf-8")
 
     assert attribution.ATTRIBUTION_POLICY_VERSION in contract
-    assert "Attribution window: **30 days**" in contract
-    assert "send_anchor < booking_created_at <= send_anchor + 30 days" in contract
+    assert "the campaign's own `attribution_window_days`" in contract
+    assert "send_anchor < booking_created_at <= send_anchor + window" in contract
+    assert "attribution_window_unusable" in contract
+    # The two findings this revision answered, written down so the wrong
+    # behaviour cannot come back as a documented contract.
+    assert "Webhook arrival order is not business order" in contract
+    assert "lifecycle_order_unproven" in contract
+    assert "Созданные записи" in contract
     # The four things the claim is NOT.
     for limit in ("advertising influence", "of a visit", "of a payment", "voucher being used"):
         assert limit in contract, limit
@@ -1239,6 +1248,8 @@ def test_the_runbook_tells_the_operator_what_the_report_does_not_prove():
         "does not move the start of the window",
         "A cancellation does not erase the fact",
         "not proof that there was no booking",
+        "The window is the campaign's own",
+        "the date the booking was CREATED",
     ):
         assert limit in runbook, limit
 
@@ -1255,3 +1266,387 @@ async def test_an_unknown_mailing_number_is_not_drawn_as_an_empty_one(ui_client)
     # yet" wording that belongs to a real preview.
     page = await ui_client.get(f"{PAGE_URL}?batch_id=999999")
     assert "Рассылка с таким номером не найдена" in page.text
+
+
+# ===========================================================================
+# Review fix 1: a late creation must not erase lifecycle facts
+# ===========================================================================
+# Webhook ARRIVAL order is not business order. EasyWeek may deliver the
+# cancellation of a booking before the creation it cancels, and the first
+# version of this module read that creation as "and now it is active", which
+# turned a cancelled booking into a live one on the operator's screen.
+
+
+async def _lifecycle(session_maker, *, hints, created_at, customer_id=NUMERIC, booking_uuid=None):
+    """One booking, with its deliveries captured in the given ORDER.
+
+    The order is the capture order, which is all a webhook ever proves.
+    """
+    booking_uuid = booking_uuid or str(uuid_module.uuid4())
+    payload = booking_payload(booking_uuid=booking_uuid, customer_id=customer_id, created_at=iso(created_at))
+    for index, hint in enumerate(hints):
+        await capture(
+            session_maker,
+            payload=payload,
+            event_hint=hint,
+            received_at=created_at + timedelta(minutes=index),
+        )
+    return booking_uuid
+
+
+async def test_a_cancellation_delivered_before_its_creation_still_cancels(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """canceled → created is cancelled, exactly as created → canceled is."""
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    await _lifecycle(session_maker, hints=["booking-canceled", "booking-created"], created_at=SENT + timedelta(days=2))
+
+    row = _row(await _report(session_maker, batch_id=batch_id))
+
+    # The creation is still the historical fact, so the recipient did book.
+    assert row.attribution_state == attribution.BOOKING_FOUND
+    assert len(row.bookings) == 1
+    assert row.bookings[0].state == attribution.BOOKING_CANCELLED
+    assert row.bookings[0].state_reason is None
+
+
+async def test_a_completion_delivered_before_its_creation_still_completes(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """succeeded → created is completed, never "active again"."""
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    await _lifecycle(session_maker, hints=["booking-succeeded", "booking-created"], created_at=SENT + timedelta(days=2))
+
+    row = _row(await _report(session_maker, batch_id=batch_id))
+
+    assert row.bookings[0].state == attribution.BOOKING_COMPLETED
+
+
+async def test_a_reassignment_delivered_before_its_creation_is_not_lost(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """The evidence survives whichever delivery arrived first.
+
+    The old code compared the lifecycle customer against the creation's at read
+    time, so a lifecycle delivery that came FIRST was compared against nothing
+    and the reassignment disappeared from the row.
+    """
+    reader = FakeReader(count=2)
+    _run_id, batch_id, _request = await delivered_batch(session_maker, reader, count=2)
+    for slot, numeric in ((1, NUMERIC), (2, OTHER_NUMERIC)):
+        await set_send_times(session_maker, batch_id=batch_id, slot=slot, attempted_at=SENT, accepted_at=SENT)
+        await bind_numeric(session_maker, batch_id=batch_id, slot=slot, customer_id=numeric)
+
+    created = SENT + timedelta(days=2)
+    booking_uuid = str(uuid_module.uuid4())
+    # The edit naming the OTHER customer lands first.
+    await capture(
+        session_maker,
+        payload=booking_payload(booking_uuid=booking_uuid, customer_id=OTHER_NUMERIC, created_at=iso(created)),
+        event_hint="booking-updated",
+        received_at=created,
+    )
+    await capture(
+        session_maker,
+        payload=booking_payload(booking_uuid=booking_uuid, customer_id=NUMERIC, created_at=iso(created)),
+        received_at=created + timedelta(hours=1),
+    )
+
+    report = await _report(session_maker, batch_id=batch_id)
+
+    first = _row(report, 1)
+    assert first.attribution_state == attribution.BOOKING_FOUND
+    assert first.bookings[0].customer_reassigned is True
+    # And the other customer is still credited with nothing.
+    assert _row(report, 2).attribution_state == attribution.BOOKING_NOT_OBSERVED
+    assert report.summary()["booked_after_send"] == 1
+
+
+async def test_an_identical_resend_after_another_lifecycle_fact_changes_nothing(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """A Resend is the same delivery, recognised by its own content hash.
+
+    Capture stores the sha256 of the canonicalised body, so the second copy of
+    a cancellation adds no second fact. What decides the state is the SET of
+    distinct facts, so replaying an old payload cannot move the answer.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    created = SENT + timedelta(days=2)
+    booking_uuid = str(uuid_module.uuid4())
+    payload = booking_payload(booking_uuid=booking_uuid, customer_id=NUMERIC, created_at=iso(created))
+
+    await capture(session_maker, payload=payload, received_at=created)
+    await capture(session_maker, payload=payload, event_hint="booking-canceled", received_at=created)
+    once = _row(await _report(session_maker, batch_id=batch_id))
+    assert once.bookings[0].state == attribution.BOOKING_CANCELLED
+
+    # The same cancellation again, and then the same creation again.
+    await capture(
+        session_maker, payload=payload, event_hint="booking-canceled", received_at=created + timedelta(days=1)
+    )
+    await capture(session_maker, payload=payload, received_at=created + timedelta(days=1))
+
+    twice = _row(await _report(session_maker, batch_id=batch_id))
+    assert twice.bookings[0].state == attribution.BOOKING_CANCELLED
+    assert len(twice.bookings) == 1
+    assert twice.attribution_state == attribution.BOOKING_FOUND
+
+
+async def test_two_terminal_facts_without_proven_order_are_unknown(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """A cancellation and a completion for one booking cannot be ordered.
+
+    The confirmed payload shape carries no per-change timestamp, and arrival
+    order proves nothing, so the state is reported as unknown WITH a reason —
+    never resolved by trusting whichever delivery was read last.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    await _lifecycle(
+        session_maker,
+        hints=["booking-created", "booking-canceled", "booking-succeeded"],
+        created_at=SENT + timedelta(days=2),
+    )
+
+    row = _row(await _report(session_maker, batch_id=batch_id))
+
+    assert row.bookings[0].state == attribution.BOOKING_STATE_UNKNOWN
+    assert row.bookings[0].state_reason == attribution.STATE_ORDER_UNPROVEN
+    # The creation is still an observed fact: only the CURRENT state is unknown.
+    assert row.attribution_state == attribution.BOOKING_FOUND
+
+
+async def test_the_ordinary_order_and_a_repeated_creation_still_read_normally(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """The common cases are unchanged by the fix above."""
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    created = SENT + timedelta(days=2)
+    # created, then an edit, then the creation delivered again.
+    uuid_one = await _lifecycle(
+        session_maker, hints=["booking-created", "booking-updated", "booking-created"], created_at=created
+    )
+    # And a second booking that is cancelled in the ordinary order.
+    await _lifecycle(
+        session_maker,
+        hints=["booking-created", "booking-canceled"],
+        created_at=created + timedelta(days=1),
+    )
+    del uuid_one
+
+    row = _row(await _report(session_maker, batch_id=batch_id))
+
+    assert [booking.state for booking in row.bookings] == [
+        attribution.BOOKING_ACTIVE,
+        attribution.BOOKING_CANCELLED,
+    ]
+    assert [booking.state_reason for booking in row.bookings] == [None, None]
+    assert row.attribution_state == attribution.BOOKING_FOUND
+
+
+# ===========================================================================
+# Review fix 2: the window belongs to the campaign, not to the application
+# ===========================================================================
+
+
+async def test_a_seven_day_campaign_does_not_count_a_booking_on_day_twenty(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """A shorter campaign window really is shorter."""
+    run_id, batch_id = await _one_sent_recipient(session_maker)
+    await set_run_window(session_maker, run_id=run_id, days=7)
+    await _booking(session_maker, created_at=SENT + timedelta(days=20))
+
+    report = await _report(session_maker, batch_id=batch_id)
+    row = _row(report)
+
+    assert report.attribution_window_days == 7
+    assert report.attribution_window_source == attribution.WINDOW_SOURCE_CAMPAIGN_RUN
+    assert row.attribution_window_days == 7
+    assert row.attribution_state == attribution.BOOKING_NOT_OBSERVED
+
+
+async def test_a_sixty_day_campaign_counts_a_booking_on_day_forty(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """And a longer one really is longer."""
+    run_id, batch_id = await _one_sent_recipient(session_maker)
+    await set_run_window(session_maker, run_id=run_id, days=60)
+    await _booking(session_maker, created_at=SENT + timedelta(days=40))
+
+    report = await _report(session_maker, batch_id=batch_id, now=SENT + timedelta(days=70))
+
+    assert report.attribution_window_days == 60
+    assert _row(report).attribution_state == attribution.BOOKING_FOUND
+
+
+async def test_the_campaign_window_decides_both_boundaries(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """`send < created <= send + window`, with the campaign's own window."""
+    run_id, batch_id = await _one_sent_recipient(session_maker)
+    await set_run_window(session_maker, run_id=run_id, days=14)
+    fortnight = timedelta(days=14)
+
+    async def attributed(created):
+        async with session_maker() as session:
+            async with session.begin():
+                await session.execute(EasyWeekEvent.__table__.delete())
+        await _booking(session_maker, created_at=created, received=max(created, SENT) + timedelta(hours=1))
+        return _row(await _report(session_maker, batch_id=batch_id)).attribution_state
+
+    assert await attributed(SENT) == attribution.BOOKING_NOT_OBSERVED
+    assert await attributed(SENT + timedelta(seconds=1)) == attribution.BOOKING_FOUND
+    assert await attributed(SENT + fortnight) == attribution.BOOKING_FOUND
+    assert await attributed(SENT + fortnight + timedelta(seconds=1)) == attribution.BOOKING_NOT_OBSERVED
+
+
+async def test_todays_campaigns_carry_the_thirty_day_default(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """Thirty days is the campaign API's default, and it is reported as such."""
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+
+    report = await _report(session_maker, batch_id=batch_id)
+
+    assert attribution.DEFAULT_ATTRIBUTION_WINDOW_DAYS == 30
+    assert report.attribution_window_days == 30
+    assert report.attribution_window_source == attribution.WINDOW_SOURCE_CAMPAIGN_RUN
+
+
+async def test_the_frozen_window_survives_a_later_change_of_the_default(
+    session_maker, production_configuration, workspace_branches, binding_key, monkeypatch
+):
+    """A frozen mailing keeps its own window, whatever moves afterwards.
+
+    The window is the run's own stored column, which nothing in this project
+    updates, so there is no module constant a later change could use to
+    redefine an old report. The default is moved here to prove it; that there
+    is no SETTING for it at all is asserted separately.
+    """
+    run_id, batch_id = await _one_sent_recipient(session_maker)
+    await set_run_window(session_maker, run_id=run_id, days=45)
+    await _booking(session_maker, created_at=SENT + timedelta(days=40))
+
+    before = await _report(session_maker, batch_id=batch_id, now=SENT + timedelta(days=50))
+    assert before.attribution_window_days == 45
+    assert _row(before).attribution_state == attribution.BOOKING_FOUND
+
+    monkeypatch.setattr(attribution, "DEFAULT_ATTRIBUTION_WINDOW_DAYS", 1, raising=False)
+
+    after = await _report(session_maker, batch_id=batch_id, now=SENT + timedelta(days=50))
+    assert after.attribution_window_days == 45
+    assert _row(after).attribution_state == attribution.BOOKING_FOUND
+    # And nothing about the frozen batch was rewritten to make that true.
+    snapshot = await ledger_module.load(session_maker, batch_id=batch_id)
+    assert snapshot.frozen_digest == (await ledger_module.load(session_maker, batch_id=batch_id)).frozen_digest
+
+
+async def test_an_unusable_stored_window_is_reported_and_not_defaulted(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """A value outside the campaign API's own bounds is an answer, not a 30."""
+    run_id, batch_id = await _one_sent_recipient(session_maker)
+    await set_run_window(session_maker, run_id=run_id, days=0)
+    await _booking(session_maker, created_at=SENT + timedelta(days=2))
+
+    report = await _report(session_maker, batch_id=batch_id)
+    row = _row(report)
+
+    assert report.attribution_window_days is None
+    assert report.attribution_window_source is None
+    assert attribution.WINDOW_UNUSABLE in report.reasons
+    assert row.attribution_state == attribution.INSUFFICIENT_DATA
+    assert attribution.WINDOW_UNUSABLE in row.reasons
+    assert row.bookings == ()
+    assert report.summary()["booked_after_send"] == 0
+
+
+async def test_no_window_is_still_not_a_window_without_an_anchor(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """An unusable window never overrides the send states that precede it."""
+    reader = FakeReader(count=1)
+    run_id, batch_id, _request = await frozen_batch(session_maker, reader, count=1)
+    await set_run_window(session_maker, run_id=run_id, days=400)
+
+    row = _row(await _report(session_maker, batch_id=batch_id))
+
+    # No send yet, so that — and not the window — is what the row says.
+    assert row.attribution_state == attribution.SEND_NOT_ATTEMPTED
+    assert row.send_anchor.window(row.attribution_window_days) is None
+
+
+# ===========================================================================
+# Review fix 3: the compact date is a CREATION date, and says so
+# ===========================================================================
+
+
+async def test_the_compact_column_names_creation_and_not_a_visit(
+    session_maker, production_configuration, workspace_branches, binding_key, ui_client
+):
+    """The first created booking is cancelled; another is active.
+
+    The compact line must not present either creation date as the customer's
+    next appointment, because the report has no proven appointment start.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    cancelled_at = SENT + timedelta(days=2)
+    cancelled_uuid = str(uuid_module.uuid4())
+    payload = booking_payload(booking_uuid=cancelled_uuid, customer_id=NUMERIC, created_at=iso(cancelled_at))
+    await capture(session_maker, payload=payload, received_at=cancelled_at)
+    await capture(
+        session_maker, payload=payload, event_hint="booking-canceled", received_at=cancelled_at + timedelta(hours=1)
+    )
+    await _booking(session_maker, created_at=SENT + timedelta(days=9))
+
+    report = await _report(session_maker, batch_id=batch_id)
+    row = _row(report)
+
+    # The order is by creation, and the earliest one is the cancelled booking.
+    assert [booking.state for booking in row.bookings] == [
+        attribution.BOOKING_CANCELLED,
+        attribution.BOOKING_ACTIVE,
+    ]
+    assert row.nearest is not None and row.nearest.state == attribution.BOOKING_CANCELLED
+
+    page = await ui_client.get(f"{PAGE_URL}?batch_id={batch_id}")
+    assert page.status_code == 200
+    # The header promises creations, and every date is labelled as one.
+    assert "Созданные записи" in page.text
+    assert "Создана: " in page.text
+    assert "Ближайшая подходящая запись" not in page.text
+    # And the page says in so many words that this is not a visit date.
+    assert "не дата визита" in page.text
+    assert "подтверждённого времени приёма отчёт не имеет" in page.text
+
+
+async def test_a_preview_without_a_batch_reports_its_real_size(
+    session_maker, production_configuration, workspace_branches, binding_key, ui_client
+):
+    """Thirty-three active recipients are thirty-three, not zero."""
+    run_id, _ = await seed_production_preview(session_maker, count=33)
+
+    report = await _report(session_maker, preview_run_id=run_id)
+
+    assert report.batch_exists is False
+    assert report.preview_active_count == 33
+    assert report.summary()["recipients"] == 33
+    body = (await ui_client.get(f"{REPORT_URL}?preview_run_id={run_id}")).json()
+    assert body["summary"]["recipients"] == 33
+    assert body["preview_active_count"] == 33
+
+
+async def test_an_empty_preview_reports_zero_without_pretending_to_be_a_mailing(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """An empty preview is zero recipients and still not a sent mailing."""
+    run_id, _ = await seed_production_preview(session_maker, count=2, recipient_status="skipped")
+
+    report = await _report(session_maker, preview_run_id=run_id)
+
+    assert report.batch_exists is False
+    assert report.preview_active_count == 0
+    assert report.summary()["recipients"] == 0
+    assert report.any_send_confirmed is False

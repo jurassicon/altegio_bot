@@ -12,7 +12,8 @@ reconciliation or refund rule. See
 `docs/easyweek/VOUCHER_PRODUCTION_MAILING_RUNBOOK.md` for the mailing itself.
 
 * Policy identifier: `easyweek-booking-report-v1`
-* Attribution window: **30 days**
+* Attribution window: **the campaign's own `attribution_window_days`** (30 is
+  the campaign API's default, not a universal contract)
 * Code: `src/altegio_bot/campaigns/easyweek_voucher_production/booking_attribution.py`
 * Interface: `src/altegio_bot/ops/voucher_mailing_report.py`,
   page `/ops/voucher-mailings/report?batch_id=…` (or `?preview_run_id=…`)
@@ -46,7 +47,8 @@ Three further statements the report makes and never blurs:
 | --- | --- |
 | Anchor | the slot's durable `send_attempted_at` |
 | Used only when | the **same** send has positive acceptance evidence: `provider_accepted_at`, or a `delivered`/`read` webhook (the schema makes both imply acceptance) |
-| Window | `send_anchor < booking_created_at <= send_anchor + 30 days` |
+| Window | `send_anchor < booking_created_at <= send_anchor + window` |
+| Window length | `CampaignRun.attribution_window_days` of the campaign the batch was frozen from |
 
 * `provider_accepted_at` is **never** the anchor. A callback may record
   acceptance long after the attempt, and anchoring on it would move the start
@@ -55,15 +57,25 @@ Three further statements the report makes and never blurs:
 * One attempt with no proven acceptance yields **no positive attribution**:
   the row reads «недостаточно данных», reason `send_attempt_unconfirmed`.
 * With no proven anchor the report states that, and never invents a send time.
-* The window is a duration from an instant — thirty times twenty-four hours — so
-  a DST change moves no boundary. Storage and comparison are timezone-aware
-  UTC; only the rendering is local.
+* The window is a duration from an instant, not a calendar step, so a DST
+  change moves no boundary. Storage and comparison are timezone-aware UTC;
+  only the rendering is local.
 * `booking_created_at` comes from the captured `booking-created` payload. It is
   never substituted by the webhook receipt time, the visit date,
   `last_change_at`, the preview time or the batch creation time.
-* The window and the policy are **code constants**. They are deliberately not
-  settings: a late configuration change must not silently redefine what an
-  older report meant. The report prints the policy version that produced it.
+* The **policy** is a code constant and deliberately not a setting: a late
+  configuration change must not silently redefine what an older report meant.
+  The report prints the policy version that produced it.
+* The **window** is not a constant: it belongs to the campaign.
+  `CampaignRun.attribution_window_days` is written once when the run is created
+  and nothing in this project updates it afterwards, so a frozen batch keeps
+  the window its own campaign was created with however the default moves. The
+  report prints the number, and names `campaign_run` as its source. No
+  reporting metadata is added and no migration is needed for this: the stored
+  column is already durable and already immutable in practice.
+* A stored value outside the bounds the campaign API itself enforces (1–365) is
+  reported as `attribution_window_unusable` and the rows read «недостаточно
+  данных». It is **never** replaced by 30 or by any other convenient number.
 * Reading a report never rewrites a signed batch fact or an HMAC binding.
 
 ## 3. Identity
@@ -115,16 +127,32 @@ Rules:
 * A late event about a booking created **before** the send is not counted.
 * Recipients are counted uniquely. Several bookings by one recipient are one
   recipient in the counter and several entries in the details.
+* **Webhook arrival order is not business order.** EasyWeek may deliver a
+  cancellation before the creation it cancels. The creation evidence (who,
+  where, when) and the state evidence are therefore computed separately, and a
+  late creation never resets a booking to `active`.
 * Current booking state is reported separately from the historical fact:
-  `active`, `cancelled`, `completed`, `unknown`. A cancellation does not erase
-  "created a booking"; one cancelled and one active booking are both visible.
-  Only a `booking-succeeded` delivery makes a booking `completed` — a single
-  `booking-created` never means the customer visited the salon.
-* An edit or a reschedule does not revive a cancellation and does not undo a
-  completed visit: neither transition is proven for this provider.
-* A booking reassigned to another customer keeps the creation attributed to the
-  customer its creation event named, flags the reassignment in the details, and
-  credits the new customer with nothing.
+  `active`, `cancelled`, `completed`, `unknown`. It is derived from the SET of
+  distinct lifecycle facts observed, not from whichever delivery was read last.
+  One terminal fact decides the state whichever order it arrived in, because a
+  booking is always created before it can be cancelled or completed.
+* A cancellation does not erase "created a booking"; one cancelled and one
+  active booking are both visible. Only a `booking-succeeded` delivery makes a
+  booking `completed` — a single `booking-created` never means the customer
+  visited the salon.
+* An edit or a reschedule contributes no state fact at all: it does not revive
+  a cancellation and does not undo a completed visit, because neither
+  transition is proven for this provider.
+* A cancellation **and** a completion for one booking cannot be ordered from
+  anything the captured payload carries, so the state is `unknown` with
+  `state_reason: lifecycle_order_unproven` rather than a guess.
+* An identical Resend is recognised by the capture's own content identity
+  (`payload_hash`) and adds no second fact, so replaying an old payload cannot
+  move the answer. Nothing is replayed by this report.
+* A booking some delivery assigns to another customer keeps the creation
+  attributed to the customer its own creation delivery named, flags
+  `customer_reassigned` in the details, and credits the other customer with
+  nothing.
 
 ## 6. Data completeness
 
@@ -181,7 +209,11 @@ Four answers are distinguished and never collapsed:
   insufficient data).
 * The main table has five columns: client (name, with the phone as a second
   line only when two rows share a display name), message state, booking after
-  the send, the nearest matching booking, and the details toggle. There are no
+  the send, the created bookings, and the details toggle.
+* Dates on the page are **creation** dates and are labelled «Создана: …». The
+  column is «Созданные записи». The report has no proven appointment start, so
+  it never presents a creation as the customer's next visit, and the details
+  say so in words. There are no
   wide columns for UUIDs, attempts, reason codes, basis, reconciliation or
   technical timestamps — all of those are in the per-row details. The Altegio
   campaign/follow-up table is not brought here.
@@ -193,7 +225,9 @@ Four answers are distinguished and never collapsed:
   `Europe/Berlin` for the German branches), named once beside the report. UTC is
   not duplicated.
 * If no batch has been frozen, or nothing has been sent, the page says so
-  instead of drawing a preview as a completed mailing.
+  instead of drawing a preview as a completed mailing. For a preview the
+  recipient count is the preview's own number of active recipients; for a
+  frozen batch it is the batch's own composition.
 * Checked at phone and desktop width. The one responsive rule the page depends
   on is defined locally, because the Bootstrap bundle comes from a CDN that may
   be blocked.

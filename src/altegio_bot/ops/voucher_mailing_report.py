@@ -21,9 +21,14 @@ What is on it, and what is deliberately not
 -------------------------------------------
 Six numbers, one compact row per recipient, and everything technical folded
 into a per-row details panel: slot, preview row, basis, item status, reason
-code, attempt count, the send anchor and its evidence, the attribution window,
-how the identity was bridged, reconciliation flags, and every matching booking
-with its branch, date and current state.
+code, attempt count, the send anchor and its evidence, the attribution window
+and where it came from, how the identity was bridged, reconciliation flags, and
+every matching booking with its branch, creation date and current state.
+
+Dates on this page are CREATION dates, and are labelled as such. The report has
+no proven appointment start, so it never presents a creation as "the next
+visit" — the compact column is "Созданные записи" and each date reads
+"Создана: …".
 
 There are no wide columns for UUIDs, attempts, reason codes, basis,
 reconciliation or technical timestamps, and the Altegio campaign/follow-up
@@ -221,8 +226,8 @@ async def page_report(request: Request, batch_id: int | None = None, preview_run
 </style>
 <h1 class="h4 mb-1">{_esc(title)}</h1>
 <p class="text-muted small mb-2">
-  Время — {_esc(tz.key)}. Окно учёта записей: {attribution.ATTRIBUTION_WINDOW_DAYS} дней от подтверждённой
-  отправки (политика <code>{_esc(attribution.ATTRIBUTION_POLICY_VERSION)}</code>).
+  Время — {_esc(tz.key)}. Политика <code>{_esc(attribution.ATTRIBUTION_POLICY_VERSION)}</code>.
+  <span id="report-window">Окно учёта записей берётся из самой кампании.</span>
   «Записался после рассылки» — наблюдаемый факт новой записи, а не доказательство влияния рекламы,
   визита, оплаты или использования ваучера.
 </p>
@@ -276,7 +281,7 @@ async def page_report(request: Request, batch_id: int | None = None, preview_run
         <th>Клиент</th>
         <th>Сообщение</th>
         <th>Запись после отправки</th>
-        <th class="report-wide">Ближайшая подходящая запись</th>
+        <th class="report-wide">Созданные записи</th>
         <th></th>
       </tr>
     </thead>
@@ -351,6 +356,8 @@ const REASON_LABELS = {
   "identity_numeric_missing": "нет доказанного numeric ID получателя",
   "identity_conflict": "конфликт identity получателя",
   "easyweek_location_registry_unavailable": "конфигурация филиалов EasyWeek недоступна",
+  "attribution_window_unusable": "у кампании нет пригодного окна учёта",
+  "lifecycle_order_unproven": "порядок событий не доказан",
   "voucher_production_batch_unknown": "рассылка не найдена",
   "truncated_payload": "обрезанный payload",
   "invalid_payload": "непригодный payload",
@@ -431,6 +438,20 @@ function card(title, value, note) {
     "</div></div>";
 }
 
+/* The window belongs to the campaign, so the page states the number it was
+   actually judged against — including when there is none. */
+function renderWindow() {
+  const area = el("report-window");
+  if (!area || !REPORT) return;
+  if (REPORT.attribution_window_days) {
+    area.textContent = "Окно учёта записей: " + REPORT.attribution_window_days +
+      " дн. от подтверждённой отправки (из параметров кампании).";
+  } else {
+    area.textContent = "Окно учёта записей не определено: у кампании нет пригодного значения, " +
+      "записи не учитываются.";
+  }
+}
+
 function renderStage() {
   const stage = el("report-stage");
   if (!stage || !REPORT) return;
@@ -461,7 +482,8 @@ function renderSummary() {
   if (!area || !REPORT) return;
   const s = REPORT.summary || {};
   area.innerHTML = '<div class="row g-2">' +
-    card("Получателей", s.recipients, REPORT.batch_exists ? "зафиксировано" : "в preview") +
+    card("Получателей", s.recipients,
+         REPORT.batch_exists ? "зафиксировано" : "активных в preview, список не зафиксирован") +
     card("Принято Meta", s.provider_accepted, null) +
     card("Доставлено", s.delivered_confirmed, null) +
     card("Прочитано", s.read_confirmed, null) +
@@ -505,12 +527,17 @@ function renderCoverage() {
     "</div>";
 }
 
+/* The earliest CREATED booking of the window, labelled as a creation.
+   Deliberately not "the nearest appointment": the report has no proven
+   appointment start, so promising one would be a date the data does not
+   support. The branch, the current state and how many other bookings there
+   are stay on the line. */
 function bookingSummary(row) {
   if (!row.bookings || !row.bookings.length) return "—";
   const first = row.bookings[0];
-  let text = first.branch_name + ", " + (first.booking_created_at_local || "") +
-             " (" + label(BOOKING_STATE_LABELS, first.state) + ")";
-  if (row.bookings.length > 1) text += " и ещё " + (row.bookings.length - 1);
+  let text = "Создана: " + (first.booking_created_at_local || "") + " · " + first.branch_name +
+             " · " + label(BOOKING_STATE_LABELS, first.state);
+  if (row.bookings.length > 1) text += " · ещё записей: " + (row.bookings.length - 1);
   return text;
 }
 
@@ -539,21 +566,25 @@ function detailLines(row) {
   });
   html += "</dl>";
   if ((row.bookings || []).length) {
-    html += '<div class="small mt-1"><b>Подходящие записи</b><ul class="mb-0">' +
+    html += '<div class="small mt-1"><b>Созданные записи в окне</b><ul class="mb-0">' +
       row.bookings.map(function (booking) {
-        return "<li>" + esc(booking.branch_name) + ", " + esc(booking.booking_created_at_local) +
+        return "<li>" + esc("создана ") + esc(booking.booking_created_at_local) +
+               ", " + esc(booking.branch_name) +
                " — " + esc(label(BOOKING_STATE_LABELS, booking.state)) +
-               (booking.customer_changed_later
-                 ? " " + esc("(позже запись переназначена другому клиенту)") : "") + "</li>";
+               (booking.state_reason ? " " + esc("(" + label(REASON_LABELS, booking.state_reason) + ")") : "") +
+               (booking.customer_reassigned
+                 ? " " + esc("(другая доставка этой записи называет другого клиента)") : "") + "</li>";
       }).join("") + "</ul></div>";
   }
   html += '<p class="small text-muted mb-0 mt-1">' +
-    esc("Время доставки и прочтения — момент регистрации подтверждения, а не точное время действия клиента. " +
+    esc("Показана дата СОЗДАНИЯ записи, а не дата визита: подтверждённого времени приёма отчёт не имеет. " +
+        "Время доставки и прочтения — момент регистрации подтверждения, а не точное время действия клиента. " +
         "Один факт «создал запись» не означает, что клиент посетил салон.") + "</p>";
   return html;
 }
 
 function render() {
+  renderWindow();
   renderStage();
   renderSummary();
   renderCoverage();
