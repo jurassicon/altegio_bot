@@ -168,6 +168,13 @@ async def session_maker(
 # ---------------------------------------------------------------------------
 # Re-exported here so the delivery suites can request them by name without each
 # module importing them and shadowing the import with its own parameter.
+#
+# `workspace_branches` belongs to the booking report: it widens the branch
+# registry to every branch of the workspace, which the report's scope needs and
+# the mailing's own single-branch limits are unaffected by.
+from altegio_bot.tests.easyweek_booking_report_fixtures import (  # noqa: E402,F401
+    workspace_branches,
+)
 from altegio_bot.tests.easyweek_manual_voucher_fixtures import (  # noqa: E402,F401
     manual_configuration,
 )
