@@ -975,8 +975,11 @@ async def test_reading_the_report_fills_no_customer_uuid(
 # ===========================================================================
 
 
-async def test_the_report_api_refuses_an_unauthenticated_request(anon_client):
+async def test_the_report_api_refuses_an_unauthenticated_request(anon_client, ops_credentials):
     """Ops auth guards the report exactly as it guards the rest of the section."""
+    # No session is not the same as no auth configuration: the read-only Ops
+    # dependency allows the latter in development. Set credentials explicitly
+    # so this check never depends on a developer's .env or CI's empty settings.
     answer = await anon_client.get(f"{REPORT_URL}?batch_id=1", headers={"Accept": "application/json"})
     assert answer.status_code == 401
     names = await anon_client.get(f"{CLIENTS_URL}?batch_id=1", headers={"Accept": "application/json"})
