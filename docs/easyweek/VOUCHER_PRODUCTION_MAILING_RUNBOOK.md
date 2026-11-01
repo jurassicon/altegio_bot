@@ -1579,3 +1579,44 @@ the singleton test record exist. An unconsumed approval and a test stopped befor
 issuance are still evidence. Close the fences, retain the records and use a
 reviewed forward fix. Do not convert zero to a paid price, delete rows or rotate
 keys to force rollback.
+
+## 16. Unsubscribes and proven delivery failures (PR-22.1)
+
+The contract for these lives in `VOUCHER_FOLLOWUP_CONSENT_EVIDENCE.md`. Three
+things changed that an operator of this mailing should know:
+
+**`стоп` is now an unsubscribe**, equal to `stop` in every respect, and every
+message of a webhook delivery counts rather than only the first. An unsubscribe
+is now durable without a client card, survives a card being created or replaced
+and a number change, and is checked at the one shared veto point this mailing
+already passes through — so a refused recipient is refused in the composition
+read, the freeze and the per-item claim alike, with its own reason code.
+
+**A `failed` callback is now recorded** as a fact about the original send, bound
+to that send's frozen sender and recipient route. It is evidence, not permission:
+it re-opens nothing, the one-attempt limit is untouched, and no retry exists.
+`send_rejected` on its own is still not proof — this mailing writes that status
+for its own parameter refusal too.
+
+**Before any follow-up is considered**, run the historical reconciliation dry
+and read its report, then apply it as a separate explicit step:
+
+```bash
+uv run python -m altegio_bot.scripts.reconcile_whatsapp_consent
+```
+
+```bash
+uv run python -m altegio_bot.scripts.reconcile_whatsapp_consent --apply
+```
+
+It writes nothing without `--apply`, makes no external request, replays nothing,
+and reports what it could not establish. Applying it can make people newly
+unsendable whose later resubscribe cannot be proven; the dry run states that
+count first.
+
+Note: with `META_APP_SECRET` unconfigured, no resubscribe can lift a refusal in
+the new ledger, because no signature is checked and an unverified START grants
+nothing. The existing `START` behaviour on client cards is unchanged.
+
+No follow-up audience, text, confirmation, ledger or send exists at this stage,
+and none is reachable by a flag.

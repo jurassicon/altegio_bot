@@ -50,6 +50,7 @@ from altegio_bot.easyweek_policy import (
     normalize_provider,
 )
 from altegio_bot.models.models import (
+    INBOUND_AUTHENTICITY_SIGNED,
     PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
@@ -64,6 +65,8 @@ from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
 from altegio_bot.services.meta_error_classifier import (
+    DELIVERY_PERMANENT_ERROR_CODES,
+    DELIVERY_TRANSIENT_ERROR_CODES,
     is_deterministic_meta_rejection,
     is_transient_provider_error,
     transient_error_reason,
@@ -82,6 +85,16 @@ from altegio_bot.webhooks.common import (
     resolve_chatwoot_general_inbox,
     resolve_chatwoot_tenant_inbox,
     safe_log_value,
+)
+from altegio_bot.whatsapp_consent import apply_inbound_consent
+from altegio_bot.whatsapp_inbound_commands import START_KEYWORDS as _START_KEYWORDS
+from altegio_bot.whatsapp_inbound_commands import STOP_KEYWORDS as _STOP_KEYWORDS
+from altegio_bot.whatsapp_inbound_commands import (
+    consent_command,
+    extract_message_text,
+    first_command_token,
+    normalize_command_text,
+    parse_event_timestamp,
 )
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
@@ -109,27 +122,11 @@ _DELIVERY_RETRY_DELAYS_SECONDS = (
 _DELIVERY_STATUS_ORDER = {"sent": 0, "delivered": 1, "read": 2}
 _SUCCESSFUL_DELIVERY_STATUSES = ("delivered", "read")
 
-_PERMANENT_DELIVERY_ERROR_CODES = {
-    131026,
-    131051,
-    131008,
-    131009,
-    100,
-    33,
-    132000,
-    132001,
-    132005,
-    132007,
-    132012,
-    132015,
-    132016,
-}
-_TRANSIENT_DELIVERY_ERROR_CODES = {
-    0,
-    131000,
-    131016,
-    131056,
-}
+# Defined in `services.meta_error_classifier` alongside the numeric-only
+# classifier the §46.3 evidence ledger uses, so the two cannot drift apart
+# about what a code means. Behaviour here is unchanged.
+_PERMANENT_DELIVERY_ERROR_CODES = DELIVERY_PERMANENT_ERROR_CODES
+_TRANSIENT_DELIVERY_ERROR_CODES = DELIVERY_TRANSIENT_ERROR_CODES
 _PERMANENT_DELIVERY_FAILURE_KEYWORDS = (
     "not a whatsapp user",
     "not registered on whatsapp",
@@ -165,24 +162,13 @@ _TRANSIENT_DELIVERY_FAILURE_KEYWORDS = (
     "overloaded",
 )
 
-STOP_KEYWORDS = {
-    "stop",
-    "unsubscribe",
-    "unsub",
-    "abmelden",
-    "отписка",
-    "отпиши",
-    "odjava",
-}
-
-START_KEYWORDS = {
-    "start",
-    "subscribe",
-    "anmelden",
-    "подписка",
-    "подпиши",
-    "prijava",
-}
+# Re-exported for existing importers. The sets, the tokenisation and the
+# Cyrillic «стоп» of §46.4.1 live in `whatsapp_inbound_commands`, because the
+# webhook ingress now has to reach the same verdict about the same message —
+# and two parsers that drift apart would drift in the direction of messaging
+# somebody who asked to be left alone.
+STOP_KEYWORDS = _STOP_KEYWORDS
+START_KEYWORDS = _START_KEYWORDS
 
 
 def _promo_keywords() -> frozenset[str]:
@@ -236,55 +222,29 @@ def _normalize_reply_context_id(value: Any) -> str | None:
     return value or None
 
 
-def _norm_text(raw: str | None) -> str:
-    if not raw:
-        return ""
-
-    text = raw.strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip(" \t\n\r.,!?:;\"'()[]{}")
-    return text
-
-
-def _extract_message_text(msg: dict[str, Any]) -> str:
-    # Every nested field is sender-controlled: `msg.get("text") or {}` does not
-    # protect against `"text": []`/`"text": "bad"` (truthy non-dict → .get()
-    # raises). mapping_or_empty degrades any non-dict to "" instead of a crash.
-    msg_type = msg.get("type")
-
-    if msg_type == "text":
-        text = mapping_or_empty(msg.get("text"))
-        return str(text.get("body") or "")
-
-    if msg_type == "button":
-        btn = mapping_or_empty(msg.get("button"))
-        return str(btn.get("text") or btn.get("payload") or "")
-
-    if msg_type == "interactive":
-        inter = mapping_or_empty(msg.get("interactive"))
-        btn_reply = mapping_or_empty(inter.get("button_reply"))
-        list_reply = mapping_or_empty(inter.get("list_reply"))
-        return str(
-            btn_reply.get("title") or btn_reply.get("id") or list_reply.get("title") or list_reply.get("id") or ""
-        )
-
-    return ""
+# Both aliases of the shared parser, kept under their historical private names
+# so existing importers and tests are untouched.
+_norm_text = normalize_command_text
+_extract_message_text = extract_message_text
 
 
 def _parse_command(text: str) -> str | None:
-    norm = _norm_text(text)
-    if not norm:
-        return None
+    """``"stop"``, ``"start"``, ``"promo"`` or ``None`` for one message.
 
-    first = norm.split(" ", 1)[0]
+    Consent is answered by the shared parser; the promo funnel keeps its own
+    settings-driven keywords here, because a marketing trigger has no business
+    being decided by the module that decides whether marketing is allowed.
 
-    if first in STOP_KEYWORDS:
-        return "stop"
+    Both read the SAME first token, so the two verdicts cannot disagree about
+    where the command ends — and a consent command always wins, which is the
+    order this project already had.
+    """
+    command = consent_command(text)
+    if command is not None:
+        return command
 
-    if first in START_KEYWORDS:
-        return "start"
-
-    if first in _promo_keywords():
+    token = first_command_token(text)
+    if token and token in _promo_keywords():
         return "promo"
 
     return None
@@ -1061,6 +1021,59 @@ async def _cancel_marketing_jobs(
     return int(getattr(res2, "rowcount", 0) or 0)
 
 
+async def _apply_inbound_command_flags(
+    session: AsyncSession,
+    actions: list[dict[str, Any]],
+) -> dict[str, tuple[int, int]]:
+    """Legacy card state for EVERY command in the payload, with STOP winning.
+
+    §46.4.1: a webhook delivery may carry several messages from several people,
+    and a refusal in the second one counts exactly as much as one in the first.
+    This worker historically acted on ``actions[0]`` alone, so a STOP that
+    happened to arrive behind another message was recorded nowhere.
+
+    The durable ledger has already seen all of them — ``process_one_event``
+    applies it before this transaction opens. What is settled here is the
+    LEGACY card state (``Client.wa_opted_out`` and the queued marketing jobs),
+    which the rest of this project still reads and which therefore has to agree
+    with the ledger about the same messages.
+
+    STOP wins inside one delivery, per address. Two commands from one person in
+    one payload have no provable order between them — Meta's timestamps are
+    whole seconds and the array order is not a guarantee — so the refusal is
+    taken, which is the same asymmetry the ledger applies and the same direction
+    of error: an unnecessary opt-out costs one unsent marketing message.
+
+    Only the FIRST action keeps the historical single acknowledgement below. A
+    delivery is answered once; answering per command would turn one webhook into
+    several outbound messages.
+    """
+    effective: dict[str, str] = {}
+    for action in actions:
+        cmd = action.get("cmd")
+        if cmd not in ("stop", "start"):
+            continue
+        phone = action.get("phone_e164")
+        if not isinstance(phone, str) or not phone:
+            continue
+        if effective.get(phone) == "stop":
+            continue
+        effective[phone] = cmd
+
+    results: dict[str, tuple[int, int]] = {}
+    for phone, cmd in effective.items():
+        opted_out = cmd == "stop"
+        affected = await _set_opt_out(
+            session,
+            phone_e164=phone,
+            opted_out=opted_out,
+            reason=f"wa:{cmd}",
+        )
+        canceled = await _cancel_marketing_jobs(session, phone_e164=phone) if opted_out else 0
+        results[phone] = (affected, canceled)
+    return results
+
+
 def _ack_text(cmd: str) -> str:
     if cmd == "stop":
         return "Sie haben sich von Marketing-Nachrichten abgemeldet. Um wieder zu abonnieren, senden Sie START."
@@ -1218,6 +1231,12 @@ def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "provider_message_id": wamid.strip(),
                         "status": status,
                         "timestamp": st.get("timestamp"),
+                        # The PROVEN moment the status describes, kept apart
+                        # from the raw value and from when we saw it. ``None``
+                        # whenever it cannot be parsed into a plausible one, so
+                        # durable evidence records an unknown event time rather
+                        # than a number the sender chose.
+                        "event_at": parse_event_timestamp(st.get("timestamp"), observed_at=utcnow()),
                         "recipient_id": st.get("recipient_id"),
                         "phone_number_id": phone_number_id,
                         "error_code": first_error.get("code"),
@@ -1777,6 +1796,91 @@ async def _apply_voucher_production_status(session: AsyncSession, provider_messa
     return result.reason != voucher_production_ledger.RECORD_MISSING_ROW
 
 
+def _event_authenticity_verified(event: WhatsAppEvent | None) -> bool:
+    """Was this delivery's signature actually checked by the ingress?
+
+    Read from what the ingress wrote down and from nothing else. Deliberately
+    NOT re-derived from ``settings.meta_app_secret``: the secret may have been
+    configured after the event arrived, the signature header is stripped from
+    the stored copy on purpose, and a check that was never performed must not
+    become "verified" because one is configured now (§46.4.7).
+
+    An event this process has no row for, and every row written before this
+    phase existed, is unverified. The absence of a recorded check is not a check.
+    """
+    if event is None:
+        return False
+    return getattr(event, "inbound_authenticity", None) == INBOUND_AUTHENTICITY_SIGNED
+
+
+async def _apply_voucher_production_failure(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+) -> bool:
+    """Record a proven ``failed`` callback for the §42 production mailing.
+
+    The fifth hook, and the first one for ``failed``. Until now a failure about
+    a production slot reached the ordinary ``OutboxMessage`` lookup, found
+    nothing — those slots have no outbox row by design — and was logged and
+    dropped, so §46.3's "proven delivery failure" group had no evidence behind
+    it at all.
+
+    Returning ``True`` means this callback belonged to the phase and has been
+    accounted for, whatever the fact turned out to be: confirmed, conflicting
+    with a success, or naming a foreign route. It must then NOT fall through to
+    the generic handler, whose matching is looser and which knows nothing about
+    the frozen route — falling back to it would be a way around the stricter
+    check, which §46.3 rules out by name.
+
+    Like its delivered/read siblings it runs inside the caller's transaction and
+    is deliberately not behind the §42 fence: a failure is a fact about a
+    message already sent, not a new effect to fence off.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    outcome = await delivery_evidence.record_callback_failure(
+        session,
+        status=status,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.claimed:
+        logger.info(
+            "status_webhook: voucher production failure recorded match=%s class=%s stored=%s",
+            outcome.match_state,
+            outcome.failure_class,
+            outcome.stored,
+        )
+    return outcome.claimed
+
+
+async def _keep_unmatched_voucher_failure(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+) -> None:
+    """Keep a ``failed`` callback that nothing in this database owns yet.
+
+    Reached only after BOTH the production lookup and the ``OutboxMessage``
+    lookup came back empty, which is an ordinary momentary state: Meta can
+    deliver a status while the transaction that records the message id is still
+    in flight. §46.3 requires such an early callback to remain matchable rather
+    than be dropped, and the binding happens later on the exact identifier —
+    never by phone similarity or timestamp proximity.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    outcome = await delivery_evidence.record_unmatched_callback_failure(
+        session,
+        status=status,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.stored:
+        logger.info("status_webhook: unmatched failed callback kept for later binding")
+
+
 # The salt for the status-webhook diagnostic handle below. Domain-separated so
 # the same identifier logged by some future call site cannot be correlated with
 # these lines by digest alone.
@@ -1848,6 +1952,15 @@ async def _handle_delivery_statuses(
         if kind in {"delivered", "read"} and await _apply_voucher_production_status(session, provider_message_id, kind):
             continue
 
+        # And the §42 mailing's PROVEN failures (§46.3), asked fifth. The four
+        # hooks above only run for delivered/read, so a `failed` callback about
+        # a production slot used to reach the outbox lookup below, match nothing
+        # and be dropped. It is claimed here instead, and once claimed it does
+        # not fall through: the generic handler matches more loosely and has no
+        # notion of this phase's frozen sender/recipient route.
+        if kind == "failed" and await _apply_voucher_production_failure(session, event, status):
+            continue
+
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
         if outbox is None:
             # Reached by every callback kind that nothing above claimed, which is
@@ -1870,6 +1983,12 @@ async def _handle_delivery_statuses(
                 _message_id_fingerprint(provider_message_id),
                 kind,
             )
+            if kind == "failed":
+                # Nobody owns this identifier yet, which for a failure is the
+                # one case that must not be a drop: §46.3 requires an early
+                # callback to stay matchable until the commit that records its
+                # message id can claim it.
+                await _keep_unmatched_voucher_failure(session, event, status)
             continue
 
         chain_resolution = None
@@ -4723,6 +4842,19 @@ async def handle_event(
     if not actions:
         return
 
+    # Every command in the delivery, before any early return below can skip
+    # past it: a payload of [ordinary text, STOP] used to reach the Chatwoot
+    # forward and return, leaving the refusal in the second message unrecorded.
+    #
+    # Chatwoot-origin events are excluded for the same reason they are excluded
+    # from the single-command path further down: a mirror of a message Meta
+    # already delivered is the SAME message, and applying it twice would double
+    # the effect of a refusal and give a mirrored START a second attempt at
+    # undoing one.
+    command_flags: dict[str, tuple[int, int]] = {}
+    if not chatwoot_origin:
+        command_flags = await _apply_inbound_command_flags(session, actions)
+
     action = actions[0]
     cmd = action.get("cmd")
     phone_e164 = str(action["phone_e164"])
@@ -4818,19 +4950,10 @@ async def handle_event(
         return
 
     if cmd in ("stop", "start"):
-        reason = f"wa:{cmd}"
-        opted_out = cmd == "stop"
-
-        affected = await _set_opt_out(
-            session,
-            phone_e164=phone_e164,
-            opted_out=opted_out,
-            reason=reason,
-        )
-
-        canceled = 0
-        if opted_out:
-            canceled = await _cancel_marketing_jobs(session, phone_e164=phone_e164)
+        # Already applied above, for this address and for every other address
+        # in the delivery. Read back here only to keep the historical log line,
+        # which is what an operator greps for.
+        affected, canceled = command_flags.get(phone_e164, (0, 0))
 
         logger.info(
             "wa_cmd=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
@@ -4926,6 +5049,33 @@ async def process_one_event(
         with perf_log("whatsapp_inbox_worker", "process_event", event_id=event_id, origin="operator_relay"):
             await _process_operator_relay_event(event_id, provider)
         return
+
+    # §46.4.6-7 — the refusal is made durable FIRST, in a transaction of its own.
+    #
+    # Before the event transaction below rather than inside it, and that order is
+    # the contract: a committed refusal cannot then be undone by an
+    # acknowledgement that fails to send, by a Chatwoot outage, by an unhandled
+    # exception in the handler, or by the process dying. The event transaction
+    # rolls back on failure — the consent write has already landed.
+    #
+    # It also holds no lock across HTTP, because nothing in it makes an HTTP
+    # request, and it is idempotent, so a recovery pass re-examining this event
+    # and a restart both converge instead of double-applying.
+    #
+    # A failure HERE is deliberately allowed to propagate: it means the refusal
+    # is not durable, the event stays `processing`/`received` for recovery, and
+    # its receipts stay unresolved — which holds sends for those people rather
+    # than letting an unread STOP look like permission.
+    consent = await apply_inbound_consent(SessionLocal, event_id=event_id)
+    if consent.applied or consent.refused:
+        logger.info(
+            "wa_consent: event_id=%s receipts=%s applied=%s refused=%s reasons=%s",
+            event_id,
+            consent.receipts,
+            consent.applied,
+            consent.refused,
+            ",".join(sorted(set(consent.reasons))) or "-",
+        )
 
     with perf_log("whatsapp_inbox_worker", "process_event", event_id=event_id) as ctx:
         async with SessionLocal() as session:

@@ -2263,6 +2263,11 @@ async def run_deliver(
             meta_template_name=prerequisites.meta_template_name or "",
             template_language=prerequisites.template_language or "",
             sender_id=prerequisites.sender_id,
+            # The route this very POST is about to use, frozen with the attempt
+            # (§46.3). Passed from here because here is the only place that
+            # knows both halves of it, and taken as digests on the other side.
+            sender_phone_number_id=prerequisites.phone_number_id,
+            destination_phone=proof.destination_phone,
             honour_stop=honour_stop,
         )
         if claim.reason == ledger_module.CLAIM_REFUSED_STOPPED:
@@ -2388,6 +2393,13 @@ async def run_deliver(
                 reason_code=outcome_meta.reason,
                 reconciliation_required=True,
                 attempt_outcome="rejected",
+                # §46.3 — the ONE branch on which `send_rejected` really is a
+                # proven external refusal. The delivery client reaches it only
+                # for Meta's own error envelope on a status Meta decides before
+                # acting on the message; the local parameter refusal above
+                # writes the same state and deliberately does not pass this.
+                proven_api_rejection=True,
+                http_status=outcome_meta.http_status,
             )
             results.append(
                 SlotResult(

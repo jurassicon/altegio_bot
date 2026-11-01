@@ -289,12 +289,30 @@ class _WAFakeSessionResult:
         return _FakeWAEvent()
 
 
+class _WAFakeScalars:
+    """An empty scalars result.
+
+    ``process_one_event`` makes the inbound refusal durable before it opens the
+    event transaction, and that pass reads the event's inbound receipts. This
+    event's payload is empty, so the honest answer is "no receipts" — and the
+    double has to be able to GIVE that answer rather than make the consent pass
+    unreachable, which would quietly stop these perf tests from covering the
+    real ordering.
+    """
+
+    def all(self) -> list[Any]:
+        return []
+
+
 class _WAFakeSession:
     def begin(self) -> _BeginCM:
         return _BeginCM()
 
     async def execute(self, *_: Any, **__: Any) -> _WAFakeSessionResult:
         return _WAFakeSessionResult()
+
+    async def scalars(self, *_: Any, **__: Any) -> _WAFakeScalars:
+        return _WAFakeScalars()
 
 
 class _WAFakeSessionLocalCM:

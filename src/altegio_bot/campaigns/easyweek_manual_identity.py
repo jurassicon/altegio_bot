@@ -2,7 +2,8 @@
 
 Workspace customer lookup does not prove a branch. A new identity can only be
 assigned explicitly to Karlsruhe, and never moves an existing EasyWeek card.
-A matching opt-out anywhere in the local database vetoes the operation.
+A matching opt-out anywhere in the local database vetoes the operation — the
+card flag, and since PR-22.1 the durable consent refusal that needs no card.
 
 One function answers this for every caller — the composition read, the freeze, the
 per-item claim, the manual Add and the batch Add — on purpose. A rule relaxed in one
@@ -20,11 +21,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import Client
 from altegio_bot.utils import utcnow
+from altegio_bot.whatsapp_consent import is_suppressed
 
 IDENTITY_CONFLICT = "manual_recipient_identity_conflict"
 BRANCH_ASSIGNMENT_REQUIRED = "manual_recipient_branch_assignment_required"
 CLIENT_AMBIGUOUS = "manual_recipient_local_client_ambiguous"
 CLIENT_OPTED_OUT = "manual_recipient_opted_out"
+# A refusal the durable consent ledger holds, which by design needs no card at
+# all (§46.4.2). Its own reason code rather than ``CLIENT_OPTED_OUT``, because
+# an operator reading a refused row has to be able to tell "this card is flagged"
+# from "this person said stop and may have no card here".
+CONSENT_SUPPRESSED = "manual_recipient_consent_suppressed"
 KARLSRUHE_COMPANY_ID = 322579
 
 
@@ -73,6 +80,22 @@ async def local_identity(
     rows = list((await session.scalars(query)).all())
     if any(row.wa_opted_out for row in rows):
         return None, CLIENT_OPTED_OUT
+    # §46.4.2-3. The durable refusal is asked here, at the one shared veto point
+    # every EasyWeek caller already goes through — the composition read, the
+    # freeze, the per-item claim, the manual Add and the batch Add — so there is
+    # one answer rather than five that can drift apart.
+    #
+    # It catches exactly what the card flag above cannot: a person who said stop
+    # before any card existed, from a number whose card was created, imported or
+    # replaced afterwards, or from a number that has since changed while the
+    # proven EasyWeek UUID stayed the same.
+    #
+    # A read, with no lock of its own. This runs inside transactions that
+    # already hold a batch header and client rows, so a second lock order here
+    # is exactly what the voucher phase must not grow; the serialisation that
+    # matters is taken where refusals are written and at the final send guard.
+    if await is_suppressed(session, phone=phone, easyweek_customer_uuid=customer_uuid):
+        return None, CONSENT_SUPPRESSED
     easyweek = [row for row in rows if row.provider == "easyweek"]
     if len(easyweek) > 1:
         identities = {row.easyweek_customer_uuid for row in easyweek}

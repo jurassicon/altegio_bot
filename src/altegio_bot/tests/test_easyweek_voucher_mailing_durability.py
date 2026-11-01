@@ -1459,3 +1459,368 @@ async def test_pr21_branch_uuid_upgrade_preserves_rows_and_refuses_lossy_downgra
             assert (await conn.execute(text("SELECT * FROM clients ORDER BY id"))).all() == before
     finally:
         await engine.dispose()
+
+
+# ===========================================================================
+# §46.4 / PR-22.1 — the consent and delivery-evidence migration
+# ===========================================================================
+
+# The revision the consent and evidence tables were created ON TOP OF. Named,
+# so "undo the migration that created them" keeps meaning that however many
+# revisions follow it.
+CONSENT_PARENT_REVISION = "c9e7a34d6210"
+
+CONSENT_TABLES = (
+    "whatsapp_inbound_receipts",
+    "whatsapp_consent_suppressions",
+    "easyweek_voucher_production_delivery_failures",
+)
+
+
+async def test_the_consent_migration_cycles_on_an_empty_database(disposable_database: str):
+    """The three tables and three columns appear, disappear and reappear.
+
+    Addressed by revision rather than by ``-1`` for the same reason the §43
+    tests are: the next revision would silently make "one step back" mean a
+    different migration than the one this test names.
+    """
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+    assert await _columns(disposable_database, "whatsapp_events") >= {"inbound_authenticity"}
+    assert await _columns(disposable_database, "easyweek_voucher_production_batch_attempts") >= {
+        "sender_phone_number_id_digest",
+        "recipient_digest",
+    }
+
+    assert _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION).returncode == 0
+    assert await _tables(disposable_database, CONSENT_TABLES) == set()
+    assert "inbound_authenticity" not in await _columns(disposable_database, "whatsapp_events")
+    # Everything the migration does NOT own is untouched by the rollback.
+    assert await _tables(disposable_database, HISTORICAL_TABLES) == set(HISTORICAL_TABLES)
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+    current = _alembic(disposable_database, "current")
+    assert current.returncode == 0 and "(head)" in current.stdout
+
+
+async def test_the_consent_migration_upgrades_a_populated_historical_database(disposable_database: str):
+    """A real deployment upgrades a database that already holds history.
+
+    The rows are written the way the OLD code wrote them — a client card with an
+    opt-out flag, a stored WhatsApp event, an attempt row with no route — and
+    the cycle has to leave every one of them exactly as it found it, including
+    the two things that must stay NULL: an authenticity nobody recorded and a
+    route nobody froze.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", CONSENT_PARENT_REVISION).returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO clients (provider, company_id, altegio_client_id, phone_e164,"
+                    " display_name, raw, wa_opted_out, wa_opted_out_at, wa_opt_out_reason)"
+                    " VALUES ('altegio', 1, 918273, '+4915177993001', 'Historical', '{}'::jsonb,"
+                    " true, now() - interval '100 days', 'wa:stop')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO whatsapp_events (dedupe_key, status, query, headers, payload)"
+                    " VALUES ('wa:historical-1', 'processed', '{}'::jsonb, '{}'::jsonb,"
+                    " CAST(:payload AS jsonb))"
+                ),
+                {
+                    "dedupe": "wa:historical-1",
+                    "payload": (
+                        '{"entry": [{"changes": [{"value": {"metadata": {"phone_number_id": "OLD"},'
+                        ' "messages": [{"from": "4915177993001", "id": "wamid.OLD",'
+                        ' "timestamp": "1700000000", "type": "text", "text": {"body": "\\u0441\\u0442\\u043e\\u043f"}}]'
+                        "}}]}]}"
+                    ),
+                },
+            )
+
+        assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+        async with engine.connect() as conn:
+            card = (
+                await conn.execute(
+                    text("SELECT wa_opted_out, wa_opt_out_reason FROM clients WHERE altegio_client_id = 918273")
+                )
+            ).one()
+            assert card[0] is True and card[1] == "wa:stop"
+            # An event stored before this phase existed proves no signature, and
+            # the upgrade does not invent one for it.
+            authenticity = (
+                await conn.execute(
+                    text("SELECT inbound_authenticity FROM whatsapp_events WHERE dedupe_key = 'wa:historical-1'")
+                )
+            ).scalar_one()
+            assert authenticity is None
+            # And the upgrade creates no receipt and no refusal by itself: the
+            # historical reconciliation is an explicit, separate action.
+            assert (await conn.execute(text("SELECT count(*) FROM whatsapp_inbound_receipts"))).scalar_one() == 0
+            assert (await conn.execute(text("SELECT count(*) FROM whatsapp_consent_suppressions"))).scalar_one() == 0
+
+        assert _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION).returncode == 0
+        assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+        async with engine.connect() as conn:
+            after = (
+                await conn.execute(
+                    text("SELECT wa_opted_out, wa_opt_out_reason FROM clients WHERE altegio_client_id = 918273")
+                )
+            ).one()
+            assert after[0] is True and after[1] == "wa:stop"
+            assert (await conn.execute(text("SELECT count(*) FROM whatsapp_events"))).scalar_one() == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_a_destructive_downgrade_refuses_and_keeps_every_refusal(disposable_database: str):
+    """§46.9 — a refusal cannot be deleted to make a rollback possible.
+
+    The downgrade is attempted with one consent decision on disk. It must fail,
+    and — the half that matters more — it must fail BEFORE any DDL, so the
+    operator who is told the rollback is unsafe finds the refusal still there and
+    the schema still whole.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO whatsapp_consent_suppressions ("
+                    " wa_address, state, consent_version, decision_command, decision_source,"
+                    " decision_authenticity, decided_observed_at, opted_out_at, last_stop_observed_at)"
+                    " VALUES ('+4915177994001', 'opted_out', 1, 'stop', 'inbound_command',"
+                    " 'unverified', now(), now(), now())"
+                )
+            )
+
+        attempt = _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION)
+        assert attempt.returncode != 0
+        assert "downgrade refused before DDL" in (attempt.stderr + attempt.stdout)
+
+        # Nothing was dropped, and nothing was lost.
+        assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+        async with engine.connect() as conn:
+            assert (
+                await conn.execute(text("SELECT count(*) FROM whatsapp_consent_suppressions WHERE state = 'opted_out'"))
+            ).scalar_one() == 1
+        current = _alembic(disposable_database, "current")
+        assert "(head)" in current.stdout
+    finally:
+        await engine.dispose()
+
+
+async def test_a_destructive_downgrade_refuses_while_delivery_evidence_exists(disposable_database: str):
+    """The same refusal for a proven failure fact, which is also undeletable."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO easyweek_voucher_production_delivery_failures ("
+                    " fact_key, source, reason_code, match_state, failure_class, authenticity,"
+                    " provider_message_id, observed_at)"
+                    " VALUES (:key, 'status_callback', 'meta_callback_failed', 'unmatched',"
+                    " 'unknown', 'unverified', 'wamid.KEEPME', now())"
+                ),
+                {"key": "c" * 64},
+            )
+
+        attempt = _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION)
+        assert attempt.returncode != 0
+        assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+        async with engine.connect() as conn:
+            assert (
+                await conn.execute(text("SELECT count(*) FROM easyweek_voucher_production_delivery_failures"))
+            ).scalar_one() == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_the_orm_and_the_migration_agree_about_the_new_schema(disposable_database: str):
+    """What Alembic builds is what the ORM expects, column for column.
+
+    Compared against the ORM's own metadata rather than a hand-written list, so
+    a column added to a model without a migration — the drift this project has
+    already been bitten by — fails here instead of in a deploy.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from altegio_bot.models.models import Base
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        for table_name in (*CONSENT_TABLES, "whatsapp_events", "easyweek_voucher_production_batch_attempts"):
+            expected = {column.name for column in Base.metadata.tables[table_name].columns}
+            actual = await _columns(disposable_database, table_name)
+            assert expected <= actual, (table_name, sorted(expected - actual))
+    finally:
+        await engine.dispose()
+
+
+async def test_the_consent_constraints_and_dedupe_hold_in_postgres(disposable_database: str):
+    """The uniqueness and CHECK rules are the database's, not the writer's."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO whatsapp_consent_suppressions ("
+                    " wa_address, state, consent_version, decision_command, decision_source,"
+                    " decision_authenticity, decided_observed_at, opted_out_at)"
+                    " VALUES ('+4915177994002', 'opted_out', 1, 'stop', 'inbound_command',"
+                    " 'unverified', now(), now())"
+                )
+            )
+        # One row per address, table-wide.
+        with pytest.raises(Exception):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO whatsapp_consent_suppressions ("
+                        " wa_address, state, consent_version, decision_command, decision_source,"
+                        " decision_authenticity, decided_observed_at, opted_out_at)"
+                        " VALUES ('+4915177994002', 'opted_out', 1, 'stop', 'inbound_command',"
+                        " 'unverified', now(), now())"
+                    )
+                )
+        # An unverified opt-in is unrepresentable, not merely unreachable.
+        with pytest.raises(Exception):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO whatsapp_consent_suppressions ("
+                        " wa_address, state, consent_version, decision_command, decision_source,"
+                        " decision_authenticity, decided_observed_at, decided_event_at)"
+                        " VALUES ('+4915177994003', 'opted_in', 1, 'start', 'inbound_command',"
+                        " 'unverified', now(), now())"
+                    )
+                )
+        # And a confirmed failure fact must name the slot it is about.
+        with pytest.raises(Exception):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO easyweek_voucher_production_delivery_failures ("
+                        " fact_key, source, reason_code, match_state, failure_class, authenticity,"
+                        " provider_message_id, observed_at)"
+                        " VALUES (:key, 'status_callback', 'meta_callback_failed', 'confirmed',"
+                        " 'unknown', 'unverified', 'wamid.NOSLOT', now())"
+                    ),
+                    {"key": "d" * 64},
+                )
+    finally:
+        await engine.dispose()
+
+
+async def test_concurrent_first_refusals_for_one_address_do_not_race(session_maker):
+    """PostgreSQL 16, two transactions, one address, no row to lock yet.
+
+    The absent-row race §46.4.6 names. Both writers decide to create the first
+    refusal for an address nobody has a row for; the advisory address lock makes
+    the read-decide-write sequence atomic, so one applies and the other reads
+    what it wrote instead of failing on the unique index.
+    """
+    from altegio_bot.models.models import WhatsAppConsentSuppression
+    from altegio_bot.whatsapp_consent import ProjectedRefusal, apply_projected_refusal
+
+    address = "+4915177994010"
+    moment = utcnow()
+
+    async def _write(origin: str) -> str:
+        async with session_maker() as session:
+            async with session.begin():
+                outcome = await apply_projected_refusal(
+                    session,
+                    ProjectedRefusal(wa_address=address, origin=origin, observed_at=moment),
+                )
+                return outcome.resolution
+
+    results = await asyncio.gather(*[_write(f"writer-{index}") for index in range(4)])
+
+    assert results.count("applied") == 1
+    assert results.count("noop") == 3
+    async with session_maker() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(WhatsAppConsentSuppression).where(WhatsAppConsentSuppression.wa_address == address)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].state == "opted_out"
+
+
+async def test_a_refusal_racing_the_final_send_guard_has_one_checkable_order(session_maker):
+    """§46.4.6 — the guard and the refusal serialise on the same address lock.
+
+    The guard holds its transaction open; a refusal for the same address then
+    tries to commit. It cannot overtake the guard, and once the guard's
+    transaction ends the refusal lands — after which the fingerprint the guard
+    handed out no longer matches, so a claim that re-checks it refuses.
+    """
+    from altegio_bot.whatsapp_consent import (
+        ProjectedRefusal,
+        apply_projected_refusal,
+        consent_unchanged,
+        final_send_guard,
+    )
+
+    address = "+4915177994011"
+    moment = utcnow()
+    guard_taken = asyncio.Event()
+    release_guard = asyncio.Event()
+    fingerprints: list[str] = []
+
+    async def _guard() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                verdict = await final_send_guard(session, phone=address)
+                assert verdict.allowed is True
+                fingerprints.append(verdict.fingerprint)
+                guard_taken.set()
+                await release_guard.wait()
+
+    async def _refuse() -> str:
+        await guard_taken.wait()
+        release_guard.set()
+        async with session_maker() as session:
+            async with session.begin():
+                outcome = await apply_projected_refusal(
+                    session,
+                    ProjectedRefusal(wa_address=address, origin="live", observed_at=moment),
+                )
+                return outcome.resolution
+
+    _, resolution = await asyncio.gather(_guard(), _refuse())
+
+    assert resolution == "applied"
+    async with session_maker() as session:
+        assert await consent_unchanged(session, phone=address, expected_fingerprint=fingerprints[0]) is False
+        assert (await final_send_guard(session, phone=address)).allowed is False
