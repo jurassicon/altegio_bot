@@ -5321,6 +5321,18 @@ class WhatsAppInboundReceipt(Base):
             "route_allowed IS NOT FALSE OR resolved_at IS NOT NULL",
             name="ck_wa_inbound_receipt_refused_route_resolved",
         ),
+        CheckConstraint(
+            "(linked_easyweek_customer_uuid IS NULL) = (linked_uuid_recorded_at IS NULL)",
+            name="ck_wa_inbound_receipt_linked_uuid_paired",
+        ),
+        # The guard's other pending lookup: everything still unaccounted for
+        # from a number this UUID was proven to use, including numbers no card
+        # carries any more.
+        Index(
+            "ix_wa_inbound_receipt_pending_uuid",
+            "linked_easyweek_customer_uuid",
+            postgresql_where=text("resolved_at IS NULL AND linked_easyweek_customer_uuid IS NOT NULL"),
+        ),
         # Conflicting reuse of one Meta message identifier is a thing this
         # phase must be able to SEE rather than a thing it forbids: two
         # different payloads naming one wamid are both recorded, and the consent
@@ -5363,6 +5375,24 @@ class WhatsAppInboundReceipt(Base):
 
     # Meta's own wamid for this message, when it supplied a usable one.
     whatsapp_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # A proven NEGATIVE-CONSENT link, and nothing else.
+    #
+    # Written only by the booking bridge, at the one moment an EasyWeek customer
+    # UUID has just been proven for this person — and only onto a receipt that
+    # is still unresolved. It exists because the card's number may change before
+    # the inbox worker reaches this message: the refusal would then be recorded
+    # against a number no card names, and nothing would connect it to the new
+    # one. With this column the decision the worker eventually makes carries the
+    # link onto the suppression row, and a send guard for the new number can see
+    # that something from the old one is still unaccounted for.
+    #
+    # Never read as positive identity. Like ``banned_easyweek_customer_uuid`` it
+    # widens who must NOT be messaged (§46.4.2) and proves nothing about whose
+    # card this is, which branch they belong to, or whether they are an EasyWeek
+    # customer at all.
+    linked_easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    linked_uuid_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Two different times, deliberately never merged. ``observed_at`` is when
     # this process accepted the delivery and is always known. ``event_at`` is
@@ -5485,6 +5515,13 @@ class WhatsAppConsentSuppression(Base):
 
     # The high-water marks each command has reached, kept apart from the current
     # decision so an out-of-order replay can be recognised rather than guessed.
+    #
+    # ``last_start_*`` is AUDIT, and deliberately nothing else: it moves only
+    # for a START this ledger actually honoured, and no rule reads it. Deriving
+    # the opt-in boundary from it was a defect — the mark used to move for every
+    # START, rejected ones included, so an unsigned attempt could raise the time
+    # a later genuine STOP had to beat. That boundary is ``decided_event_at`` of
+    # the decision in force, and only that.
     last_stop_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_stop_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_start_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

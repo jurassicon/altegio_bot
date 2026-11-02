@@ -331,7 +331,7 @@ def test_wa_inbox_perf_enrichment(
     monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
     monkeypatch.setattr(wa_iw, "SessionLocal", lambda: _WAFakeSessionLocalCM())
 
-    async def fake_handle(session: Any, event: Any, provider: Any) -> None:
+    async def fake_handle(session: Any, event: Any, provider: Any, **_kwargs: Any) -> None:
         pass
 
     monkeypatch.setattr(wa_iw, "handle_event", fake_handle)
@@ -386,7 +386,7 @@ def test_wa_inbox_perf_chatwoot_origin(
 
     monkeypatch.setattr(wa_iw, "SessionLocal", lambda: _CWCM())
 
-    async def fake_handle(session: Any, event: Any, provider: Any) -> None:
+    async def fake_handle(session: Any, event: Any, provider: Any, **_kwargs: Any) -> None:
         pass
 
     monkeypatch.setattr(wa_iw, "handle_event", fake_handle)

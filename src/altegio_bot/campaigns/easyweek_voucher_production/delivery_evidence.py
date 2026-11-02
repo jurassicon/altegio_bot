@@ -58,7 +58,7 @@ import logging
 import uuid as uuid_module
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, Iterable
 
 from sqlalchemy import select
 from sqlalchemy import text as sql_text
@@ -151,6 +151,61 @@ async def lock_message_identity(session: AsyncSession, provider_message_id: str)
         signed=True,
     )
     await session.execute(sql_text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+async def lock_callback_scope(
+    session: AsyncSession,
+    provider_message_ids: Iterable[object],
+) -> list[str]:
+    """Take every lock ONE callback transaction needs, in the one global order.
+
+    Per-status locking was not enough, and the counterexample is an ordinary
+    Meta delivery. One callback carries ``delivered`` for message A and
+    ``failed`` for message B of the same batch. The handler took the header to
+    record A's delivery, then asked for B's message lock — while the transaction
+    that was accepting B held B's message lock and was waiting for that same
+    header. A cycle, resolved by PostgreSQL aborting one of them, and the one it
+    aborted was the acceptance: Meta had the message, the slot kept
+    ``send_claimed`` with no identifier, and B's failure stayed unmatched.
+    Sorting the failures after the header was already held could not help,
+    because the header was the half taken first.
+
+    So the whole scope is declared up front: every message identifier the
+    payload names, in sorted order, and only then the production headers those
+    identifiers belong to, in ascending id order. After this function no message
+    lock is ever requested behind a header lock, so the acceptance either has
+    its identifier — and this transaction waits for it holding no header — or it
+    does not, and waits for this one. The global order is
+    ``message → header → item`` on both sides, unchanged; what is new is that a
+    transaction handling several messages takes ALL of its message locks at the
+    start rather than one per message as it goes.
+
+    The header pre-read is safe without a lock precisely because the identifiers
+    are already held: nothing can bind one of them to a different slot while
+    this transaction owns it. Identifiers belonging to no production slot lock
+    nothing further, which is every ordinary campaign callback.
+    """
+    ordered = sorted({str(value).strip() for value in provider_message_ids if str(value or "").strip()})
+    for provider_message_id in ordered:
+        await lock_message_identity(session, provider_message_id)
+    if not ordered:
+        return ordered
+    with session.no_autoflush:
+        batch_ids = sorted(
+            {
+                int(value)
+                for value in (
+                    await session.scalars(
+                        select(EasyWeekVoucherProductionBatchItem.batch_id).where(
+                            EasyWeekVoucherProductionBatchItem.provider_message_id.in_(ordered)
+                        )
+                    )
+                ).all()
+            }
+        )
+    for batch_id in batch_ids:
+        await session.get(EasyWeekVoucherProductionBatch, batch_id, with_for_update=True)
+    return ordered
 
 
 @dataclass(frozen=True)
@@ -756,6 +811,7 @@ __all__ = [
     "UNPROVEN_ROUTE_UNKNOWN",
     "FailureOutcome",
     "bind_unmatched_failures",
+    "lock_callback_scope",
     "lock_message_identity",
     "record_api_rejection",
     "record_callback_failure",

@@ -1621,6 +1621,15 @@ and reports what it could not establish. Applying it can make people newly
 unsendable whose later resubscribe cannot be proven; the dry run states that
 count first.
 
+The report's numbers describe what the writes did, and three of them are worth
+reading together: `written` is refusals that really landed, `superseded` is
+candidates the run declined because a proven opt-in for that address had been
+observed after the source's own moment, and `newly_suppressed_addresses` counts
+people who were sendable before the run and are not after it. A rerun is a
+no-op; a stored STOP newer than the refusal already in force is applied again on
+purpose, to move the boundary a later resubscribe has to beat, and is reported
+as a no-op because nothing about the person's state changed.
+
 Note: with `META_APP_SECRET` unconfigured, no resubscribe can lift a refusal in
 the new ledger, because no signature is checked and an unverified START grants
 nothing. Such a START is no longer acknowledged either — confirming a
@@ -1629,6 +1638,15 @@ recorded on the stored event as `start_authenticity_unproven`. The card flag of
 somebody with no ledger refusal at all keeps its historical behaviour, so an
 ordinary resubscribe still works for them. Configuring the secret is what makes
 a resubscribe work for everybody.
+
+What a customer is told always describes the state that settled for their
+number, and only when one of their accepted messages asked for it. A delivery
+carrying both commands therefore gets the unsubscribe confirmation when the
+refusal wins and the subscription confirmation when a proven, strictly newer
+START wins; a command the ledger did not honour gets silence and a reason on the
+event. An acknowledgement never leaves through a sender route this deployment
+does not accept, even when another message in the same delivery arrived on one
+that it does.
 
 A refusal whose own event time could never be established — every refusal
 projected from a legacy card flag, and any STOP whose timestamp Meta sent

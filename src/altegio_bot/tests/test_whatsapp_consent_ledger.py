@@ -1044,7 +1044,7 @@ async def test_the_refusal_is_already_durable_when_the_handler_runs(session_make
 
     seen: list[bool] = []
 
-    async def _observe(session: Any, event: Any, provider: Any) -> None:
+    async def _observe(session: Any, event: Any, provider: Any, **_kwargs: Any) -> None:
         async with session_maker() as reader:
             seen.append(await is_suppressed(reader, phone=ADDRESS))
 
@@ -1569,12 +1569,14 @@ async def test_a_refusal_on_another_number_of_the_same_identity_refuses_the_clai
         guard = await final_send_guard(session, phone=OTHER_ADDRESS, easyweek_customer_uuid=customer)
     assert guard.allowed is False
     assert guard.reason == GUARD_SUPPRESSED
-    # Found through the UUID bound to the refusal, not through the address set:
-    # no card carries the old number any more, so nothing links it to this
-    # person except the refusal itself. That is also the boundary of the lock —
-    # an address nothing can name cannot be locked in advance, and a refusal
-    # landing there is caught by the claim-time fingerprint instead.
+    # Reached through the refusal's own proven UUID link, and reported as such:
+    # no card carries the old number any more, so nothing else connects it to
+    # this person. Review fix 3 also brought it INTO the locked set — a refusal
+    # bound to a proven UUID is itself a durable negative link, so the address it
+    # names can be locked in advance after all, and the serialisation covers it
+    # rather than leaving it to the claim-time fingerprint alone.
     assert SOURCE_SUPPRESSION_UUID in guard.decision.sources
+    assert ADDRESS in guard.decision.matched_addresses
 
 
 async def test_the_guard_locks_every_address_it_reads(session_maker, monkeypatch) -> None:
@@ -1815,3 +1817,877 @@ def test_a_hostile_sender_route_still_produces_a_digest() -> None:
     # And the other two digests over sender-controlled values.
     assert recipient_route_digest(f"+4915177991001{chr(0xD800)}") is None, "an unnormalisable number has no handle"
     assert len(receipt_key("wa:\ud800", 0)) == 64
+
+
+# ===========================================================================
+# Round 2, review fix 1 — a rejected START leaves no usable mark
+# ===========================================================================
+
+
+async def _deliver(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: WhatsAppProvider,
+    *messages: dict[str, Any],
+    signed: bool = True,
+    phone_number_id: str = PNID,
+) -> None:
+    """Ingest one delivery and let the worker claim it, exactly as production does."""
+    await _seed_sender(session_maker)
+    await _ingest(
+        session_maker,
+        _payload(*messages, phone_number_id=phone_number_id),
+        signed=signed,
+        monkeypatch=monkeypatch,
+    )
+    await _process_pending(session_maker, provider)
+
+
+async def _deliver_mixed(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: WhatsAppProvider,
+    *groups: tuple[str, list[dict[str, Any]]],
+) -> None:
+    await _seed_sender(session_maker)
+    await _ingest(session_maker, _mixed_payload(*groups), monkeypatch=monkeypatch)
+    await _process_pending(session_maker, provider)
+
+
+async def _no_chatwoot(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+async def test_a_rejected_start_cannot_license_ignoring_a_later_stop(session_maker, monkeypatch) -> None:
+    """The review's sequence, end to end, with every message really delivered.
+
+    STOP 10:00, an UNSIGNED START 11:00 that is refused, the signed START 10:30
+    that is honoured, then the signed STOP 10:45 — which must apply.
+
+    It did not. The refusal's "am I a replay?" test compared the new STOP
+    against ``last_start_event_at``, and that mark moved for every START before
+    any of the proofs ran, so the rejected 11:00 attempt raised the bar to 11:00
+    and a genuine refusal 15 minutes after the real opt-in was filed away as a
+    replay of something that never happened. The send guard then allowed the
+    send.
+    """
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R1S", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text="START", msg_id="wamid.R1UNSIGNED", epoch=BASE_EPOCH + 3600),
+        signed=False,
+    )
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    # The rejected attempt is recorded as audit and nowhere else.
+    assert row.last_start_event_at is None
+    assert row.evidence.get("last_refused_start_reason") == REFUSED_START_UNVERIFIED
+    assert row.evidence.get("last_refused_start_event_at") is not None
+
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R1A", epoch=BASE_EPOCH + 1800)
+    )
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_IN
+
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R1S2", epoch=BASE_EPOCH + 2700)
+    )
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is False
+    assert guard.reason == GUARD_SUPPRESSED
+
+
+async def test_a_start_rejected_for_a_reused_identifier_also_raises_nothing(session_maker, monkeypatch) -> None:
+    """The same property through a different refusal, so it is the RULE that holds.
+
+    A reused Meta identifier is refused on authenticity grounds rather than on
+    time, and its own timestamp is as late as it likes. If the boundary moved
+    for it, a later honest STOP would be discarded exactly as before.
+    """
+    provider = CaptureProvider()
+    # The ordinary message below is mirrored to Chatwoot, which is not what this
+    # test is about and is not reachable from here.
+    monkeypatch.setattr(worker_module, "_forward_text_to_chatwoot", _no_chatwoot)
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R1C", epoch=BASE_EPOCH))
+    # The same wamid, from somebody else: one identifier, two senders.
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text="hallo", sender=OTHER_RAW_FROM, msg_id="wamid.R1DUP", epoch=BASE_EPOCH + 60),
+    )
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text="START", msg_id="wamid.R1DUP", epoch=BASE_EPOCH + 7200),
+    )
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    assert row.evidence.get("last_refused_start_reason") == REFUSED_START_IDENTIFIER_CONFLICT
+    assert row.last_start_event_at is None
+
+    # And a real opt-in, then a newer STOP, still behave.
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R1OK", epoch=BASE_EPOCH + 1800)
+    )
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R1S3", epoch=BASE_EPOCH + 2000)
+    )
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+
+
+@pytest.mark.parametrize(
+    "stop_offset,expected",
+    [
+        (900, CONSENT_STATE_OPTED_IN),  # provably older than the opt-in: a replay
+        (1800, CONSENT_STATE_OPTED_OUT),  # the same second: a tie refuses
+        (2700, CONSENT_STATE_OPTED_OUT),  # newer: applies
+    ],
+)
+async def test_a_stop_is_ordered_against_the_opt_in_in_force(
+    session_maker, monkeypatch, stop_offset: int, expected: str
+) -> None:
+    """One table, three answers, all of them about ``decided_event_at``.
+
+    The opt-in in force happened at 10:30. A STOP from 10:15 is a replay of
+    something already answered; one from 10:30 is a tie, and a tie refuses; one
+    from 10:45 wins. No rejected attempt is involved anywhere, which is the
+    point — the boundary has to be right for the ordinary case too.
+    """
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R1T1", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R1T2", epoch=BASE_EPOCH + 1800)
+    )
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text="STOP", msg_id="wamid.R1T3", epoch=BASE_EPOCH + stop_offset),
+    )
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == expected
+
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is (expected == CONSENT_STATE_OPTED_OUT)
+    assert _marketing_verdict(card) == ("opted_out" if expected == CONSENT_STATE_OPTED_OUT else None)
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is (expected == CONSENT_STATE_OPTED_IN)
+    assert guard.reason == (GUARD_ALLOWED if expected == CONSENT_STATE_OPTED_IN else GUARD_SUPPRESSED)
+
+
+# ===========================================================================
+# Round 2, review fix 2 — the card projection cannot be overtaken
+# ===========================================================================
+
+
+def _arm_competitor(monkeypatch: pytest.MonkeyPatch, competitor) -> dict[str, Any]:
+    """Run *competitor* in full the FIRST time the worker reads the ledger.
+
+    This is the schedule from the review, written out exactly: the handler takes
+    its read, the competing decision lands and is projected completely, and only
+    then does the handler get on with writing what it read. The value handed
+    back is the one from BEFORE the competitor ran, which is what makes the read
+    stale rather than merely old.
+
+    Disarmed on the first use, so the competitor itself runs on the unpatched
+    path and nothing recurses.
+    """
+    real = worker_module.ledger_state
+    state: dict[str, Any] = {"armed": True, "stale": None}
+
+    async def _patched(session: Any, *, phone: Any) -> Any:
+        value = await real(session, phone=phone)
+        if state["armed"]:
+            state["armed"] = False
+            state["stale"] = value
+            await competitor()
+        return value
+
+    monkeypatch.setattr(worker_module, "ledger_state", _patched)
+    return state
+
+
+async def test_a_stale_read_cannot_write_its_answer_at_all(session_maker, monkeypatch) -> None:
+    """The write carries its premise, so one attempt is enough to prove it.
+
+    With the retry budget cut to a single pass there is nothing to converge: the
+    handler derives ``sendable`` from a read that a newer STOP has already
+    invalidated, and if that write could land the card would say sendable while
+    the ledger refused. Here it cannot land — the statement itself re-asks the
+    question — so the newer refusal survives and the command is reported as not
+    honoured.
+    """
+    monkeypatch.setattr(worker_module, "_PROJECTION_ATTEMPTS", 1)
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+
+    # A refusal, then a proven opt-in: the ledger permits and the card is clear.
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2A", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2B", epoch=BASE_EPOCH + 1800)
+    )
+    assert (await _client_row(session_maker, client_id)).wa_opted_out is False
+
+    async def _competing_stop() -> None:
+        await _deliver(
+            session_maker,
+            monkeypatch,
+            CaptureProvider(),
+            _message(text="STOP", msg_id="wamid.R2RACE", epoch=BASE_EPOCH + 3600),
+        )
+
+    state = _arm_competitor(monkeypatch, _competing_stop)
+    late = CaptureProvider()
+    await _deliver(
+        session_maker, monkeypatch, late, _message(text="START", msg_id="wamid.R2C", epoch=BASE_EPOCH + 2000)
+    )
+
+    assert state["armed"] is False
+    assert state["stale"].state == CONSENT_STATE_OPTED_IN
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+    # Nothing was confirmed to the customer either: what we would be confirming
+    # is no longer known to be true.
+    assert late.sent == []
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is False
+    assert guard.reason == GUARD_SUPPRESSED
+
+
+async def test_the_projection_converges_on_the_newer_decision(session_maker, monkeypatch) -> None:
+    """The same schedule with the real retry budget: it re-derives and settles."""
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2D", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2E", epoch=BASE_EPOCH + 1800)
+    )
+
+    async def _competing_stop() -> None:
+        await _deliver(
+            session_maker,
+            monkeypatch,
+            CaptureProvider(),
+            _message(text="STOP", msg_id="wamid.R2RACE2", epoch=BASE_EPOCH + 3600),
+        )
+
+    _arm_competitor(monkeypatch, _competing_stop)
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        CaptureProvider(),
+        _message(text="START", msg_id="wamid.R2F", epoch=BASE_EPOCH + 2000),
+    )
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+
+
+async def test_the_reverse_schedule_also_settles_on_the_ledger(session_maker, monkeypatch) -> None:
+    """A STOP's projection overtaken by a proven newer START.
+
+    The mirror image, and it must come out the other way round: the START is
+    strictly newer and signed, so the settled answer is the opt-in, the card
+    follows it, and the STOP that lost is NOT acknowledged — telling somebody
+    they are unsubscribed when the settled state says otherwise is the same
+    defect in the other direction.
+    """
+    client_id = await _card(session_maker, opted_out=False)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2G", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2H", epoch=BASE_EPOCH + 1800)
+    )
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2I", epoch=BASE_EPOCH + 2000)
+    )
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+
+    async def _competing_start() -> None:
+        await _deliver(
+            session_maker,
+            monkeypatch,
+            CaptureProvider(),
+            _message(text="START", msg_id="wamid.R2RACE3", epoch=BASE_EPOCH + 7200),
+        )
+
+    _arm_competitor(monkeypatch, _competing_start)
+    late = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, late, _message(text="STOP", msg_id="wamid.R2J", epoch=BASE_EPOCH + 2100))
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is False
+    assert _marketing_verdict(card) is None
+    assert late.sent == []
+
+
+async def test_a_concurrent_historical_projection_also_wins_over_a_stale_read(session_maker, monkeypatch) -> None:
+    """The competitor does not have to be a live message.
+
+    ``project(apply=True)`` writes through the same ledger path, so a stored
+    historical STOP landing between a handler's read and its write is exactly
+    the same race — and the card must end up agreeing with the ledger, not with
+    the handler's view of it.
+    """
+    from altegio_bot.whatsapp_consent_projection import project
+
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2K", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2L", epoch=BASE_EPOCH + 1800)
+    )
+
+    # A stored delivery nobody ever processed, carrying a refusal newer than the
+    # opt-in. The projection is what turns it into a ledger decision.
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:historical-stop-r2",
+                    status="processed",
+                    payload=_payload(_message(text="стоп", msg_id="wamid.R2HIST", epoch=BASE_EPOCH + 5400)),
+                    received_at=datetime.now(timezone.utc),
+                )
+            )
+
+    async def _run_projection() -> None:
+        await project(session_maker, apply=True)
+
+    _arm_competitor(monkeypatch, _run_projection)
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        CaptureProvider(),
+        _message(text="START", msg_id="wamid.R2M", epoch=BASE_EPOCH + 2000),
+    )
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+
+
+async def test_a_permitted_new_start_still_lifts_the_refusal(session_maker, monkeypatch) -> None:
+    """The negative half: none of the above may turn into a refusal that sticks."""
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2N", epoch=BASE_EPOCH))
+    assert (await _client_row(session_maker, client_id)).wa_opted_out is True
+
+    acked = CaptureProvider()
+    await _deliver(
+        session_maker, monkeypatch, acked, _message(text="START", msg_id="wamid.R2O", epoch=BASE_EPOCH + 1800)
+    )
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is False
+    assert _marketing_verdict(card) is None
+    assert len(acked.sent) == 1
+    assert "wieder angemeldet" in acked.sent[0][2]
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is True
+
+
+# ===========================================================================
+# Round 2, review fix 5A — one order over the whole set of address locks
+# ===========================================================================
+
+
+async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float = 15.0) -> None:
+    """Wait until PostgreSQL reports somebody queued on an advisory lock.
+
+    The schedules below have to be exact, and "the other transaction is now
+    waiting" is a fact this database publishes. Polling ``pg_locks`` is how a
+    test observes it without a sleep that would pass or fail by luck.
+    """
+    from sqlalchemy import text as sql_text
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with session_maker() as probe:
+            waiting = await probe.scalar(
+                sql_text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            )
+        if int(waiting or 0) >= 1:
+            return
+        assert loop.time() < deadline, "nothing ever queued on an advisory lock"
+        await asyncio.sleep(0.05)
+
+
+async def test_the_worker_takes_the_whole_address_set_in_sorted_order(session_maker, monkeypatch) -> None:
+    """The mutual block of review fix 5A, reproduced and shown closed.
+
+    A delivery of [STOP B, STOP A] used to be locked in MESSAGE order, so the
+    worker held B and waited for A while an ingress for the same two addresses —
+    which has always locked them sorted — held A and waited for B. PostgreSQL
+    broke that by aborting one of them, and the one it aborted here loses for
+    good: ordinary inbound has no recovery pass, so the event stayed
+    ``processing``, no suppression was written, and the receipts stayed
+    unresolved.
+
+    Here a third transaction holds A, the first address of the sorted order.
+    With the fix the worker is queued on A while holding NOTHING, so the holder
+    can go on to take B; without it the worker would already hold B and the two
+    would deadlock.
+    """
+    from altegio_bot.whatsapp_consent import lock_consent_address
+
+    await _seed_sender(session_maker)
+    await _ingest(
+        session_maker,
+        _payload(
+            _message(text="STOP", sender=OTHER_RAW_FROM, msg_id="wamid.R5B"),
+            _message(text="STOP", sender=RAW_FROM, msg_id="wamid.R5A"),
+        ),
+        monkeypatch=monkeypatch,
+    )
+    [event_id] = await _event_ids(session_maker)
+    assert ADDRESS < OTHER_ADDRESS, "the sorted order must differ from the message order"
+
+    release = asyncio.Event()
+    took_the_second = asyncio.Event()
+
+    async def _holder() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await lock_consent_address(session, ADDRESS)
+                await release.wait()
+                # The whole question: can the holder of the FIRST address still
+                # take the second one while the worker is in flight?
+                await asyncio.wait_for(lock_consent_address(session, OTHER_ADDRESS), timeout=10)
+                took_the_second.set()
+
+    provider = CaptureProvider()
+    holder = asyncio.create_task(_holder())
+    await asyncio.sleep(0)
+    # The whole production path, so a lost race shows up as a stranded event
+    # rather than only as an exception: an aborted transaction here leaves the
+    # row unprocessed, and ordinary inbound has no recovery pass to pick it up.
+    worker = asyncio.create_task(_process(session_maker, provider, event_id))
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+    await asyncio.wait_for(took_the_second.wait(), timeout=10)
+    await asyncio.wait_for(holder, timeout=10)
+    await asyncio.wait_for(worker, timeout=20)
+
+    assert (await _suppression(session_maker, ADDRESS)) is not None
+    assert (await _suppression(session_maker, OTHER_ADDRESS)) is not None
+    assert [receipt.resolved_at is not None for receipt in await _receipts(session_maker)] == [True, True]
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, event_id)
+    assert event.status == "processed"
+    assert event.error is None
+
+
+async def test_the_ingress_takes_the_same_order_as_the_worker(session_maker, monkeypatch) -> None:
+    """The other half of the pair, so the two sides provably agree.
+
+    The receipts are written before the 200, under the same address locks, and
+    in the same sorted order. A holder of the first address therefore blocks the
+    ingress while the ingress holds nothing, and can still take the second.
+    """
+    from altegio_bot.whatsapp_consent import lock_consent_address
+
+    await _seed_sender(session_maker)
+    release = asyncio.Event()
+    took_the_second = asyncio.Event()
+
+    async def _holder() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await lock_consent_address(session, ADDRESS)
+                await release.wait()
+                await asyncio.wait_for(lock_consent_address(session, OTHER_ADDRESS), timeout=10)
+                took_the_second.set()
+
+    holder = asyncio.create_task(_holder())
+    await asyncio.sleep(0)
+    ingress = asyncio.create_task(
+        _ingest(
+            session_maker,
+            _payload(
+                _message(text="STOP", sender=OTHER_RAW_FROM, msg_id="wamid.R5IB"),
+                _message(text="STOP", sender=RAW_FROM, msg_id="wamid.R5IA"),
+            ),
+            monkeypatch=monkeypatch,
+        )
+    )
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+    await asyncio.wait_for(took_the_second.wait(), timeout=10)
+    await asyncio.wait_for(holder, timeout=10)
+    response = await asyncio.wait_for(ingress, timeout=10)
+
+    assert response.status_code == 200
+    receipts = await _receipts(session_maker)
+    assert sorted(receipt.wa_address for receipt in receipts) == [ADDRESS, OTHER_ADDRESS]
+
+
+async def test_a_final_guard_and_the_worker_do_not_block_each_other(session_maker, monkeypatch) -> None:
+    """The guard locks the same addresses in the same order, so neither waits twice."""
+    from altegio_bot.whatsapp_consent import lock_consent_address
+
+    await _seed_sender(session_maker)
+    await _ingest(
+        session_maker,
+        _payload(
+            _message(text="STOP", sender=OTHER_RAW_FROM, msg_id="wamid.R5GB"),
+            _message(text="STOP", sender=RAW_FROM, msg_id="wamid.R5GA"),
+        ),
+        monkeypatch=monkeypatch,
+    )
+    [event_id] = await _event_ids(session_maker)
+
+    release = asyncio.Event()
+    took_the_second = asyncio.Event()
+
+    async def _holder() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await lock_consent_address(session, ADDRESS)
+                await release.wait()
+                await asyncio.wait_for(lock_consent_address(session, OTHER_ADDRESS), timeout=10)
+                took_the_second.set()
+
+    async def _guard() -> Any:
+        async with session_maker() as session:
+            async with session.begin():
+                return await final_send_guard(session, phone=OTHER_ADDRESS)
+
+    holder = asyncio.create_task(_holder())
+    await asyncio.sleep(0)
+    worker = asyncio.create_task(apply_inbound_consent(session_maker, event_id=event_id))
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+    await asyncio.wait_for(took_the_second.wait(), timeout=10)
+    await asyncio.wait_for(holder, timeout=10)
+    await asyncio.wait_for(worker, timeout=10)
+    verdict = await asyncio.wait_for(_guard(), timeout=10)
+
+    assert verdict.allowed is False
+    assert verdict.reason == GUARD_SUPPRESSED
+
+
+# ===========================================================================
+# Round 2, review fix 6 — the verdict and the answer belong to one message
+# ===========================================================================
+
+OTHER_PNID = "PNID-REFUSED"
+
+
+async def _seed_second_sender(session_maker) -> int:
+    """A sender row for the REFUSED route, so using it would be possible.
+
+    Without this row the refused route could never produce an outbound message
+    anyway and the test would prove nothing: ``_pick_sender`` would find
+    nothing and the handler would stop. The point is that the sender exists and
+    is still not used.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            existing = await session.scalar(
+                select(WhatsAppSender.id).where(WhatsAppSender.phone_number_id == OTHER_PNID)
+            )
+            if existing is not None:
+                return int(existing)
+            sender = WhatsAppSender(
+                company_id=2,
+                sender_code="refused",
+                phone_number_id=OTHER_PNID,
+                display_phone="+4930000001",
+                is_active=True,
+            )
+            session.add(sender)
+            await session.flush()
+            return int(sender.id)
+
+
+async def _allowed_sender_id(session_maker) -> int:
+    await _seed_sender(session_maker)
+    async with session_maker() as session:
+        return int(await session.scalar(select(WhatsAppSender.id).where(WhatsAppSender.phone_number_id == PNID)))
+
+
+async def _acknowledgements(session_maker) -> list[tuple[str, str]]:
+    from altegio_bot.models.models import OutboxMessage
+
+    async with session_maker() as session:
+        rows = (
+            await session.execute(
+                select(OutboxMessage.template_code, OutboxMessage.phone_e164).order_by(OutboxMessage.id)
+            )
+        ).all()
+    return [(str(code), str(phone)) for code, phone in rows]
+
+
+@pytest.mark.parametrize("order", [("START", "STOP"), ("STOP", "START")])
+async def test_one_address_saying_both_things_is_answered_by_the_settled_state(
+    session_maker, monkeypatch, order: tuple[str, str]
+) -> None:
+    """Two commands from one person in one delivery, both permutations.
+
+    The acknowledgement used to be taken from ``actions[0]``, so [START, STOP]
+    left the ledger and the card refusing while the customer was told "you are
+    subscribed again" — the one thing §46.4.7 rules out by name.
+
+    It now describes the state that SETTLED, and the two permutations settle
+    differently on purpose: the second message is a minute later than the first
+    and both times are provable, so [START, STOP] ends in a refusal and
+    [STOP, START] in a proven opt-in. Either way the sentence the customer gets
+    is the one the record supports.
+    """
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text=order[0], msg_id="wamid.R6A1", epoch=BASE_EPOCH),
+        _message(text=order[1], msg_id="wamid.R6A2", epoch=BASE_EPOCH + 60),
+    )
+
+    refused = order[1] == "STOP"
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == (CONSENT_STATE_OPTED_OUT if refused else CONSENT_STATE_OPTED_IN)
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is refused
+    assert _marketing_verdict(card) == ("opted_out" if refused else None)
+    assert len(provider.sent) == 1
+    if refused:
+        assert "abgemeldet" in provider.sent[0][2]
+        assert "wieder angemeldet" not in provider.sent[0][2]
+        assert await _acknowledgements(session_maker) == [("wa_cmd_stop", ADDRESS)]
+    else:
+        assert "wieder angemeldet" in provider.sent[0][2]
+        assert await _acknowledgements(session_maker) == [("wa_cmd_start", ADDRESS)]
+
+
+async def test_a_start_the_ledger_refuses_is_never_confirmed_even_beside_a_stop(session_maker, monkeypatch) -> None:
+    """The prohibition itself, isolated from the ordering above.
+
+    Both messages arrive in one delivery and the START is the LATER of the two,
+    so only its own unprovable authenticity stands between it and an opt-in. It
+    is refused, the refusal settles, and the sentence the customer gets is the
+    refusal's — never the subscription's.
+    """
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+    await _deliver(
+        session_maker,
+        monkeypatch,
+        provider,
+        _message(text="STOP", msg_id="wamid.R6A3", epoch=BASE_EPOCH),
+        _message(text="START", msg_id="wamid.R6A4", epoch=BASE_EPOCH + 60),
+        signed=False,
+    )
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    assert row.evidence.get("last_refused_start_reason") == REFUSED_START_UNVERIFIED
+    assert (await _client_row(session_maker, client_id)).wa_opted_out is True
+    assert len(provider.sent) == 1
+    assert "abgemeldet" in provider.sent[0][2]
+    assert await _acknowledgements(session_maker) == [("wa_cmd_stop", ADDRESS)]
+
+
+@pytest.mark.parametrize("refused_first", [True, False])
+async def test_a_refused_route_never_carries_the_answer(session_maker, monkeypatch, refused_first: bool) -> None:
+    """One address, two routes: a START on the refused one and a STOP on ours.
+
+    The receipts were already right — ``ignored_route`` for the START,
+    ``applied`` for the STOP — and the worker filtered by ADDRESS, which has at
+    least one accepted message and therefore passed whole. ``actions[0]`` was
+    then the refused START, so the positive acknowledgement went out through
+    the very sender the deployment had declined to accept.
+    """
+    monkeypatch.setattr(settings, "whatsapp_allowed_phone_number_ids", PNID)
+    refused_sender_id = await _seed_second_sender(session_maker)
+    allowed_sender_id = await _allowed_sender_id(session_maker)
+    client_id = await _card(session_maker)
+    provider = CaptureProvider()
+
+    start = [_message(text="START", msg_id="wamid.R6B1", epoch=BASE_EPOCH + 3600)]
+    stop = [_message(text="STOP", msg_id="wamid.R6B2", epoch=BASE_EPOCH)]
+    groups = ((OTHER_PNID, start), (PNID, stop)) if refused_first else ((PNID, stop), (OTHER_PNID, start))
+    await _deliver_mixed(session_maker, monkeypatch, provider, *groups)
+
+    receipts = await _receipts(session_maker)
+    assert sorted((receipt.command, bool(receipt.route_allowed)) for receipt in receipts) == [
+        (CONSENT_COMMAND_START, False),
+        (CONSENT_COMMAND_STOP, True),
+    ]
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+
+    assert len(provider.sent) == 1
+    sender_used, phone_used, text_used = provider.sent[0]
+    assert sender_used == allowed_sender_id
+    assert sender_used != refused_sender_id
+    assert phone_used == ADDRESS
+    assert "abgemeldet" in text_used
+    assert await _acknowledgements(session_maker) == [("wa_cmd_stop", ADDRESS)]
+
+
+async def test_a_refused_ordinary_message_is_not_mirrored_because_of_an_allowed_neighbour(
+    session_maker, monkeypatch
+) -> None:
+    """An accepted STOP does not make the refused message next to it actionable."""
+    monkeypatch.setattr(settings, "whatsapp_allowed_phone_number_ids", PNID)
+    await _seed_second_sender(session_maker)
+    forwarded: list[str] = []
+
+    async def _spy(session: Any, event: Any, *, phone_e164: str, text: str, **_kwargs: Any) -> None:
+        forwarded.append(text)
+
+    monkeypatch.setattr(worker_module, "_forward_text_to_chatwoot", _spy)
+    provider = CaptureProvider()
+    await _deliver_mixed(
+        session_maker,
+        monkeypatch,
+        provider,
+        (OTHER_PNID, [_message(text="ich habe eine Frage", msg_id="wamid.R6C1")]),
+        (PNID, [_message(text="STOP", msg_id="wamid.R6C2", epoch=BASE_EPOCH + 60)]),
+    )
+
+    assert forwarded == []
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    assert await _acknowledgements(session_maker) == [("wa_cmd_stop", ADDRESS)]
+
+
+async def test_a_refused_promo_message_does_not_run_the_promo_funnel(session_maker, monkeypatch) -> None:
+    """Same property for the promo branch, which has effects of its own."""
+    monkeypatch.setattr(settings, "whatsapp_allowed_phone_number_ids", PNID)
+    monkeypatch.setattr(settings, "promo_lead_funnel_enabled", True)
+    await _seed_second_sender(session_maker)
+    promo_calls: list[str] = []
+
+    async def _spy(**kwargs: Any) -> None:
+        promo_calls.append(str(kwargs.get("text")))
+
+    monkeypatch.setattr(worker_module, "handle_promo_command", _spy)
+    # A keyword the funnel really recognises, read from its own list: a word it
+    # ignores would make this test pass for the wrong reason.
+    promo_word = sorted(worker_module.PROMO_KEYWORDS)[0]
+    assert worker_module._parse_command(promo_word) == "promo"
+    provider = CaptureProvider()
+    await _deliver_mixed(
+        session_maker,
+        monkeypatch,
+        provider,
+        (OTHER_PNID, [_message(text=promo_word, msg_id="wamid.R6D1")]),
+        (PNID, [_message(text="STOP", msg_id="wamid.R6D2", epoch=BASE_EPOCH + 60)]),
+    )
+
+    assert promo_calls == []
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+
+
+async def test_a_refused_stop_does_not_execute_because_an_allowed_message_follows_it(
+    session_maker, monkeypatch
+) -> None:
+    """The refusing direction of the same rule, which must not be weakened.
+
+    A STOP on a route this deployment declines is not executed, and an ordinary
+    accepted message from the same person in the same delivery does not make it
+    executable. The accepted message is still resolved, so nothing is left
+    holding sends.
+    """
+    monkeypatch.setattr(settings, "whatsapp_allowed_phone_number_ids", PNID)
+    await _seed_second_sender(session_maker)
+
+    async def _quiet(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(worker_module, "_forward_text_to_chatwoot", _quiet)
+    provider = CaptureProvider()
+    await _deliver_mixed(
+        session_maker,
+        monkeypatch,
+        provider,
+        (OTHER_PNID, [_message(text="STOP", msg_id="wamid.R6E1")]),
+        (PNID, [_message(text="danke", msg_id="wamid.R6E2", epoch=BASE_EPOCH + 60)]),
+    )
+
+    assert await _suppression(session_maker) is None
+    assert provider.sent == []
+    receipts = await _receipts(session_maker)
+    assert [receipt.resolution for receipt in receipts] == [INBOUND_RESOLUTION_IGNORED_ROUTE, "noop"]
+    assert all(receipt.resolved_at is not None for receipt in receipts)
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is True
+
+
+async def test_an_event_without_receipts_keeps_its_historical_handling(session_maker, monkeypatch) -> None:
+    """No per-message provenance means no re-decision against today's routes.
+
+    Every delivery stored before this phase existed is in this shape. Its
+    commands are still applied and its acknowledgement still goes out, because
+    re-judging it now would mean deciding an old message by configuration it
+    never saw.
+    """
+    await _seed_sender(session_maker)
+    client_id = await _card(session_maker)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:no-receipts-r6",
+                    status="received",
+                    payload=_payload(_message(text="STOP", msg_id="wamid.R6F")),
+                    received_at=datetime.now(timezone.utc),
+                )
+            )
+    provider = CaptureProvider()
+    await _process_pending(session_maker, provider)
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+    assert (await _client_row(session_maker, client_id)).wa_opted_out is True
+    assert len(provider.sent) == 1
+    assert "abgemeldet" in provider.sent[0][2]

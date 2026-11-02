@@ -67,12 +67,14 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_consent import (
+    NOOP_PROJECTION_SUPERSEDED,
     SOURCE_SUPPRESSION,
     SOURCE_SUPPRESSION_UUID,
     ProjectedRefusal,
     apply_projected_refusal,
     consent_decision,
     iter_payload_consent_commands,
+    ledger_state,
     normalize_wa_address,
 )
 
@@ -91,6 +93,12 @@ SKIP_ADDRESS_UNNORMALISABLE = "address_not_normalisable"
 # message against today's allow list would make the reconciliation a way to
 # apply exactly the commands the deployment was configured to refuse.
 SKIP_ROUTE_NOT_ALLOWED = "sender_route_not_allowed"
+# The source has no provable event time and its own observed moment predates the
+# moment a proven opt-in for that address was observed. A stale snapshot of a
+# state the ledger has already moved past: projecting it would undo a
+# resubscribe nobody disputes AND make the resulting refusal unorderable, which
+# by §46.4.4 means permanent.
+SKIP_SUPERSEDED_BY_OPT_IN = "superseded_by_proven_opt_in"
 
 # Why a historical delivery outcome stays unknown.
 UNKNOWN_NOT_PROVEN_EXTERNAL = "rejection_not_proven_external"
@@ -116,6 +124,21 @@ class RefusalCandidate:
     notes: dict[str, Any] = field(default_factory=dict)
     already_suppressed: bool = False
     newly_suppressed: bool = False
+    projectable: bool = False
+
+    @property
+    def carries_event_evidence(self) -> bool:
+        """Is this a stored MESSAGE rather than a flag or a snapshot?
+
+        A stored event is a refusal somebody actually sent, with its own event
+        time or a provable absence of one, so it has something to say about WHEN
+        the refusal happened and must still be applied when a refusal is already
+        active — that is how the boundary a future START has to beat moves to
+        the newest known STOP. A card flag or a preview snapshot carries no time
+        of its own, so once the ledger already refuses there is nothing left for
+        it to add.
+        """
+        return self.origin == ORIGIN_STORED_EVENT
 
 
 @dataclass
@@ -147,6 +170,7 @@ class ProjectionReport:
     refusals_to_write: int = 0
     refusals_written: int = 0
     refusals_noop: int = 0
+    refusals_superseded: int = 0
     newly_suppressed_addresses: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
     by_origin: dict[str, int] = field(default_factory=dict)
@@ -172,6 +196,7 @@ class ProjectionReport:
                 "to_write": self.refusals_to_write,
                 "written": self.refusals_written,
                 "noop": self.refusals_noop,
+                "superseded": self.refusals_superseded,
                 "newly_suppressed_addresses": self.newly_suppressed_addresses,
                 "by_origin": dict(sorted(self.by_origin.items())),
                 "skipped": dict(sorted(self.skipped.items())),
@@ -496,9 +521,16 @@ async def project(
     live ingress instead of interleaving with it.
 
     Re-running is safe and re-running against a stale read is safe: each write
-    re-reads the ledger under the address lock, a refusal that is already active
-    is a no-op, and nothing here can lower a state. A live STOP that lands
-    between the read and the write wins and stays won.
+    re-reads the ledger under the address lock and DECIDES AGAIN there, a
+    refusal that is already active is a no-op, and nothing here can lower a
+    state. A live STOP that lands between the read and the write wins and stays
+    won; a live proven START that lands there turns the stale snapshot behind a
+    time-unknown candidate into a no-op instead of a permanent refusal.
+
+    A stored STOP is applied even when a refusal is already active, which is how
+    the boundary a future START has to beat moves to the newest known one. A
+    card flag or a preview snapshot is not: it carries no time of its own, so
+    once the ledger refuses there is nothing left for it to say.
     """
     report = ProjectionReport(applied=apply, started_at=utcnow())
 
@@ -536,10 +568,30 @@ async def project(
             # durable row that survives the card.
             ledger_already = any(source in (SOURCE_SUPPRESSION, SOURCE_SUPPRESSION_UUID) for source in decision.sources)
             candidate.already_suppressed = ledger_already
-            if ledger_already:
+            if ledger_already and not candidate.carries_event_evidence:
                 report.refusals_already_suppressed += 1
                 _bump(report.skipped, SKIP_ALREADY_SUPPRESSED)
                 continue
+            # A source with no event time of its own cannot override a proven
+            # opt-in for the SAME address that this process observed later. Per
+            # address deliberately: an opt-in proven for another number of the
+            # same person says nothing about this one, and the asymmetry only
+            # ever runs in the refusing direction.
+            #
+            # This is the preview of the rule. The decision that counts is made
+            # again inside the write transaction, under the address lock, so a
+            # START landing between the two is not missed.
+            if candidate.event_at is None:
+                state = await ledger_state(session, phone=candidate.wa_address)
+                if (
+                    state.permits
+                    and state.decided_observed_at is not None
+                    and candidate.observed_at < state.decided_observed_at
+                ):
+                    report.refusals_superseded += 1
+                    _bump(report.skipped, SKIP_SUPERSEDED_BY_OPT_IN)
+                    continue
+            candidate.projectable = True
             candidate.newly_suppressed = not decision.suppressed
             if candidate.newly_suppressed:
                 report.newly_suppressed_addresses += 1
@@ -549,11 +601,20 @@ async def project(
         logger.info("consent_projection: dry run %s", report.as_safe_dict())
         return report
 
+    # Counted from what the WRITES actually did, not from the preview: the
+    # ledger is re-read under the lock in every one of those transactions, and
+    # its answer there is the only one that describes a change to this database.
+    report.newly_suppressed_addresses = 0
     for candidate in candidates:
-        if candidate.already_suppressed:
+        if not candidate.projectable:
             continue
         async with session_maker() as session:
             async with session.begin():
+                before = await consent_decision(
+                    session,
+                    phone=candidate.wa_address,
+                    include_pending=False,
+                )
                 outcome = await apply_projected_refusal(
                     session,
                     ProjectedRefusal(
@@ -568,6 +629,13 @@ async def project(
                 )
         if outcome.applied:
             report.refusals_written += 1
+            if not before.suppressed:
+                # The same question the preview asks, so the number means one
+                # thing in both: this person was sendable and now is not.
+                report.newly_suppressed_addresses += 1
+        elif outcome.reason == NOOP_PROJECTION_SUPERSEDED:
+            report.refusals_superseded += 1
+            _bump(report.skipped, SKIP_SUPERSEDED_BY_OPT_IN)
         else:
             report.refusals_noop += 1
 
@@ -652,6 +720,7 @@ __all__ = [
     "SKIP_ALREADY_SUPPRESSED",
     "SKIP_HISTORICAL_START",
     "SKIP_ROUTE_NOT_ALLOWED",
+    "SKIP_SUPERSEDED_BY_OPT_IN",
     "UNKNOWN_ALREADY_SUCCEEDED",
     "UNKNOWN_NOT_PROVEN_EXTERNAL",
     "UNKNOWN_NO_ATTEMPT",

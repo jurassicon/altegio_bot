@@ -113,6 +113,12 @@ NOOP_STOP_ALREADY_ACTIVE: Final = "stop_already_active"
 # past, and letting it win would undo a verified, strictly-newer opt-in every
 # time the reconciliation ran.
 NOOP_STOP_SUPERSEDED: Final = "stop_older_than_proven_opt_in"
+# A projected historical refusal with no provable event time, whose own OBSERVED
+# moment is older than the moment a proven opt-in for that same address was
+# observed. It is a stale snapshot of a state this ledger has already moved
+# past, and writing it would turn a resubscribe nobody disputes into a refusal
+# of unknown order — one that, by §46.4.4, no later START could ever lift.
+NOOP_PROJECTION_SUPERSEDED: Final = "projection_older_than_proven_opt_in"
 
 # Where an aggregate refusal came from. The caller shows these to an operator.
 SOURCE_SUPPRESSION: Final = "consent_suppression"
@@ -495,6 +501,7 @@ async def apply_consent_decision(
     event_at: datetime | None,
     receipt_id: int | None = None,
     whatsapp_message_id: str | None = None,
+    linked_customer_uuid: uuid_module.UUID | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> DecisionOutcome:
     """Apply one STOP or START to one address, in the CALLER's transaction.
@@ -520,6 +527,19 @@ async def apply_consent_decision(
             # Named for what it is: the basis is a phone match, which bans and
             # proves nothing else.
             base_evidence["uuid_binding"] = "phone_matched_easyweek_card"
+        elif linked_customer_uuid is not None:
+            # No card carries this number any more — but one did at the moment an
+            # EasyWeek booking PROVED this UUID for this person, and that proof
+            # was written onto the receipt this refusal is being applied from.
+            #
+            # Without it the refusal would be recorded against the old number
+            # alone while the card had already moved to the new one, and nothing
+            # would connect the two: the person who said stop before the worker
+            # got to their message would come out sendable. Still a ban
+            # extension and nothing more — it is never read back as proof that
+            # this address belongs to that customer or to that branch.
+            banned_uuid = linked_customer_uuid
+            base_evidence["uuid_binding"] = "proven_uuid_link_on_receipt"
 
         if row is not None and row.state == CONSENT_STATE_OPTED_IN:
             # A proven opt-in is in force. A STOP that can PROVE it happened
@@ -533,7 +553,18 @@ async def apply_consent_decision(
             # on either side, or a newer STOP all APPLY: a tie and an unproven
             # order both fall to the refusal, which is the same asymmetry the
             # START rules use in the other direction.
-            opt_in_event_at = row.last_start_event_at or row.decided_event_at
+            #
+            # The bar is the PROVEN event time of the opt-in actually IN FORCE,
+            # read from the decision itself. Never from ``last_start_event_at``,
+            # which is an audit high-water mark over every START this address
+            # ever sent — and that was the defect: the mark moved before any of
+            # the START proofs below ran, so an unsigned START at 11:00 raised
+            # the bar to 11:00 although it changed nothing, the genuine signed
+            # START at 10:30 then took the state, and the next real STOP at
+            # 10:45 was discarded as a replay of something that never happened.
+            # An audit trail of rejected attempts must not be able to license
+            # ignoring a refusal.
+            opt_in_event_at = row.decided_event_at if row.decision_command == CONSENT_COMMAND_START else None
             if event_at is not None and opt_in_event_at is not None and event_at < opt_in_event_at:
                 if row.last_stop_observed_at is None or observed_at > row.last_stop_observed_at:
                     row.last_stop_observed_at = observed_at
@@ -640,16 +671,17 @@ async def apply_consent_decision(
             int(row.consent_version) if row is not None else None,
         )
 
-    if row.last_start_observed_at is None or observed_at > row.last_start_observed_at:
-        row.last_start_observed_at = observed_at
-    if event_at is not None and (row.last_start_event_at is None or event_at > row.last_start_event_at):
-        row.last_start_event_at = event_at
-
     def _refuse(reason: str) -> DecisionOutcome:
+        # A rejected START is AUDIT, and audit may not move a proof. Everything
+        # written here lives in ``evidence``; the ``last_start_*`` marks below
+        # are touched only once every proof has passed, so nothing a rejected
+        # attempt claims can raise the time a later STOP has to beat.
         merged = dict(row.evidence or {})
         merged.update(base_evidence)
         merged["last_refused_start_reason"] = reason
         merged["last_refused_start_at"] = observed_at.isoformat()
+        if event_at is not None:
+            merged["last_refused_start_event_at"] = event_at.isoformat()
         row.evidence = merged
         return DecisionOutcome(
             False,
@@ -693,6 +725,13 @@ async def apply_consent_decision(
         outcome = _refuse(REFUSED_START_IDENTIFIER_CONFLICT)
         await session.flush()
         return outcome
+
+    # Honoured, and only now do the marks move: every one of them describes a
+    # START this ledger actually acted on.
+    if row.last_start_observed_at is None or observed_at > row.last_start_observed_at:
+        row.last_start_observed_at = observed_at
+    if row.last_start_event_at is None or event_at > row.last_start_event_at:
+        row.last_start_event_at = event_at
 
     row.state = CONSENT_STATE_OPTED_IN
     row.consent_version = int(row.consent_version) + 1
@@ -838,6 +877,16 @@ async def extend_refusal_to_uuid(
     UUID has just been proven for this person by ``easyweek_uuid_identity``,
     against the numbers that proof was about.
 
+    An ACCEPTED BUT UNRESOLVED message is bound too, and that half is not an
+    optimisation. The refusal does not have to be in the ledger yet: the ingress
+    may have accepted a STOP seconds ago and the inbox worker may not have
+    reached it, and a protection that only covered existing suppression rows
+    would skip exactly that case. The number then changes, the worker finally
+    applies the STOP, and it writes a refusal against a number no card names any
+    more — provably the same person, and provably unreachable from the new one.
+    So the proof is stamped onto the pending receipt as well, and the decision
+    the worker eventually makes carries it onto the suppression row.
+
     It stays a BAN EXTENSION. The UUID is recorded on a refusal so the refusal
     travels; it is never written anywhere that reads it back as proof of who
     this address belongs to, which branch they are in, or that they are an
@@ -845,13 +894,16 @@ async def extend_refusal_to_uuid(
     as it is — one number can belong to two people over time, and overwriting
     would move an existing ban onto the wrong identity. The phone-keyed refusal
     keeps vetoing either way, and the disagreement is recorded.
+
+    Returns how many durable links were written — suppression rows plus pending
+    receipts — so a caller can log that something was carried forward.
     """
     now = observed_at or utcnow()
     normalised = sorted({value for value in (normalize_wa_address(raw) for raw in addresses) if value})
     if not normalised:
         return 0
     await lock_consent_addresses(session, normalised)
-    bound = 0
+    bound = await _link_pending_receipts_to_uuid(session, addresses=normalised, customer_uuid=customer_uuid, now=now)
     for address in normalised:
         row = await _suppression_for_update(session, address)
         if row is None:
@@ -870,6 +922,45 @@ async def extend_refusal_to_uuid(
             row.evidence = merged
     await session.flush()
     return bound
+
+
+async def _link_pending_receipts_to_uuid(
+    session: AsyncSession,
+    *,
+    addresses: Sequence[str],
+    customer_uuid: uuid_module.UUID,
+    now: datetime,
+) -> int:
+    """Carry the same proof onto every unresolved receipt for these addresses.
+
+    The caller holds the address locks, so a receipt is either already on disk
+    and stamped here, or its insert is waiting for those locks and will be read
+    by the guard afterwards. Rows already linked to a different UUID are left
+    alone for the same reason the suppression rows are: one number can belong to
+    two people over time.
+
+    Scoped to UNRESOLVED rows deliberately. A resolved receipt has already had
+    its say — whatever it decided is on the suppression row, which this function
+    binds separately — and re-stamping history would claim a link for a moment
+    at which nothing had been proven.
+    """
+    rows = list(
+        (
+            await session.scalars(
+                select(WhatsAppInboundReceipt)
+                .where(WhatsAppInboundReceipt.resolved_at.is_(None))
+                .where(WhatsAppInboundReceipt.wa_address.in_(list(addresses)))
+                .with_for_update()
+            )
+        ).all()
+    )
+    linked = 0
+    for row in rows:
+        if row.linked_easyweek_customer_uuid is None:
+            row.linked_easyweek_customer_uuid = customer_uuid
+            row.linked_uuid_recorded_at = now
+            linked += 1
+    return linked
 
 
 async def apply_inbound_consent(
@@ -910,6 +1001,42 @@ async def apply_inbound_consent(
             if not receipts:
                 receipts = await _backfill_receipts(session, event, observed_at=now)
 
+            # Every address of the delivery, locked at once and in sorted order,
+            # BEFORE the first decision is applied.
+            #
+            # This was a mutual block with a durable loss behind it. The ingress
+            # locks a payload's addresses sorted; this loop used to take them one
+            # at a time in MESSAGE order, so a delivery of [STOP B, STOP A] left
+            # the worker holding B and waiting for A while a concurrent ingress
+            # for the same two addresses held A and waited for B. PostgreSQL
+            # resolves that by aborting one of them, and the one it aborts here
+            # is not a retryable delay: ordinary inbound has no recovery pass of
+            # its own, so the event stayed `processing`, the suppression was
+            # never written, and the receipts stayed unresolved for good.
+            #
+            # The ORDER OF APPLICATION below is untouched — commands are still
+            # applied in message order, with STOP taking precedence by the
+            # ledger's own rules. Only the order in which the locks are acquired
+            # is fixed, and it is now the same one on both sides.
+            # Every address of the delivery, locked at once and in sorted order,
+            # BEFORE the first decision is applied.
+            #
+            # This was a mutual block with a durable loss behind it. The ingress
+            # locks a payload's addresses sorted; this loop used to take them one
+            # at a time in MESSAGE order, so a delivery of [STOP B, STOP A] left
+            # the worker holding B and waiting for A while a concurrent ingress
+            # for the same two addresses held A and waited for B. PostgreSQL
+            # resolves that by aborting one of them, and the one it aborts here
+            # is not a retryable delay: ordinary inbound has no recovery pass of
+            # its own, so the event stayed `processing`, the suppression was
+            # never written, and the receipts stayed unresolved for good.
+            #
+            # The ORDER OF APPLICATION below is untouched — commands are still
+            # applied in message order, with STOP taking precedence by the
+            # ledger's own rules. Only the order in which the locks are acquired
+            # is fixed, and it is now the same one on both sides.
+            await lock_consent_addresses(session, (receipt.wa_address for receipt in receipts))
+
             applied = refused = noop = 0
             reasons: list[str] = []
             for receipt in receipts:
@@ -936,7 +1063,9 @@ async def apply_inbound_consent(
                     noop += 1
                     continue
 
-                await lock_consent_address(session, receipt.wa_address)
+                # No lock is taken here: this address is already held, with
+                # every other address of the delivery, in the one sorted order
+                # above.
                 outcome = await apply_consent_decision(
                     session,
                     wa_address=receipt.wa_address,
@@ -947,6 +1076,7 @@ async def apply_inbound_consent(
                     event_at=receipt.event_at,
                     receipt_id=int(receipt.id),
                     whatsapp_message_id=receipt.whatsapp_message_id,
+                    linked_customer_uuid=receipt.linked_easyweek_customer_uuid,
                 )
                 receipt.resolved_at = now
                 receipt.resolution = outcome.resolution
@@ -1074,13 +1204,62 @@ async def _uuid_linked_addresses(
     return sorted(addresses)
 
 
+async def _historically_linked_addresses(
+    session: AsyncSession,
+    customer_uuid: uuid_module.UUID | None,
+) -> list[str]:
+    """Addresses this UUID is PROVABLY linked to that no card carries any more.
+
+    The cards hold today's numbers. They are not the history of the negative
+    links, and §46.4.2 needs that history: a refusal — or an accepted message
+    that has not been decided yet — recorded against a number the person used to
+    have is still about this person after the card moves on, and the old number
+    is then reachable from nowhere else.
+
+    Two sources, both of them facts this database already wrote down for the ban
+    to travel: suppression rows bound to this UUID, and unresolved receipts
+    stamped with it when the booking bridge proved it. Used ONLY to widen the
+    search for refusals and the set of addresses to serialise against — never
+    read back as proof that one of them belongs to this customer.
+    """
+    if customer_uuid is None:
+        return []
+    addresses: set[str] = set()
+    suppressed = (
+        await session.scalars(
+            select(WhatsAppConsentSuppression.wa_address).where(
+                WhatsAppConsentSuppression.banned_easyweek_customer_uuid == customer_uuid
+            )
+        )
+    ).all()
+    pending = (
+        await session.scalars(
+            select(WhatsAppInboundReceipt.wa_address)
+            .where(WhatsAppInboundReceipt.linked_easyweek_customer_uuid == customer_uuid)
+            .where(WhatsAppInboundReceipt.resolved_at.is_(None))
+        )
+    ).all()
+    for value in (*suppressed, *pending):
+        normalised = normalize_wa_address(value)
+        if normalised is not None:
+            addresses.update(address_variants(normalised))
+    return sorted(addresses)
+
+
 @dataclass(frozen=True)
 class _Identity:
     """Who the refusal search is about, before anything is read or locked."""
 
     address: str | None
     customer_uuid: uuid_module.UUID | None
+    # Every address a refusal for this person could be recorded against: what to
+    # search, and what to lock.
     addresses: tuple[str, ...]
+    # The subset of those that no card of this person carries today, reached
+    # only through a stored negative link. Kept apart because the operator
+    # report needs to be able to say so — "this refusal is on a number they used
+    # to have" is a different sentence from "this refusal is on their number".
+    linked_addresses: tuple[str, ...] = ()
     gaps: tuple[str, ...] = ()
 
 
@@ -1115,7 +1294,7 @@ async def _resolve_identity(
         customer_uuid = easyweek_customer_uuid
 
     if address is None:
-        return _Identity(None, customer_uuid, (), (GAP_ADDRESS_UNNORMALISABLE,))
+        return _Identity(None, customer_uuid, (), gaps=(GAP_ADDRESS_UNNORMALISABLE,))
 
     gaps: list[str] = []
     if customer_uuid is None:
@@ -1126,7 +1305,15 @@ async def _resolve_identity(
 
     addresses = set(address_variants(address))
     addresses.update(await _uuid_linked_addresses(session, customer_uuid))
-    return _Identity(address, customer_uuid, tuple(sorted(addresses)), tuple(gaps))
+    linked = {value for value in await _historically_linked_addresses(session, customer_uuid) if value not in addresses}
+    addresses.update(linked)
+    return _Identity(
+        address,
+        customer_uuid,
+        tuple(sorted(addresses)),
+        tuple(sorted(linked)),
+        tuple(gaps),
+    )
 
 
 async def consent_decision(
@@ -1191,7 +1378,8 @@ async def consent_decision(
             suppressed = True
             sources.append(
                 SOURCE_SUPPRESSION_UUID
-                if row.wa_address not in ordered_addresses and row.banned_easyweek_customer_uuid is not None
+                if row.wa_address in identity.linked_addresses
+                or (row.wa_address not in ordered_addresses and row.banned_easyweek_customer_uuid is not None)
                 else SOURCE_SUPPRESSION
             )
         elif row.decided_observed_at is not None and (newest_opt_in is None or row.decided_observed_at > newest_opt_in):
@@ -1232,13 +1420,21 @@ async def consent_decision(
 
     pending_ids: list[int] = []
     if include_pending:
+        pending_conditions = [WhatsAppInboundReceipt.wa_address.in_(ordered_addresses)]
+        if customer_uuid is not None:
+            # A message accepted from a number this UUID was PROVEN to use is
+            # still unaccounted for, whatever the cards say today. Without this
+            # clause a STOP that arrived moments before the card's number
+            # changed was invisible to the guard for the new number, and the
+            # send went ahead while the refusal sat unread.
+            pending_conditions.append(WhatsAppInboundReceipt.linked_easyweek_customer_uuid == customer_uuid)
         pending_ids = [
             int(value)
             for value in (
                 await session.scalars(
                     select(WhatsAppInboundReceipt.id)
                     .where(WhatsAppInboundReceipt.resolved_at.is_(None))
-                    .where(WhatsAppInboundReceipt.wa_address.in_(ordered_addresses))
+                    .where(or_(*pending_conditions))
                     .order_by(WhatsAppInboundReceipt.id.asc())
                     .limit(200)
                 )
@@ -1280,6 +1476,12 @@ class LedgerState:
     state: str | None
     consent_version: int | None = None
     last_refused_start_reason: str | None = None
+    # When the decision in force was OBSERVED by this process. For an
+    # ``opted_in`` row that is the moment a proven opt-in landed, which is what
+    # a historical source with no event time of its own has to be ordered
+    # against — our own clock on both sides, never a timestamp invented for the
+    # snapshot.
+    decided_observed_at: datetime | None = None
 
     @property
     def refuses(self) -> bool:
@@ -1303,19 +1505,66 @@ async def ledger_state(session: AsyncSession, *, phone: object) -> LedgerState:
     address = normalize_wa_address(phone)
     if address is None:
         return LedgerState(None)
+    # Values, not the mapped entity. An entity already loaded in this session
+    # comes back from the identity map with the attributes it had when it was
+    # first read, so a second call inside one transaction would hand back a
+    # stale answer — and the projection below re-reads deliberately, to find out
+    # whether the ledger moved under it.
     row = (
         await session.execute(
-            select(WhatsAppConsentSuppression).where(WhatsAppConsentSuppression.wa_address == address)
+            select(
+                WhatsAppConsentSuppression.state,
+                WhatsAppConsentSuppression.consent_version,
+                WhatsAppConsentSuppression.evidence,
+                WhatsAppConsentSuppression.decided_observed_at,
+            ).where(WhatsAppConsentSuppression.wa_address == address)
         )
-    ).scalar_one_or_none()
+    ).first()
     if row is None:
         return LedgerState(None)
-    reason = (row.evidence or {}).get("last_refused_start_reason")
+    state, version, evidence, decided_observed_at = row
+    reason = (evidence or {}).get("last_refused_start_reason")
     return LedgerState(
-        row.state,
-        int(row.consent_version),
+        str(state),
+        int(version),
         str(reason) if isinstance(reason, str) else None,
+        decided_observed_at,
     )
+
+
+def ledger_matches_clause(phone: object, observed: LedgerState) -> Any:
+    """A SQL condition that holds only while the ledger still reads as *observed*.
+
+    The compare-and-set half of §46.4.7's projection contract. The inbox worker
+    derives the legacy card flag from the ledger and then writes it, and those
+    are two statements: between them a newer STOP can be decided and projected
+    by another event's handler, and the older handler would then write its stale
+    answer over the newer one — the ledger refusing while ``Client.wa_opted_out``
+    said sendable, which is the flag every marketing path reads.
+
+    Holding a lock across that gap is not available: the write happens in a
+    transaction that goes on to acknowledge the customer over HTTP, and no lock
+    may be held across a network call. So the write carries its premise instead.
+    An UPDATE guarded by this clause lands only while the ledger still says
+    exactly what the value was derived from, and the writer re-reads afterwards
+    and derives again if it moved. A stale projection cannot land, and the last
+    projection to commit is the one that read the final state.
+
+    ``observed.state is None`` means "no row for this address", and the clause is
+    then the negative one: a suppression appearing in between must invalidate the
+    legacy fallback just as surely as a changed one.
+    """
+    address = normalize_wa_address(phone)
+    if address is None:
+        # Nothing to compare, and nothing this clause could make safe.
+        return text("false")
+    matching = select(WhatsAppConsentSuppression.id).where(WhatsAppConsentSuppression.wa_address == address)
+    if observed.state is None:
+        return ~matching.exists()
+    return matching.where(
+        WhatsAppConsentSuppression.state == observed.state,
+        WhatsAppConsentSuppression.consent_version == int(observed.consent_version or 0),
+    ).exists()
 
 
 async def is_suppressed(
@@ -1511,8 +1760,40 @@ async def apply_projected_refusal(
     recovered from a sanitised stored event, so it could not lift anything even
     if it were, and writing it down would create an opt-in record out of a
     payload nobody can verify.
+
+    And the decision is re-made HERE, under the lock, not only when the
+    candidate was collected. That was a defect with two halves. A
+    ``CampaignRecipient`` snapshot taken at 10:10 was still written as a fresh
+    refusal after a proven START at 10:30 — and because a snapshot has no event
+    time of its own, the refusal it created was one of UNKNOWN order, which
+    §46.4.4 then makes permanent: no later START can lift it. The other half was
+    the collection-time shortcut, which skipped a candidate whenever any refusal
+    was already active, so a stored STOP at 11:00 never advanced the boundary
+    past the 10:00 one and a START at 10:30 lifted a refusal the database could
+    prove was newer than it.
+
+    A source with no provable event time is therefore ordered against the moment
+    a proven opt-in for THIS address was observed. Both sides of that comparison
+    are this process's own clock, so nothing external is invented; and it is
+    strictly per address, because a proven opt-in on another number of the same
+    person is not an opt-in for this one.
     """
     await lock_consent_address(session, refusal.wa_address)
+    if refusal.event_at is None:
+        current = await _suppression_for_update(session, refusal.wa_address)
+        if (
+            current is not None
+            and current.state == CONSENT_STATE_OPTED_IN
+            and current.decided_observed_at is not None
+            and refusal.observed_at < current.decided_observed_at
+        ):
+            return DecisionOutcome(
+                False,
+                INBOUND_RESOLUTION_NOOP,
+                NOOP_PROJECTION_SUPERSEDED,
+                current.state,
+                int(current.consent_version),
+            )
     evidence: dict[str, Any] = {"projected_from": refusal.origin}
     evidence.update(refusal.notes)
     return await apply_consent_decision(
@@ -1547,6 +1828,7 @@ def iter_payload_consent_commands(
 
 __all__ = [
     "GAP_ADDRESS_UNNORMALISABLE",
+    "NOOP_PROJECTION_SUPERSEDED",
     "GAP_PENDING_INBOUND",
     "GAP_UUID_BINDING_AMBIGUOUS",
     "GUARD_ADDRESS_SET_MOVED",
@@ -1584,6 +1866,7 @@ __all__ = [
     "final_send_guard",
     "is_suppressed",
     "iter_payload_consent_commands",
+    "ledger_matches_clause",
     "ledger_state",
     "lock_consent_address",
     "lock_consent_addresses",

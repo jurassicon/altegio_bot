@@ -1015,11 +1015,11 @@ async def _claimed_slot(session_maker) -> tuple[int, Any]:
     return batch_id, claim
 
 
-async def _accept(session_maker, batch_id: int, wamid: str) -> Any:
+async def _accept(session_maker, batch_id: int, wamid: str, *, slot: int = 1) -> Any:
     return await ledger_module.record_item_outcome(
         session_maker,
         batch_id=batch_id,
-        slot=1,
+        slot=slot,
         status=VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
         expected_statuses=frozenset({VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED}),
         provider_message_id=wamid,
@@ -1170,3 +1170,277 @@ async def test_an_early_unsigned_callback_is_not_promoted_by_being_bound(
     assert fact.evidence.get("unproven") == UNPROVEN_CALLBACK_UNVERIFIED
     assert fact.item_id == int((await _item(session_maker, batch_id)).id)
     assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is None
+
+
+# ===========================================================================
+# Round 2, review fix 5B — one order for the WHOLE callback transaction
+# ===========================================================================
+
+
+def _multi_status_payload(*entries: tuple[str, str], recipient: str, epoch: int = 1_760_000_500) -> dict[str, Any]:
+    """One delivery carrying several statuses, which is what Meta really sends.
+
+    The whole point of this group: a payload is not one status, and handling it
+    one status at a time took locks in an order the acceptance could cross.
+    """
+    statuses: list[dict[str, Any]] = []
+    for wamid, status in entries:
+        entry: dict[str, Any] = {
+            "id": wamid,
+            "status": status,
+            "timestamp": str(epoch),
+            "recipient_id": recipient,
+        }
+        if status == "failed":
+            entry["errors"] = [{"code": 131026, "title": "Message undeliverable"}]
+        statuses.append(entry)
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "WABA-PROD",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": SENDER_PNID},
+                            "statuses": statuses,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+async def _claim(session_maker, batch_id: int, slot: int) -> Any:
+    item = await _item(session_maker, batch_id, slot)
+    return await ledger_module.claim_send(
+        session_maker,
+        identity=await _identity_for(session_maker, batch_id),
+        batch_id=batch_id,
+        slot=slot,
+        plan_digest="d" * 64,
+        live_guard_reproven_at=item.pay_verified_at,
+        template_code="new_client_voucher_10eur_v2",
+        meta_template_name="meta_template",
+        template_language="de",
+        sender_id=None,
+        sender_phone_number_id=SENDER_PNID,
+        destination_phone=PHONES[slot - 1],
+    )
+
+
+async def _one_sent_one_claimed(session_maker, *, first_wamid: str) -> int:
+    """A two-slot batch mid-delivery: slot 1 accepted, slot 2 claimed.
+
+    The shape the executor really passes through, slot by slot — claim, send,
+    accept, claim the next — and the shape the deadlock needed: one message of
+    the batch already has an identifier a callback can arrive about, while the
+    next one is still being accepted.
+    """
+    reader = FakeReader(count=2)
+    _run_id, batch_id, _request = await _paid_batch(session_maker, reader, count=2)
+    assert (await _claim(session_maker, batch_id, 1)).granted
+    assert (await _accept(session_maker, batch_id, first_wamid, slot=1)).applied
+    assert (await _claim(session_maker, batch_id, 2)).granted
+    return batch_id
+
+
+async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float = 15.0) -> None:
+    """Wait until PostgreSQL reports somebody queued on an advisory lock."""
+    from sqlalchemy import text as sql_text
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with session_maker() as probe:
+            waiting = await probe.scalar(
+                sql_text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            )
+        if int(waiting or 0) >= 1:
+            return
+        assert loop.time() < deadline, "nothing ever queued on an advisory lock"
+        await asyncio.sleep(0.05)
+
+
+async def test_a_mixed_callback_does_not_deadlock_the_acceptance_of_another_slot(
+    session_maker, production_configuration, binding_key, monkeypatch
+) -> None:
+    """The review's schedule B, reproduced and shown closed.
+
+    One callback carries ``delivered`` for slot 1's message and ``failed`` for
+    slot 2's. Handling them one at a time took the batch header to record the
+    delivery and then asked for slot 2's identifier lock — while the transaction
+    accepting slot 2 held that identifier and was waiting for the same header.
+    PostgreSQL broke the cycle by aborting one of them, and the one it aborted
+    was the acceptance: Meta already had the message, the slot stayed
+    ``send_claimed`` with no identifier, slot 2's failure stayed unmatched, and
+    the executor gave up on an operation it could no longer describe.
+
+    Here the acceptance is parked between its identifier lock and the header,
+    which is exactly where it was when the cycle used to close. The callback
+    must then be waiting WITHOUT the header, so the acceptance can take it.
+    """
+    wamid_delivered = "wamid.MIXED-DELIVERED"
+    wamid_failed = "wamid.MIXED-FAILED"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid_delivered)
+
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    real_header = ledger_module._header_by_id
+    first = {"pending": True}
+
+    async def _parking_header(session: Any, header_id: int, *, for_update: bool = False) -> Any:
+        if first["pending"]:
+            first["pending"] = False
+            parked.set()
+            await release.wait()
+        return await real_header(session, header_id, for_update=for_update)
+
+    monkeypatch.setattr(ledger_module, "_header_by_id", _parking_header)
+    acceptance = asyncio.create_task(_accept(session_maker, batch_id, wamid_failed, slot=2))
+    await asyncio.wait_for(parked.wait(), timeout=10)
+
+    callback = asyncio.create_task(
+        _deliver_status(
+            session_maker,
+            _multi_status_payload(
+                (wamid_delivered, "delivered"),
+                (wamid_failed, "failed"),
+                recipient=PHONES[1].lstrip("+"),
+            ),
+        )
+    )
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+
+    recorded = await asyncio.wait_for(acceptance, timeout=20)
+    callback_event_id = await asyncio.wait_for(callback, timeout=20)
+
+    assert recorded.applied, recorded.reason
+    second = await _item(session_maker, batch_id, 2)
+    assert second.provider_message_id == wamid_failed
+    facts = [fact for fact in await _facts(session_maker) if fact.provider_message_id == wamid_failed]
+    assert len(facts) == 1
+    # Bound to the slot in either commit order, and nothing was re-sent: the
+    # provider double in this module raises if anything tries.
+    assert facts[0].item_id == int(second.id)
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    first_item = await _item(session_maker, batch_id, 1)
+    assert first_item.delivered_at is not None
+    # And the delivery itself was processed rather than left behind: an aborted
+    # callback transaction used to strand the event as well as lose the fact.
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, callback_event_id)
+    assert event.status == "processed"
+    assert event.error is None
+
+
+async def test_a_callback_takes_its_message_locks_in_sorted_order(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Two failures in one payload, in the order that is NOT the sorted one.
+
+    A transaction that locked identifiers in payload order could cross another
+    one carrying the same two in the opposite order. Here the sorted-first
+    identifier is held by a third transaction, so the callback has to be queued
+    on it while holding nothing — which is what lets the holder take the second
+    identifier without a cycle.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production.delivery_evidence import lock_message_identity
+
+    low = "wamid.AAA-SORTS-FIRST"
+    high = "wamid.ZZZ-SORTS-LAST"
+    assert low < high
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=low)
+    assert (await _accept(session_maker, batch_id, high, slot=2)).applied
+
+    release = asyncio.Event()
+    took_the_second = asyncio.Event()
+
+    async def _holder() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await lock_message_identity(session, low)
+                await release.wait()
+                await asyncio.wait_for(lock_message_identity(session, high), timeout=10)
+                took_the_second.set()
+
+    holder = asyncio.create_task(_holder())
+    await asyncio.sleep(0)
+    callback = asyncio.create_task(
+        _deliver_status(
+            session_maker,
+            # Payload order is high, low — the reverse of the sorted order.
+            _multi_status_payload((high, "failed"), (low, "failed"), recipient=PHONES[0].lstrip("+")),
+        )
+    )
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+    await asyncio.wait_for(took_the_second.wait(), timeout=10)
+    await asyncio.wait_for(holder, timeout=10)
+    await asyncio.wait_for(callback, timeout=20)
+
+    facts = {fact.provider_message_id: fact for fact in await _facts(session_maker)}
+    assert set(facts) == {low, high}
+    assert all(fact.item_id is not None for fact in facts.values())
+
+
+async def test_two_callbacks_with_the_same_pair_in_opposite_orders_both_land(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The same two identifiers, two deliveries, opposite payload orders.
+
+    Both transactions sort the same way, so one simply waits for the other.
+    Neither is aborted, and the facts are idempotent across the pair.
+    """
+    first_id = "wamid.PAIR-ONE"
+    second_id = "wamid.PAIR-TWO"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=first_id)
+    assert (await _accept(session_maker, batch_id, second_id, slot=2)).applied
+
+    await asyncio.gather(
+        _deliver_status(
+            session_maker,
+            _multi_status_payload((first_id, "failed"), (second_id, "failed"), recipient=PHONES[0].lstrip("+")),
+        ),
+        _deliver_status(
+            session_maker,
+            _multi_status_payload((second_id, "failed"), (first_id, "failed"), recipient=PHONES[0].lstrip("+")),
+        ),
+    )
+
+    facts = await _facts(session_maker)
+    by_message = {fact.provider_message_id: fact for fact in facts}
+    assert set(by_message) == {first_id, second_id}
+    assert len(facts) == 2, "the same fact delivered twice is still one row"
+    for fact in facts:
+        assert fact.item_id is not None
+        assert fact.match_state in {DELIVERY_FAILURE_MATCH_CONFIRMED, DELIVERY_FAILURE_MATCH_CONFLICTING}
+
+
+async def test_a_delivered_in_the_same_payload_still_outranks_its_own_failure(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Locking the scope up front changes no outcome, only the order of waits.
+
+    ``read`` and ``delivered`` keep outranking a ``failed`` about the same
+    message, including when both arrive in one delivery.
+    """
+    wamid = "wamid.SAME-PAYLOAD"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid)
+
+    await _deliver_status(
+        session_maker,
+        _multi_status_payload((wamid, "delivered"), (wamid, "failed"), recipient=PHONES[0].lstrip("+")),
+    )
+
+    item = await _item(session_maker, batch_id, 1)
+    assert item.delivered_at is not None
+    assert item.status in {VOUCHER_PRODUCTION_ITEM_DELIVERED, VOUCHER_PRODUCTION_ITEM_READ}
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert facts[0].evidence.get("conflict") == CONFLICT_AFTER_SUCCESS
+    assert item.evidence.get("confirmed_delivery_failure") is not True

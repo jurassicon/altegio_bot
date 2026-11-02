@@ -77,6 +77,8 @@ def upgrade() -> None:
         sa.Column("sender_route_digest", sa.String(64), nullable=True),
         sa.Column("route_allowed", sa.Boolean(), nullable=True),
         sa.Column("whatsapp_message_id", sa.String(128), nullable=True),
+        sa.Column("linked_easyweek_customer_uuid", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("linked_uuid_recorded_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("event_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
@@ -106,6 +108,10 @@ def upgrade() -> None:
             "route_allowed IS NOT FALSE OR resolved_at IS NOT NULL",
             name="ck_wa_inbound_receipt_refused_route_resolved",
         ),
+        sa.CheckConstraint(
+            "(linked_easyweek_customer_uuid IS NULL) = (linked_uuid_recorded_at IS NULL)",
+            name="ck_wa_inbound_receipt_linked_uuid_paired",
+        ),
     )
     op.create_index(
         "ix_wa_inbound_receipt_pending",
@@ -120,6 +126,12 @@ def upgrade() -> None:
         RECEIPTS,
         ["whatsapp_message_id"],
         postgresql_where=sa.text("whatsapp_message_id IS NOT NULL"),
+    )
+    op.create_index(
+        "ix_wa_inbound_receipt_pending_uuid",
+        RECEIPTS,
+        ["linked_easyweek_customer_uuid"],
+        postgresql_where=sa.text("resolved_at IS NULL AND linked_easyweek_customer_uuid IS NOT NULL"),
     )
 
     op.create_table(

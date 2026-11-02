@@ -50,8 +50,20 @@ actually made instead of re-deriving one.
 - A delivery is marked `ignored` only when **none** of its routes is allowed.
 - A refused message is resolved where that decision was made, so it never holds
   a send and is never executed later.
-- An address whose every message in one delivery was refused is one this worker
-  does nothing about: no command, no Chatwoot mirror, no acknowledgement.
+- The worker filters **per message**, by position against the stored verdict,
+  with the sender address checked on every row as the proof the two readings
+  still line up. A refused message triggers none of what follows — not its
+  command, not its Chatwoot mirror, not its promo branch, and not an
+  acknowledgement through the sender it named. Filtering by ADDRESS was a defect
+  with an outbound consequence: a delivery carrying a START on a refused route
+  and a STOP on an allowed one named an address with at least one accepted
+  message, the whole address passed, the first action survived, and the positive
+  acknowledgement went out through the very sender the deployment had declined.
+- A delivery whose receipts cannot be lined up with its payload yields
+  **nothing**: that is a disagreement about one payload, and acting on none of it
+  is the honest answer.
+- A delivery with no receipts at all — every event stored before this stage — is
+  handled exactly as it was then.
 - Re-deriving an old message's verdict from today's settings is forbidden. The
   allow list is configuration; re-reading it would turn a route that was refused
   into an executable command, or refuse one that was accepted.
@@ -137,6 +149,16 @@ reported. Only a provable order refuses it: an equal time, an unknown time on
 either side, or a newer STOP all apply, so a tie and an unproven order both fall
 to the refusal.
 
+The bar that exception is measured against is **`decided_event_at` of the
+decision in force**, and nothing else. `last_start_observed_at` and
+`last_start_event_at` are audit: they move only for a START this ledger actually
+honoured, and no rule reads them. Deriving the bar from the high-water mark was a
+defect — the mark moved for every START, including the ones the proofs rejected,
+so an unsigned attempt timestamped an hour later raised the bar to that hour and
+the next genuine refusal was filed away as a replay of something that never
+happened. An audit trail of rejected attempts may not license ignoring a
+refusal.
+
 **A START lifts a refusal only if all of these hold:**
 
 - Meta's HMAC was configured **and** verified for that very request;
@@ -187,12 +209,45 @@ command it just read:
   authoritative answer to follow, and refusing to clear here would strand
   everybody whose only refusal predates this stage.
 
-A command the ledger did not honour is **not acknowledged**. Telling somebody
-"you are subscribed again" while the durable answer still says `opted_out` is
-the one outcome §46.4.7 rules out by name; the reason is recorded on the event
-for an operator instead. On a deployment with no app secret that is every START
-from a refused address, which makes the consequence below the thing to fix first.
-A lifted refusal never revives cancelled marketing jobs.
+The projection runs in a **transaction of its own**, after the consent write and
+before the event transaction. Both of those matter: it is then durable against
+an acknowledgement that fails, a Chatwoot outage, an exception in the handler or
+the process dying, and it holds nothing while the handler makes its network
+calls.
+
+It is also a **compare-and-set**. Deriving the value and writing it are two
+statements, and between them another event's handler can decide and project a
+newer refusal — after which the older handler would write its stale answer over
+the newer one, leaving the ledger refusing while the flag every sender reads said
+sendable. The UPDATE therefore carries its premise: it lands only while the
+ledger still reads exactly as the value was derived from, and the writer re-reads
+afterwards and derives again if it moved. `consent_version` only increases and
+never changes without the state changing with it, so an unchanged version after
+the write proves the premise held. A lock across that gap is not an option — the
+same transaction used to go on to acknowledge the customer — and a stale
+projection simply cannot land.
+
+### What the acknowledgement says
+
+The acknowledgement describes the state that **settled**, for the address the
+message came from, and it is sent only when some accepted message of that
+delivery asked for exactly that state.
+
+- the ledger refuses and a STOP was among the delivery's accepted commands →
+  the unsubscribe confirmation;
+- the ledger has proven an opt-in and a START was among them → the subscription
+  confirmation;
+- the ledger has no row → the command's own historical answer;
+- otherwise — a START the ledger refused, a STOP it proved to be a replay —
+  **nothing is sent**, and the reason is recorded on the event.
+
+Taking it from the first message of the payload was a defect. A delivery of
+[START, STOP] from one person leaves them opted out, and the customer was told
+"you are subscribed again" anyway; §46.4.7 rules that out by name. Nothing may
+confirm a subscription when the settled state is a refusal. On a deployment with
+no app secret the silent case is every START from a refused address, which makes
+the consequence below the thing to fix first. A lifted refusal never revives
+cancelled marketing jobs.
 
 ### Consequence to know before rollout
 
@@ -202,10 +257,13 @@ recorded `unverified`, and `start_authenticity_unproven` refuses. This is
 §46.4.7 working as specified — "a check that is not configured is not a check" —
 and it is deliberately fail-closed.
 
-What it does **not** change: the existing START behaviour is untouched. A START
-still clears `Client.wa_opted_out` exactly as before, so Altegio and generic
-EasyWeek marketing behave as they do today. Only the new ledger — read by the
-EasyWeek consent guard and by the future follow-up — is strict.
+What it does **not** change: no existing sender was rewritten, and an address
+this database holds no ledger row for behaves exactly as it did before — the
+command's own historical answer stands, so nobody whose only refusal predates
+this stage is stranded. What did change, deliberately, is that where a ledger row
+exists it is the authority: a START it refuses no longer clears
+`Client.wa_opted_out`, because that flag is what Altegio and generic EasyWeek
+marketing read, and leaving it cleared was the refusal being lost.
 
 A refusal whose own event time is unknown (a historical projection, a legacy
 flag) can never be lifted by a START, because "strictly newer" cannot be
@@ -276,14 +334,48 @@ so a receipt could commit between the comparison and the claim with neither side
 noticing.
 
 One boundary the locks cannot cover, stated rather than hidden: a refusal
-arriving on a number that no card names yet cannot be locked in advance, because
-nothing links it to this person until the refusal itself exists. It changes the
-fingerprint, so the claim-time re-check catches it.
+arriving on a number that **nothing** links to this person — no card, no
+suppression row, no stamped receipt — cannot be locked in advance, because the
+link does not exist until the refusal does. It changes the fingerprint, so the
+claim-time re-check catches it. A number only a stored negative link names is
+covered; see below.
 
 The locks take part in no cycle with the voucher stages: they are taken by the
 consent writer, the ingress and the guard, and by nothing that holds a batch
 header or item lock; among themselves they are always taken in sorted order. No
 HTTP happens under them, and none may.
+
+**Sorted means the whole set, at once, on every side.** The consent worker used
+to take a delivery's addresses one at a time in MESSAGE order, so a payload of
+[STOP B, STOP A] left it holding B and waiting for A while an ingress for the
+same two addresses held A and waited for B. PostgreSQL resolves that by aborting
+one of them, and the one it aborts here loses for good: ordinary inbound has no
+recovery pass of its own, so the event stayed `processing`, the suppression was
+never written, and the receipts stayed unresolved. The worker now locks every
+address of the delivery before it applies the first decision. The ORDER OF
+APPLICATION is unchanged — commands are still applied in message order, with the
+ledger's own precedence rules.
+
+### Addresses a card no longer carries
+
+The cards hold today's numbers, and they are not the history of the negative
+links. Two stored facts are read as that history, and both only ever widen who
+must not be messaged:
+
+- a suppression row bound to this UUID — the address it names is searched and
+  locked even when no card carries it any more;
+- an **unresolved receipt** stamped with this UUID when the booking bridge
+  proved it (`linked_easyweek_customer_uuid`). The ingress may have accepted a
+  STOP seconds before the number changed, and a protection that began at the
+  suppression row skipped exactly that case: the adoption found nothing to bind,
+  the number moved, and the worker then wrote the refusal against a number no
+  card names. The decision carries the stamped proof onto the suppression row
+  (`proven_uuid_link_on_receipt`).
+
+Neither is ever read back as proof that an address belongs to that customer, to
+that branch, or to EasyWeek at all. A row already linked to a different UUID is
+left exactly as it is — one number can belong to two people over time — and the
+disagreement is recorded.
 
 ### The exact guarantee, and its limit
 
@@ -372,7 +464,22 @@ Its facts say `route_proven = false` instead.
   never by timestamp proximity.
 - **Binding is guaranteed in either commit order**, by a transaction-scoped
   advisory lock on the message identifier that both sides take first (order:
-  message → header → item, the same relative order the stage writers use). The
+  message → header → item, the same relative order the stage writers use). A
+  callback transaction declares its WHOLE scope up front: every message
+  identifier its payload names, in sorted order, and only then the production
+  headers those identifiers belong to, in ascending id order. Per-status locking
+  was not enough, and the counterexample is an ordinary Meta delivery — one
+  payload carrying `delivered` for one message of a batch and `failed` for
+  another. Handling them one at a time took the header to record the delivery and
+  then asked for the second identifier, while the transaction accepting that
+  second message held its identifier and was waiting for the same header. The
+  cycle closed, PostgreSQL aborted one of them, and the one it aborted was the
+  acceptance: Meta already had the message, the slot stayed `send_claimed` with
+  no identifier, its failure stayed unmatched, and the executor gave up on an
+  operation it could no longer describe. Sorting the failures after the header
+  was already held could not help, because the header was the half taken first.
+  After the scope is declared, no identifier lock is ever requested behind a
+  header lock. The
   window it closes cannot be closed by re-reading: the callback looks for the
   slot before the identifier is committed and the acceptance looks for unmatched
   facts before the callback is committed, so both are correct about what they saw
@@ -458,9 +565,33 @@ Rules:
   per-message verdict was never recorded — every event older than that column —
   the event-level status is what is known, and the report says so every run
   (`historical_per_message_route_unrecorded`).
+- **The decision is made again inside the write transaction**, under the address
+  lock, not only when the candidate was collected. Two halves of this were
+  defects. A source with no event time of its own — a card flag, a preview
+  snapshot, a stored message whose timestamp nobody can parse — used to be
+  written as a fresh refusal even after a proven opt-in for that address had
+  been observed later; and because such a refusal has no provable order, §46.4.4
+  then makes it permanent. It is now reported as
+  `superseded_by_proven_opt_in` / `projection_older_than_proven_opt_in` and
+  written nowhere. Both sides of that comparison are this process's own clock, so
+  no external timestamp is invented, and it is strictly per address: an opt-in
+  proven for another number of the same person is not an opt-in for this one.
+- A **stored STOP is applied even when a refusal is already active**, which is
+  how the boundary a future START has to beat moves to the newest known
+  refusal. The collection-time shortcut used to skip every candidate once any
+  refusal was active, so a stored STOP from 11:00 never advanced a ledger
+  refusing from 10:00 — and a START from 10:30 then lifted a refusal this
+  database could prove was older than a STOP it already held. A card flag or a
+  snapshot is still skipped in that case: it carries no time of its own, so it
+  has nothing to add.
 - A STOP the ledger has already moved past is not re-applied: a proven, verified
   opt-in that came after it stands, and the run reports the STOP as a no-op.
   This is what makes the reconciliation safe to run nightly rather than once.
+- The counters describe what the writes actually did. `written` is the number of
+  refusals that really landed, `noop` the ones that changed nothing,
+  `superseded` the ones the re-decision declined, and
+  `newly_suppressed_addresses` counts people who were sendable before the run
+  and are not after it.
 - An unprovable delivery outcome stays unknown and never becomes a confirmed
   failure. A provable historical rejection is recorded with `route_proven=false`
   and no numeric code — the honest shape of an old fact.
@@ -549,3 +680,14 @@ Not implemented, and not reachable by any flag:
 All are required. No marker, skip or xfail was added. A change to shared inbound
 also requires `uv run pytest -q -m legacy_altegio`, per
 `docs/ops/test_suite_tiers.md`.
+
+The mutual-block cases are covered by deterministic PostgreSQL 16 schedules
+rather than by repetition: a third transaction holds the first lock of the
+agreed order and the code under test must be queued on it **holding nothing**,
+which is the property that rules the cycle out. Each of them reproduces a real
+`deadlock detected` when the fix is reverted — the consent worker against the
+ingress, a mixed `delivered`/`failed` callback against the acceptance of another
+slot of the same batch, and two callbacks naming the same identifiers in
+opposite payload order. The stale-projection race is covered the same way: with
+the retry budget cut to one pass, a write derived from a read a newer refusal has
+already invalidated must not land at all.

@@ -27,12 +27,17 @@ from sqlalchemy import func, select
 
 from altegio_bot import easyweek_uuid_identity as identity
 from altegio_bot.models.models import (
+    CONSENT_COMMAND_START,
     CONSENT_SOURCE_INBOUND,
+    CONSENT_STATE_OPTED_IN,
     CONSENT_STATE_OPTED_OUT,
+    INBOUND_AUTHENTICITY_SIGNED,
     PROVIDER_EASYWEEK,
     Client,
     EasyWeekEvent,
     WhatsAppConsentSuppression,
+    WhatsAppEvent,
+    WhatsAppInboundReceipt,
 )
 from altegio_bot.tests.easyweek_fixtures import TEST_CUSTOMER_ID, TEST_LOCATION_ID, booking_created
 from altegio_bot.tests.test_easyweek_uuid_identity_worker import CUSTOMER, PHONE, Reader
@@ -42,10 +47,13 @@ from altegio_bot.tests.test_easyweek_uuid_identity_worker import (
 from altegio_bot.whatsapp_consent import (
     CONSENT_COMMAND_STOP,
     apply_consent_decision,
+    apply_inbound_consent,
     consent_decision,
+    extend_refusal_to_uuid,
     final_send_guard,
     is_suppressed,
     lock_consent_address,
+    record_inbound_receipts,
 )
 from altegio_bot.workers import easyweek_inbox_worker as worker
 
@@ -324,3 +332,314 @@ async def test_adoption_without_any_refusal_writes_no_consent_row(session_maker,
     async with session_maker() as session:
         assert await session.scalar(select(func.count()).select_from(WhatsAppConsentSuppression)) == 0
         assert await is_suppressed(session, phone=PHONE) is False
+
+
+# ===========================================================================
+# Round 2, review fix 3 — a refusal already ACCEPTED but not yet decided
+# ===========================================================================
+
+
+def _stop_payload(address: str, *, msg_id: str, epoch: int, text: str = "STOP") -> dict:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "WABA-ADOPTION",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": "PNID-ADOPTION"},
+                            "messages": [
+                                {
+                                    "from": address.lstrip("+"),
+                                    "id": msg_id,
+                                    "timestamp": str(epoch),
+                                    "type": "text",
+                                    "text": {"body": text},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+async def _accept_without_deciding(
+    session_maker,
+    *,
+    address: str = PHONE,
+    msg_id: str = "wamid.PENDING",
+    epoch: int = 1_760_000_000,
+    text: str = "STOP",
+) -> int:
+    """The ingress half of a refusal: durable, unresolved, nobody has acted.
+
+    Written through ``record_inbound_receipts`` — the function the webhook
+    really calls, in one transaction with the event, before the 200 — because
+    the whole point is the window between accepting a message and deciding it.
+    """
+    now = datetime.now(timezone.utc)
+    payload = _stop_payload(address, msg_id=msg_id, epoch=epoch, text=text)
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key=f"wa:{msg_id}",
+                status="received",
+                payload=payload,
+                inbound_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                received_at=now,
+            )
+            session.add(event)
+            await session.flush()
+            await record_inbound_receipts(
+                session,
+                dedupe_key=str(event.dedupe_key),
+                event_id=int(event.id),
+                payload=payload,
+                signature_verified=True,
+                observed_at=now,
+            )
+            return int(event.id)
+
+
+async def _decide(session_maker, event_id: int) -> None:
+    """The worker half: the durable consent pass, in its own transaction."""
+    await apply_inbound_consent(session_maker, event_id=event_id)
+
+
+async def _move_the_card(session_maker, *, to: str = NEW_PHONE) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            card = (
+                await session.execute(
+                    select(Client).where(
+                        Client.provider == PROVIDER_EASYWEEK,
+                        Client.easyweek_customer_uuid == uuid.UUID(CUSTOMER),
+                    )
+                )
+            ).scalar_one()
+            card.phone_e164 = to
+
+
+async def _receipts(session_maker, address: str = PHONE) -> list[WhatsAppInboundReceipt]:
+    async with session_maker() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(WhatsAppInboundReceipt)
+                    .where(WhatsAppInboundReceipt.wa_address == address)
+                    .order_by(WhatsAppInboundReceipt.id)
+                )
+            ).all()
+        )
+
+
+async def test_a_pending_refusal_survives_the_number_changing_under_it(session_maker, monkeypatch) -> None:
+    """The review's sequence: accepted, then the contact moves, then decided.
+
+    The protection used to start at the suppression row, so this window was
+    open: the ingress had the STOP on disk, the worker had not reached it, the
+    adoption found nothing to bind, the number changed, and the refusal was then
+    written against a number no card names — unreachable from the new one. The
+    proof is stamped onto the pending receipt instead, and the decision carries
+    it onto the row.
+    """
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker)
+    _booking_id, payload = await _capture_booking(session_maker)
+
+    await _adopt(session_maker, monkeypatch, payload)
+
+    # The proof reached the message that had not been decided yet.
+    [receipt] = await _receipts(session_maker)
+    assert receipt.resolved_at is None
+    assert receipt.linked_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+    assert receipt.linked_uuid_recorded_at is not None
+    assert await _suppression(session_maker) is None, "nothing was decided yet"
+
+    await _move_the_card(session_maker)
+    await _decide(session_maker, event_id)
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    assert row.banned_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+    assert row.evidence.get("uuid_binding") == "proven_uuid_link_on_receipt"
+
+    async with session_maker() as session:
+        assert await is_suppressed(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+        assert await is_suppressed(session, phone=NEW_PHONE)
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    # No permission at the final boundary is the zero-POST guarantee: the
+    # executor may not make a request without one.
+    assert guard.allowed is False
+    assert guard.reason == "consent_refusal_active"
+
+
+async def test_the_other_worker_order_ends_in_the_same_place(session_maker, monkeypatch) -> None:
+    """Decided before the number moves, which is the ordinary case.
+
+    Here the decision itself finds the card, so the suppression row is bound
+    when it is created and the pending link has nothing left to do. Both orders
+    must end with the same refusal applying to the new number.
+    """
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker, msg_id="wamid.PENDING2")
+    _booking_id, payload = await _capture_booking(session_maker)
+    await _adopt(session_maker, monkeypatch, payload)
+    await _decide(session_maker, event_id)
+    await _move_the_card(session_maker)
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.banned_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    assert guard.allowed is False
+
+
+async def test_the_link_survives_a_restart_between_every_step(session_maker, monkeypatch) -> None:
+    """Every step in its own session, with the next one reading only the database.
+
+    A restart between accepting the message, proving the UUID, moving the number
+    and deciding the refusal has to be survivable, so nothing may be carried in
+    memory. The link columns are read back from disk here between each step,
+    which is the only place they could be.
+    """
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker, msg_id="wamid.PENDING3")
+    _booking_id, payload = await _capture_booking(session_maker)
+    await _adopt(session_maker, monkeypatch, payload)
+
+    async with session_maker() as session:
+        stored = (
+            await session.execute(
+                select(
+                    WhatsAppInboundReceipt.linked_easyweek_customer_uuid,
+                    WhatsAppInboundReceipt.resolved_at,
+                ).where(WhatsAppInboundReceipt.whatsapp_event_id == event_id)
+            )
+        ).all()
+    assert stored == [(uuid.UUID(CUSTOMER), None)]
+
+    await _move_the_card(session_maker)
+
+    async with session_maker() as session:
+        # Nothing but the database connects the two now.
+        assert (await session.scalar(select(func.count()).select_from(Client).where(Client.phone_e164 == PHONE))) == 0
+
+    await _decide(session_maker, event_id)
+    async with session_maker() as session:
+        assert await is_suppressed(session, phone=NEW_PHONE)
+
+
+async def test_a_pending_refusal_on_a_number_the_card_has_left_still_holds_the_send(session_maker, monkeypatch) -> None:
+    """The second sequence: the historical link is there, the refusal is not yet.
+
+    A refusal was recorded on the old number once and lifted by a proven START,
+    so the suppression row survives as an ``opted_in`` row bound to this UUID.
+    The card then moves to the new number and a FRESH STOP arrives on the old
+    one. The guard for the new number used to see nothing — the pending set was
+    looked up by the addresses the cards carry — and allowed the send while an
+    accepted refusal sat unread.
+
+    Today's card phones are not the history of the negative links, and the
+    history is where the pending set has to be looked up.
+    """
+    await _uuid_only_card(session_maker)
+    await _refuse(session_maker)
+    moment = datetime.now(timezone.utc) - timedelta(days=1)
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, PHONE)
+            lifted = await apply_consent_decision(
+                session,
+                wa_address=PHONE,
+                command=CONSENT_COMMAND_START,
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source=CONSENT_SOURCE_INBOUND,
+                observed_at=moment,
+                event_at=moment,
+            )
+    assert lifted.applied
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_IN
+    assert row.banned_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+
+    await _move_the_card(session_maker)
+    await _accept_without_deciding(session_maker, msg_id="wamid.PENDING4")
+
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    assert guard.allowed is False
+    assert guard.reason == "pending_inbound_unresolved"
+    assert guard.decision.pending_inbound == 1
+    assert PHONE in guard.decision.matched_addresses
+
+
+async def test_an_unresolved_ordinary_message_on_the_old_number_also_holds(session_maker, monkeypatch) -> None:
+    """Any unaccounted message, not only a STOP: the hold is about not knowing.
+
+    The guard cannot tell what an undecided message says, and §46.4.6 says a
+    queue that is behind must not become a permission.
+    """
+    await _uuid_only_card(session_maker)
+    await _refuse(session_maker)
+    await _move_the_card(session_maker)
+    await _accept_without_deciding(session_maker, msg_id="wamid.PENDING5", text="danke!")
+
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    # The old refusal refuses on its own; what this asserts is that the
+    # undecided message on the number the card has left is SEEN at all.
+    assert guard.allowed is False
+    assert guard.decision.pending_inbound == 1
+
+
+async def test_the_link_is_never_positive_identity(session_maker, monkeypatch) -> None:
+    """A link that bans must not start proving anything.
+
+    No card is created or changed by the binding, the pending receipt gains no
+    authority to decide who this person is, and a refusal is not invented.
+    """
+    await _uuid_only_card(session_maker)
+    await _accept_without_deciding(session_maker, msg_id="wamid.PENDING6", text="guten Tag")
+    _booking_id, payload = await _capture_booking(session_maker)
+    await _adopt(session_maker, monkeypatch, payload)
+
+    async with session_maker() as session:
+        assert await session.scalar(select(func.count()).select_from(WhatsAppConsentSuppression)) == 0
+        cards = list(
+            (
+                await session.scalars(
+                    select(Client).where(
+                        Client.provider == PROVIDER_EASYWEEK,
+                        Client.easyweek_customer_uuid == uuid.UUID(CUSTOMER),
+                    )
+                )
+            ).all()
+        )
+        assert len(cards) == 1
+        assert cards[0].wa_opted_out is False
+        assert await is_suppressed(session, phone=PHONE) is False
+
+
+async def test_a_pending_link_is_not_moved_onto_another_identity(session_maker, monkeypatch) -> None:
+    """One number can be two people over time, so a stamped link is left alone."""
+    other = uuid.uuid4()
+    await _uuid_only_card(session_maker)
+    await _accept_without_deciding(session_maker, msg_id="wamid.PENDING7")
+    async with session_maker() as session:
+        async with session.begin():
+            await extend_refusal_to_uuid(session, addresses=[PHONE], customer_uuid=other)
+
+    _booking_id, payload = await _capture_booking(session_maker)
+    await _adopt(session_maker, monkeypatch, payload)
+
+    [receipt] = await _receipts(session_maker)
+    assert receipt.linked_easyweek_customer_uuid == other
