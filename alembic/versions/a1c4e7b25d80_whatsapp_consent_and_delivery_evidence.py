@@ -24,6 +24,13 @@ means "unknown", honestly, rather than a value derived from today's settings.
 The downgrade refuses while any new consent or evidence fact exists, and it
 refuses BEFORE any DDL: a refusal has to be undeletable even by a rollback, and
 an operator who is told the rollback is unsafe must find the data still there.
+
+"Any fact" includes the ones that live in COLUMNS on existing tables, not only
+the ones in the new tables. The route digests are the only record of which
+sender and which recipient a slot's single attempt really used, and the event
+authenticity is the only record of whether a signature was ever checked —
+neither can be recomputed afterwards, and a re-upgrade brings them back as NULL.
+So the emptiness check covers the dropped columns too, under the same locks.
 """
 
 import sqlalchemy as sa
@@ -49,7 +56,7 @@ _STATES = "'opted_out', 'opted_in'"
 _SOURCES = "'inbound_command', 'historical_projection'"
 _FAILURE_SOURCES = "'meta_api_rejection', 'status_callback'"
 _FAILURE_REASONS = "'meta_api_rejected', 'meta_callback_failed'"
-_FAILURE_MATCHES = "'confirmed', 'unmatched', 'conflicting'"
+_FAILURE_MATCHES = "'confirmed', 'unmatched', 'conflicting', 'unproven'"
 _FAILURE_CLASSES = "'permanent', 'transient', 'unknown'"
 
 
@@ -67,6 +74,8 @@ def upgrade() -> None:
         sa.Column("wa_address", sa.String(32), nullable=False),
         sa.Column("command", sa.String(8), nullable=False),
         sa.Column("authenticity", sa.String(24), nullable=False),
+        sa.Column("sender_route_digest", sa.String(64), nullable=True),
+        sa.Column("route_allowed", sa.Boolean(), nullable=True),
         sa.Column("whatsapp_message_id", sa.String(128), nullable=True),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("event_at", sa.DateTime(timezone=True), nullable=True),
@@ -93,6 +102,10 @@ def upgrade() -> None:
             name="ck_wa_inbound_receipt_resolution_paired",
         ),
         sa.CheckConstraint("message_index >= 0", name="ck_wa_inbound_receipt_index"),
+        sa.CheckConstraint(
+            "route_allowed IS NOT FALSE OR resolved_at IS NOT NULL",
+            name="ck_wa_inbound_receipt_refused_route_resolved",
+        ),
     )
     op.create_index(
         "ix_wa_inbound_receipt_pending",
@@ -126,6 +139,12 @@ def upgrade() -> None:
         sa.Column("last_stop_event_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_start_observed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_start_event_at", sa.DateTime(timezone=True), nullable=True),
+        # When a STOP was accepted whose own event time could not be proven. The
+        # high-water mark above only ever moves to a known time, so without this
+        # an unorderable refusal left an older provable one as the bar a START
+        # had to clear — and a START that cleared it lifted a refusal nobody
+        # could order it against.
+        sa.Column("stop_event_time_unknown_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("banned_easyweek_customer_uuid", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("banned_uuid_recorded_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("evidence", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
@@ -233,6 +252,20 @@ def upgrade() -> None:
             name="ck_ew_voucher_failure_unmatched_has_no_item",
         ),
         sa.CheckConstraint(
+            "match_state <> 'unproven' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_failure_unproven_has_item",
+        ),
+        # A confirmed CALLBACK carries both of the proofs §46.3 asks of it: the
+        # signature the ingress verified, and a route matching the one the
+        # slot's single attempt froze. An API rejection has its own contract —
+        # this process watched Meta refuse its own request, so there is no
+        # webhook signature to require.
+        sa.CheckConstraint(
+            "match_state <> 'confirmed' OR source <> 'status_callback' "
+            "OR (authenticity = 'signature_verified' AND route_proven)",
+            name="ck_ew_voucher_failure_callback_confirmed_proof",
+        ),
+        sa.CheckConstraint(
             "source <> 'status_callback' OR provider_message_id IS NOT NULL",
             name="ck_ew_voucher_failure_callback_has_message",
         ),
@@ -274,7 +307,13 @@ def downgrade() -> None:
     # told the rollback is unsafe finds every refusal and every failure fact
     # still exactly where it was.
     bind = op.get_bind()
-    for table in (SUPPRESSIONS, RECEIPTS, FAILURES):
+    # A fixed order, and the two OLD tables are in it. Their locks are what stop
+    # a live acceptance from freezing a route, or the ingress from recording an
+    # authenticity, between the check and the DROP — the same race the new
+    # tables were already protected from, on data that is just as unrecoverable.
+    # Both are hot tables, which is the point: a destructive downgrade is an
+    # offline operation and has to behave like one.
+    for table in (SUPPRESSIONS, RECEIPTS, FAILURES, ATTEMPTS, EVENTS):
         op.execute(sa.text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
 
     if bind.execute(sa.text(f"SELECT EXISTS (SELECT 1 FROM {SUPPRESSIONS})")).scalar_one():
@@ -283,6 +322,25 @@ def downgrade() -> None:
         raise RuntimeError("WhatsApp inbound receipts exist; destructive downgrade refused before DDL")
     if bind.execute(sa.text(f"SELECT EXISTS (SELECT 1 FROM {FAILURES})")).scalar_one():
         raise RuntimeError("Voucher delivery failure evidence exists; destructive downgrade refused before DDL")
+    # The route a slot's ONE attempt used. Nothing can recompute it: both of its
+    # sources are mutable, which is why it was frozen at the claim in the first
+    # place. Dropping it would leave every confirmed failure unverifiable and
+    # every future callback about those sends unprovable.
+    if bind.execute(
+        sa.text(
+            f"SELECT EXISTS (SELECT 1 FROM {ATTEMPTS} "
+            "WHERE sender_phone_number_id_digest IS NOT NULL OR recipient_digest IS NOT NULL)"
+        )
+    ).scalar_one():
+        raise RuntimeError("Frozen voucher send routes exist; destructive downgrade refused before DDL")
+    # And whether a delivery's signature was really checked. The ingress strips
+    # the signature header from the stored copy on purpose, so this column is
+    # the only surviving record — a re-upgrade would bring every row back as
+    # "unknown", and §46.4.7 reads unknown as unverified for good.
+    if bind.execute(
+        sa.text(f"SELECT EXISTS (SELECT 1 FROM {EVENTS} WHERE inbound_authenticity IS NOT NULL)")
+    ).scalar_one():
+        raise RuntimeError("Recorded inbound authenticity exists; destructive downgrade refused before DDL")
 
     op.drop_index("ix_ew_voucher_failure_unmatched", table_name=FAILURES)
     op.drop_index("ix_ew_voucher_failure_message", table_name=FAILURES)
@@ -299,9 +357,9 @@ def downgrade() -> None:
     op.drop_index("ix_wa_inbound_receipt_pending", table_name=RECEIPTS)
     op.drop_table(RECEIPTS)
 
-    # The two attempt digests and the event's authenticity are dropped last and
-    # unconditionally: they are audit detail about rows that stay, not facts the
-    # tables above hold, and nothing else reads them.
+    # Reached only when the checks above proved every one of these columns is
+    # empty, so this drops nothing: provenance is not traded for the ability to
+    # roll back.
     op.drop_column(ATTEMPTS, "recipient_digest")
     op.drop_column(ATTEMPTS, "sender_phone_number_id_digest")
     op.drop_column(EVENTS, "inbound_authenticity")

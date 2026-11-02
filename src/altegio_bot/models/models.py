@@ -5315,6 +5315,12 @@ class WhatsAppInboundReceipt(Base):
         ),
         Index("ix_wa_inbound_receipt_address_observed", "wa_address", "observed_at"),
         Index("ix_wa_inbound_receipt_event", "whatsapp_event_id"),
+        # A refused route is resolved the moment it is written, so the two are
+        # one fact and a row cannot claim to be both ignored and pending.
+        CheckConstraint(
+            "route_allowed IS NOT FALSE OR resolved_at IS NOT NULL",
+            name="ck_wa_inbound_receipt_refused_route_resolved",
+        ),
         # Conflicting reuse of one Meta message identifier is a thing this
         # phase must be able to SEE rather than a thing it forbids: two
         # different payloads naming one wamid are both recorded, and the consent
@@ -5341,6 +5347,19 @@ class WhatsAppInboundReceipt(Base):
     wa_address: Mapped[str] = mapped_column(String(32), nullable=False)
     command: Mapped[str] = mapped_column(String(8), nullable=False)
     authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # The sender route THIS message arrived on, as a one-way digest, and the
+    # verdict the ingress reached about it at the time.
+    #
+    # Both are provenance, and the second one is why the first is not enough:
+    # the allow list is configuration and can be changed, so re-deriving an old
+    # message's verdict from today's settings would silently rewrite history —
+    # a route that was refused when the message arrived would become an
+    # executable command, and one that was accepted would become a refusal. A
+    # NULL ``route_allowed`` is an honest "not recorded per message", which is
+    # what every row written before this column existed really is.
+    sender_route_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # Meta's own wamid for this message, when it supplied a usable one.
     whatsapp_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -5471,6 +5490,16 @@ class WhatsAppConsentSuppression(Base):
     last_start_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_start_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # When a STOP was accepted whose OWN event time could not be proven.
+    #
+    # Load-bearing, and the reason is an ordering one. ``last_stop_event_at``
+    # only moves forward, so a later STOP with an unprovable time used to leave
+    # it reading the older, provable one — and a START merely had to beat THAT
+    # to lift a refusal nobody could order it against. With this column the
+    # unprovable STOP stays visible: "strictly newer" has no answer while it is
+    # set, and §46.4.4 says an unproven order is not a permission.
+    stop_event_time_unknown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     banned_easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
     banned_uuid_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -5501,11 +5530,18 @@ DELIVERY_FAILURE_MATCH_UNMATCHED = "unmatched"
 # It names a slot but disagrees with it — a foreign sender or recipient, or a
 # failure arriving after delivered/read. Stored for audit; changes nothing.
 DELIVERY_FAILURE_MATCH_CONFLICTING = "conflicting"
+# It names the right slot and contradicts nothing, but the proof its SOURCE
+# requires is incomplete — an unsigned callback, or one about an attempt that
+# froze no route. Kept for audit, and deliberately not confirmed: "nothing
+# contradicts it" is not the same fact as "it is proven", and only the second
+# one may mark a slot.
+DELIVERY_FAILURE_MATCH_UNPROVEN = "unproven"
 
 DELIVERY_FAILURE_MATCH_STATES = (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
     DELIVERY_FAILURE_MATCH_UNMATCHED,
     DELIVERY_FAILURE_MATCH_CONFLICTING,
+    DELIVERY_FAILURE_MATCH_UNPROVEN,
 )
 
 _DELIVERY_FAILURE_MATCH_SQL = ", ".join(f"'{value}'" for value in DELIVERY_FAILURE_MATCH_STATES)
@@ -5610,6 +5646,22 @@ class EasyWeekVoucherProductionDeliveryFailure(Base):
         CheckConstraint(
             f"match_state <> '{DELIVERY_FAILURE_MATCH_UNMATCHED}' OR item_id IS NULL",
             name="ck_ew_voucher_failure_unmatched_has_no_item",
+        ),
+        # An unproven fact knows which slot it was tested against — that is the
+        # difference between it and an unmatched one.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_UNPROVEN}' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_failure_unproven_has_item",
+        ),
+        # And a confirmed CALLBACK carries the two proofs §46.3 asks of it: the
+        # signature the ingress checked, and the route the attempt froze. An
+        # API rejection has its own contract — this process observed Meta refuse
+        # its own request, so no webhook signature exists to require.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_CONFIRMED}' "
+            f"OR source <> '{DELIVERY_FAILURE_SOURCE_CALLBACK}' "
+            f"OR (authenticity = '{INBOUND_AUTHENTICITY_SIGNED}' AND route_proven)",
+            name="ck_ew_voucher_failure_callback_confirmed_proof",
         ),
         # A callback is about a message id; an API refusal happens before any id
         # exists and is tied to the committed intent instead.

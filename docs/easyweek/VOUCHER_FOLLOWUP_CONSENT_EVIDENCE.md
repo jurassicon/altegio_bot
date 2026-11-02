@@ -39,6 +39,28 @@ cannot reach different verdicts about the same message.
 Chatwoot mirrors and operator relay events never execute commands: a mirror of
 a message Meta already delivered is the same message, not a second one.
 
+### The sender route is decided per message
+
+A delivery may carry several `changes`, each with its own `phone_number_id`, and
+each is judged on its own against the allow list. The verdict is stored on the
+message's receipt (`route_allowed`, plus a one-way `sender_route_digest`), so
+the inbox worker and the historical reconciliation read the decision that was
+actually made instead of re-deriving one.
+
+- A delivery is marked `ignored` only when **none** of its routes is allowed.
+- A refused message is resolved where that decision was made, so it never holds
+  a send and is never executed later.
+- An address whose every message in one delivery was refused is one this worker
+  does nothing about: no command, no Chatwoot mirror, no acknowledgement.
+- Re-deriving an old message's verdict from today's settings is forbidden. The
+  allow list is configuration; re-reading it would turn a route that was refused
+  into an executable command, or refuse one that was accepted.
+
+Delivery **statuses** are deliberately not filtered by the allow list. A status
+proves which message it is about by exact provider message id, and §46.3 checks
+it against the route the attempt froze — a stronger check that does not change
+meaning when the configuration does.
+
 ---
 
 ## 2. Where a refusal lives
@@ -58,6 +80,20 @@ customer UUID, so the refusal follows the person through a number change. It is
 never read the other way round: a phone match does not prove who somebody is,
 which branch they belong to, or that they are an EasyWeek customer. An ambiguous
 match binds nothing and is reported as a gap; the phone refusal still stands.
+
+The binding is also written **when a UUID is proven later**. A refusal recorded
+before any card existed has no UUID to record, so
+`easyweek_uuid_identity.resolve_webhook_identity` — the one path that proves the
+numeric↔UUID bridge against EasyWeek's own records — extends an existing refusal
+for the numbers that proof was about. Without it the chain "STOP with no card →
+card adopted → number changed" lost the refusal, because the aggregate read looks
+for refusals on the numbers cards carry now. The binding never creates, lifts or
+weakens a refusal, and a row already bound to a different UUID is left alone and
+the disagreement recorded: one number can belong to two people over time.
+
+When the caller names no UUID, the aggregate derives one from an unambiguous card
+on that number — for the same purpose and in the same direction, to widen the
+search for refusals and nothing else.
 
 The legacy sources are **read, not replaced**. One aggregate answer consults:
 
@@ -88,15 +124,25 @@ this stage; they keep their existing card-flag checks.
 
 Deliberately asymmetric. A refusal is cheap to make and expensive to undo.
 
-**A STOP always applies.** Whatever its authenticity, whatever its timestamp.
-Idempotent: a duplicate is a no-op that records itself. A late or replayed STOP
-cannot move the refusal's own recorded time backwards.
+**A STOP always applies**, with one narrow exception. Whatever its
+authenticity, whatever its timestamp. Idempotent: a duplicate is a no-op that
+records itself. A late or replayed STOP cannot move the refusal's own recorded
+time backwards.
+
+The exception: a STOP that can **prove** it happened before the opt-in currently
+in force is a replay of something already answered — a reconciliation re-reading
+an old stored event, or Meta delivering the same payload again — and it does not
+take the state back (`stop_older_than_proven_opt_in`). It is recorded and
+reported. Only a provable order refuses it: an equal time, an unknown time on
+either side, or a newer STOP all apply, so a tie and an unproven order both fall
+to the refusal.
 
 **A START lifts a refusal only if all of these hold:**
 
 - Meta's HMAC was configured **and** verified for that very request;
 - the START's own event time is proven;
 - the refusal's event time is proven;
+- **no** accepted STOP for that address has an unprovable event time;
 - the START's is **strictly** later — an equal timestamp is not newer;
 - its message identifier has not been seen naming another address.
 
@@ -106,7 +152,7 @@ Anything else refuses with a reason code, and the refusal stands:
 | --- | --- |
 | `start_authenticity_unproven` | no signature was checked for that delivery |
 | `start_event_time_unproven` | the claimed event time does not parse, or is implausibly in the future |
-| `stop_event_time_unproven` | the refusal's own time is unknown, so "newer" has no answer |
+| `stop_event_time_unproven` | the refusal's own time is unknown, or an accepted STOP for this address has an unprovable one, so "newer" has no answer |
 | `start_not_newer_than_stop` | equal or earlier than the refusal |
 | `start_event_identifier_conflict` | that message id already names another address |
 
@@ -116,6 +162,37 @@ never written down as a granted permission.
 The last rule is a CHECK constraint, not only a code path: an `opted_in` row
 whose decision was a START must carry a verified signature and a proven event
 time, so an unsigned, replayed or time-unknown opt-in is unrepresentable.
+
+`stop_event_time_unknown_at` records a STOP whose own event time could not be
+proven. It is load-bearing: the high-water mark only ever moves to a known time,
+so without it a later unorderable refusal left an older, provable one as the bar
+a START had to clear — and clearing that bar lifted a refusal nobody could order
+it against. **Once such a refusal exists for an address, no START lifts it.** That
+is a real limitation, accepted knowingly: the alternative is to order events by
+our own reception clock, which Meta promises nothing about.
+
+### What the legacy card flag says
+
+`Client.wa_opted_out` is a **projection of the ledger**, not a second decision.
+`message_planner`, the outbox worker and every campaign path read it, so the
+inbox worker writes it from the durable consent answer rather than from the
+command it just read:
+
+- the ledger refuses this address → the card refuses. A card that disagreed is
+  converged without restamping one that already agrees, so `wa_opted_out_at` and
+  `wa_opt_out_reason` keep saying when and why somebody refused;
+- the ledger has proven an opt-in → the card is cleared;
+- the ledger has **no row** for this address → the historical behaviour of the
+  command stands. Nothing has been recorded about this number, so there is no
+  authoritative answer to follow, and refusing to clear here would strand
+  everybody whose only refusal predates this stage.
+
+A command the ledger did not honour is **not acknowledged**. Telling somebody
+"you are subscribed again" while the durable answer still says `opted_out` is
+the one outcome §46.4.7 rules out by name; the reason is recorded on the event
+for an operator instead. On a deployment with no app secret that is every START
+from a refused address, which makes the consequence below the thing to fix first.
+A lifted refusal never revives cancelled marketing jobs.
 
 ### Consequence to know before rollout
 
@@ -158,29 +235,55 @@ inbound_authenticity` carries the same fact for a delivery that has no messages
 at all — a `statuses` payload has no receipt to hang it on.
 
 `resolved_at` is the pending marker. Rows are never deleted; the pending set
-drains by being resolved, which is a fact rather than a cleanup. A delivery from
+drains by being resolved, which is a fact rather than a cleanup. A message from
 a sender route this deployment does not allow is resolved at the ingress, because
-no worker will ever look at it and a permanent hold would be a bug.
+no worker will ever act on it and a permanent hold would be a bug.
+
+The ingress takes the **same address locks** as the guard before it writes. That
+is what makes the pending set a boundary rather than a best effort: a receipt
+either lands before the guard reads — and holds the send — or waits for the
+guard's transaction to end and is caught by the claim-time re-check. There is no
+interleaving in which an unresolved refusal is invisible to both.
 
 ### The guard
 
-`whatsapp_consent.final_send_guard` takes a transaction-scoped advisory lock on
-the address, then answers. It refuses when:
+`whatsapp_consent.final_send_guard` takes transaction-scoped advisory locks on
+**every** address it reads — the person's own number and every number an EasyWeek
+card of their proven UUID carries, always in sorted order — then answers. It
+refuses when:
 
 - a proven refusal matches the person (`consent_refusal_active`);
 - anything from them is unresolved (`pending_inbound_unresolved`) — a queue that
   is behind must not read as permission;
-- the address cannot be normalised (`address_not_normalisable`).
+- the address cannot be normalised (`address_not_normalisable`);
+- the set of addresses changed under the locks
+  (`address_set_changed_under_the_lock`), so the read is not one the locks make
+  safe. Held, and the next attempt sees a settled set.
 
-It returns a `fingerprint` over every matched `(address, consent_version)` pair
-and the verdict. A sender re-checks it with `consent_unchanged` **inside the same
-transaction as its send claim**. A refusal that landed in between, a version that
-moved, or a suppression row that did not exist before all change the fingerprint
-and refuse the claim.
+It returns a `fingerprint` over every matched `(address, consent_version)` pair,
+the matched address set, the identities of the unresolved receipts, and the
+verdict. A sender re-checks it with `recheck_consent_boundary` **inside the same
+transaction as its send claim**, and that function re-asks the whole question:
+it takes the same locks, reaches the verdict through the same code, and requires
+the fingerprint to be the one the guard handed out (`consent_state_changed`
+otherwise).
 
-The lock takes part in no cycle with the voucher stages: it is taken by the
-consent writer and by the guard, and by nothing that holds a batch header or
-item lock. No HTTP happens under it, and none may.
+All three parts are needed, and the missing ones were a defect. A bare
+fingerprint comparison answered only "is the state the one I was issued
+against?", so a STOP sitting unresolved in the pending set — which a fresh guard
+refuses on sight — compared equal and the claim went ahead; and it held no lock,
+so a receipt could commit between the comparison and the claim with neither side
+noticing.
+
+One boundary the locks cannot cover, stated rather than hidden: a refusal
+arriving on a number that no card names yet cannot be locked in advance, because
+nothing links it to this person until the refusal itself exists. It changes the
+fingerprint, so the claim-time re-check catches it.
+
+The locks take part in no cycle with the voucher stages: they are taken by the
+consent writer, the ingress and the guard, and by nothing that holds a batch
+header or item lock; among themselves they are always taken in sorted order. No
+HTTP happens under them, and none may.
 
 ### The exact guarantee, and its limit
 
@@ -212,9 +315,20 @@ letting an unread STOP look like permission.
 ### What counts as proof — exactly two things
 
 - Meta refused the request itself, with its own error envelope, on a status it
-  decides before acting on the message (`meta_api_rejected`);
+  decides before acting on the message (`meta_api_rejected`). This process
+  watched that happen on its own request, so there is no webhook signature to
+  require and the link to the slot is the intent committed before the request
+  left — a historical attempt that froze no route is still confirmed;
 - a `failed` delivery status naming the exact message id of the slot
-  (`meta_callback_failed`).
+  (`meta_callback_failed`), **with** the signature the ingress verified over the
+  raw body **and** a route matching the one that slot's single attempt froze.
+
+The second one needs all three parts. An unsigned callback is an unattributed
+claim — anybody who can reach the webhook can make it — and a slot whose attempt
+froze no route gives nothing to compare a claimed route against. Either way the
+fact is kept as `unproven` and marks nothing: "the right message id and nothing
+contradicting it" is a weaker statement than proof. For a callback this is a
+CHECK constraint as well as a code path.
 
 ### What does not, and never becomes proof later
 
@@ -247,7 +361,8 @@ Its facts say `route_proven = false` instead.
 | --- | --- |
 | `confirmed` | bound to one proven attempt of one slot, with no `delivered`/`read` present |
 | `unmatched` | nobody owns this identifier yet; kept so an early callback is not lost, bindable later on the exact id |
-| `conflicting` | names a slot but disagrees with it — a foreign sender or recipient, or a failure after `delivered`/`read`. Kept for audit; changes nothing |
+| `conflicting` | names a slot but disagrees with it — a foreign sender or recipient, a route the fact does not name at all, or a failure after `delivered`/`read`. Kept for audit; changes nothing |
+| `unproven` | names the right slot and contradicts nothing, but its source's proof is incomplete: an unsigned callback, or one about an attempt that froze no route. Kept for audit; marks nothing |
 
 ### Callback rules
 
@@ -255,6 +370,18 @@ Its facts say `route_proven = false` instead.
   is stored `unmatched` and bound by the acceptance that records that id.
   Matching is only ever by exact proven identity. Never by phone similarity and
   never by timestamp proximity.
+- **Binding is guaranteed in either commit order**, by a transaction-scoped
+  advisory lock on the message identifier that both sides take first (order:
+  message → header → item, the same relative order the stage writers use). The
+  window it closes cannot be closed by re-reading: the callback looks for the
+  slot before the identifier is committed and the acceptance looks for unmatched
+  facts before the callback is committed, so both are correct about what they saw
+  and the fact ends up owned by nobody. `SELECT ... FOR UPDATE` does not help
+  either — there is no row to lock in either direction — while an advisory lock
+  on the identifier exists before the rows do.
+- A bound fact is re-judged from scratch and is never promoted for having
+  waited: an unsigned early callback binds as `unproven`, a foreign-route one as
+  `conflicting`.
 - Duplicates are idempotent: the fact key is computed from the proven contents
   of the fact, not from when it arrived.
 - A callback naming a sender or recipient that is not the frozen route does not
@@ -322,6 +449,18 @@ Rules:
   payload.
 - A flagged card with no usable number is counted, never guessed at.
 - A Chatwoot mirror is not counted a second time.
+- The **sender route decision of the day is honoured, never re-made**. An event
+  the ingress marked `ignored` named no allowed route, and a message whose
+  receipt says `route_allowed = false` was refused individually; neither is
+  projected, and both are counted (`events_route_not_allowed`,
+  `messages_route_not_allowed`). Otherwise `--apply` would be the one way to
+  apply exactly the commands the configuration exists to refuse. Where the
+  per-message verdict was never recorded — every event older than that column —
+  the event-level status is what is known, and the report says so every run
+  (`historical_per_message_route_unrecorded`).
+- A STOP the ledger has already moved past is not re-applied: a proven, verified
+  opt-in that came after it stands, and the run reports the STOP as a no-op.
+  This is what makes the reconciliation safe to run nightly rather than once.
 - An unprovable delivery outcome stays unknown and never becomes a confirmed
   failure. A provable historical rejection is recorded with `route_proven=false`
   and no numeric code — the honest shape of an old fact.
@@ -350,12 +489,20 @@ binding is touched, and an existing row keeps saying exactly what it said before
 — which for authenticity and for the route means **unknown**, honestly, rather
 than a value derived from today's settings.
 
-**The downgrade refuses while any consent decision, inbound receipt or delivery
-failure fact exists, and it refuses before any DDL**, under `ACCESS EXCLUSIVE`
-locks taken first. Both halves matter: checking emptiness without the locks would
-race a concurrent STOP, and dropping first would mean the data was already gone.
-An operator told the rollback is unsafe finds every refusal still exactly where
-it was.
+**The downgrade refuses while any of the facts it would destroy exists, and it
+refuses before any DDL**, under `ACCESS EXCLUSIVE` locks taken first. Both halves
+matter: checking emptiness without the locks would race a concurrent write, and
+dropping first would mean the data was already gone. An operator told the
+rollback is unsafe finds every fact still exactly where it was.
+
+"Any fact" includes the ones that live in **columns on existing tables**, not
+only the ones in the new tables: a frozen send route and a recorded inbound
+authenticity are both unrecoverable — the route's two sources are mutable and the
+signature header is stripped before the event is stored — and a re-upgrade brings
+them back as NULL. So the emptiness check and the locks cover
+`easyweek_voucher_production_batch_attempts` and `whatsapp_events` as well. Both
+are hot tables, which is the point: a destructive downgrade is an offline
+operation and behaves like one.
 
 Rollout order:
 
@@ -395,7 +542,8 @@ Not implemented, and not reachable by any flag:
 | --- | --- |
 | Recognition, durability, STOP/START order, pending boundary, guard | `tests/test_whatsapp_consent_ledger.py` |
 | Proven failures, early/duplicate/foreign callbacks, local vs external refusal | `tests/test_easyweek_voucher_delivery_failures.py` |
-| Historical reconciliation, its limits, racing live ingress | `tests/test_whatsapp_consent_projection.py` |
+| Historical reconciliation, its limits, racing live ingress, route provenance | `tests/test_whatsapp_consent_projection.py` |
+| A refusal surviving a UUID proven later and a number change | `tests/test_whatsapp_consent_uuid_adoption.py` |
 | Migration cycle, ORM parity, destructive-downgrade refusal, PG16 concurrency | `tests/test_easyweek_voucher_mailing_durability.py` |
 
 All are required. No marker, skip or xfail was added. A change to shared inbound

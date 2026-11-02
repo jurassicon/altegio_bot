@@ -371,15 +371,33 @@ async def test_a_live_refusal_landing_mid_run_is_not_overwritten(session_maker) 
 
 
 async def test_a_projection_cannot_undo_a_proven_opt_in(session_maker) -> None:
-    """The one direction that needs proof keeps needing it, from any source.
+    """The reproduction from the review, with a candidate that really exists.
 
-    A proven, verified opt-in is in the ledger; the historical card flag is
-    still set, because nothing clears a legacy snapshot. The projection must not
-    be able to turn that stale flag into a new refusal that outranks the proven
-    decision — and it does not, because the aggregate read sees the card flag as
-    a live refusal only while the card itself says so.
+    The scenario this test is about needs THREE things, and the version it
+    replaced had only the last two: a STOP sitting in a source the projection
+    reads, a proven opt-in that came after it, and a real reconciliation run.
+    Without the stored event the projection had nothing to collect, so it could
+    not have undone anything and the test proved only that.
+
+    With it, the run re-collects a STOP the ledger has already moved past. It
+    must stay moved past: a verified, strictly-newer opt-in is the one decision
+    in this phase that was expensive to establish, and a reconciliation that
+    quietly reverted it every time it ran would be worse than no reconciliation.
     """
-    moment = datetime.now(timezone.utc)
+    from altegio_bot.whatsapp_consent import NOOP_STOP_SUPERSEDED
+
+    stop_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    start_at = stop_at + timedelta(minutes=30)
+
+    # The source: a stored event carrying the original STOP, exactly as the old
+    # ingress left it.
+    await _store_event(
+        session_maker,
+        _stored_payload(text="STOP", msg_id="wamid.HIST-STOP", epoch=int(stop_at.timestamp())),
+        dedupe_key="wa:hist-stop",
+    )
+    # And the live decisions that followed it: the same STOP applied, then a
+    # proven, verified, strictly newer START.
     async with session_maker() as session:
         async with session.begin():
             await lock_consent_address(session, ADDRESS)
@@ -389,8 +407,8 @@ async def test_a_projection_cannot_undo_a_proven_opt_in(session_maker) -> None:
                 command=CONSENT_COMMAND_STOP,
                 authenticity=INBOUND_AUTHENTICITY_SIGNED,
                 source="inbound_command",
-                observed_at=moment - timedelta(minutes=10),
-                event_at=moment - timedelta(minutes=10),
+                observed_at=stop_at,
+                event_at=stop_at,
             )
     async with session_maker() as session:
         async with session.begin():
@@ -401,20 +419,247 @@ async def test_a_projection_cannot_undo_a_proven_opt_in(session_maker) -> None:
                 command="start",
                 authenticity=INBOUND_AUTHENTICITY_SIGNED,
                 source="inbound_command",
-                observed_at=moment,
-                event_at=moment,
+                observed_at=start_at,
+                event_at=start_at,
             )
     assert lifted.applied
+
+    dry = await project(session_maker)
+    assert dry.refusals_seen >= 1, "the stored STOP must really be a candidate"
 
     report = await project(session_maker, apply=True)
 
     rows = await _suppressions(session_maker)
     assert len(rows) == 1
     assert rows[0].state == CONSENT_STATE_OPTED_IN
+    assert rows[0].decision_source == "inbound_command"
+    assert rows[0].evidence.get("superseded_stop_event_at") is not None
     assert report.refusals_written == 0
+    assert report.refusals_noop >= 1
     async with session_maker() as session:
         decision = await consent_decision(session, phone=ADDRESS, include_pending=False)
     assert decision.suppressed is False
+
+    # And again: a reconciliation that is safe to run once is not safe at all
+    # unless it is safe to run every night.
+    second = await project(session_maker, apply=True)
+    assert second.refusals_written == 0
+    rows = await _suppressions(session_maker)
+    assert len(rows) == 1 and rows[0].state == CONSENT_STATE_OPTED_IN
+    assert NOOP_STOP_SUPERSEDED  # the reason code the ledger records for it
+
+
+async def test_a_projection_racing_a_live_start_converges_on_the_opt_in(session_maker) -> None:
+    """The stale-read version of the same thing: the live decision wins.
+
+    The projection reads its candidates while the refusal is still in force,
+    and the proven START lands before the apply pass runs. The apply pass is
+    therefore working from a snapshot in which this person is banned — and must
+    still not re-ban them, because every write re-reads the ledger under the
+    address lock.
+    """
+    stop_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    await _store_event(
+        session_maker,
+        _stored_payload(text="СТОП", msg_id="wamid.HIST-RACE", epoch=int(stop_at.timestamp())),
+        dedupe_key="wa:hist-race",
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, ADDRESS)
+            await apply_consent_decision(
+                session,
+                wa_address=ADDRESS,
+                command=CONSENT_COMMAND_STOP,
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source="inbound_command",
+                observed_at=stop_at,
+                event_at=stop_at,
+            )
+
+    # The projection's own read happens here, while the ban is live.
+    staged = await project(session_maker)
+    assert staged.refusals_seen >= 1
+
+    later = stop_at + timedelta(hours=1)
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, ADDRESS)
+            lifted = await apply_consent_decision(
+                session,
+                wa_address=ADDRESS,
+                command="start",
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source="inbound_command",
+                observed_at=later,
+                event_at=later,
+            )
+    assert lifted.applied
+
+    await project(session_maker, apply=True)
+
+    rows = await _suppressions(session_maker)
+    assert len(rows) == 1
+    assert rows[0].state == CONSENT_STATE_OPTED_IN
+
+
+async def test_a_projected_refusal_of_unknown_time_keeps_every_start_out(session_maker) -> None:
+    """A card flag has no event time, and nothing can be ordered against it.
+
+    This is the conservative half of the ordering rule, and it is the one an
+    operator has to know about before running ``--apply``: a refusal projected
+    from a legacy flag can never be lifted by a START, however well signed and
+    however recent, because "strictly newer" has no answer. The alternative —
+    comparing against our own reception clock — would be inventing an order
+    Meta never promised.
+    """
+    from altegio_bot.whatsapp_consent import REFUSED_START_BAN_TIME_UNKNOWN
+
+    await _add_opted_out_card(session_maker, ADDRESS)
+    report = await project(session_maker, apply=True)
+    assert report.refusals_written == 1
+
+    rows = await _suppressions(session_maker)
+    assert rows[0].state == CONSENT_STATE_OPTED_OUT
+    assert rows[0].decided_event_at is None
+
+    moment = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, ADDRESS)
+            refused = await apply_consent_decision(
+                session,
+                wa_address=ADDRESS,
+                command="start",
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source="inbound_command",
+                observed_at=moment,
+                event_at=moment,
+            )
+    assert refused.applied is False
+    assert refused.reason == REFUSED_START_BAN_TIME_UNKNOWN
+    assert (await _suppressions(session_maker))[0].state == CONSENT_STATE_OPTED_OUT
+
+
+# ===========================================================================
+# The sender route decision of the day is honoured, never re-made
+# ===========================================================================
+
+
+async def test_an_event_the_ingress_ignored_is_never_projected(session_maker) -> None:
+    """A deliberate refusal must not become a global suppression.
+
+    ``status = "ignored"`` is the ingress saying this delivery named no sender
+    route this deployment serves. The command in it was never executed, and
+    projecting it would make the reconciliation the one way to apply exactly the
+    commands the configuration exists to refuse — on an address that may belong
+    to somebody else's customer entirely.
+    """
+    from altegio_bot.whatsapp_consent_projection import SKIP_ROUTE_NOT_ALLOWED
+
+    await _store_event(
+        session_maker,
+        _stored_payload(text="STOP", msg_id="wamid.IGNORED-HIST"),
+        dedupe_key="wa:hist-ignored",
+        status="ignored",
+    )
+
+    report = await project(session_maker, apply=True)
+
+    assert report.events_route_not_allowed == 1
+    assert report.skipped.get(SKIP_ROUTE_NOT_ALLOWED) == 1
+    assert await _suppressions(session_maker) == []
+
+
+async def test_a_message_refused_by_its_own_route_is_never_projected(session_maker) -> None:
+    """Per message, from the verdict the ingress recorded on the receipt.
+
+    The delivery as a whole was accepted — one of its changes named an allowed
+    route — and the message in question was refused individually. The receipt is
+    where that distinction lives, so the reconciliation reads it rather than
+    re-deciding against today's allow list, which may have changed since.
+    """
+    from altegio_bot.models.models import INBOUND_RESOLUTION_IGNORED_ROUTE, WhatsAppInboundReceipt
+    from altegio_bot.whatsapp_consent import receipt_key
+    from altegio_bot.whatsapp_consent_projection import SKIP_ROUTE_NOT_ALLOWED
+
+    event_id = await _store_event(
+        session_maker,
+        _stored_payload(text="STOP", msg_id="wamid.REFUSED-ROUTE"),
+        dedupe_key="wa:hist-refused-route",
+    )
+    moment = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppInboundReceipt(
+                    receipt_key=receipt_key("wa:hist-refused-route", 0),
+                    whatsapp_event_id=event_id,
+                    message_index=0,
+                    wa_address=ADDRESS,
+                    command=CONSENT_COMMAND_STOP,
+                    authenticity=INBOUND_AUTHENTICITY_UNVERIFIED,
+                    route_allowed=False,
+                    observed_at=moment,
+                    resolved_at=moment,
+                    resolution=INBOUND_RESOLUTION_IGNORED_ROUTE,
+                    resolution_reason="ingress_sender_route_not_allowed",
+                )
+            )
+
+    report = await project(session_maker, apply=True)
+
+    assert report.messages_route_not_allowed == 1
+    assert report.skipped.get(SKIP_ROUTE_NOT_ALLOWED) == 1
+    assert await _suppressions(session_maker) == []
+
+
+async def test_an_accepted_message_is_still_projected_beside_a_refused_one(session_maker) -> None:
+    """The filter is per message, so it must not swallow the allowed one too."""
+    from altegio_bot.models.models import INBOUND_RESOLUTION_IGNORED_ROUTE, WhatsAppInboundReceipt
+    from altegio_bot.whatsapp_consent import receipt_key
+
+    payload = _stored_payload(text="STOP", msg_id="wamid.MIXED-A")
+    payload["entry"][0]["changes"][0]["value"]["messages"].append(
+        {
+            "from": OTHER_RAW_FROM,
+            "id": "wamid.MIXED-B",
+            "timestamp": str(BASE_EPOCH),
+            "type": "text",
+            "text": {"body": "STOP"},
+        }
+    )
+    event_id = await _store_event(session_maker, payload, dedupe_key="wa:hist-mixed")
+    moment = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppInboundReceipt(
+                    receipt_key=receipt_key("wa:hist-mixed", 0),
+                    whatsapp_event_id=event_id,
+                    message_index=0,
+                    wa_address=ADDRESS,
+                    command=CONSENT_COMMAND_STOP,
+                    authenticity=INBOUND_AUTHENTICITY_UNVERIFIED,
+                    route_allowed=False,
+                    observed_at=moment,
+                    resolved_at=moment,
+                    resolution=INBOUND_RESOLUTION_IGNORED_ROUTE,
+                    resolution_reason="ingress_sender_route_not_allowed",
+                )
+            )
+
+    report = await project(session_maker, apply=True)
+
+    assert report.messages_route_not_allowed == 1
+    addresses = [row.wa_address for row in await _suppressions(session_maker)]
+    assert addresses == [OTHER_ADDRESS]
+
+
+async def test_the_report_names_the_route_provenance_it_does_not_have(session_maker) -> None:
+    """Said every run, because it never stops being true of old rows."""
+    report = await project(session_maker)
+    assert "historical_per_message_route_unrecorded" in report.as_safe_dict()["source_gaps"]
 
 
 async def test_the_projection_creates_no_jobs_and_no_outbound_rows(session_maker) -> None:

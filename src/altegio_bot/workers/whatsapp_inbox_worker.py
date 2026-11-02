@@ -58,6 +58,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
     WhatsAppEvent,
+    WhatsAppInboundReceipt,
     WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
@@ -86,7 +87,7 @@ from altegio_bot.webhooks.common import (
     resolve_chatwoot_tenant_inbox,
     safe_log_value,
 )
-from altegio_bot.whatsapp_consent import apply_inbound_consent
+from altegio_bot.whatsapp_consent import apply_inbound_consent, ledger_state
 from altegio_bot.whatsapp_inbound_commands import START_KEYWORDS as _START_KEYWORDS
 from altegio_bot.whatsapp_inbound_commands import STOP_KEYWORDS as _STOP_KEYWORDS
 from altegio_bot.whatsapp_inbound_commands import (
@@ -971,7 +972,17 @@ async def _set_opt_out(
     phone_e164: str,
     opted_out: bool,
     reason: str,
+    only_when_unset: bool = False,
 ) -> int:
+    """Project a consent answer onto the legacy card flags.
+
+    ``only_when_unset`` is for CONVERGENCE rather than for a decision: it brings
+    a card that disagrees with the ledger into line without touching a card that
+    already agrees. The difference matters because ``wa_opted_out_at`` and
+    ``wa_opt_out_reason`` describe WHEN and WHY somebody refused, and restamping
+    them every time a refused START arrives would overwrite that history with
+    the time of the message that changed nothing.
+    """
     variants = _phone_variants(phone_e164)
 
     if opted_out:
@@ -988,6 +999,8 @@ async def _set_opt_out(
         }
 
     stmt = update(Client).where(Client.phone_e164.in_(variants)).values(**values)
+    if only_when_unset:
+        stmt = stmt.where(Client.wa_opted_out.is_(not opted_out))
 
     res = await session.execute(stmt)
     return int(getattr(res, "rowcount", 0) or 0)
@@ -1021,56 +1034,167 @@ async def _cancel_marketing_jobs(
     return int(getattr(res2, "rowcount", 0) or 0)
 
 
+async def _event_receipts(session: AsyncSession, event: WhatsAppEvent) -> list[WhatsAppInboundReceipt]:
+    """The receipts the ingress wrote for this delivery, in message order.
+
+    Empty for every event stored before this phase existed, and for an event a
+    test or a recovery path created directly. Each caller below says what it
+    does in that case, and in every case it is what this worker did before the
+    receipts existed.
+    """
+    if event.id is None:
+        return []
+    return list(
+        (
+            await session.scalars(
+                select(WhatsAppInboundReceipt)
+                .where(WhatsAppInboundReceipt.whatsapp_event_id == int(event.id))
+                .order_by(WhatsAppInboundReceipt.message_index.asc())
+            )
+        ).all()
+    )
+
+
+async def _addresses_refused_by_route(session: AsyncSession, event: WhatsAppEvent) -> set[str]:
+    """Addresses whose EVERY message in this delivery arrived on a refused route.
+
+    An address with one refused and one accepted message is not in here: we are
+    allowed to talk to them, and the refused message is excluded on its own by
+    :func:`_inbound_commands`. No receipts means no recorded refusal, so nothing
+    is excluded — the historical behaviour exactly.
+    """
+    receipts = await _event_receipts(session, event)
+    if not receipts:
+        return set()
+    refused: set[str] = set()
+    accepted: set[str] = set()
+    for receipt in receipts:
+        (refused if receipt.route_allowed is False else accepted).add(str(receipt.wa_address))
+    return refused - accepted
+
+
+async def _inbound_commands(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    actions: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """``(address, command)`` for every command this delivery may act on.
+
+    Read from the receipts when there are any, because they are the record of
+    what arrived AND of which routes were accepted — the same rows the durable
+    consent pass worked from, so the legacy card flags below cannot end up
+    disagreeing with the ledger about which messages existed. A refused route is
+    skipped here and nowhere else has to remember to skip it.
+
+    Falls back to the parsed actions for an event with no receipts, which is
+    what this worker read before the receipts existed.
+    """
+    receipts = await _event_receipts(session, event)
+    if receipts:
+        return [
+            (str(receipt.wa_address), str(receipt.command))
+            for receipt in receipts
+            if receipt.route_allowed is not False and receipt.command in ("stop", "start")
+        ]
+    pairs: list[tuple[str, str]] = []
+    for action in actions:
+        command = action.get("cmd")
+        phone = action.get("phone_e164")
+        if command in ("stop", "start") and isinstance(phone, str) and phone:
+            pairs.append((phone, command))
+    return pairs
+
+
+@dataclass(frozen=True)
+class CommandProjection:
+    """What one address's command turned into, after the ledger had its say."""
+
+    command: str
+    ledger_state: str | None
+    opted_out: bool
+    clients_updated: int
+    jobs_canceled: int
+    # Does the authoritative consent answer match what this command asked for?
+    # ``False`` means the ledger refused it — a START it will not honour, or a
+    # STOP it has proven to be a replay of something already answered — and the
+    # customer must NOT be told the opposite.
+    agreed: bool
+    refusal_reason: str | None = None
+
+
 async def _apply_inbound_command_flags(
     session: AsyncSession,
-    actions: list[dict[str, Any]],
-) -> dict[str, tuple[int, int]]:
-    """Legacy card state for EVERY command in the payload, with STOP winning.
+    commands: list[tuple[str, str]],
+) -> dict[str, CommandProjection]:
+    """Project the LEDGER's answer onto the legacy card state, per address.
 
     §46.4.1: a webhook delivery may carry several messages from several people,
     and a refusal in the second one counts exactly as much as one in the first.
     This worker historically acted on ``actions[0]`` alone, so a STOP that
     happened to arrive behind another message was recorded nowhere.
 
-    The durable ledger has already seen all of them — ``process_one_event``
-    applies it before this transaction opens. What is settled here is the
-    LEGACY card state (``Client.wa_opted_out`` and the queued marketing jobs),
-    which the rest of this project still reads and which therefore has to agree
-    with the ledger about the same messages.
+    What is settled here is the LEGACY card state — ``Client.wa_opted_out`` and
+    the queued marketing jobs — which ``message_planner``, the outbox worker and
+    every campaign path still read. It is therefore not derived from the command
+    any more. It is derived from the durable consent decision, which
+    ``process_one_event`` has already committed before this transaction opened:
+
+    * the ledger refuses this address → the card refuses, converging a card that
+      disagreed without restamping one that already agreed;
+    * the ledger has PROVEN an opt-in → the card is cleared;
+    * the ledger has no row for this address → the historical behaviour of the
+      command stands. Nothing has been recorded about this number, so there is
+      no authoritative answer to follow, and refusing to clear a card here would
+      strand everybody whose only refusal predates this phase.
+
+    The defect this closes: ``opted_out = cmd == "stop"`` cleared the card for
+    ANY start, including one the ledger had just refused as unverified or as
+    older than the refusal it would lift. The ledger said opted_out, the card
+    said sendable, and the card is what the senders read.
 
     STOP wins inside one delivery, per address. Two commands from one person in
     one payload have no provable order between them — Meta's timestamps are
     whole seconds and the array order is not a guarantee — so the refusal is
     taken, which is the same asymmetry the ledger applies and the same direction
     of error: an unnecessary opt-out costs one unsent marketing message.
-
-    Only the FIRST action keeps the historical single acknowledgement below. A
-    delivery is answered once; answering per command would turn one webhook into
-    several outbound messages.
     """
     effective: dict[str, str] = {}
-    for action in actions:
-        cmd = action.get("cmd")
-        if cmd not in ("stop", "start"):
-            continue
-        phone = action.get("phone_e164")
-        if not isinstance(phone, str) or not phone:
+    for phone, cmd in commands:
+        if cmd not in ("stop", "start") or not phone:
             continue
         if effective.get(phone) == "stop":
             continue
         effective[phone] = cmd
 
-    results: dict[str, tuple[int, int]] = {}
+    results: dict[str, CommandProjection] = {}
     for phone, cmd in effective.items():
-        opted_out = cmd == "stop"
+        state = await ledger_state(session, phone=phone)
+        wanted_out = cmd == "stop"
+        if state.refuses:
+            opted_out = True
+        elif state.permits:
+            opted_out = False
+        else:
+            opted_out = wanted_out
+        agreed = opted_out == wanted_out
+
         affected = await _set_opt_out(
             session,
             phone_e164=phone,
             opted_out=opted_out,
-            reason=f"wa:{cmd}",
+            reason=f"wa:{cmd}" if agreed else "wa:consent_ledger",
+            only_when_unset=not agreed,
         )
         canceled = await _cancel_marketing_jobs(session, phone_e164=phone) if opted_out else 0
-        results[phone] = (affected, canceled)
+        results[phone] = CommandProjection(
+            command=cmd,
+            ledger_state=state.state,
+            opted_out=opted_out,
+            clients_updated=affected,
+            jobs_canceled=canceled,
+            agreed=agreed,
+            refusal_reason=None if agreed else (state.last_refused_start_reason or "consent_ledger_disagrees"),
+        )
     return results
 
 
@@ -4817,6 +4941,13 @@ async def handle_event(
     # ------------------------------------------------------------------ #
     # 1. Delivery status webhooks (value.statuses)                        #
     # ------------------------------------------------------------------ #
+    # Statuses are deliberately NOT filtered by the sender-route allow list.
+    # A status proves which message it is about by exact provider message id,
+    # and the §46.3 evidence path checks it against the route that slot's one
+    # attempt froze — a stronger check than the allow list, and one that does
+    # not change meaning when the configuration does. Filtering here would
+    # instead drop real delivered/read callbacks for messages this deployment
+    # genuinely sent before its allow list was configured.
     statuses = [] if chatwoot_origin else _extract_statuses(payload)
     if statuses:
         logger.info(
@@ -4842,6 +4973,26 @@ async def handle_event(
     if not actions:
         return
 
+    # The sender-route verdict of §46.4.1, read from what the ingress wrote
+    # down rather than re-decided here.
+    #
+    # Per address, and from the receipts: the ingress judged every message of
+    # this delivery against its OWN change's ``phone_number_id`` and stored the
+    # answer, so an address whose every message in this delivery was refused is
+    # one this worker must do nothing about — no command, no Chatwoot mirror, no
+    # acknowledgement. An address with at least one accepted message stays
+    # actionable, which is the honest reading: we are allowed to talk to them.
+    #
+    # Re-deriving this from ``settings`` would have been wrong twice over: it
+    # would re-decide old deliveries against a configuration that has since
+    # changed, and it would start dropping events that no ingress ever refused.
+    refused_addresses = await _addresses_refused_by_route(session, event)
+    if refused_addresses:
+        actions = [action for action in actions if action.get("phone_e164") not in refused_addresses]
+        if not actions:
+            logger.info("Every address in event id=%s arrived on a refused sender route", event.id)
+            return
+
     # Every command in the delivery, before any early return below can skip
     # past it: a payload of [ordinary text, STOP] used to reach the Chatwoot
     # forward and return, leaving the refusal in the second message unrecorded.
@@ -4851,9 +5002,9 @@ async def handle_event(
     # already delivered is the SAME message, and applying it twice would double
     # the effect of a refusal and give a mirrored START a second attempt at
     # undoing one.
-    command_flags: dict[str, tuple[int, int]] = {}
+    command_flags: dict[str, CommandProjection] = {}
     if not chatwoot_origin:
-        command_flags = await _apply_inbound_command_flags(session, actions)
+        command_flags = await _apply_inbound_command_flags(session, await _inbound_commands(session, event, actions))
 
     action = actions[0]
     cmd = action.get("cmd")
@@ -4949,19 +5100,24 @@ async def handle_event(
             )
         return
 
+    projection: CommandProjection | None = None
     if cmd in ("stop", "start"):
         # Already applied above, for this address and for every other address
-        # in the delivery. Read back here only to keep the historical log line,
-        # which is what an operator greps for.
-        affected, canceled = command_flags.get(phone_e164, (0, 0))
+        # in the delivery. Read back here for the historical log line, which is
+        # what an operator greps for — and for whether the ledger agreed, which
+        # decides the acknowledgement below.
+        projection = command_flags.get(phone_e164)
 
         logger.info(
-            "wa_cmd=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
+            "wa_cmd=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s "
+            "consent=%s agreed=%s event_id=%s",
             cmd,
             safe_log_value(phone_number_id, limit=32),
             sender_id,
-            affected,
-            canceled,
+            projection.clients_updated if projection is not None else 0,
+            projection.jobs_canceled if projection is not None else 0,
+            projection.ledger_state if projection is not None else "-",
+            projection.agreed if projection is not None else "-",
             event.id,
         )
     else:
@@ -4972,6 +5128,23 @@ async def handle_event(
             sender_id,
             event.id,
         )
+
+    if projection is not None and not projection.agreed:
+        # The ledger did not honour this command, so there is nothing to
+        # confirm. Telling a customer "you are subscribed again" while the
+        # durable answer still says opted_out would be the one outcome §46.4.7
+        # rules out by name — worse than silence, because it invites them to
+        # expect messages that will never be sent. The reason is recorded for an
+        # operator instead; an unverified deployment shows up here as
+        # ``start_authenticity_unproven`` every time.
+        event.error = f"Inbound command not honoured: {projection.refusal_reason}"
+        logger.info(
+            "wa_cmd=%s not acknowledged reason=%s event_id=%s",
+            cmd,
+            projection.refusal_reason,
+            event.id,
+        )
+        return
 
     if sender_id is None:
         event.error = "No sender found for incoming phone_number_id"

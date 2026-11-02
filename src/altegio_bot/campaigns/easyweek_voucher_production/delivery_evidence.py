@@ -23,8 +23,19 @@ any later phase may act on it is a separate policy that does not live here.
 Two things count as proof, and only two
 ---------------------------------------
 * Meta refused the request itself, with its own error envelope, on a status it
-  decides before acting on the message;
-* a ``failed`` delivery status naming the exact message id of this slot.
+  decides before acting on the message. This process watched that happen on its
+  own request, so there is no signature to check and the link to the slot is the
+  intent committed before the request left;
+* a ``failed`` delivery status naming the exact message id of this slot, WITH
+  the signature the ingress verified over the raw body AND a route matching the
+  one that slot's single attempt froze.
+
+The second one needs all three parts. An unsigned callback is an unattributed
+claim — anybody who can reach the webhook can make it — and a slot whose attempt
+froze no route gives nothing to compare a claimed route against. Either way the
+fact is kept, as ``unproven`` rather than ``confirmed``, and marks nothing: "the
+right message id and nothing contradicting it" is a weaker statement than proof,
+and §46.3 asks for proof.
 
 A timeout, a transport failure, a 429, a 409, a redirect, an unreadable 2xx, a
 2xx without a message id, a missing callback, ``accepted``-only, a slot with no
@@ -50,6 +61,7 @@ from datetime import datetime
 from typing import Any, Final
 
 from sqlalchemy import select
+from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +69,7 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
     DELIVERY_FAILURE_MATCH_CONFLICTING,
     DELIVERY_FAILURE_MATCH_UNMATCHED,
+    DELIVERY_FAILURE_MATCH_UNPROVEN,
     DELIVERY_FAILURE_REASON_API_REJECTED,
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
@@ -89,9 +102,55 @@ CONFLICT_AFTER_SUCCESS: Final = "failed_after_delivered_or_read"
 # declines to say which message it is about.
 CONFLICT_ROUTE_UNVERIFIABLE: Final = "route_not_named_by_the_fact"
 
+# Why a fact about the right slot is nevertheless not proof. Not conflicts —
+# nothing contradicts them — but §46.3 asks a callback for two things, and a
+# fact missing either of them is evidence of nothing.
+UNPROVEN_CALLBACK_UNVERIFIED: Final = "callback_signature_unproven"
+UNPROVEN_ROUTE_UNKNOWN: Final = "attempt_route_unknown"
+
 # Why nothing was written.
 SKIPPED_NOT_OURS: Final = "not_a_production_message"
 SKIPPED_NO_MESSAGE_ID: Final = "callback_without_message_id"
+
+# Domain-separated handle for the per-identifier lock below.
+_MESSAGE_LOCK_DOMAIN: Final = "altegio_bot/easyweek_voucher_production/message_identity/v1"
+
+
+async def lock_message_identity(session: AsyncSession, provider_message_id: str) -> None:
+    """Serialize everything that happens about ONE Meta message identifier.
+
+    This is the synchronisation protocol §46.3 needs, and the window it closes
+    cannot be closed by re-reading. Two transactions are involved: the one that
+    records a slot's message id and scans for facts that arrived early (A), and
+    the one that handles a ``failed`` callback and inserts an unmatched fact
+    when nobody owns the id yet (C). Both of them look for something the other
+    has not committed, so without a shared lock this interleaving loses the
+    fact for good::
+
+        C: look for the slot  → not committed yet, so none
+        A: look for unmatched facts → not committed yet, so none
+        A: commit (message id now on disk)
+        C: insert unmatched, commit (fact now on disk, bound to nothing)
+
+    ``SELECT ... FOR UPDATE`` does not help: there is no row to lock in either
+    direction. A transaction-scoped advisory lock on the identifier itself does,
+    because it exists before the rows do. Whichever transaction takes it first
+    commits first, and the second one then SEES what the first wrote: A finds
+    the unmatched fact and binds it, or C finds the slot and judges the callback
+    against it directly.
+
+    Lock order is ``message → header → item`` on both sides, the same relative
+    order the stage writers already use among themselves, so this adds no cycle.
+    """
+    # ``surrogatepass`` for the same reason the consent digests use it: a message
+    # id arrives in a webhook body and may not be encodable, and a raise here
+    # would be a 500 on a payload that cannot succeed on retry either.
+    key = int.from_bytes(
+        hashlib.sha256(f"{_MESSAGE_LOCK_DOMAIN}:{provider_message_id}".encode("utf-8", "surrogatepass")).digest()[:8],
+        "big",
+        signed=True,
+    )
+    await session.execute(sql_text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
 
 
 @dataclass(frozen=True)
@@ -205,6 +264,38 @@ def _route_verdict(
     return True, None
 
 
+def _not_proven(
+    *,
+    source: str,
+    signature_verified: bool,
+    route_proven: bool,
+) -> str | None:
+    """Why this fact is not proof, or ``None`` when it is.
+
+    The two sources have different proof contracts, and collapsing them would
+    break one of them:
+
+    * a CALLBACK is somebody else's claim arriving over the network. §46.3 asks
+      it for both of the things that make it checkable — the HMAC the ingress
+      verified over the raw body, and a route that matches the one this slot's
+      one attempt froze. "Nothing contradicts it" is not either of those: an
+      unsigned callback is unattributed, and a route nobody froze cannot be
+      compared, so neither may mark a slot as a confirmed failure;
+    * an API REJECTION was observed by this process on its OWN request. There is
+      no webhook and therefore no signature to require, and the link to the
+      attempt is the intent committed before the request left. Requiring a
+      signature here would mean no real Meta rejection could ever be confirmed,
+      and requiring a frozen route would silently drop every historical one.
+    """
+    if source != DELIVERY_FAILURE_SOURCE_CALLBACK:
+        return None
+    if not signature_verified:
+        return UNPROVEN_CALLBACK_UNVERIFIED
+    if not route_proven:
+        return UNPROVEN_ROUTE_UNKNOWN
+    return None
+
+
 def _mark_item(
     item: EasyWeekVoucherProductionBatchItem,
     *,
@@ -283,6 +374,9 @@ async def record_callback_failure(
     if not provider_message_id:
         return FailureOutcome(False, False, reason=SKIPPED_NO_MESSAGE_ID)
 
+    # Before the lookup, not after: the lookup is one half of the race.
+    await lock_message_identity(session, provider_message_id)
+
     with session.no_autoflush:
         located = await _locate_item(session, provider_message_id)
     if located is None:
@@ -350,6 +444,11 @@ async def record_unmatched_callback_failure(
     provider_message_id = str(status.get("provider_message_id") or "").strip()
     if not provider_message_id:
         return FailureOutcome(False, False, reason=SKIPPED_NO_MESSAGE_ID)
+
+    # Re-entrant: the caller reached here through ``record_callback_failure``,
+    # which already holds this lock for this identifier, and the acceptance that
+    # will bind this row cannot commit while it is held.
+    await lock_message_identity(session, provider_message_id)
 
     error_code = parse_meta_error_code(status.get("error_code"))
     failure_class = classify_delivery_error_code(status.get("error_code"))
@@ -426,10 +525,22 @@ async def _store(
     if conflict is None and (item.delivered_at is not None or item.read_at is not None):
         conflict = CONFLICT_AFTER_SUCCESS
 
-    match_state = DELIVERY_FAILURE_MATCH_CONFLICTING if conflict else DELIVERY_FAILURE_MATCH_CONFIRMED
+    unproven = (
+        None
+        if conflict
+        else _not_proven(source=source, signature_verified=signature_verified, route_proven=route_proven)
+    )
+    if conflict:
+        match_state = DELIVERY_FAILURE_MATCH_CONFLICTING
+    elif unproven:
+        match_state = DELIVERY_FAILURE_MATCH_UNPROVEN
+    else:
+        match_state = DELIVERY_FAILURE_MATCH_CONFIRMED
     evidence: dict[str, Any] = {"route_proven": route_proven}
     if conflict:
         evidence["conflict"] = conflict
+    if unproven:
+        evidence["unproven"] = unproven
     if attempt is not None and (attempt.sender_phone_number_id_digest is None or attempt.recipient_digest is None):
         # Named rather than inferred: a historical attempt has no frozen route,
         # so this fact is about the right slot and an unknown route — and no
@@ -489,7 +600,7 @@ async def _store(
         stored=fact_id is not None,
         match_state=match_state,
         failure_class=failure_class,
-        reason=conflict,
+        reason=conflict or unproven,
         fact_id=fact_id,
     )
 
@@ -580,31 +691,48 @@ async def bind_unmatched_failures(
         )
         if conflict is None and (item.delivered_at is not None or item.read_at is not None):
             conflict = CONFLICT_AFTER_SUCCESS
+        # The same rule the live path uses, from the authenticity stored on the
+        # row when it arrived. A fact is not promoted for having waited, and an
+        # unsigned callback does not become proof once a slot owns its id.
+        unproven = (
+            None
+            if conflict
+            else _not_proven(
+                source=row.source,
+                signature_verified=row.authenticity == INBOUND_AUTHENTICITY_SIGNED,
+                route_proven=route_proven,
+            )
+        )
 
-        row.match_state = DELIVERY_FAILURE_MATCH_CONFLICTING if conflict else DELIVERY_FAILURE_MATCH_CONFIRMED
+        if conflict:
+            row.match_state = DELIVERY_FAILURE_MATCH_CONFLICTING
+        elif unproven:
+            row.match_state = DELIVERY_FAILURE_MATCH_UNPROVEN
+        else:
+            row.match_state = DELIVERY_FAILURE_MATCH_CONFIRMED
         row.route_proven = route_proven
         row.attempt_id = int(attempt.id) if attempt is not None else None
         row.batch_id = int(item.batch_id)
         row.slot = int(item.slot)
         row.intent_uuid = item.outbound_intent_uuid
+        # Every bound fact names which slot it was tested against, so an
+        # operator can find it. Only a CONFIRMED one is that slot's evidence.
+        row.item_id = int(item.id)
         if row.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED:
-            row.item_id = int(item.id)
             _mark_item(
                 item,
                 reason_code=row.reason_code,
                 failure_class=row.failure_class or DELIVERY_CLASS_UNKNOWN,
                 observed_at=now,
             )
-        else:
-            # A conflicting fact still names which slot it was tested against,
-            # so an operator can find it — but it is NOT this slot's evidence.
-            row.item_id = int(item.id)
         merged = dict(row.evidence or {})
         merged.pop("awaiting_binding", None)
         merged["bound_at"] = now.isoformat()
         merged["route_proven"] = route_proven
         if conflict:
             merged["conflict"] = conflict
+        if unproven:
+            merged["unproven"] = unproven
         row.evidence = merged
         row.updated_at = now
         bound += 1
@@ -624,8 +752,11 @@ __all__ = [
     "CONFLICT_ROUTE_UNVERIFIABLE",
     "SKIPPED_NOT_OURS",
     "SKIPPED_NO_MESSAGE_ID",
+    "UNPROVEN_CALLBACK_UNVERIFIED",
+    "UNPROVEN_ROUTE_UNKNOWN",
     "FailureOutcome",
     "bind_unmatched_failures",
+    "lock_message_identity",
     "record_api_rejection",
     "record_callback_failure",
     "record_unmatched_callback_failure",

@@ -24,6 +24,7 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.customers import normalized_international_phone
 from altegio_bot.easyweek_normalizer import NormalizedBooking, normalize_event
 from altegio_bot.models.models import Client, EasyWeekEvent
+from altegio_bot.whatsapp_consent import extend_refusal_to_uuid
 
 
 class UUIDIdentityResolutionRequired(Exception):
@@ -184,6 +185,12 @@ async def resolve_webhook_identity(
                 )
             ):
                 return False
+        # Read BEFORE anything below changes a number: a refusal recorded
+        # against the number this person used to have has to keep applying once
+        # the card moves to the new one, and after the write that number is no
+        # longer on any card to find it by.
+        consent_addresses = {proven_phone, captured_phone} | {row.phone_e164 for row in rows}
+
         branch_rows = [row for row in rows if row.company_id == booking.company_id]
         if len(branch_rows) > 1:
             return False
@@ -219,6 +226,14 @@ async def resolve_webhook_identity(
                     wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
                 )
             )
+        # §46.4.2 — the one moment this binding is justified. The UUID has just
+        # been proven for this person against EasyWeek's own records, so an
+        # existing phone-keyed refusal for any of those numbers is bound to it
+        # and keeps applying after the number changes. Ban extension only: it
+        # writes a UUID onto a refusal and claims nothing about whose card this
+        # is, which branch they belong to, or whether they are an EasyWeek
+        # customer — and it never creates, lifts or weakens a refusal.
+        await extend_refusal_to_uuid(session, addresses=consent_addresses, customer_uuid=identity)
         if stale_contact:
             # Consume the same event's business changes atomically with the
             # proven contact. Otherwise the next pass would restore/re-prove

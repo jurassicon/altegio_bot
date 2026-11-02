@@ -1598,6 +1598,13 @@ it re-opens nothing, the one-attempt limit is untouched, and no retry exists.
 `send_rejected` on its own is still not proof — this mailing writes that status
 for its own parameter refusal too.
 
+A callback is only `confirmed` when its delivery's signature was verified **and**
+the route matches the one that slot's single attempt froze. Without either it is
+kept as `unproven` and marks nothing, so on a deployment with no
+`META_APP_SECRET` the failure evidence will read `unproven` rather than
+`confirmed`. Meta's own rejection of the POST keeps its own contract — this
+process watched it happen — and is confirmed without any webhook signature.
+
 **Before any follow-up is considered**, run the historical reconciliation dry
 and read its report, then apply it as a separate explicit step:
 
@@ -1616,7 +1623,19 @@ count first.
 
 Note: with `META_APP_SECRET` unconfigured, no resubscribe can lift a refusal in
 the new ledger, because no signature is checked and an unverified START grants
-nothing. The existing `START` behaviour on client cards is unchanged.
+nothing. Such a START is no longer acknowledged either — confirming a
+subscription the ledger refused would be worse than silence — and the reason is
+recorded on the stored event as `start_authenticity_unproven`. The card flag of
+somebody with no ledger refusal at all keeps its historical behaviour, so an
+ordinary resubscribe still works for them. Configuring the secret is what makes
+a resubscribe work for everybody.
+
+A refusal whose own event time could never be established — every refusal
+projected from a legacy card flag, and any STOP whose timestamp Meta sent
+unparseably — cannot be lifted by a START at all, because "strictly newer" has no
+answer. Those people are unsubscribed for good as far as this mailing is
+concerned; an operator who needs to reverse one has to do it deliberately, as a
+data change, not through a message.
 
 No follow-up audience, text, confirmation, ledger or send exists at this stage,
 and none is reachable by a flag.

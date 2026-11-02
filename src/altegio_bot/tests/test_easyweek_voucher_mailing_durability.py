@@ -1786,10 +1786,11 @@ async def test_a_refusal_racing_the_final_send_guard_has_one_checkable_order(ses
     handed out no longer matches, so a claim that re-checks it refuses.
     """
     from altegio_bot.whatsapp_consent import (
+        GUARD_CONSENT_MOVED,
         ProjectedRefusal,
         apply_projected_refusal,
-        consent_unchanged,
         final_send_guard,
+        recheck_consent_boundary,
     )
 
     address = "+4915177994011"
@@ -1822,5 +1823,220 @@ async def test_a_refusal_racing_the_final_send_guard_has_one_checkable_order(ses
 
     assert resolution == "applied"
     async with session_maker() as session:
-        assert await consent_unchanged(session, phone=address, expected_fingerprint=fingerprints[0]) is False
+        recheck = await recheck_consent_boundary(session, phone=address, expected_fingerprint=fingerprints[0])
+        assert recheck.allowed is False
+        # It is the refusal itself that stops the claim, not merely a moved
+        # fingerprint: the re-check asks the same question a fresh guard asks.
+        assert recheck.reason != GUARD_CONSENT_MOVED
         assert (await final_send_guard(session, phone=address)).allowed is False
+
+
+# ===========================================================================
+# Review fix 8 — the downgrade protects the provenance in OLD tables too
+# ===========================================================================
+
+
+async def _seed_one_attempt(db_url: str) -> tuple[int, int]:
+    """One batch, one item and one attempt, through the §42 raw-SQL seeder.
+
+    Imported rather than hand-rolled: that module owns the exact column list
+    these tables require, and a second copy of it here would drift from the
+    schema the migrations actually produce.
+    """
+    from altegio_bot.tests.test_easyweek_voucher_production_migration import (
+        _add_item,
+        _execute,
+        _fetch,
+        _seed_batch,
+    )
+
+    run_id, recipient_ids, batch_id = await _seed_batch(db_url, recipient_count=1)
+    customer = str(uuid_module.UUID(int=0xC0FFEE))
+    await _add_item(
+        db_url,
+        batch_id=batch_id,
+        batch_count=1,
+        slot=1,
+        run_id=run_id,
+        recipient_id=recipient_ids[0],
+        customer=customer,
+        marker="marker-route-1",
+    )
+    item_id = (await _fetch(db_url, "SELECT id FROM easyweek_voucher_production_batch_items ORDER BY id DESC LIMIT 1"))[
+        0
+    ][0]
+    await _execute(
+        db_url,
+        "INSERT INTO easyweek_voucher_production_batch_attempts ("
+        " item_id, intent_uuid, outcome, template_code, meta_template_name, template_language,"
+        " campaign_recipient_id, batch_id, slot, claimed_at)"
+        " VALUES (:item, :intent, 'claimed', 'new_client_voucher_10eur_v2', 'meta_template', 'de',"
+        " :recipient, :batch, 1, now())",
+        {
+            "item": item_id,
+            "intent": str(uuid_module.uuid4()),
+            "recipient": recipient_ids[0],
+            "batch": batch_id,
+        },
+    )
+    return int(batch_id), int(item_id)
+
+
+async def test_a_downgrade_refuses_while_a_frozen_send_route_exists(disposable_database: str):
+    """§46.3 — the route of a real send is not traded for a rollback.
+
+    The reproduction from the review: a mailing went out, its route digests were
+    frozen with the one attempt it got, and no consent row or failure fact
+    exists yet. The downgrade used to pass straight through that state and drop
+    both digest columns, which cannot be recomputed — the sender configuration
+    and the client's number are both mutable, which is why they were frozen in
+    the first place — so a re-upgrade would bring them back as NULL and every
+    later callback about those sends would be unprovable.
+    """
+    from altegio_bot.tests.test_easyweek_voucher_production_migration import _execute, _fetch
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    _batch_id, item_id = await _seed_one_attempt(disposable_database)
+    await _execute(
+        disposable_database,
+        "UPDATE easyweek_voucher_production_batch_attempts"
+        " SET sender_phone_number_id_digest = :sender, recipient_digest = :recipient"
+        " WHERE item_id = :item",
+        {"sender": "a" * 64, "recipient": "b" * 64, "item": item_id},
+    )
+
+    attempt = _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION)
+    assert attempt.returncode != 0
+    assert "downgrade refused before DDL" in (attempt.stderr + attempt.stdout)
+
+    # Nothing dropped, nothing lost, still at head.
+    columns = await _columns(disposable_database, "easyweek_voucher_production_batch_attempts")
+    assert {"sender_phone_number_id_digest", "recipient_digest"} <= columns
+    rows = await _fetch(
+        disposable_database,
+        "SELECT sender_phone_number_id_digest, recipient_digest"
+        " FROM easyweek_voucher_production_batch_attempts WHERE item_id = :item",
+        {"item": item_id},
+    )
+    assert rows == [("a" * 64, "b" * 64)]
+    assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+    assert "(head)" in _alembic(disposable_database, "current").stdout
+
+
+async def test_a_downgrade_refuses_while_a_recorded_authenticity_exists(disposable_database: str):
+    """The same for a status-only delivery, whose proof lives on the event.
+
+    An event carrying no messages has no receipt to record authenticity on, so
+    ``whatsapp_events.inbound_authenticity`` is the only place the fact that a
+    signature WAS checked survives — the header itself is stripped before the
+    row is written. Dropping the column turns every one of those into
+    "unknown", and §46.4.7 reads unknown as unverified for good.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO whatsapp_events (dedupe_key, status, query, headers, payload,"
+                    " inbound_authenticity)"
+                    " VALUES ('wa:status-only-1', 'processed', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,"
+                    " 'signature_verified')"
+                )
+            )
+
+        attempt = _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION)
+        assert attempt.returncode != 0
+        assert "downgrade refused before DDL" in (attempt.stderr + attempt.stdout)
+
+        assert "inbound_authenticity" in await _columns(disposable_database, "whatsapp_events")
+        async with engine.connect() as conn:
+            stored = (
+                await conn.execute(
+                    text("SELECT inbound_authenticity FROM whatsapp_events WHERE dedupe_key = 'wa:status-only-1'")
+                )
+            ).scalar_one()
+        assert stored == "signature_verified"
+        assert "(head)" in _alembic(disposable_database, "current").stdout
+    finally:
+        await engine.dispose()
+
+
+async def test_a_downgrade_cannot_overtake_a_route_being_frozen(disposable_database: str):
+    """The check and the DROP are one atomic decision, under the table lock.
+
+    An acceptance freezes a route in an open transaction while the downgrade
+    runs. Without the ACCESS EXCLUSIVE lock on that old table the downgrade
+    could count zero digests and drop the columns a moment before the insert
+    commits — the race the new tables were already protected from, on data that
+    is exactly as unrecoverable. So the downgrade must WAIT (asserted here) and
+    then refuse on what it finds.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from altegio_bot.tests.test_easyweek_voucher_production_migration import _fetch
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    _batch_id, item_id = await _seed_one_attempt(disposable_database)
+
+    engine = create_async_engine(disposable_database)
+    blocked: list[bool] = []
+    try:
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            await conn.execute(
+                text(
+                    "UPDATE easyweek_voucher_production_batch_attempts"
+                    " SET sender_phone_number_id_digest = :sender, recipient_digest = :recipient"
+                    " WHERE item_id = :item"
+                ),
+                {"sender": "c" * 64, "recipient": "d" * 64, "item": item_id},
+            )
+
+            task = asyncio.create_task(
+                asyncio.to_thread(_alembic, disposable_database, "downgrade", CONSENT_PARENT_REVISION)
+            )
+            done, _pending = await asyncio.wait({task}, timeout=3.0)
+            blocked.append(not done)
+            await transaction.commit()
+            attempt = await task
+
+        assert blocked == [True], "the downgrade must wait for the writer, not read around it"
+        assert attempt.returncode != 0
+        assert "downgrade refused before DDL" in (attempt.stderr + attempt.stdout)
+        rows = await _fetch(
+            disposable_database,
+            "SELECT sender_phone_number_id_digest FROM easyweek_voucher_production_batch_attempts"
+            " WHERE item_id = :item",
+            {"item": item_id},
+        )
+        assert rows == [("c" * 64,)]
+    finally:
+        await engine.dispose()
+
+
+async def test_an_empty_database_still_downgrades_and_re_upgrades(disposable_database: str):
+    """The guard is about data, not about the migration being irreversible.
+
+    With no consent row, no failure fact, no frozen route and no recorded
+    authenticity, the rollback is exactly as available as it was — and the
+    re-upgrade leaves one head.
+    """
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    await _seed_one_attempt(disposable_database)
+
+    assert _alembic(disposable_database, "downgrade", CONSENT_PARENT_REVISION).returncode == 0
+    assert await _tables(disposable_database, CONSENT_TABLES) == set()
+    columns = await _columns(disposable_database, "easyweek_voucher_production_batch_attempts")
+    assert "sender_phone_number_id_digest" not in columns
+    assert "recipient_digest" not in columns
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, CONSENT_TABLES) == set(CONSENT_TABLES)
+    current = _alembic(disposable_database, "current")
+    assert "(head)" in current.stdout
+    heads = [line for line in _alembic(_repo_root(), "heads").stdout.splitlines() if "(head)" in line]
+    assert len(heads) == 1

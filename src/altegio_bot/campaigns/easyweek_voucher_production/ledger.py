@@ -2048,6 +2048,15 @@ async def record_item_outcome(
     now = utcnow()
     async with session_maker() as session:
         async with session.begin():
+            if provider_message_id is not None:
+                # FIRST, before the header: this transaction is one half of the
+                # §46.3 binding protocol, and the callback handler takes the
+                # same lock before its own lookup. Taking it here, ahead of the
+                # header and item locks, keeps one global order
+                # (message → header → item) on both sides, so the protocol adds
+                # no cycle to the stage locks — and makes the early-callback
+                # window unreachable rather than merely unlikely.
+                await delivery_evidence.lock_message_identity(session, provider_message_id)
             header = await _header_by_id(session, batch_id, for_update=True)
             if header is None:
                 return RecordOutcome(False, RECORD_MISSING_ROW)

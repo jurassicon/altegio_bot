@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final
+from typing import Any, Collection, Final
 
-from altegio_bot.webhooks.common import mapping_or_empty
+from altegio_bot.settings import settings
+from altegio_bot.webhooks.common import list_or_empty, mapping_or_empty
 
 # Both spellings of the same request, and the historical aliases this project
 # already supported. The Cyrillic «стоп» is new in PR-22.1 and is equal to
@@ -193,12 +194,89 @@ def parse_event_timestamp(value: object, *, observed_at: datetime | None = None)
     return moment
 
 
+def sender_route_of_change(change: object) -> str | None:
+    """The Meta sender route one ``changes[]`` entry names, or ``None``.
+
+    Per change, because that is the granularity Meta actually sends: one
+    delivery may carry several changes, each with its own
+    ``value.metadata.phone_number_id``. Reading only the first one and applying
+    its verdict to the whole payload is what let a refusal from an allowed
+    sender be dropped behind a disallowed one, and a command from a disallowed
+    sender be executed behind an allowed one.
+    """
+    if not isinstance(change, dict):
+        return None
+    value = change.get("value")
+    if not isinstance(value, dict):
+        return None
+    metadata = mapping_or_empty(value.get("metadata"))
+    raw = metadata.get("phone_number_id")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def payload_sender_routes(payload: dict[str, Any]) -> list[str | None]:
+    """One entry per ``changes[]`` of *payload*, in document order.
+
+    ``None`` for a change that names no route at all, which is kept rather than
+    dropped: "this change named nothing" is the historical not-ignored case and
+    has to stay distinguishable from "this change named a route we refuse".
+    """
+    routes: list[str | None] = []
+    for entry in list_or_empty(payload.get("entry")):
+        if not isinstance(entry, dict):
+            continue
+        for change in list_or_empty(entry.get("changes")):
+            if not isinstance(change, dict):
+                continue
+            routes.append(sender_route_of_change(change))
+    return routes
+
+
+def allowed_sender_routes() -> set[str]:
+    """The Meta sender routes this deployment accepts, from settings.
+
+    One definition, read by the ingress when it judges a delivery and by the
+    inbox worker when it acts on one, because two readings of the same setting
+    would eventually disagree about which sender is ours — and the direction of
+    that disagreement is either a lost refusal or an executed command from a
+    sender this deployment does not serve.
+    """
+    raw = getattr(settings, "whatsapp_allowed_phone_number_ids", "")
+    ids = [value.strip() for value in str(raw).split(",")] if raw else []
+    ids = [value for value in ids if value]
+    if not ids and settings.meta_wa_phone_number_id:
+        ids = [str(settings.meta_wa_phone_number_id).strip()]
+    return {value for value in ids if value}
+
+
+def route_allowed(phone_number_id: str | None, allowed: Collection[str] | None) -> bool:
+    """The historical allow rule, asked about ONE route instead of a payload.
+
+    Exactly the ingress's own condition — an unlisted ``phone_number_id`` is
+    refused, an empty allow list means "no filter configured" and a change that
+    names no route is not refused on a guess — moved here so the ingress, the
+    inbox worker and the historical reconciliation cannot answer it differently.
+    """
+    if not allowed:
+        return True
+    if phone_number_id is None:
+        return True
+    return phone_number_id in allowed
+
+
 __all__ = [
     "START_KEYWORDS",
+    "allowed_sender_routes",
     "STOP_KEYWORDS",
     "consent_command",
     "extract_message_text",
     "first_command_token",
     "normalize_command_text",
     "parse_event_timestamp",
+    "payload_sender_routes",
+    "route_allowed",
+    "sender_route_of_change",
 ]

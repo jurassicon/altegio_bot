@@ -16,15 +16,19 @@ asked for is one marketing message that was not sent. Moving back is expensive
 and almost never allowed: the cost of a wrong opt-in is a message to somebody
 who told us to stop. So:
 
-* a STOP applies whatever its authenticity and whatever its timestamp;
+* a STOP applies whatever its authenticity and whatever its timestamp, unless
+  it can PROVE it is older than the opt-in currently in force — a replay of
+  something already answered, which is kept and reported rather than acted on;
 * a START lifts a refusal only when Meta's signature was configured AND
   verified for that very request, its own event time is proven, the refusal's
-  event time is proven, and the START's is strictly later.
+  event time is proven, no accepted STOP for that address has an unprovable
+  event time, and the START's time is strictly later.
 
 Everything else — an unsigned request, a deployment with no app secret, a
 replayed payload, an equal timestamp, a timestamp nobody can parse, a historical
-ban of unknown time, a reused message identifier — refuses, with a reason code.
-That is not a gap to be closed later; it is §46.4.7 and §46.4.4 written out.
+ban of unknown time, a refusal whose order cannot be established at all, a
+reused message identifier — refuses, with a reason code. That is not a gap to be
+closed later; it is §46.4.7 and §46.4.4 written out.
 
 The absence of a refusal here is NOT evidence of marketing consent. It means
 only that this database holds no proven refusal for that address.
@@ -45,7 +49,7 @@ import re
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Final, Iterable, Sequence
+from typing import Any, Collection, Final, Iterable, Sequence
 
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -78,6 +82,8 @@ from altegio_bot.whatsapp_inbound_commands import (
     extract_message_text,
     first_command_token,
     parse_event_timestamp,
+    route_allowed,
+    sender_route_of_change,
 )
 
 logger = logging.getLogger("whatsapp_consent")
@@ -101,6 +107,12 @@ REFUSED_START_IDENTIFIER_CONFLICT: Final = "start_event_identifier_conflict"
 # absent refusal must never be written down as a granted permission.
 NOOP_START_NO_ACTIVE_BAN: Final = "start_without_active_refusal"
 NOOP_STOP_ALREADY_ACTIVE: Final = "stop_already_active"
+# A STOP that is PROVABLY older than the opt-in currently in force. It is kept
+# and reported, and it does not take the state back: the only way to get here is
+# a replay or a historical projection of an event the ledger has already moved
+# past, and letting it win would undo a verified, strictly-newer opt-in every
+# time the reconciliation ran.
+NOOP_STOP_SUPERSEDED: Final = "stop_older_than_proven_opt_in"
 
 # Where an aggregate refusal came from. The caller shows these to an operator.
 SOURCE_SUPPRESSION: Final = "consent_suppression"
@@ -117,6 +129,13 @@ GAP_PENDING_INBOUND: Final = "pending_inbound_unresolved"
 GUARD_SUPPRESSED: Final = "consent_refusal_active"
 GUARD_PENDING_INBOUND: Final = "pending_inbound_unresolved"
 GUARD_ADDRESS_UNPROVEN: Final = "address_not_normalisable"
+# The consent state is not the one the guard was issued against: a decision, a
+# newly linked address or an unresolved inbound message landed in between.
+GUARD_CONSENT_MOVED: Final = "consent_state_changed"
+# The set of addresses this person's cards name changed between taking the
+# locks and reading under them, so the read is not covered by the locks. Held
+# rather than allowed, and the next attempt sees a settled set.
+GUARD_ADDRESS_SET_MOVED: Final = "address_set_changed_under_the_lock"
 GUARD_ALLOWED: Final = "no_local_refusal_and_nothing_pending"
 
 
@@ -149,7 +168,17 @@ def address_variants(address: str) -> list[str]:
 
 
 def _digest(domain: str, value: str) -> str:
-    return hashlib.sha256(f"{domain}:{value}".encode("utf-8")).hexdigest()
+    """A domain-separated one-way handle, total over hostile input.
+
+    ``surrogatepass`` is load-bearing, not tidiness. Some of the values digested
+    here come straight out of a webhook body — a sender route id, a recipient —
+    and a lone surrogate in one of them would otherwise raise
+    ``UnicodeEncodeError`` inside the ingress transaction, which is a 500 and a
+    Meta retry loop on a payload that will fail the same way every time. It
+    changes nothing for valid input: a well-formed string has no surrogates, so
+    every digest this project has already computed stays the same.
+    """
+    return hashlib.sha256(f"{domain}:{value}".encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def sender_route_digest(phone_number_id: object) -> str | None:
@@ -198,11 +227,26 @@ async def lock_consent_address(session: AsyncSession, address: str) -> None:
     item lock, so it cannot take part in a cycle with the voucher stages.
     """
     key = int.from_bytes(
-        hashlib.sha256(f"{_ADDRESS_LOCK_DOMAIN}:{address}".encode("utf-8")).digest()[:8],
+        hashlib.sha256(f"{_ADDRESS_LOCK_DOMAIN}:{address}".encode("utf-8", "surrogatepass")).digest()[:8],
         "big",
         signed=True,
     )
     await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+async def lock_consent_addresses(session: AsyncSession, addresses: Iterable[str]) -> list[str]:
+    """Lock several addresses, always in sorted order. Returns what was locked.
+
+    Sorted is the whole point. A send guard holds a person's own number and
+    every number an EasyWeek card of their proven UUID carries; the ingress
+    holds every address in one webhook delivery. Two such sets can overlap in
+    any way, so a fixed global order over the addresses themselves is what keeps
+    two writers from each holding what the other is waiting for.
+    """
+    ordered = sorted({address for address in addresses if address})
+    for address in ordered:
+        await lock_consent_address(session, address)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +263,10 @@ class InboundReceiptDraft:
     command: str
     whatsapp_message_id: str | None
     event_at: datetime | None
+    # The Meta sender route of the CHANGE this message arrived in, exactly as
+    # the payload spelled it. Per message, because a delivery may carry several
+    # changes with different routes and only some of them allowed.
+    sender_phone_number_id: str | None = None
     # The exact token that matched, for a consent command only. In memory and
     # for reporting; never stored. Left ``None`` for an ordinary message, whose
     # first word is arbitrary customer text and has no business being carried
@@ -254,6 +302,7 @@ def extract_inbound_receipts(
             value = change.get("value")
             if not isinstance(value, dict):
                 continue
+            change_route = sender_route_of_change(change)
             for msg in list_or_empty(value.get("messages")):
                 if not isinstance(msg, dict):
                     continue
@@ -280,6 +329,7 @@ def extract_inbound_receipts(
                         ),
                         event_at=parse_event_timestamp(msg.get("timestamp"), observed_at=observed_at),
                         command_token=first_command_token(raw_text) if matched else None,
+                        sender_phone_number_id=change_route,
                     )
                 )
                 index += 1
@@ -295,7 +345,7 @@ async def record_inbound_receipts(
     payload: dict[str, Any],
     signature_verified: bool,
     observed_at: datetime,
-    ignored_route: bool = False,
+    allowed_phone_number_ids: Collection[str] | None = None,
 ) -> int:
     """Write the receipts for one event, in the CALLER's transaction.
 
@@ -309,17 +359,30 @@ async def record_inbound_receipts(
     live request's HMAC over its raw body, and the stored copy of the headers
     has the signature stripped out of it by design.
 
-    An event this deployment will never process — a sender route that is not
-    allowed — is written down and resolved in the same breath. It still happened,
-    an operator should be able to see that it did, and leaving it pending would
-    hold sends forever waiting for a worker that is never going to look at it.
+    The route is decided PER MESSAGE, against the allow list as it reads right
+    now, and the verdict is stored on the row. A message whose own route this
+    deployment refuses is written down and resolved in the same breath: it still
+    happened, an operator should be able to see that it did, and leaving it
+    pending would hold sends forever waiting for a worker that is never going to
+    act on it. A message from an allowed route inside the same delivery keeps its
+    hold, which is the half the payload-level verdict used to lose.
+
+    The address lock is taken here, before the insert, and that is what makes the
+    pending set a real boundary rather than a best effort: a final send guard
+    holds the same lock while it reads, so a receipt either lands before the
+    guard looks — and holds the send — or waits for the guard's transaction to
+    end and is then caught by the claim-time re-check. There is no interleaving
+    in which an unresolved refusal is invisible to both.
     """
     drafts = extract_inbound_receipts(payload, observed_at=observed_at)
     if not drafts:
         return 0
 
+    await lock_consent_addresses(session, (draft.wa_address for draft in drafts))
+
     authenticity = INBOUND_AUTHENTICITY_SIGNED if signature_verified else INBOUND_AUTHENTICITY_UNVERIFIED
     for draft in drafts:
+        allowed = route_allowed(draft.sender_phone_number_id, allowed_phone_number_ids)
         session.add(
             WhatsAppInboundReceipt(
                 receipt_key=receipt_key(dedupe_key, draft.message_index),
@@ -328,12 +391,14 @@ async def record_inbound_receipts(
                 wa_address=draft.wa_address,
                 command=draft.command,
                 authenticity=authenticity,
+                sender_route_digest=sender_route_digest(draft.sender_phone_number_id),
+                route_allowed=allowed,
                 whatsapp_message_id=draft.whatsapp_message_id,
                 observed_at=observed_at,
                 event_at=draft.event_at,
-                resolved_at=observed_at if ignored_route else None,
-                resolution=INBOUND_RESOLUTION_IGNORED_ROUTE if ignored_route else None,
-                resolution_reason="ingress_sender_route_not_allowed" if ignored_route else None,
+                resolved_at=None if allowed else observed_at,
+                resolution=None if allowed else INBOUND_RESOLUTION_IGNORED_ROUTE,
+                resolution_reason=None if allowed else "ingress_sender_route_not_allowed",
             )
         )
     return len(drafts)
@@ -456,6 +521,36 @@ async def apply_consent_decision(
             # proves nothing else.
             base_evidence["uuid_binding"] = "phone_matched_easyweek_card"
 
+        if row is not None and row.state == CONSENT_STATE_OPTED_IN:
+            # A proven opt-in is in force. A STOP that can PROVE it happened
+            # before that opt-in is a replay of something already answered — a
+            # reconciliation pass re-reading an old stored event, or Meta
+            # delivering the same payload again — and must not take the state
+            # back, or every run of the projection would undo the same person's
+            # resubscribe again.
+            #
+            # Only a provable order refuses it. An equal time, an unknown time
+            # on either side, or a newer STOP all APPLY: a tie and an unproven
+            # order both fall to the refusal, which is the same asymmetry the
+            # START rules use in the other direction.
+            opt_in_event_at = row.last_start_event_at or row.decided_event_at
+            if event_at is not None and opt_in_event_at is not None and event_at < opt_in_event_at:
+                if row.last_stop_observed_at is None or observed_at > row.last_stop_observed_at:
+                    row.last_stop_observed_at = observed_at
+                merged = dict(row.evidence or {})
+                merged.update(base_evidence)
+                merged["superseded_stop_observed_at"] = observed_at.isoformat()
+                merged["superseded_stop_event_at"] = event_at.isoformat()
+                row.evidence = merged
+                await session.flush()
+                return DecisionOutcome(
+                    False,
+                    INBOUND_RESOLUTION_NOOP,
+                    NOOP_STOP_SUPERSEDED,
+                    row.state,
+                    int(row.consent_version),
+                )
+
         if row is None:
             row = WhatsAppConsentSuppression(
                 wa_address=wa_address,
@@ -470,6 +565,7 @@ async def apply_consent_decision(
                 opted_out_at=observed_at,
                 last_stop_observed_at=observed_at,
                 last_stop_event_at=event_at,
+                stop_event_time_unknown_at=None if event_at is not None else observed_at,
                 banned_easyweek_customer_uuid=banned_uuid,
                 banned_uuid_recorded_at=observed_at if banned_uuid is not None else None,
                 evidence=base_evidence,
@@ -486,6 +582,14 @@ async def apply_consent_decision(
             row.last_stop_observed_at = observed_at
         if event_at is not None and (row.last_stop_event_at is None or event_at > row.last_stop_event_at):
             row.last_stop_event_at = event_at
+        if event_at is None and (
+            row.stop_event_time_unknown_at is None or observed_at > row.stop_event_time_unknown_at
+        ):
+            # This refusal cannot be ordered against anything. Recorded as its
+            # own fact rather than folded into the high-water mark above, which
+            # only ever moves to a KNOWN time and would otherwise leave an older,
+            # provable STOP as the bar a future START has to clear.
+            row.stop_event_time_unknown_at = observed_at
         if row.banned_easyweek_customer_uuid is None and banned_uuid is not None:
             row.banned_easyweek_customer_uuid = banned_uuid
             row.banned_uuid_recorded_at = observed_at
@@ -564,10 +668,18 @@ async def apply_consent_decision(
         await session.flush()
         return outcome
     ban_event_at = row.last_stop_event_at if row.last_stop_event_at is not None else row.decided_event_at
-    if ban_event_at is None:
+    if ban_event_at is None or row.stop_event_time_unknown_at is not None:
         # The refusal's own time is unknown, so "strictly newer" is not a
         # question that has an answer. §46.4.4: an unproven state is not a
         # permission, so the refusal stands.
+        #
+        # The second clause is the one a provable timestamp cannot talk its way
+        # past: a STOP whose event time nobody could parse has been accepted for
+        # this address, and beating the LAST provable STOP says nothing about
+        # beating that one. Once such a refusal exists it stays unorderable and
+        # no START lifts it — a real limitation, written down in the contract
+        # document rather than papered over by comparing our own reception
+        # clock, which Meta promises nothing about.
         outcome = _refuse(REFUSED_START_BAN_TIME_UNKNOWN)
         await session.flush()
         return outcome
@@ -650,6 +762,16 @@ async def _backfill_receipts(
     drafts = extract_inbound_receipts(event.payload or {}, observed_at=observed_at)
     if not drafts:
         return []
+    # What the ingress of the day decided about this delivery's route, read from
+    # the stored event and from nothing else. NOT recomputed against today's
+    # allow list: that list is configuration, and re-deciding an old message by
+    # it would turn a route that was refused then into an executable command now,
+    # or silently refuse one that was accepted. An accepted event therefore
+    # leaves ``route_allowed`` NULL — "accepted, but never recorded per
+    # message", which is the honest state of a row written before that column
+    # existed.
+    route_allowed_then = False if event.status == "ignored" else None
+    await lock_consent_addresses(session, (draft.wa_address for draft in drafts))
     for draft in drafts:
         session.add(
             WhatsAppInboundReceipt(
@@ -659,9 +781,14 @@ async def _backfill_receipts(
                 wa_address=draft.wa_address,
                 command=draft.command,
                 authenticity=INBOUND_AUTHENTICITY_UNVERIFIED,
+                sender_route_digest=sender_route_digest(draft.sender_phone_number_id),
+                route_allowed=route_allowed_then,
                 whatsapp_message_id=draft.whatsapp_message_id,
                 observed_at=event.received_at or observed_at,
                 event_at=draft.event_at,
+                resolved_at=None if route_allowed_then is not False else observed_at,
+                resolution=None if route_allowed_then is not False else INBOUND_RESOLUTION_IGNORED_ROUTE,
+                resolution_reason=(None if route_allowed_then is not False else "sender_route_not_allowed"),
             )
         )
     # A concurrent pass writing the same receipts loses on ``receipt_key`` and
@@ -689,6 +816,60 @@ def _is_chatwoot_sourced(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     if isinstance(dedupe_key, str) and (dedupe_key.startswith("chatwoot:") or dedupe_key.startswith("chatwoot_out:")):
         return True
     return False
+
+
+async def extend_refusal_to_uuid(
+    session: AsyncSession,
+    *,
+    addresses: Iterable[object],
+    customer_uuid: uuid_module.UUID,
+    observed_at: datetime | None = None,
+) -> int:
+    """Bind existing refusals for these numbers to a NEWLY PROVEN customer UUID.
+
+    The gap this closes, in order: a STOP arrives before any card exists, so the
+    refusal is recorded against the number alone; an ordinary booking later
+    proves a customer UUID for that person and adopts a card; the card's number
+    then changes. From that moment the aggregate read looks for refusals on the
+    numbers the cards carry NOW, the old refusal is not bound to the UUID, and
+    nothing connects the two — the person who said stop becomes sendable again.
+
+    So the binding is written at the one moment it can be justified: when the
+    UUID has just been proven for this person by ``easyweek_uuid_identity``,
+    against the numbers that proof was about.
+
+    It stays a BAN EXTENSION. The UUID is recorded on a refusal so the refusal
+    travels; it is never written anywhere that reads it back as proof of who
+    this address belongs to, which branch they are in, or that they are an
+    EasyWeek customer. A row already bound to a DIFFERENT UUID is left exactly
+    as it is — one number can belong to two people over time, and overwriting
+    would move an existing ban onto the wrong identity. The phone-keyed refusal
+    keeps vetoing either way, and the disagreement is recorded.
+    """
+    now = observed_at or utcnow()
+    normalised = sorted({value for value in (normalize_wa_address(raw) for raw in addresses) if value})
+    if not normalised:
+        return 0
+    await lock_consent_addresses(session, normalised)
+    bound = 0
+    for address in normalised:
+        row = await _suppression_for_update(session, address)
+        if row is None:
+            continue
+        if row.banned_easyweek_customer_uuid is None:
+            row.banned_easyweek_customer_uuid = customer_uuid
+            row.banned_uuid_recorded_at = now
+            merged = dict(row.evidence or {})
+            merged["uuid_binding"] = "proven_uuid_adoption"
+            merged["uuid_bound_at"] = now.isoformat()
+            row.evidence = merged
+            bound += 1
+        elif row.banned_easyweek_customer_uuid != customer_uuid:
+            merged = dict(row.evidence or {})
+            merged["uuid_binding_conflict_at"] = now.isoformat()
+            row.evidence = merged
+    await session.flush()
+    return bound
 
 
 async def apply_inbound_consent(
@@ -733,6 +914,17 @@ async def apply_inbound_consent(
             reasons: list[str] = []
             for receipt in receipts:
                 if receipt.resolved_at is not None:
+                    continue
+                if receipt.route_allowed is False:
+                    # Belt to the ingress's braces. A refused route is already
+                    # resolved when it is written, so reaching this would mean a
+                    # row got here another way — and a command from a sender
+                    # route this deployment refuses must not be executed because
+                    # some other message in the same delivery was allowed.
+                    receipt.resolved_at = now
+                    receipt.resolution = INBOUND_RESOLUTION_IGNORED_ROUTE
+                    receipt.resolution_reason = "sender_route_not_allowed"
+                    noop += 1
                     continue
                 if receipt.command == CONSENT_COMMAND_NONE:
                     # An ordinary message is not consent in either direction.
@@ -801,6 +993,11 @@ class ConsentDecision:
     fingerprint: str = ""
     primary_version: int | None = None
     matched_addresses: tuple[str, ...] = ()
+    # The exact unresolved receipts this answer was taken over, not just how
+    # many: the identities are what a claim-time re-check compares, so one
+    # message being resolved while another arrives cannot cancel out.
+    pending_receipt_ids: tuple[int, ...] = ()
+    easyweek_customer_uuid: uuid_module.UUID | None = None
 
     @property
     def allowed_by_local_state(self) -> bool:
@@ -814,17 +1011,36 @@ class ConsentDecision:
         return not self.suppressed and self.pending_inbound == 0
 
 
-def _fingerprint(pairs: Sequence[tuple[str, int]], *, suppressed: bool) -> str:
-    """A handle over the exact consent rows this decision was taken from.
+def _fingerprint(
+    pairs: Sequence[tuple[str, int]],
+    *,
+    suppressed: bool,
+    addresses: Sequence[str] = (),
+    pending_receipt_ids: Sequence[int] = (),
+) -> str:
+    """A handle over everything this decision was taken from.
 
     One number cannot describe several matched addresses, and a later claim has
     to be able to notice a row that did not exist when the plan was made — so
     the guard hands out a digest over every (address, version) pair plus the
     verdict, and the claim recomputes it. A new row, a bumped version or a
     flipped verdict all change it.
+
+    Two more things are inside it, and both are defects this closed. The ADDRESS
+    SET is here because a card gaining or losing a number changes which
+    refusals apply to this person without touching any suppression row. The
+    PENDING RECEIPT IDENTITIES are here because an unresolved inbound message
+    may BE the refusal: a fingerprint that ignored them matched happily while a
+    STOP sat in the pending set, and a sender re-checking only the fingerprint
+    would have gone ahead with a send a fresh guard was already refusing.
     """
     material = "|".join(f"{address}:{version}" for address, version in sorted(pairs))
-    return _digest("altegio_bot/whatsapp_consent/fingerprint/v1", f"{material}#{int(suppressed)}")
+    scope = ",".join(sorted(addresses))
+    pending = ",".join(str(int(value)) for value in sorted(pending_receipt_ids))
+    return _digest(
+        "altegio_bot/whatsapp_consent/fingerprint/v2",
+        f"{material}#{scope}#{pending}#{int(suppressed)}",
+    )
 
 
 async def _uuid_linked_addresses(
@@ -858,6 +1074,61 @@ async def _uuid_linked_addresses(
     return sorted(addresses)
 
 
+@dataclass(frozen=True)
+class _Identity:
+    """Who the refusal search is about, before anything is read or locked."""
+
+    address: str | None
+    customer_uuid: uuid_module.UUID | None
+    addresses: tuple[str, ...]
+    gaps: tuple[str, ...] = ()
+
+
+async def _resolve_identity(
+    session: AsyncSession,
+    *,
+    phone: object,
+    easyweek_customer_uuid: uuid_module.UUID | str | None,
+) -> _Identity:
+    """Every address a refusal for this person could be recorded against.
+
+    Three sources, and the third one is the fix for a real hole: the address
+    itself in every spelling a phone column may hold; every number an EasyWeek
+    card of this UUID carries now; and — when the caller did not name a UUID —
+    the one a card for this number names, so a refusal recorded against an older
+    number of the same proven person is still found by a caller that only has
+    the new number.
+
+    That derivation is a BAN EXTENSION, exactly as §46.4.2 permits, and nothing
+    else: it is used to widen the search for refusals, never read back as proof
+    that this address belongs to that customer or to that branch. An ambiguous
+    phone is reported as a gap and derives nothing.
+    """
+    address = normalize_wa_address(phone)
+    customer_uuid: uuid_module.UUID | None
+    if isinstance(easyweek_customer_uuid, str):
+        try:
+            customer_uuid = uuid_module.UUID(easyweek_customer_uuid)
+        except ValueError:
+            customer_uuid = None
+    else:
+        customer_uuid = easyweek_customer_uuid
+
+    if address is None:
+        return _Identity(None, customer_uuid, (), (GAP_ADDRESS_UNNORMALISABLE,))
+
+    gaps: list[str] = []
+    if customer_uuid is None:
+        derived, ambiguous = await _unambiguous_banned_uuid(session, address)
+        if ambiguous:
+            gaps.append(GAP_UUID_BINDING_AMBIGUOUS)
+        customer_uuid = derived
+
+    addresses = set(address_variants(address))
+    addresses.update(await _uuid_linked_addresses(session, customer_uuid))
+    return _Identity(address, customer_uuid, tuple(sorted(addresses)), tuple(gaps))
+
+
 async def consent_decision(
     session: AsyncSession,
     *,
@@ -872,7 +1143,7 @@ async def consent_decision(
     claim among them — so taking anything here would introduce a second lock
     order into paths that have exactly one. The durable serialisation that
     matters happens where decisions are WRITTEN, and the final send guard takes
-    the address lock itself.
+    the address locks itself.
 
     The four sources of §46.4.3, in one answer:
 
@@ -884,15 +1155,9 @@ async def consent_decision(
     4. the historical ``CampaignRecipient.is_opted_out`` snapshot, unless a
        proven, verified opt-in landed after that snapshot was taken.
     """
-    address = normalize_wa_address(phone)
-    customer_uuid: uuid_module.UUID | None
-    if isinstance(easyweek_customer_uuid, str):
-        try:
-            customer_uuid = uuid_module.UUID(easyweek_customer_uuid)
-        except ValueError:
-            customer_uuid = None
-    else:
-        customer_uuid = easyweek_customer_uuid
+    identity = await _resolve_identity(session, phone=phone, easyweek_customer_uuid=easyweek_customer_uuid)
+    address = identity.address
+    customer_uuid = identity.customer_uuid
 
     if address is None:
         # Nothing to match. Reported as a gap, never as permission: an address
@@ -900,13 +1165,11 @@ async def consent_decision(
         return ConsentDecision(
             address=None,
             suppressed=False,
-            gaps=(GAP_ADDRESS_UNNORMALISABLE,),
+            gaps=identity.gaps,
             fingerprint=_fingerprint((), suppressed=False),
         )
 
-    addresses = set(address_variants(address))
-    addresses.update(await _uuid_linked_addresses(session, customer_uuid))
-    ordered_addresses = sorted(addresses)
+    ordered_addresses = list(identity.addresses)
 
     conditions = [WhatsAppConsentSuppression.wa_address.in_(ordered_addresses)]
     if customer_uuid is not None:
@@ -920,7 +1183,7 @@ async def consent_decision(
     )
 
     sources: list[str] = []
-    gaps: list[str] = []
+    gaps: list[str] = list(identity.gaps)
     suppressed = False
     newest_opt_in: datetime | None = None
     for row in rows:
@@ -928,7 +1191,7 @@ async def consent_decision(
             suppressed = True
             sources.append(
                 SOURCE_SUPPRESSION_UUID
-                if row.wa_address not in addresses and row.banned_easyweek_customer_uuid is not None
+                if row.wa_address not in ordered_addresses and row.banned_easyweek_customer_uuid is not None
                 else SOURCE_SUPPRESSION
             )
         elif row.decided_observed_at is not None and (newest_opt_in is None or row.decided_observed_at > newest_opt_in):
@@ -967,18 +1230,21 @@ async def consent_decision(
         sources.append(SOURCE_RECIPIENT_FLAG)
         break
 
-    pending = 0
+    pending_ids: list[int] = []
     if include_pending:
-        pending = int(
-            await session.scalar(
-                select(func.count())
-                .select_from(WhatsAppInboundReceipt)
-                .where(WhatsAppInboundReceipt.resolved_at.is_(None))
-                .where(WhatsAppInboundReceipt.wa_address.in_(ordered_addresses))
-            )
-            or 0
-        )
-        if pending:
+        pending_ids = [
+            int(value)
+            for value in (
+                await session.scalars(
+                    select(WhatsAppInboundReceipt.id)
+                    .where(WhatsAppInboundReceipt.resolved_at.is_(None))
+                    .where(WhatsAppInboundReceipt.wa_address.in_(ordered_addresses))
+                    .order_by(WhatsAppInboundReceipt.id.asc())
+                    .limit(200)
+                )
+            ).all()
+        ]
+        if pending_ids:
             gaps.append(GAP_PENDING_INBOUND)
 
     primary = next((int(row.consent_version) for row in rows if row.wa_address == address), None)
@@ -987,13 +1253,68 @@ async def consent_decision(
         suppressed=suppressed,
         sources=tuple(dict.fromkeys(sources)),
         gaps=tuple(dict.fromkeys(gaps)),
-        pending_inbound=pending,
+        pending_inbound=len(pending_ids),
         fingerprint=_fingerprint(
             [(str(row.wa_address), int(row.consent_version)) for row in rows],
             suppressed=suppressed,
+            addresses=ordered_addresses,
+            pending_receipt_ids=pending_ids,
         ),
         primary_version=primary,
         matched_addresses=tuple(ordered_addresses),
+        pending_receipt_ids=tuple(pending_ids),
+        easyweek_customer_uuid=customer_uuid,
+    )
+
+
+@dataclass(frozen=True)
+class LedgerState:
+    """What the ledger says about ONE address, for projecting onto a card.
+
+    Deliberately narrow — this one address's row, not the aggregate. The card
+    flag of this number must follow the decision made about this number; a
+    refusal recorded against another number of the same identity bans the send
+    through :func:`consent_decision`, which is where that question belongs.
+    """
+
+    state: str | None
+    consent_version: int | None = None
+    last_refused_start_reason: str | None = None
+
+    @property
+    def refuses(self) -> bool:
+        return self.state == CONSENT_STATE_OPTED_OUT
+
+    @property
+    def permits(self) -> bool:
+        """A refusal was PROVEN lifted. Not "there is no refusal"."""
+        return self.state == CONSENT_STATE_OPTED_IN
+
+
+async def ledger_state(session: AsyncSession, *, phone: object) -> LedgerState:
+    """The authoritative consent state of one address, or ``None`` if unrecorded.
+
+    This is what the inbox worker projects onto ``Client.wa_opted_out``. It
+    exists because the worker used to derive that flag from the COMMAND it had
+    just read — so a refused START, one the ledger would not honour, still
+    cleared the card flag that message_planner, the outbox worker and every
+    marketing path actually read. The ledger decides; the card follows.
+    """
+    address = normalize_wa_address(phone)
+    if address is None:
+        return LedgerState(None)
+    row = (
+        await session.execute(
+            select(WhatsAppConsentSuppression).where(WhatsAppConsentSuppression.wa_address == address)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return LedgerState(None)
+    reason = (row.evidence or {}).get("last_refused_start_reason")
+    return LedgerState(
+        row.state,
+        int(row.consent_version),
+        str(reason) if isinstance(reason, str) else None,
     )
 
 
@@ -1059,20 +1380,26 @@ async def final_send_guard(
     phone: object,
     easyweek_customer_uuid: uuid_module.UUID | str | None = None,
 ) -> FinalSendGuard:
-    """Take the address lock, then answer. In the CALLER's transaction.
+    """Take the address locks, then answer. In the CALLER's transaction.
 
-    The lock is what makes the ordering single and checkable (§46.4.6): a
-    concurrent consent write for this address either commits before this guard
-    and is seen by it, or waits until this transaction ends and is then caught by
-    the claim-time re-check. There is no third interleaving, and no row has to
-    exist for the lock to work — which is what closes the absent-row race for an
-    address that has never been heard from.
+    The locks are what make the ordering single and checkable (§46.4.6): a
+    concurrent consent write for any of these addresses — or a receipt insert at
+    the ingress, which takes the same locks before it writes — either commits
+    before this guard and is seen by it, or waits until this transaction ends and
+    is then caught by the claim-time re-check. There is no third interleaving,
+    and no row has to exist for a lock to work, which is what closes the
+    absent-row race for an address that has never been heard from.
 
-    No HTTP happens under this lock, and none may: the caller is expected to
+    Every address is locked, not only the one passed in: a refusal recorded
+    against another number of the same proven EasyWeek identity bans this send
+    just as hard, so leaving those out would have left a real refusal able to
+    land unserialised.
+
+    No HTTP happens under these locks, and none may: the caller is expected to
     commit its claim and only then make its external request.
     """
-    address = normalize_wa_address(phone)
-    if address is None:
+    identity = await _resolve_identity(session, phone=phone, easyweek_customer_uuid=easyweek_customer_uuid)
+    if identity.address is None:
         return FinalSendGuard(
             False,
             GUARD_ADDRESS_UNPROVEN,
@@ -1083,13 +1410,23 @@ async def final_send_guard(
                 fingerprint=_fingerprint((), suppressed=False),
             ),
         )
-    await lock_consent_address(session, address)
+    locked = await lock_consent_addresses(session, identity.addresses or (identity.address,))
     decision = await consent_decision(
         session,
-        phone=address,
-        easyweek_customer_uuid=easyweek_customer_uuid,
+        phone=identity.address,
+        easyweek_customer_uuid=identity.customer_uuid,
         include_pending=True,
     )
+    return _verdict(decision, locked=locked)
+
+
+def _verdict(decision: ConsentDecision, *, locked: Sequence[str]) -> FinalSendGuard:
+    """One place where an answer becomes an allow or a hold.
+
+    Shared by the guard and by the claim-time re-check deliberately: two
+    separate readings of what counts as allowed is how a boundary ends up
+    permitting something at the claim that the guard itself refused.
+    """
     if decision.suppressed:
         return FinalSendGuard(False, GUARD_SUPPRESSED, decision)
     if decision.pending_inbound:
@@ -1097,29 +1434,45 @@ async def final_send_guard(
         # may be carrying the refusal, so the send is HELD rather than allowed:
         # a queue that is behind must not become a permission.
         return FinalSendGuard(False, GUARD_PENDING_INBOUND, decision)
+    if not set(decision.matched_addresses) <= set(locked):
+        # The read reached an address the locks do not cover, because a card
+        # gained a number between the two. Held rather than allowed: this answer
+        # is not one the locks make safe, and the next attempt sees a settled
+        # set.
+        return FinalSendGuard(False, GUARD_ADDRESS_SET_MOVED, decision)
     return FinalSendGuard(True, GUARD_ALLOWED, decision)
 
 
-async def consent_unchanged(
+async def recheck_consent_boundary(
     session: AsyncSession,
     *,
     phone: object,
     expected_fingerprint: str,
     easyweek_customer_uuid: uuid_module.UUID | str | None = None,
-) -> bool:
-    """Is the consent state exactly the one a guard was issued against?
+) -> FinalSendGuard:
+    """Re-prove the boundary inside the transaction that claims the send.
 
-    Called by a sender inside the same transaction as its claim. A refusal that
-    landed in between, a version that moved, or a suppression row that did not
-    exist before all change the fingerprint and refuse the claim.
+    This replaced a bare fingerprint comparison, and the difference is the whole
+    point of the function. The old check answered "is the state the one I was
+    issued against?" and nothing else, so a STOP sitting unresolved in the
+    pending set — which a fresh guard refuses on sight — compared equal and the
+    claim went ahead. It also held no lock, so a receipt could commit between
+    the comparison and the claim without either side noticing.
+
+    So this takes the same locks the guard takes, re-asks the same question
+    through the same verdict, AND requires the fingerprint to be the one the
+    guard handed out. All three, because each catches something the others do
+    not: the locks order it against concurrent writers, the verdict catches a
+    refusal or a hold that appeared since, and the fingerprint catches a
+    decision that landed and was answered in between — a STOP then a proven
+    START, say, which leaves the verdict allowed and the version moved.
     """
-    decision = await consent_decision(
-        session,
-        phone=phone,
-        easyweek_customer_uuid=easyweek_customer_uuid,
-        include_pending=True,
-    )
-    return bool(expected_fingerprint) and decision.fingerprint == expected_fingerprint
+    guard = await final_send_guard(session, phone=phone, easyweek_customer_uuid=easyweek_customer_uuid)
+    if not guard.allowed:
+        return guard
+    if not expected_fingerprint or guard.decision.fingerprint != expected_fingerprint:
+        return FinalSendGuard(False, GUARD_CONSENT_MOVED, guard.decision)
+    return guard
 
 
 # ---------------------------------------------------------------------------
@@ -1196,12 +1549,15 @@ __all__ = [
     "GAP_ADDRESS_UNNORMALISABLE",
     "GAP_PENDING_INBOUND",
     "GAP_UUID_BINDING_AMBIGUOUS",
+    "GUARD_ADDRESS_SET_MOVED",
     "GUARD_ADDRESS_UNPROVEN",
     "GUARD_ALLOWED",
+    "GUARD_CONSENT_MOVED",
     "GUARD_PENDING_INBOUND",
     "GUARD_SUPPRESSED",
     "NOOP_START_NO_ACTIVE_BAN",
     "NOOP_STOP_ALREADY_ACTIVE",
+    "NOOP_STOP_SUPERSEDED",
     "REFUSED_START_BAN_TIME_UNKNOWN",
     "REFUSED_START_EVENT_TIME_UNKNOWN",
     "REFUSED_START_IDENTIFIER_CONFLICT",
@@ -1216,20 +1572,24 @@ __all__ = [
     "DecisionOutcome",
     "FinalSendGuard",
     "InboundReceiptDraft",
+    "LedgerState",
     "ProjectedRefusal",
     "address_variants",
     "apply_consent_decision",
     "apply_inbound_consent",
     "apply_projected_refusal",
     "consent_decision",
-    "consent_unchanged",
+    "extend_refusal_to_uuid",
     "extract_inbound_receipts",
     "final_send_guard",
     "is_suppressed",
     "iter_payload_consent_commands",
+    "ledger_state",
     "lock_consent_address",
+    "lock_consent_addresses",
     "normalize_wa_address",
     "receipt_key",
+    "recheck_consent_boundary",
     "recipient_route_digest",
     "record_inbound_receipts",
     "sender_route_digest",

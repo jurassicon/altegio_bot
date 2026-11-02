@@ -13,6 +13,7 @@ produce.
 
 from __future__ import annotations
 
+import asyncio
 import uuid as uuid_module
 from typing import Any
 
@@ -40,6 +41,7 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
     DELIVERY_FAILURE_MATCH_CONFLICTING,
     DELIVERY_FAILURE_MATCH_UNMATCHED,
+    DELIVERY_FAILURE_MATCH_UNPROVEN,
     DELIVERY_FAILURE_REASON_API_REJECTED,
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
@@ -769,16 +771,23 @@ async def test_a_callback_that_names_no_route_cannot_confirm_a_frozen_send(
     assert after.evidence.get("confirmed_delivery_failure") is None
 
 
-async def test_a_historical_attempt_without_a_frozen_route_still_confirms(
+async def test_a_historical_attempt_without_a_frozen_route_is_not_proof(
     session_maker, production_configuration, binding_key
 ) -> None:
-    """An old row proves no route, and that absence is honest rather than fatal.
+    """A callback about a send whose route was never frozen proves nothing.
 
-    The attempt's digests are cleared to make it look like one written before
-    this stage existed. The fact is still confirmed — it is about the right slot
-    by message id — and says ``route_proven = false``, which is exactly what is
-    known about it.
+    This replaced a test that asserted the opposite. The reasoning that looked
+    sound — "the message id names the right slot, and the missing route is just
+    an old row being honest" — skips the question §46.3 actually asks: WAS this
+    the message that failed? The frozen route is what answers it, and with
+    nothing to compare against, a callback naming any route at all is an
+    unchecked claim. It is kept, as ``unproven``, and marks nothing.
+
+    The attempt's digests are cleared to make it look like a row written before
+    this stage existed, which is exactly the population this matters for.
     """
+    from altegio_bot.campaigns.easyweek_voucher_production.delivery_evidence import UNPROVEN_ROUTE_UNKNOWN
+
     batch_id, _report, _sender = await _delivered_batch(session_maker)
     item = await _item(session_maker, batch_id)
     async with session_maker() as session:
@@ -795,6 +804,369 @@ async def test_a_historical_attempt_without_a_frozen_route_still_confirms(
     )
 
     fact = (await _facts(session_maker))[0]
-    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_UNPROVEN
     assert fact.route_proven is False
-    assert fact.evidence.get("historical_route_unknown") is True
+    assert fact.evidence.get("unproven") == UNPROVEN_ROUTE_UNKNOWN
+    assert fact.item_id == int(item.id), "it still names the slot it was tested against"
+    after = await _item(session_maker, batch_id)
+    assert after.evidence.get("confirmed_delivery_failure") is None
+
+
+async def test_an_unsigned_callback_is_kept_and_confirms_nothing(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """§46.3 — an unattributed claim is not evidence, however well it matches.
+
+    Everything else about this callback is right: the exact message id, the real
+    frozen route, no delivered/read to contradict it. The one thing missing is
+    the signature, which is the only reason to believe it came from Meta at all
+    — and on a deployment with no app secret that is EVERY callback. Confirming
+    on "nothing contradicts it" would mean anybody who can reach the webhook can
+    write this phase's failure evidence.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production.delivery_evidence import UNPROVEN_CALLBACK_UNVERIFIED
+
+    batch_id, _report, _sender = await _delivered_batch(session_maker)
+    item = await _item(session_maker, batch_id)
+
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=item.provider_message_id or "", recipient=PHONES[0].lstrip("+")),
+        signature_verified=False,
+    )
+
+    fact = (await _facts(session_maker))[0]
+    assert fact.authenticity == INBOUND_AUTHENTICITY_UNVERIFIED
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_UNPROVEN
+    assert fact.evidence.get("unproven") == UNPROVEN_CALLBACK_UNVERIFIED
+    # The route WAS proven; that half is recorded truthfully either way.
+    assert fact.route_proven is True
+    after = await _item(session_maker, batch_id)
+    assert after.evidence.get("confirmed_delivery_failure") is None
+
+
+async def test_a_signed_callback_on_the_frozen_route_is_still_confirmed(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The positive case, stated beside the negatives it is contrasted with."""
+    batch_id, _report, _sender = await _delivered_batch(session_maker)
+    item = await _item(session_maker, batch_id)
+
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=item.provider_message_id or "", recipient=PHONES[0].lstrip("+")),
+        signature_verified=True,
+    )
+
+    fact = (await _facts(session_maker))[0]
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert fact.authenticity == INBOUND_AUTHENTICITY_SIGNED
+    assert fact.route_proven is True
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is True
+
+
+async def test_a_historical_api_rejection_is_confirmed_without_a_frozen_route(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The other source keeps its own proof contract, and must not be collapsed.
+
+    An API rejection was watched by this process on its own request: there is no
+    webhook, so there is no signature, and a historical attempt froze no route.
+    Applying the callback rule here would quietly stop every real Meta rejection
+    from ever being confirmed — including the ones the historical reconciliation
+    exists to record.
+    """
+    batch_id, _report, _sender = await _delivered_batch(
+        session_maker,
+        outcomes=[DeliveryOutcome(DELIVERY_REJECTED, reason=REASON_REJECTED, http_status=400)],
+    )
+    item = await _item(session_maker, batch_id)
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                EasyWeekVoucherProductionBatchAttempt.__table__.update()
+                .values(sender_phone_number_id_digest=None, recipient_digest=None)
+                .where(EasyWeekVoucherProductionBatchAttempt.item_id == int(item.id))
+            )
+            fact = (await session.execute(select(EasyWeekVoucherProductionDeliveryFailure))).scalar_one()
+            await session.delete(fact)
+
+    async with session_maker() as session:
+        async with session.begin():
+            from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+            fresh = (
+                await session.execute(
+                    select(EasyWeekVoucherProductionBatchItem).where(
+                        EasyWeekVoucherProductionBatchItem.id == int(item.id)
+                    )
+                )
+            ).scalar_one()
+            outcome = await delivery_evidence.record_api_rejection(session, item=fresh, http_status=400)
+
+    assert outcome.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    stored = (await _facts(session_maker))[0]
+    assert stored.source == DELIVERY_FAILURE_SOURCE_META_API
+    assert stored.authenticity == INBOUND_AUTHENTICITY_UNVERIFIED
+    assert stored.route_proven is False
+
+
+async def test_an_unproven_callback_does_not_disturb_delivered_or_read(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """A success already recorded stays recorded, and outranks the doubt."""
+    batch_id, _report, _sender = await _delivered_batch(session_maker)
+    item = await _item(session_maker, batch_id)
+    wamid = item.provider_message_id or ""
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=PHONES[0].lstrip("+")))
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")),
+        signature_verified=False,
+    )
+
+    after = await _item(session_maker, batch_id)
+    assert after.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert after.read_at is not None
+    assert after.evidence.get("confirmed_delivery_failure") is None
+    fact = (await _facts(session_maker))[0]
+    # The success contradiction is reported ahead of the missing signature: it
+    # is the stronger statement about the same fact.
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert fact.evidence.get("conflict") == CONFLICT_AFTER_SUCCESS
+
+
+async def test_the_database_refuses_a_confirmed_callback_without_its_proofs(session_maker) -> None:
+    """The callback rule is a CHECK, not only a code path.
+
+    Written directly, bypassing every function in this phase, because the point
+    is that an unsigned or route-unproven CONFIRMED callback is unrepresentable
+    rather than merely unreachable.
+    """
+    for authenticity, route_proven in (
+        (INBOUND_AUTHENTICITY_UNVERIFIED, True),
+        (INBOUND_AUTHENTICITY_SIGNED, False),
+    ):
+        with pytest.raises(IntegrityError):
+            async with session_maker() as session:
+                async with session.begin():
+                    session.add(
+                        EasyWeekVoucherProductionDeliveryFailure(
+                            fact_key=f"forced-{authenticity}-{route_proven}",
+                            source=DELIVERY_FAILURE_SOURCE_CALLBACK,
+                            reason_code=DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
+                            match_state=DELIVERY_FAILURE_MATCH_CONFIRMED,
+                            failure_class=DELIVERY_FAILURE_CLASS_UNKNOWN,
+                            authenticity=authenticity,
+                            item_id=None,
+                            provider_message_id="wamid.FORCED",
+                            observed_sender_digest="s" * 64,
+                            observed_recipient_digest="r" * 64,
+                            route_proven=route_proven,
+                            observed_at=utcnow(),
+                            evidence={},
+                        )
+                    )
+
+
+# ===========================================================================
+# Review fix 6 — an early callback is bound whichever transaction commits first
+# ===========================================================================
+
+
+def _internal_status(
+    *,
+    wamid: str,
+    recipient: str = PHONES[0],
+    phone_number_id: str = SENDER_PNID,
+    error_code: Any = 131026,
+) -> dict[str, Any]:
+    """One status in the shape the worker hands to the evidence layer."""
+    return {
+        "provider_message_id": wamid,
+        "status": "failed",
+        "recipient_id": recipient.lstrip("+"),
+        "phone_number_id": phone_number_id,
+        "error_code": error_code,
+        "event_at": None,
+    }
+
+
+async def _claimed_slot(session_maker) -> tuple[int, Any]:
+    """A batch whose slot is claimed for delivery and has no identifier yet."""
+    reader = FakeReader(count=1)
+    _run_id, batch_id, _request = await _paid_batch(session_maker, reader, count=1)
+    claim = await ledger_module.claim_send(
+        session_maker,
+        identity=await _identity_for(session_maker, batch_id),
+        batch_id=batch_id,
+        slot=1,
+        plan_digest="d" * 64,
+        live_guard_reproven_at=(await _item(session_maker, batch_id)).pay_verified_at,
+        template_code="new_client_voucher_10eur_v2",
+        meta_template_name="meta_template",
+        template_language="de",
+        sender_id=None,
+        sender_phone_number_id=SENDER_PNID,
+        destination_phone=PHONES[0],
+    )
+    assert claim.granted, claim.reason
+    return batch_id, claim
+
+
+async def _accept(session_maker, batch_id: int, wamid: str) -> Any:
+    return await ledger_module.record_item_outcome(
+        session_maker,
+        batch_id=batch_id,
+        slot=1,
+        status=VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
+        expected_statuses=frozenset({VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED}),
+        provider_message_id=wamid,
+        verified_field="provider_accepted_at",
+        reconciliation_required=False,
+        attempt_outcome="provider_accepted",
+    )
+
+
+async def test_an_acceptance_that_commits_first_lets_the_callback_find_the_slot(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The easy order, stated so the hard one below has something to differ from."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.ORDER-A-FIRST"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")))
+
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert facts[0].item_id == int((await _item(session_maker, batch_id)).id)
+
+
+async def test_an_uncommitted_callback_cannot_be_overtaken_by_the_acceptance(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """§46.3 — the window two re-reads cannot close, closed by one lock.
+
+    The interleaving staged here is the one that loses a real failure for good:
+    the callback transaction looks for the slot before the identifier is
+    committed (finds nothing, so it will keep the fact unmatched), and the
+    acceptance looks for unmatched facts before the callback is committed (finds
+    nothing, so it binds nothing). Both of them are then correct about what they
+    saw, and the fact ends up owned by nobody.
+
+    With the per-identifier lock the second half cannot run: the acceptance
+    BLOCKS while the callback transaction is open — asserted here, because a
+    test that only checked the end state would pass just as happily on a
+    re-read-based implementation that still has the hole — and once the callback
+    commits, the acceptance sees the fact and binds it.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.ORDER-RACE"
+    callback_open = asyncio.Event()
+    release = asyncio.Event()
+    blocked_while_open: list[bool] = []
+
+    async def _callback() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                missed = await delivery_evidence.record_callback_failure(
+                    session,
+                    status=_internal_status(wamid=wamid),
+                    signature_verified=True,
+                )
+                # Nobody owns the identifier yet: the first half of the race.
+                assert missed.claimed is False
+                kept = await delivery_evidence.record_unmatched_callback_failure(
+                    session,
+                    status=_internal_status(wamid=wamid),
+                    signature_verified=True,
+                )
+                assert kept.stored is True
+                callback_open.set()
+                await release.wait()
+
+    async def _acceptance() -> Any:
+        await callback_open.wait()
+        task = asyncio.create_task(_accept(session_maker, batch_id, wamid))
+        done, _pending = await asyncio.wait({task}, timeout=1.0)
+        # It cannot finish: the identifier lock is held by the open callback.
+        blocked_while_open.append(not done)
+        release.set()
+        return await task
+
+    _, recorded = await asyncio.gather(_callback(), _acceptance())
+
+    assert blocked_while_open == [True]
+    assert recorded.applied
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    item = await _item(session_maker, batch_id)
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert facts[0].item_id == int(item.id)
+    assert facts[0].route_proven is True
+    assert item.evidence.get("confirmed_delivery_failure") is True
+
+
+async def test_the_same_callback_delivered_twice_through_the_race_is_one_fact(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Idempotency survives the binding protocol, in both orders."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.ORDER-DUP"
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")))
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")))
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")))
+
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+
+
+async def test_an_early_callback_from_a_foreign_route_binds_as_a_conflict(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Waiting for its slot never upgrades a fact. It is re-judged from scratch."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.ORDER-FOREIGN"
+
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, recipient="4915100009999"),
+    )
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    fact = (await _facts(session_maker))[0]
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert fact.evidence.get("conflict") == CONFLICT_FOREIGN_ROUTE
+    assert fact.route_proven is False
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is None
+
+
+async def test_an_early_unsigned_callback_is_not_promoted_by_being_bound(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The authenticity stored when it arrived is the one it is judged by."""
+    from altegio_bot.campaigns.easyweek_voucher_production.delivery_evidence import UNPROVEN_CALLBACK_UNVERIFIED
+
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.ORDER-UNSIGNED"
+
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")),
+        signature_verified=False,
+    )
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    fact = (await _facts(session_maker))[0]
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_UNPROVEN
+    assert fact.evidence.get("unproven") == UNPROVEN_CALLBACK_UNVERIFIED
+    assert fact.item_id == int((await _item(session_maker, batch_id)).id)
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is None

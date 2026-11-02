@@ -63,6 +63,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
     WhatsAppEvent,
+    WhatsAppInboundReceipt,
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_consent import (
@@ -85,6 +86,11 @@ ORIGIN_STORED_EVENT = "stored_whatsapp_event"
 SKIP_ALREADY_SUPPRESSED = "already_suppressed"
 SKIP_HISTORICAL_START = "historical_start_not_provable"
 SKIP_ADDRESS_UNNORMALISABLE = "address_not_normalisable"
+# The ingress refused this sender route when the message arrived. The command
+# was never executed then and must not be executed now: re-deciding an old
+# message against today's allow list would make the reconciliation a way to
+# apply exactly the commands the deployment was configured to refuse.
+SKIP_ROUTE_NOT_ALLOWED = "sender_route_not_allowed"
 
 # Why a historical delivery outcome stays unknown.
 UNKNOWN_NOT_PROVEN_EXTERNAL = "rejection_not_proven_external"
@@ -146,6 +152,8 @@ class ProjectionReport:
     by_origin: dict[str, int] = field(default_factory=dict)
     cyrillic_stop_events: int = 0
     historical_starts_seen: int = 0
+    events_route_not_allowed: int = 0
+    messages_route_not_allowed: int = 0
     failures_seen: int = 0
     failures_provable: int = 0
     failures_written: int = 0
@@ -169,6 +177,8 @@ class ProjectionReport:
                 "skipped": dict(sorted(self.skipped.items())),
                 "cyrillic_stop_events": self.cyrillic_stop_events,
                 "historical_starts_seen": self.historical_starts_seen,
+                "events_route_not_allowed": self.events_route_not_allowed,
+                "messages_route_not_allowed": self.messages_route_not_allowed,
             },
             "delivery_failures": {
                 "seen": self.failures_seen,
@@ -276,11 +286,26 @@ async def _collect_stored_events(
     Chatwoot-sourced rows are excluded here for the same reason the worker
     excludes them: a mirror of a message Meta already delivered is the same
     message, and counting it again would double one person's refusal.
+
+    And the SENDER ROUTE decision of the day is honoured rather than re-made. An
+    event the ingress marked ``ignored`` named no route this deployment accepts,
+    and a message whose receipt records ``route_allowed = false`` was refused
+    individually; neither was ever acted on, and projecting either would turn a
+    deliberate refusal into a global suppression the moment somebody ran the
+    reconciliation with ``--apply``. Where the per-message verdict was never
+    recorded — every event older than that column — the event-level status is
+    what is known, and the report says so rather than inventing a verdict.
     """
     rows = list(
         (
             await session.execute(
-                select(WhatsAppEvent.id, WhatsAppEvent.dedupe_key, WhatsAppEvent.payload, WhatsAppEvent.received_at)
+                select(
+                    WhatsAppEvent.id,
+                    WhatsAppEvent.dedupe_key,
+                    WhatsAppEvent.payload,
+                    WhatsAppEvent.received_at,
+                    WhatsAppEvent.status,
+                )
                 .where(WhatsAppEvent.payload.is_not(None))
                 .order_by(WhatsAppEvent.id.asc())
                 .limit(limit + 1)
@@ -292,10 +317,27 @@ async def _collect_stored_events(
         report.source_gaps.append(f"stored_events_truncated_at_{limit}")
         rows = rows[:limit]
 
+    # The per-message refusals, read from the receipts the ingress wrote. A tiny
+    # set by nature: it holds one row per message this deployment declined.
+    refused_messages = {
+        (int(event_id), int(index))
+        for event_id, index in (
+            await session.execute(
+                select(WhatsAppInboundReceipt.whatsapp_event_id, WhatsAppInboundReceipt.message_index)
+                .where(WhatsAppInboundReceipt.route_allowed.is_(False))
+                .where(WhatsAppInboundReceipt.whatsapp_event_id.is_not(None))
+            )
+        ).all()
+    }
+
     candidates: list[RefusalCandidate] = []
-    for event_id, dedupe_key, payload, received_at in rows:
+    for event_id, dedupe_key, payload, received_at, event_status in rows:
         if not isinstance(payload, dict):
             report.source_gaps.append("stored_event_payload_not_object")
+            continue
+        if event_status == "ignored":
+            report.events_route_not_allowed += 1
+            _bump(report.skipped, SKIP_ROUTE_NOT_ALLOWED)
             continue
         if "_chatwoot" in payload or isinstance(payload.get("_chatwoot_operator_relay"), dict):
             continue
@@ -305,6 +347,10 @@ async def _collect_stored_events(
             continue
         observed = received_at or utcnow()
         for draft in iter_payload_consent_commands(payload, observed_at=observed):
+            if (int(event_id), int(draft.message_index)) in refused_messages:
+                report.messages_route_not_allowed += 1
+                _bump(report.skipped, SKIP_ROUTE_NOT_ALLOWED)
+                continue
             if draft.command != CONSENT_COMMAND_STOP:
                 # A historical START is never projected. Its authenticity cannot
                 # be recovered from a sanitised stored event, so it could not
@@ -466,6 +512,11 @@ async def project(
         # historical refusal can be proven authentic and no historical START can
         # ever lift one. This is a boundary of the data, not of the projection.
         report.source_gaps.append("historical_signature_unrecoverable")
+        # Also stated every run: events stored before the per-message route
+        # verdict existed carry only the event-level one. Their accepted
+        # messages are projected on that basis, which is what the ingress of the
+        # day actually decided — not on today's allow list.
+        report.source_gaps.append("historical_per_message_route_unrecorded")
 
         # Oldest first, so the earliest provable refusal is the one that becomes
         # the ledger's recorded decision rather than whichever source happened
@@ -600,6 +651,7 @@ __all__ = [
     "SKIP_ADDRESS_UNNORMALISABLE",
     "SKIP_ALREADY_SUPPRESSED",
     "SKIP_HISTORICAL_START",
+    "SKIP_ROUTE_NOT_ALLOWED",
     "UNKNOWN_ALREADY_SUCCEEDED",
     "UNKNOWN_NOT_PROVEN_EXTERNAL",
     "UNKNOWN_NO_ATTEMPT",
