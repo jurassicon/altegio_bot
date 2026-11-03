@@ -942,9 +942,25 @@ async def _requeue_processing_jobs(
     if not job_ids:
         return
 
+    # The booking planner also locks processing jobs in ascending id order.
+    # An unordered UPDATE can visit them by run_at instead and form a cycle.
+    locked_job_ids = list(
+        (
+            await session.scalars(
+                select(MessageJob.id)
+                .where(MessageJob.id.in_(job_ids))
+                .where(MessageJob.status == "processing")
+                .order_by(MessageJob.id.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not locked_job_ids:
+        return
+
     stmt = (
         update(MessageJob)
-        .where(MessageJob.id.in_(job_ids))
+        .where(MessageJob.id.in_(locked_job_ids))
         .where(MessageJob.status == "processing")
         .values(status="queued", locked_at=None)
     )

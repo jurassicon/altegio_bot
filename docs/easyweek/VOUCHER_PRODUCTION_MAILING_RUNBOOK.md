@@ -1649,6 +1649,12 @@ existing system jobs of its record/company, in every status, before cancellation
 or dedupe upserts. Cancellation keeps its original scope and queued-only rule;
 the wider lock set also covers rows a later upsert can touch or revive.
 
+Outbox uses the same id order when returning a claimed batch's remainder after
+token expiry: it locks the supplied ids still in `processing`, without skipping
+locked rows, and returns only those ids to `queued` after re-checking their
+status. Both steps stay in one transaction, so this return cannot take the
+planner's job locks in the opposite order.
+
 The live projection's card lock is `FOR NO KEY UPDATE`: it blocks other card
 writes but permits an Outbox insert's foreign-key reference to finish. This
 avoids a cycle through a running job that the booking planner must lock.

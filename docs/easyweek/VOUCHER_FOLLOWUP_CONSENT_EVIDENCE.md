@@ -247,6 +247,14 @@ still match the original company, record, system type and `queued` predicates.
 The standalone cancellation helper takes the same ordered set when the caller
 has not already supplied it.
 
+When Outbox returns the unprocessed remainder of a claimed batch after token
+expiry, `_requeue_processing_jobs` also locks rows in ascending id order. It
+selects only the supplied ids still in `processing`, waits for their locks
+without `SKIP LOCKED`, then updates only those locked ids with `processing`
+checked again. Selection and return to `queued` remain in the caller's one
+transaction. This orders the return against the planner's wider lock set;
+sorting the ids inside an `IN` predicate alone would not order an `UPDATE`.
+
 The participating inbox writer already holds its card and record; the record
 write orders competing booking planners. This is a protocol for their existing
 job rows, not a claim to lock jobs that unrelated callers might insert later.
