@@ -1633,8 +1633,11 @@ resubscribe has to beat, and is reported as a no-op because nothing about the
 person's state changed.
 
 A run writes each refusal in two steps — the ledger first, then the card flags
-it locked — so a refusal is durable even if the second step fails, and the next
-run converges the flag. A card that is moved onto a refused number by the
+it locked — so a refusal is durable even if the second step fails. The next run
+finishes the card half: an address whose ledger already refuses is still checked
+against its cards, and one that is still marked sendable is repaired without
+writing the evidence again. `card_recovery` counts those, which is how a repeat
+of the evidence is told apart from a repair of the flags. A card that is moved onto a refused number by the
 ordinary client import carries the refusal itself, so it does not wait for a
 reconciliation at all.
 

@@ -119,6 +119,10 @@ NOOP_STOP_SUPERSEDED: Final = "stop_older_than_proven_opt_in"
 # past, and writing it would turn a resubscribe nobody disputes into a refusal
 # of unknown order — one that, by §46.4.4, no later START could ever lift.
 NOOP_PROJECTION_SUPERSEDED: Final = "projection_older_than_proven_opt_in"
+# A projected refusal whose evidence was already durable and whose CARD half was
+# all that remained. No decision is made and no evidence is written: the state
+# the ledger already holds is reported back so the caller can say what it did.
+NOOP_CARD_RECOVERY: Final = "card_projection_recovered"
 
 # Where an aggregate refusal came from. The caller shows these to an operator.
 SOURCE_SUPPRESSION: Final = "consent_suppression"
@@ -1883,6 +1887,7 @@ def iter_payload_consent_commands(
 
 __all__ = [
     "GAP_ADDRESS_UNNORMALISABLE",
+    "NOOP_CARD_RECOVERY",
     "NOOP_PROJECTION_SUPERSEDED",
     "GAP_PENDING_INBOUND",
     "GAP_UUID_BINDING_AMBIGUOUS",

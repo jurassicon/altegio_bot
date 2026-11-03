@@ -56,6 +56,7 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_REASON_API_REJECTED,
     DELIVERY_FAILURE_SOURCE_META_API,
     INBOUND_AUTHENTICITY_UNVERIFIED,
+    INBOUND_RESOLUTION_NOOP,
     VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
     CampaignRecipient,
     Client,
@@ -68,6 +69,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_consent import (
+    NOOP_CARD_RECOVERY,
     NOOP_PROJECTION_SUPERSEDED,
     SOURCE_SUPPRESSION,
     SOURCE_SUPPRESSION_UUID,
@@ -133,6 +135,11 @@ class RefusalCandidate:
     already_suppressed: bool = False
     newly_suppressed: bool = False
     projectable: bool = False
+    # The refusal is already in the ledger and only the card flags are behind.
+    # A separate state because it needs no evidence written: re-applying a
+    # snapshot would stamp a fresh "order unknown" onto a refusal that may have
+    # a provable time, and that is a downgrade, not a repair.
+    cards_only: bool = False
 
     @property
     def carries_event_evidence(self) -> bool:
@@ -179,6 +186,7 @@ class ProjectionReport:
     refusals_written: int = 0
     refusals_noop: int = 0
     refusals_superseded: int = 0
+    refusals_card_recovery: int = 0
     cards_converged: int = 0
     newly_suppressed_addresses: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
@@ -206,6 +214,7 @@ class ProjectionReport:
                 "written": self.refusals_written,
                 "noop": self.refusals_noop,
                 "superseded": self.refusals_superseded,
+                "card_recovery": self.refusals_card_recovery,
                 "cards_converged": self.cards_converged,
                 "newly_suppressed_addresses": self.newly_suppressed_addresses,
                 "by_origin": dict(sorted(self.by_origin.items())),
@@ -229,6 +238,23 @@ class ProjectionReport:
 
 def _bump(counter: dict[str, int], key: str) -> None:
     counter[key] = counter.get(key, 0) + 1
+
+
+async def _cards_disagree(session: AsyncSession, address: str) -> bool:
+    """Is there a card on this address that still reads as sendable?
+
+    The recovery question. ``Client.wa_opted_out`` is what every campaign path
+    reads, so one card left ``false`` in front of an active refusal is the
+    refusal not working — whichever source the refusal originally came from, and
+    however many runs ago it was recorded.
+    """
+    variants = address_variants(address)
+    if not variants:
+        return False
+    found = await session.scalar(
+        select(Client.id).where(Client.phone_e164.in_(variants)).where(Client.wa_opted_out.is_(False)).limit(1)
+    )
+    return found is not None
 
 
 async def _card_ids_matching(session: AsyncSession, address: str, *, lock: bool) -> set[int]:
@@ -602,6 +628,22 @@ async def project(
             ledger_already = any(source in (SOURCE_SUPPRESSION, SOURCE_SUPPRESSION_UUID) for source in decision.sources)
             candidate.already_suppressed = ledger_already
             if ledger_already and not candidate.carries_event_evidence:
+                # A refusal in the ledger is NOT proof that there is nothing to
+                # do. The two halves of a projected refusal commit separately —
+                # the evidence first, so it is durable on its own — and if the
+                # card half rolled back, the only record of the work left is a
+                # card that still says sendable. Treating the ledger row as
+                # "already handled" left that card refusing nowhere, run after
+                # run, while `compute_excluded_reason` kept allowing marketing.
+                #
+                # So the question asked here is the one that matters: does any
+                # card matching this address still disagree? If it does, the
+                # candidate is projectable for its CARD half alone.
+                if await _cards_disagree(session, candidate.wa_address):
+                    candidate.cards_only = True
+                    candidate.projectable = True
+                    report.refusals_card_recovery += 1
+                    continue
                 report.refusals_already_suppressed += 1
                 _bump(report.skipped, SKIP_ALREADY_SUPPRESSED)
                 continue
@@ -652,6 +694,10 @@ async def project(
             continue
         outcome, converged, was_suppressed = await _write_one_refusal(session_maker, candidate)
         report.cards_converged += converged
+        if candidate.cards_only:
+            # Counted as recovery at collection time; no evidence was written,
+            # so it is neither a write nor a no-op decision.
+            continue
         if outcome.applied:
             report.refusals_written += 1
             if not was_suppressed:
@@ -699,6 +745,18 @@ async def _write_one_refusal(
     Returns the ledger outcome, how many card flags were converged, and whether
     this person was already unsendable before the write.
     """
+    if candidate.cards_only:
+        # Recovery only: the evidence is already on disk and must not be written
+        # again. The card half re-reads the ledger under the address lock, so a
+        # proven, strictly newer START that landed in between is honoured — the
+        # convergence writes nothing when the ledger permits.
+        converged = await _converge_only(session_maker, candidate)
+        return (
+            DecisionOutcome(False, INBOUND_RESOLUTION_NOOP, NOOP_CARD_RECOVERY, CONSENT_STATE_OPTED_OUT, None),
+            converged,
+            True,
+        )
+
     async with session_maker() as session:
         async with session.begin():
             before = await consent_decision(
@@ -732,6 +790,28 @@ async def _write_one_refusal(
                     reason=REASON_PROJECTION,
                 )
     return outcome, converged, bool(before.suppressed)
+
+
+async def _converge_only(
+    session_maker: async_sessionmaker[AsyncSession],
+    candidate: RefusalCandidate,
+) -> int:
+    """Finish the card half of a refusal whose evidence is already durable.
+
+    Same transaction shape and same lock order as the second half of
+    :func:`_write_one_refusal`: card rows first, then the consent address, then
+    the write — scoped to the rows that were locked, so no row lock follows a
+    consent lock.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            locked_ids = await _card_ids_matching(session, candidate.wa_address, lock=True)
+            return await converge_cards_with_ledger(
+                session,
+                addresses=[candidate.wa_address],
+                card_ids=locked_ids,
+                reason=REASON_PROJECTION,
+            )
 
 
 async def _write_historical_failure(

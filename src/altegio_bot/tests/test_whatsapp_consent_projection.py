@@ -1276,3 +1276,213 @@ async def test_the_report_counts_what_the_writes_actually_did(session_maker) -> 
         OTHER_ADDRESS: CONSENT_STATE_OPTED_OUT,
         third: CONSENT_STATE_OPTED_IN,
     }
+
+
+# ===========================================================================
+# Round 6, review fix 1 — an active refusal is not proof the cards are done
+# ===========================================================================
+
+
+def _marketing_verdict(card: Client) -> str | None:
+    from altegio_bot.campaigns.segment import compute_excluded_reason
+
+    return compute_excluded_reason(
+        wa_opted_out=bool(card.wa_opted_out),
+        phone_e164=card.phone_e164,
+        count_before=0,
+        lash_count=1,
+        attended_lash_count=1,
+    )
+
+
+async def _sendable_card(session_maker, address: str, *, altegio_client_id: int) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            card = Client(
+                provider="altegio",
+                company_id=1,
+                altegio_client_id=altegio_client_id,
+                phone_e164=address,
+                display_name="Sendable",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add(card)
+            await session.flush()
+            return int(card.id)
+
+
+def _break_the_card_half(monkeypatch) -> dict[str, int]:
+    """Let the real card UPDATE run, then lose its transaction.
+
+    A real rollback after a real write, which is the shape the review
+    reproduced: the evidence transaction has already committed, so the next run
+    sees a refusal in the ledger and used to conclude there was nothing left to
+    do — while the only record of the unfinished work was a card still reading
+    as sendable.
+    """
+    import altegio_bot.whatsapp_consent_projection as projection_module
+
+    real = projection_module.converge_cards_with_ledger
+    seen = {"calls": 0, "rows": 0}
+
+    async def _patched(session, **kwargs):
+        seen["calls"] += 1
+        seen["rows"] += await real(session, **kwargs)
+        raise RuntimeError("the card half lost its transaction")
+
+    monkeypatch.setattr(projection_module, "converge_cards_with_ledger", _patched)
+    return seen
+
+
+async def _cards(session_maker) -> list[Client]:
+    async with session_maker() as session:
+        return list((await session.scalars(select(Client).order_by(Client.id))).all())
+
+
+async def test_a_recipient_snapshot_finishes_its_card_half_on_the_next_run(session_maker, monkeypatch) -> None:
+    """The review's sequence, with a real rollback and no stubs after it.
+
+    A preview snapshot is the only evidence, so there is no stored STOP to
+    re-apply; the first run commits the refusal and then loses the card
+    transaction. The next run has to finish the card half — and used to skip the
+    candidate as ``already_suppressed``, leaving the ledger refusing, the flag
+    saying sendable and the real campaign classifier allowing marketing, run
+    after run.
+    """
+    card_id = await _sendable_card(session_maker, ADDRESS, altegio_client_id=998001)
+    await _add_opted_out_recipient(
+        session_maker, ADDRESS, created_at=datetime.fromtimestamp(BASE_EPOCH, tz=timezone.utc)
+    )
+
+    seen = _break_the_card_half(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await project(session_maker, apply=True)
+    assert seen["calls"] == 1
+    assert seen["rows"] == 1, "the UPDATE really ran before the rollback"
+
+    # The evidence committed on its own; the card did not.
+    rows = await _suppressions(session_maker)
+    assert [row.state for row in rows] == [CONSENT_STATE_OPTED_OUT]
+    card = (await _cards(session_maker))[0]
+    assert card.wa_opted_out is False
+    assert _marketing_verdict(card) is None
+
+    monkeypatch.undo()
+    recovery = await project(session_maker, apply=True)
+
+    assert recovery.refusals_card_recovery == 1
+    assert recovery.cards_converged == 1
+    assert recovery.refusals_written == 0, "no evidence is written a second time"
+    card = await _card_row(session_maker, card_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+
+    # And the run after that has nothing left to do.
+    again = await project(session_maker, apply=True)
+    assert again.refusals_card_recovery == 0
+    assert again.cards_converged == 0
+    # Two sources now agree with the ledger: the snapshot this started from and
+    # the card flag the recovery wrote. Both are nothing left to do.
+    assert again.refusals_already_suppressed == 2
+    assert [int(row.consent_version) for row in await _suppressions(session_maker)] == [int(rows[0].consent_version)]
+
+
+async def _card_row(session_maker, card_id: int) -> Client:
+    async with session_maker() as session:
+        return await session.get(Client, card_id)
+
+
+async def test_a_card_flag_source_finishes_a_second_matching_card(session_maker, monkeypatch) -> None:
+    """The same recovery where the source is a card flag, not a snapshot.
+
+    One card carries the flag — that is what the candidate was collected from —
+    and a second card on the same number does not. The refusal has to reach
+    both, and "the ledger already refuses" says nothing about the second one.
+    """
+    await _add_opted_out_card(session_maker, ADDRESS)
+    second = await _sendable_card(session_maker, ADDRESS, altegio_client_id=998002)
+
+    seen = _break_the_card_half(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await project(session_maker, apply=True)
+    assert seen["rows"] == 1
+
+    assert [row.state for row in await _suppressions(session_maker)] == [CONSENT_STATE_OPTED_OUT]
+    assert (await _card_row(session_maker, second)).wa_opted_out is False
+
+    monkeypatch.undo()
+    recovery = await project(session_maker, apply=True)
+
+    assert recovery.refusals_card_recovery == 1
+    assert recovery.cards_converged == 1
+    assert recovery.refusals_written == 0
+    card = await _card_row(session_maker, second)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+    assert card.wa_opt_out_reason == "wa:consent_projection"
+
+
+async def test_a_proven_start_between_the_recovery_stages_keeps_the_card_sendable(session_maker, monkeypatch) -> None:
+    """Recovery is not a second chance for a stale snapshot.
+
+    The card half is lost, and before the next run a proven, strictly newer
+    START lifts the refusal. The snapshot that started all this is older than
+    that opt-in, so the recovery must write nothing: the card stays sendable and
+    the run reports the candidate as superseded rather than recovered.
+    """
+    card_id = await _sendable_card(session_maker, ADDRESS, altegio_client_id=998003)
+    # A refusal whose own event time IS provable, so a later START can lift it.
+    # A snapshot-only refusal could not be: it records an unknown order, and
+    # §46.4.4 then makes it permanent.
+    await _refuse_at(session_maker, offset=0)
+    await _add_opted_out_recipient(
+        session_maker, ADDRESS, created_at=datetime.fromtimestamp(BASE_EPOCH + 600, tz=timezone.utc)
+    )
+
+    _break_the_card_half(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await project(session_maker, apply=True)
+    monkeypatch.undo()
+
+    await _permit_now(session_maker)
+    report = await project(session_maker, apply=True)
+
+    assert report.refusals_card_recovery == 0
+    assert report.refusals_superseded == 1
+    assert report.cards_converged == 0
+    card = await _card_row(session_maker, card_id)
+    assert card.wa_opted_out is False
+    assert _marketing_verdict(card) is None
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, include_pending=False)
+    assert decision.suppressed is False
+
+
+async def test_a_stored_stop_still_reapplies_its_evidence_on_recovery(session_maker, monkeypatch) -> None:
+    """A real message is not recovered as cards-only.
+
+    Its evidence is what moves the boundary a later resubscribe has to beat, so
+    it keeps going through the ordinary ledger path on every run — and the card
+    half is finished in the same pass.
+    """
+    card_id = await _sendable_card(session_maker, ADDRESS, altegio_client_id=998004)
+    await _store_event(
+        session_maker,
+        _stored_payload(text="стоп", msg_id="wamid.R6STORED", epoch=BASE_EPOCH),
+        dedupe_key="wa:r6-stored",
+    )
+
+    _break_the_card_half(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await project(session_maker, apply=True)
+    monkeypatch.undo()
+
+    recovery = await project(session_maker, apply=True)
+
+    assert recovery.refusals_card_recovery == 0, "a stored message keeps its evidence path"
+    assert recovery.refusals_noop == 1
+    assert recovery.cards_converged == 1
+    card = await _card_row(session_maker, card_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"

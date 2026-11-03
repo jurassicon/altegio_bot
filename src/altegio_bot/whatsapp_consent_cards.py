@@ -131,4 +131,88 @@ async def converge_cards_with_ledger(
     return changed
 
 
-__all__ = ["REASON_LEDGER", "converge_cards_with_ledger"]
+# Where a transaction accumulates the cards it has written, until its consent
+# section runs. A plain dict on ``Session.info``, which lives exactly as long as
+# the session does and costs nothing to read.
+_PENDING_KEY: Final = "whatsapp_consent_cards_pending"
+
+
+def note_card_write(session: AsyncSession, *, card_id: int, phone: object) -> None:
+    """Record that this transaction wrote a card's phone. No lock, no query.
+
+    The counterpart of :func:`settle_card_writes`, and the reason the pair
+    exists rather than one call at the write site: both providers' event
+    handlers make external HTTP requests AFTER writing a card and before they
+    commit — Altegio looks up the service category, EasyWeek reads the
+    multi-service snapshot — and a consent lock taken at the write would be held
+    across those calls. A STOP arriving for the same number then waits for a CRM
+    request to finish before its receipt can even be stored, which is the one
+    thing the durable inbound boundary exists to prevent.
+
+    So the write site only remembers, locally, and the transaction's single
+    consent section runs once everything external is done.
+    """
+    address = normalize_wa_address(phone)
+    if address is None:
+        return
+    pending: dict[str, set[int]] = session.info.setdefault(_PENDING_KEY, {})
+    pending.setdefault(address, set()).add(int(card_id))
+
+
+def noted_addresses(session: AsyncSession) -> list[str]:
+    """The addresses this transaction has written a card for, so far."""
+    return sorted(session.info.get(_PENDING_KEY) or {})
+
+
+async def settle_card_writes(
+    session: AsyncSession,
+    *,
+    extra_addresses: Iterable[object] = (),
+    reason: str = REASON_LEDGER,
+    now: datetime | None = None,
+) -> int:
+    """The transaction's ONE consent section. Call it after every external call.
+
+    Takes every consent address lock this transaction needs in a **single
+    sorted acquisition** — the cards it wrote plus ``extra_addresses``, which is
+    how a caller that also binds a refusal to a UUID declares those addresses —
+    and only then converges the cards.
+
+    One acquisition is the point. Sorting inside each separate helper call was
+    not enough: the UUID path's nested client upsert took the proven number's
+    lock while the resolver later asked for the old number's, and an ingress
+    holding the old one and waiting for the proven one closed the cycle. A
+    single sorted set per transaction has no such pair.
+
+    Consent locks are therefore the LAST locks any write transaction takes, and
+    nothing external happens after this call — the transaction commits.
+    """
+    pending: dict[str, set[int]] = session.info.pop(_PENDING_KEY, {}) or {}
+    extras = {value for value in (normalize_wa_address(raw) for raw in extra_addresses) if value}
+    addresses = sorted(set(pending) | extras)
+    if not addresses:
+        return 0
+
+    # The single acquisition, before anything is read or written below. Every
+    # ``converge_cards_with_ledger`` call that follows re-takes a lock this
+    # transaction already holds, which PostgreSQL counts rather than queues.
+    await lock_consent_addresses(session, addresses)
+    changed = 0
+    for address in sorted(pending):
+        changed += await converge_cards_with_ledger(
+            session,
+            addresses=[address],
+            card_ids=pending[address],
+            reason=reason,
+            now=now,
+        )
+    return changed
+
+
+__all__ = [
+    "REASON_LEDGER",
+    "converge_cards_with_ledger",
+    "note_card_write",
+    "noted_addresses",
+    "settle_card_writes",
+]

@@ -26,7 +26,7 @@ from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update, try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
 from altegio_bot.settings import settings
-from altegio_bot.whatsapp_consent_cards import converge_cards_with_ledger
+from altegio_bot.whatsapp_consent_cards import note_card_write, settle_card_writes
 
 logger = logging.getLogger("inbox_worker")
 TZ = ZoneInfo("Europe/Belgrade")
@@ -523,21 +523,19 @@ async def upsert_client(
     client_id = int(res.scalar_one())
 
     # §46.4.3 — this row may have just started matching a refusal that is
-    # already on disk, and the flag below is what every campaign path reads.
+    # already on disk, and the flag below is what every campaign path reads. An
+    # import moving a phone is an ordinary writer that knows nothing about
+    # consent, so the consent locks cannot order it from outside: the obligation
+    # sits with the transaction that holds the row.
     #
-    # An import moving a phone from one number to another is a real, ordinary
-    # writer that knows nothing about consent, so the consent locks could not
-    # order it: a card moved onto a refused address between a projection's read
-    # and its write was excluded from that write, the ledger refused, this flag
-    # stayed false, and `compute_excluded_reason` went on allowing marketing to
-    # somebody who had said stop. The obligation therefore sits here, with the
-    # transaction that holds the row: ask the ledger, and carry its refusal.
-    #
-    # Taken AFTER the row write, which is the one lock order this project keeps
-    # (card rows, then consent). Refusing direction only; nothing here can lift
-    # a refusal or restamp a card that already carries one.
+    # NOTED here, converged at the end of the transaction. Taking the consent
+    # lock at this line held it across the service-category HTTP request that
+    # `handle_event` makes a few statements later, and a STOP for this very
+    # number then waited for that request before its receipt could be stored —
+    # the durable inbound boundary blocked by a CRM lookup. Nothing is locked
+    # and nothing is queried by the call below.
     if phone:
-        await converge_cards_with_ledger(session, addresses=[phone], card_ids=[client_id])
+        note_card_write(session, card_id=client_id, phone=phone)
     return client_id
 
 
@@ -688,6 +686,27 @@ async def lock_next_batch(
 
 
 async def handle_event(session: AsyncSession, event: AltegioEvent) -> None:
+    """Apply one Altegio event, then run this transaction's consent section.
+
+    The consent section is last on every path, including the failing ones: this
+    worker commits the event row even when the handler raised, so a card written
+    before the failure would otherwise be committed without the refusal it
+    should carry. It is attempted on the way out and, if the transaction is
+    already unusable, left to the historical reconciliation, which converges
+    exactly that.
+    """
+    try:
+        await _handle_event(session, event)
+    except BaseException:
+        try:
+            await settle_card_writes(session)
+        except Exception:  # pragma: no cover - only on an already-broken session
+            logger.warning("consent: card convergence skipped for failed event=%s", event.id)
+        raise
+    await settle_card_writes(session)
+
+
+async def _handle_event(session: AsyncSession, event: AltegioEvent) -> None:
     payload = event.payload or {}
 
     company_id = event.company_id or payload.get("company_id")

@@ -25,7 +25,7 @@ from altegio_bot.easyweek_migration.customers import normalized_international_ph
 from altegio_bot.easyweek_normalizer import NormalizedBooking, normalize_event
 from altegio_bot.models.models import Client, EasyWeekEvent
 from altegio_bot.whatsapp_consent import extend_refusal_to_uuid
-from altegio_bot.whatsapp_consent_cards import converge_cards_with_ledger
+from altegio_bot.whatsapp_consent_cards import note_card_write, settle_card_writes
 
 
 class UUIDIdentityResolutionRequired(Exception):
@@ -231,7 +231,27 @@ async def resolve_webhook_identity(
             # Consume the same event's business changes atomically with the
             # proven contact. Otherwise the next pass would restore/re-prove
             # its obsolete phone forever. Captured payload remains untouched.
+            #
+            # This is also where this transaction's external calls happen — the
+            # ordinary EasyWeek write reads the multi-service snapshot over HTTP
+            # — so the whole consent section below is deliberately after it.
             await apply_stale_contact(session, event, proven_phone)
+
+        # Every card this transaction touched, remembered for the consent
+        # section below. Noting is local: no lock, no query.
+        for row in rows:
+            if row.id is not None:
+                note_card_write(session, card_id=int(row.id), phone=row.phone_e164)
+        note_card_write(session, card_id=int(client.id), phone=client.phone_e164)
+
+        # ONE sorted acquisition for every consent address this transaction
+        # needs — the cards it wrote and the addresses the refusal is bound to.
+        # Sorting inside each helper was not enough: the nested client upsert
+        # used to take the proven number's lock and the binding below the old
+        # number's, so an ingress holding the old one and waiting for the proven
+        # one closed a cycle. Consent locks are the last locks taken here, and
+        # nothing external happens after this point.
+        await settle_card_writes(session, extra_addresses=consent_addresses)
         # §46.4.2 — the one moment this binding is justified. The UUID has just
         # been proven for this person against EasyWeek's own records, so an
         # existing phone-keyed refusal for any of those numbers is bound to it
@@ -240,24 +260,8 @@ async def resolve_webhook_identity(
         # is, which branch they belong to, or whether they are an EasyWeek
         # customer — and it never creates, lifts or weakens a refusal.
         #
-        # LAST, after the business writes above, and that position is part of
-        # the project's one lock order: card rows first, consent addresses
-        # after them, never the other way round. ``apply_stale_contact`` runs
-        # the ordinary EasyWeek write for this event and touches card rows of
-        # its own, so taking the consent locks before it would have left this
-        # transaction holding a consent lock while asking for a card row — the
-        # inversion the consent projection deadlocked against. The addresses
-        # were read BEFORE the number changed, so moving the call does not
-        # change what is bound.
+        # The addresses were read BEFORE the number changed, which is what makes
+        # this position safe, and the acquisition above already holds every one
+        # of them: this call queues for nothing and adds no order of its own.
         await extend_refusal_to_uuid(session, addresses=consent_addresses, customer_uuid=identity)
-        # §46.4.3 — and the same obligation every card writer now carries: the
-        # card this proof just adopted or created may be standing in front of a
-        # refusal that is already on disk, and the flag below is what every
-        # campaign path reads. Asked with the rows already held and the consent
-        # locks already taken, so it adds no lock and no new order.
-        await converge_cards_with_ledger(
-            session,
-            addresses=consent_addresses,
-            card_ids={int(row.id) for row in rows if row.id is not None} | {int(client.id)},
-        )
         return True

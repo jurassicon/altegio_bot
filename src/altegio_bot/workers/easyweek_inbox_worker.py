@@ -130,7 +130,7 @@ from ..easyweek_uuid_identity import (
 from ..message_planner import MAX_VISITS_FOR_REVIEW
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
-from ..whatsapp_consent_cards import converge_cards_with_ledger
+from ..whatsapp_consent_cards import note_card_write, settle_card_writes
 
 logger = logging.getLogger("easyweek_inbox_worker")
 
@@ -625,9 +625,12 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
         session.add(client)
         await session.flush()
         # §46.4.3 — a first card for this person may be standing in front of a
-        # refusal that is already on disk. Asked here, where the row is held,
-        # and with the consent locks taken last of all.
-        await converge_cards_with_ledger(session, addresses=[booking.phone_e164], card_ids=[int(client.id)])
+        # refusal that is already on disk. Noted here, where the row is held,
+        # and converged by this transaction's consent section once every
+        # external call is done: `apply_booking` reads the multi-service
+        # snapshot over HTTP a few statements later, and a consent lock taken
+        # at this line would be held across it.
+        note_card_write(session, card_id=int(client.id), phone=booking.phone_e164)
         return client
 
     # A numeric hit does not override an independently proven UUID identity.
@@ -664,9 +667,9 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     _patch(existing, "display_name", booking, booking.display_name)
     _patch(existing, "email", booking, booking.email)
     # The patch above may have moved this card onto a refused number. Same
-    # obligation, same order: the row is already held, the consent locks come
-    # last, and only the refusing direction is written.
-    await converge_cards_with_ledger(session, addresses=[existing.phone_e164], card_ids=[int(existing.id)])
+    # obligation, same place: noted now, converged by the transaction's consent
+    # section after the HTTP that follows.
+    note_card_write(session, card_id=int(existing.id), phone=existing.phone_e164)
     return existing
 
 
@@ -2184,13 +2187,25 @@ async def apply_booking(
 
 
 async def process_claimed_event(
-    session: AsyncSession, event: EasyWeekEvent, *, proven_contact: tuple[str | None] | None = None
+    session: AsyncSession,
+    event: EasyWeekEvent,
+    *,
+    proven_contact: tuple[str | None] | None = None,
+    settle_consent: bool = True,
 ) -> None:
     """Normalise and apply one already-claimed event.
 
     Runs inside the caller's transaction: the claim, the domain writes and the
     terminal status all commit together, or none of them do. Raises
     :class:`NormalizationError` for deterministic rejections.
+
+    ``settle_consent`` says whether this call OWNS the transaction's consent
+    section. It is false exactly once: when the UUID resolver runs this as the
+    business half of its own transaction. That transaction has a second set of
+    consent addresses to declare — the ones a refusal is being bound to — and
+    both sets have to be taken in one sorted acquisition, so the resolver does
+    it after this returns. Settling here as well would be the piecemeal
+    acquisition that deadlocked against the ingress.
     """
     event_id = event.id
     event_hint = event.event_hint
@@ -2295,6 +2310,10 @@ async def process_claimed_event(
         )
 
     mark_processed(event)
+    if settle_consent:
+        # This transaction's consent section, last of all and after every
+        # external call `apply_booking` made.
+        await settle_card_writes(session)
     # Safe metadata only: ids and the action. No phone, e-mail, name or payload.
     logger.info(
         "easyweek event=%s hint=%s action=%s booking_uuid=%s processed",
@@ -2792,7 +2811,8 @@ async def process_one() -> bool:
                 if not settings.easyweek_processing_enabled:
                     raise RecoverableCategoryConfigurationError("processing_disabled")
                 event.status = STATUS_PROCESSING
-                await process_claimed_event(session, event, proven_contact=(phone,))
+                # The resolver owns the consent section of its own transaction.
+                await process_claimed_event(session, event, proven_contact=(phone,), settle_consent=False)
 
             try:
                 resolved = await resolve_webhook_identity(

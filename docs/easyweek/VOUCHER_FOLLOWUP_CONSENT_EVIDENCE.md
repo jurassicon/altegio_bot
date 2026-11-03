@@ -270,32 +270,62 @@ position does not change what is bound.
 `Client.wa_opted_out` is what `message_planner`, the outbox worker and every
 campaign path actually read, and a card can start matching a refused address at
 any moment — long after any consent decision was made. So every path that
-creates a card or moves a phone onto an address calls
-`converge_cards_with_ledger` in the same transaction, with the row already held
-and the consent locks taken **last**:
+creates a card or moves a phone onto an address converges that card against the
+ledger **in the same transaction**, and it does it in two steps:
 
-| path | when |
-| --- | --- |
-| `workers/inbox_worker.upsert_client` | after the Altegio import writes the row |
-| `workers/easyweek_inbox_worker.upsert_client` | after a card is created or its phone patched |
-| `easyweek_uuid_identity.resolve_webhook_identity` | after the business write and the UUID binding |
-| both consent projections | for the rows they locked |
+1. the write site calls `note_card_write`, which takes no lock and runs no
+   query — it only remembers the address and the row id;
+2. the transaction's **one** consent section, `settle_card_writes`, runs after
+   everything external is done and just before the commit. It takes every
+   consent address the transaction needs in a **single sorted acquisition** and
+   only then converges the cards.
+
+| path | notes | settles |
+| --- | --- | --- |
+| `workers/inbox_worker` | `upsert_client` | end of `handle_event`, on every path including a failing one |
+| `workers/easyweek_inbox_worker` | `upsert_client` | end of `process_claimed_event` |
+| `easyweek_uuid_identity.resolve_webhook_identity` | the rows it adopted or created | after the business write, together with the UUID binding |
+| both consent projections | — | they pass their own locked row ids directly |
+
+Both halves of that split are load-bearing.
+
+**No consent lock across an external request.** Both providers write a card
+early in their event transaction and then make an HTTP call before they commit:
+Altegio looks up the service category, EasyWeek proves the two-service
+snapshot. A lock taken at the write site was still held at that point, so a STOP
+for the same number could not have its receipt stored until the CRM answered —
+the durable inbound boundary of §46.4.6 waiting on a service lookup. Checking
+that the helper itself makes no request was not enough; the callers had to be
+read.
+
+**One acquisition per transaction, not per call.** Sorting inside each helper
+left the UUID resolver taking the proven number's lock in its nested client
+upsert and the old number's in its own binding, which deadlocked against an
+ingress holding the old one and waiting for the proven one. The resolver now
+declares both sets at once, and `process_claimed_event` is told not to settle
+when it runs as that resolver's business half (`settle_consent=False`) —
+settling there as well would be the piecemeal acquisition again.
 
 It only ever moves a card **to** refusing. Clearing a refusal needs the proven,
 strictly newer opt-in that only the ledger can establish, and that projection
 belongs to the inbox worker; a card that already refuses is never restamped,
 because `wa_opted_out_at` and `wa_opt_out_reason` say when and why somebody
-refused rather than when a writer noticed. No HTTP happens under those locks.
+refused rather than when a writer noticed.
 
-Because every participant takes all of its card row locks before its first
-consent lock, no transaction anywhere asks for a card row while holding a
-consent lock, and the cycle that once made the projection a deadlock victim has
-no second edge.
+Because every participant takes all of its card row locks — and makes all of its
+external requests — before its first consent lock, no transaction anywhere asks
+for a card row while holding a consent lock, and the cycle that once made the
+projection a deadlock victim has no second edge. The order of the whole
+transaction, callbacks included, is:
+
+**workspace → card rows → business writes → external requests → consent
+addresses (one sorted acquisition) → commit.**
 
 A writer outside that table — a manual card edit, a future import — can still
-put an unconverged row in front of a refusal. It is caught by the reconciliation
-below, which converges any card flag that disagrees with the ledger; and any new
-card writer is expected to call the same function.
+put an unconverged row in front of a refusal, and so can a transaction that
+fails after noting a card but before its consent section. Both are caught by the
+reconciliation below, which converges any card flag that disagrees with the
+ledger; and any new card writer is expected to use the same pair of calls.
 
 The compare-and-set stays on the write as a second line of defence, and it is
 the only protection on the one path that cannot hold the locks: a direct
@@ -642,6 +672,20 @@ Rules:
   carry it; while the two shared one transaction there was an interleaving
   nobody covered, and a run that gave up left a known STOP with no durable
   refusal at all.
+- **A refusal in the ledger is not proof that the cards are done.** Because the
+  two halves commit separately, a lost card transaction leaves a refusal on disk
+  and a card still reading as sendable — and treating the ledger row as "already
+  handled" left it that way, run after run, while the real campaign classifier
+  kept allowing marketing. A snapshot candidate whose refusal is already active
+  is therefore checked against the cards: if any matching card still says
+  sendable, the candidate is projectable for its **card half alone**. No
+  evidence is written a second time — re-applying a snapshot would stamp a fresh
+  "order unknown" onto a refusal that may have a provable time, which is a
+  downgrade, not a repair — and the card half re-reads the ledger under the
+  address lock, so a proven, strictly newer START that landed in between is
+  honoured and nothing is written. `card_recovery` counts those candidates and
+  `cards_converged` the flags actually fixed, which is how a repeat of the
+  evidence is told apart from a repair of the cards.
 - A refusal it writes is also projected onto the card flags it locked, in the
   refusing direction only, through the same `converge_cards_with_ledger` every
   card writer uses. `cards_converged` counts them.

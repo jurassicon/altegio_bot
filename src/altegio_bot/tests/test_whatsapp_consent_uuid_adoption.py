@@ -57,6 +57,7 @@ from altegio_bot.whatsapp_consent import (
     lock_consent_address,
     record_inbound_receipts,
 )
+from altegio_bot.whatsapp_consent_cards import settle_card_writes
 from altegio_bot.workers import easyweek_inbox_worker as worker
 from altegio_bot.workers import whatsapp_inbox_worker as wa_worker
 
@@ -1189,6 +1190,7 @@ async def test_a_card_moved_onto_a_refused_address_arrives_already_refused(sessi
                 1,
                 {"id": 994777, "name": "Moved", "phone": PHONE},
             )
+            await settle_card_writes(session)
     assert moved == card_id, "the real importer moved the existing card"
 
     async with session_maker() as session:
@@ -1211,6 +1213,7 @@ async def test_a_brand_new_card_on_a_refused_address_is_refused_too(session_make
                 1,
                 {"id": 994888, "name": "Fresh", "phone": PHONE},
             )
+            await settle_card_writes(session)
 
     async with session_maker() as session:
         card = await session.get(Client, created)
@@ -1226,6 +1229,7 @@ async def test_a_card_moved_onto_an_address_with_no_refusal_stays_sendable(sessi
     async with session_maker() as session:
         async with session.begin():
             await altegio_upsert(session, 1, {"id": 994999, "name": "Clean", "phone": PHONE})
+            await settle_card_writes(session)
 
     async with session_maker() as session:
         card = await session.get(Client, card_id)
@@ -1261,6 +1265,7 @@ async def test_the_importer_does_not_restamp_a_card_that_already_refuses(session
     async with session_maker() as session:
         async with session.begin():
             await altegio_upsert(session, 1, {"id": 995111, "name": "Already out", "phone": PHONE})
+            await settle_card_writes(session)
 
     async with session_maker() as session:
         after = await session.get(Client, card_id)
@@ -1360,6 +1365,7 @@ async def test_a_stable_recipient_is_never_left_allowed_by_another_address_movin
                         1,
                         {"id": 996000 + index, "name": "Mover", "phone": movers[index]},
                     )
+                    await settle_card_writes(writer)
         return ids
 
     monkeypatch.setattr(wa_worker, "_card_ids_matching", _patched)
@@ -1400,6 +1406,7 @@ async def test_the_importer_moving_a_card_twice_is_idempotent(session_maker) -> 
         async with session_maker() as session:
             async with session.begin():
                 await altegio_upsert(session, 1, {"id": 997001, "name": "Twice", "phone": PHONE})
+                await settle_card_writes(session)
 
     async with session_maker() as session:
         card = await session.get(Client, card_id)
