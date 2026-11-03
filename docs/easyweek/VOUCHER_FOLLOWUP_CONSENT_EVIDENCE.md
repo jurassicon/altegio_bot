@@ -215,25 +215,34 @@ an acknowledgement that fails, a Chatwoot outage, an exception in the handler or
 the process dying, and it holds nothing while the handler makes its network
 calls.
 
-It is **serialised**, and that is the only thing that closes the gap. The
-transaction locks, before its first read:
+It is **serialised**. Before reading the consent decision, the live projection
+locks the whole delivery's matching rows in this order:
 
 1. every **card row** of every address in the delivery, in one statement, in
    ascending id order;
-2. every **consent address**, sorted;
+2. the matching **queued marketing `MessageJob` rows**, in ascending id order;
+3. every **consent address**, sorted.
 
-and the write touches only the ids locked in step 1, so a row lock is never
-taken after a consent lock. That is what keeps the projection from deadlocking
-against a contact proof that moves a card onto one of these addresses.
+Both STOP and START addresses participate: a rejected START can still leave an
+active refusal. The decision to cancel jobs is made only after reading the
+current ledger under the consent lock. A proven newer START that commits while
+the projection waits for jobs is therefore respected.
 
-**A card that starts matching after step 1 is not this transaction's business,
-and no amount of re-reading could make it so.** A consent lock orders only the
-transactions that take it, and the client importer does not take one: it has no
-reason to know this phase exists. An earlier version re-compared the set and
-rolled the whole transaction back when it had moved, which was wrong twice over —
-it could not see a row the importer committed after the last comparison, and
-running out of restarts left every address in the delivery, including the ones
-whose cards never moved, with the ledger refusing and the flag saying sendable.
+Card writes and job cancellations are restricted to their respective locked id
+sets. Cancellation also re-checks the current phone/client scope, marketing type
+and `queued` status. The projection does not acquire another card or job row
+after taking consent locks. This matters when a booking update has already
+locked a marketing job and is about to settle its card's consent: the projection
+must wait for that job **before** holding the consent lock the update needs.
+
+Jobs created or made eligible after the job selection are outside that
+cancellation set. This is not a promise to cancel future jobs: the atomically
+saved card refusal and the Outbox's final card check still prevent their send.
+
+**A card that starts matching after step 1 is outside the projection's locked
+set.** Its writer must converge it against the ledger before committing that
+same transaction. Re-reading the set would not protect against a later arrival;
+the writer's final consent section is what covers that window.
 
 So the obligation is turned around, and it lives in `whatsapp_consent_cards`:
 **whoever writes a card's phone converges that card itself**. See
@@ -252,10 +261,11 @@ one, ordinary inbound has no recovery pass, so the event stayed `processing` and
 the address only that delivery mentioned kept a sendable card against a refusing
 ledger.
 
-The order the commands are **applied** in is untouched. Only the order the locks
-are taken in is fixed, and it is the same one `resolve_webhook_identity` and the
-historical reconciliation use: **cards → consent addresses → receipts →
-message jobs**.
+The order the commands are **applied** in is untouched. The live projection uses
+**cards → queued marketing jobs → consent addresses**. Card writers finish their
+business and job writes before settling consent; the historical projection uses
+**cards → consent addresses** and never cancels jobs. Receipt resolution happens
+in the earlier consent transaction, not in this card/job projection.
 
 `resolve_webhook_identity` takes its consent locks **last of all**, after the
 ordinary EasyWeek write for that event. That position is part of the order:
@@ -285,7 +295,8 @@ ledger **in the same transaction**, and it does it in two steps:
 | `workers/inbox_worker` | `upsert_client` | end of `handle_event`, on every path including a failing one |
 | `workers/easyweek_inbox_worker` | `upsert_client` | end of `process_claimed_event` |
 | `easyweek_uuid_identity.resolve_webhook_identity` | the rows it adopted or created | after the business write, together with the UUID binding |
-| both consent projections | — | they pass their own locked row ids directly |
+| live consent projection | — | locks cards and queued marketing jobs before consent; writes only those ids |
+| historical consent projection | — | locks cards before consent; does not cancel jobs |
 
 Both halves of that split are load-bearing.
 
@@ -312,14 +323,11 @@ belongs to the inbox worker; a card that already refuses is never restamped,
 because `wa_opted_out_at` and `wa_opt_out_reason` say when and why somebody
 refused rather than when a writer noticed.
 
-Because every participant takes all of its card row locks — and makes all of its
-external requests — before its first consent lock, no transaction anywhere asks
-for a card row while holding a consent lock, and the cycle that once made the
-projection a deadlock victim has no second edge. The order of the whole
-transaction, callbacks included, is:
-
-**workspace → card rows → business writes → external requests → consent
-addresses (one sorted acquisition) → commit.**
+For the listed writers, card and job writes and all external requests finish
+before the final consent section, including work in nested callbacks. The live
+projection takes its job locks before that same boundary. Neither side waits for
+a new card or job row while holding consent locks. This is the protocol for these
+participants, not a universal lock-order claim about every service subsystem.
 
 A writer outside that table — a manual card edit, a future import — can still
 put an unconverged row in front of a refusal, and so can a transaction that
@@ -827,6 +835,8 @@ Not implemented, and not reachable by any flag:
 | Proven failures, early/duplicate/foreign callbacks, local vs external refusal | `tests/test_easyweek_voucher_delivery_failures.py` |
 | Historical reconciliation, its limits, racing live ingress, route provenance | `tests/test_whatsapp_consent_projection.py` |
 | A refusal surviving a UUID proven later and a number change | `tests/test_whatsapp_consent_uuid_adoption.py` |
+| Consent locks outside HTTP and one address order across nested writers | `tests/test_whatsapp_consent_card_locks.py` |
+| Booking reassignment racing STOP and queued marketing job cancellation | `tests/test_whatsapp_consent_job_locks.py` |
 | Migration cycle, ORM parity, destructive-downgrade refusal, PG16 concurrency | `tests/test_easyweek_voucher_mailing_durability.py` |
 
 All are required. No marker, skip or xfail was added. A change to shared inbound
@@ -858,3 +868,9 @@ lock, the other for the row. The release of the delivery locks is asserted from 
 call itself: the acknowledgement probes the batch header with
 `FOR UPDATE NOWAIT` and the message identifier with `pg_try_advisory_xact_lock`,
 for every status kind including `sent`, and both must be free.
+
+The job-lock regression uses a real Altegio booking reassignment, its real job
+planner and a claimed WhatsApp STOP. It pauses the competing transactions at the
+job/consent boundary and requires both events to finish, both cards to refuse,
+and the queued marketing jobs to be cancelled without replaying external actions.
+Unexpected HTTP requests are blocked in this reproduction.

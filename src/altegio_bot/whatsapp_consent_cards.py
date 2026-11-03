@@ -24,26 +24,24 @@ The protocol
 So the obligation is turned around. **Whoever writes a card's phone converges
 that card itself**, in the same transaction, before it commits:
 
-1. the writer already holds the row it is writing;
-2. it calls :func:`converge_cards_with_ledger`, which takes the consent locks
-   for the addresses involved — always the LAST locks a card writer takes;
-3. under those locks it reads the authoritative ledger;
-4. where the ledger refuses, it sets the flag on the rows it was given.
+1. the writer holds the card row and calls :func:`note_card_write`;
+2. it finishes its business/job writes and external requests;
+3. :func:`settle_card_writes` takes the complete sorted set of consent locks;
+4. under those locks it reads the ledger and converges the noted card flags.
 
 A card that appears after a projection has read its set is then not the
 projection's problem: its own writer is holding it, and that writer cannot
 commit until it has asked the ledger. If the projection is mid-flight the writer
 queues on the consent lock and reads the settled answer afterwards.
 
-Lock order, and why the old deadlock cannot come back
-----------------------------------------------------
-Every participant takes **all of its card row locks before its first consent
-lock**: the importer writes its row and then calls this; the EasyWeek UUID
-bridge locks its rows, does its business write and then binds and converges; the
-two consent projections lock the rows they will write, take the consent locks,
-and write only those rows. No transaction anywhere asks for a card row while
-holding a consent lock, so the cycle that once made the projection a deadlock
-victim has no second edge.
+Lock order of the consent participants
+--------------------------------------
+The live projection locks cards, then queued marketing jobs, then consent
+addresses. Its card and cancellation writes are restricted to those locked ids.
+Card writers and the EasyWeek UUID bridge finish business/job writes before
+their consent section. Waiting for a job while holding consent would invert
+that order against a writer finishing a record reassignment. Historical
+reconciliation locks cards before consent and does not cancel jobs.
 
 What this never does
 --------------------
@@ -52,7 +50,7 @@ needs the proven, strictly newer opt-in the ledger alone can establish, and that
 projection belongs to the inbox worker. It never restamps a card that already
 refuses, because ``wa_opted_out_at`` and ``wa_opt_out_reason`` describe when and
 why somebody refused rather than when a writer noticed. It makes no HTTP
-request, so the consent locks it takes are never held across one.
+request; callers place the consent section after their own external requests.
 """
 
 from __future__ import annotations
@@ -92,10 +90,9 @@ async def converge_cards_with_ledger(
     """Set ``wa_opted_out`` where the ledger refuses, under the consent locks.
 
     ``addresses`` are the numbers whose refusal applies; ``card_ids`` the rows
-    the caller is holding and is allowed to write. ``None`` means "every card
-    matching those addresses", which is only safe for a caller that holds no
-    consent lock yet and takes its row locks here — the two consent projections
-    pass an explicit set for exactly that reason.
+    the caller is holding and is allowed to write. ``None`` means an unrestricted
+    phone-matching UPDATE; this helper does not prelock its rows. Participants
+    in the transaction protocol pass their explicit, already-locked card ids.
 
     Returns how many card flags were changed, for the caller's own reporting.
     """

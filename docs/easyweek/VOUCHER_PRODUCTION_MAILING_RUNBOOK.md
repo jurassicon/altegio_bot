@@ -1641,6 +1641,14 @@ of the evidence is told apart from a repair of the flags. A card that is moved o
 ordinary client import carries the refusal itself, so it does not wait for a
 reconciliation at all.
 
+Live STOP processing locks matching cards, then queued marketing jobs, then
+consent addresses. The job set is selected for the whole delivery in id order;
+only those jobs can be cancelled in that transaction, with their current scope
+and queued status re-checked. Booking writers finish their job changes and HTTP
+requests before settling consent. This prevents a booking update and STOP from
+waiting on each other's job/consent locks. Later jobs still face the saved card
+refusal at Outbox's final check; historical reconciliation does not cancel jobs.
+
 `superseded` never applies to a stored STOP message. A refusal somebody sent is
 not stale because of when this process received it — a signed START sent at
 10:10 can arrive at 10:30 behind a STOP received at 10:20 — so a stored STOP

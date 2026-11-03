@@ -1040,7 +1040,10 @@ async def _cancel_marketing_jobs(
     session: AsyncSession,
     *,
     phone_e164: str,
+    job_ids: Collection[int] | None = None,
 ) -> int:
+    if job_ids is not None and not job_ids:
+        return 0
     variants = _phone_variants(phone_e164)
 
     stmt = select(Client.id).where(Client.phone_e164.in_(variants))
@@ -1060,6 +1063,11 @@ async def _cancel_marketing_jobs(
             last_error="Canceled: client unsubscribed",
         )
     )
+    if job_ids is not None:
+        # The serialised projection may only write rows locked before consent.
+        # Keep the current phone, status and type predicates as well: an id is
+        # a lock boundary, not permission to cancel a different recipient's job.
+        upd = upd.where(MessageJob.id.in_(sorted(job_ids)))
     res2 = await session.execute(upd)
     return int(getattr(res2, "rowcount", 0) or 0)
 
@@ -1241,6 +1249,7 @@ async def _apply_inbound_command_flags(
     opted out and used to confirm a subscription to them.
     """
     locked_ids: set[int] | None = None
+    locked_job_ids: set[int] | None = None
     effective: dict[str, str] = {}
     requested: dict[str, set[str]] = {}
     for phone, cmd in commands:
@@ -1252,9 +1261,10 @@ async def _apply_inbound_command_flags(
         effective[phone] = cmd
 
     if serialised:
-        # Everything this projection will touch, locked before the first read,
-        # in the one global order this project uses: the CARD ROWS first, by
-        # ascending id, and then every consent address, sorted.
+        # Everything this projection will touch, locked before the consent read:
+        # CARD ROWS first, by
+        # ascending id, then queued marketing JOBS by id, then every consent
+        # address, sorted. This applies to START too: the ledger can refuse it.
         #
         # Both halves were defects. Without the address locks there was a window
         # after the last read of the ledger: the historical projection could
@@ -1268,25 +1278,20 @@ async def _apply_inbound_command_flags(
         # inbound has no recovery pass, so the addresses only that delivery
         # mentioned were left with the ledger refusing and the card sendable.
         #
-        # ``resolve_webhook_identity`` takes the same two in the same order
-        # (cards under ``FOR UPDATE``, then — last of all — the consent address
-        # locks), so this adds no cycle.
+        # Card writers finish their business/job writes before taking consent.
+        # A record reassignment can touch a job of another matching card that
+        # this projection holds. Taking that job only after consent would leave
+        # the projection waiting for the writer's job and the writer waiting
+        # for consent. Wait for all jobs here, while consent is still free.
         #
-        # The writes below touch only the ids locked here, so no row lock is
-        # ever taken after a consent lock. That is what keeps the one order
-        # (card rows, then consent) intact and what stops the projection from
-        # deadlocking against a contact proof that moves a card onto one of
-        # these addresses.
+        # The writes below touch only the card/job ids locked here. A broader
+        # UPDATE after consent could discover a new row and recreate the cycle.
         #
-        # A card that starts matching AFTER this read is deliberately not this
-        # transaction's business, and re-reading the set here would not make it
-        # so: a consent lock orders only the transactions that take it, and the
-        # client importer does not take one. The obligation sits with the writer
-        # instead — ``converge_cards_with_ledger`` is called by every path that
-        # creates a card or moves a phone, with the row already held and the
-        # consent locks taken last, so such a card arrives already carrying the
-        # refusal. See ``whatsapp_consent_cards``.
+        # A card that starts matching after the read is covered by its writer's
+        # final consent section: that writer converges the flag atomically with
+        # the card change. Re-reading the set here would not close later arrivals.
         locked_ids = await _card_ids_matching(session, effective, lock=True)
+        locked_job_ids = await _marketing_job_ids_matching(session, effective)
         await lock_consent_addresses(session, effective)
 
     results: dict[str, CommandProjection] = {}
@@ -1298,6 +1303,7 @@ async def _apply_inbound_command_flags(
             requested=requested.get(phone, {cmd}),
             serialised=serialised,
             card_ids=locked_ids,
+            job_ids=locked_job_ids,
         )
     return results
 
@@ -1311,9 +1317,9 @@ async def _card_ids_matching(session: AsyncSession, phones: Collection[str], *, 
 
     ``lock=True`` is the first step of the projection's protocol: one statement
     for the whole set, in ascending id order, so two transactions touching
-    overlapping people always queue rather than cross. ``lock=False`` is the
-    re-check under the consent locks, which is the second step — and the one
-    that makes the locked set a CHECKED fact rather than an assumption.
+    overlapping people always queue rather than cross. A plain read takes no
+    row locks. Writers of cards that start matching later converge their own
+    flags before committing; the projection writes only its locked set.
     """
     variants = _phone_set(phones)
     if not variants:
@@ -1321,6 +1327,29 @@ async def _card_ids_matching(session: AsyncSession, phones: Collection[str], *, 
     statement = select(Client.id).where(Client.phone_e164.in_(variants)).order_by(Client.id.asc())
     if lock:
         statement = statement.with_for_update()
+    return {int(value) for value in (await session.scalars(statement)).all()}
+
+
+async def _marketing_job_ids_matching(session: AsyncSession, phones: Collection[str]) -> set[int]:
+    """Lock this delivery's queued marketing jobs before any consent lock.
+
+    The subquery reads card ids without locking additional card rows. Only the
+    selected job ids may be cancelled later, with current scope/status checks.
+    Jobs appearing after this read remain subject to the committed card veto
+    and the outbox's check; they cannot be locked here after consent is taken.
+    """
+    variants = _phone_set(phones)
+    if not variants:
+        return set()
+    client_ids = select(Client.id).where(Client.phone_e164.in_(variants))
+    statement = (
+        select(MessageJob.id)
+        .where(MessageJob.client_id.in_(client_ids))
+        .where(MessageJob.status == "queued")
+        .where(MessageJob.job_type.in_(MARKETING_JOB_TYPES))
+        .order_by(MessageJob.id.asc())
+        .with_for_update()
+    )
     return {int(value) for value in (await session.scalars(statement)).all()}
 
 
@@ -1338,6 +1367,7 @@ async def _project_ledger_onto_card(
     requested: Collection[str] = (),
     serialised: bool = False,
     card_ids: Collection[int] | None = None,
+    job_ids: Collection[int] | None = None,
 ) -> CommandProjection:
     """Derive one address's legacy card state from the ledger and write it.
 
@@ -1399,7 +1429,7 @@ async def _project_ledger_onto_card(
             if (settled.state, settled.consent_version) != (state.state, state.consent_version):
                 continue
 
-        canceled = await _cancel_marketing_jobs(session, phone_e164=phone) if opted_out else 0
+        canceled = await _cancel_marketing_jobs(session, phone_e164=phone, job_ids=job_ids) if opted_out else 0
         return CommandProjection(
             command=settled_command,
             ledger_state=state.state,
