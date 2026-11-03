@@ -130,6 +130,7 @@ from ..easyweek_uuid_identity import (
 from ..message_planner import MAX_VISITS_FOR_REVIEW
 from ..models.models import Client, EasyWeekEvent, MessageJob, Record, RecordService
 from ..settings import settings
+from ..whatsapp_consent_cards import converge_cards_with_ledger
 
 logger = logging.getLogger("easyweek_inbox_worker")
 
@@ -623,6 +624,10 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
         )
         session.add(client)
         await session.flush()
+        # §46.4.3 — a first card for this person may be standing in front of a
+        # refusal that is already on disk. Asked here, where the row is held,
+        # and with the consent locks taken last of all.
+        await converge_cards_with_ledger(session, addresses=[booking.phone_e164], card_ids=[int(client.id)])
         return client
 
     # A numeric hit does not override an independently proven UUID identity.
@@ -658,6 +663,10 @@ async def upsert_client(session: AsyncSession, booking: NormalizedBooking) -> Cl
     _patch(existing, "phone_e164", booking, booking.phone_e164)
     _patch(existing, "display_name", booking, booking.display_name)
     _patch(existing, "email", booking, booking.email)
+    # The patch above may have moved this card onto a refused number. Same
+    # obligation, same order: the row is already held, the consent locks come
+    # last, and only the refusing direction is written.
+    await converge_cards_with_ledger(session, addresses=[existing.phone_e164], card_ids=[int(existing.id)])
     return existing
 
 

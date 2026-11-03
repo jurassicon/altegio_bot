@@ -222,31 +222,22 @@ transaction locks, before its first read:
    ascending id order;
 2. every **consent address**, sorted;
 
-and then, under both, it **compares the matching card set again**. The write
-touches only the ids locked in step 1.
+and the write touches only the ids locked in step 1, so a row lock is never
+taken after a consent lock. That is what keeps the projection from deadlocking
+against a contact proof that moves a card onto one of these addresses.
 
-Those last two sentences are not belt and braces. `SELECT … FOR UPDATE` protects
-the rows that matched when it ran, and nothing more — a legitimate contact proof
-can move a card **onto** one of these addresses afterwards. A write that matched
-by phone would then reach for that row's lock after the consent locks, inverting
-the order, and PostgreSQL made the projection the deadlock victim against the
-very proof that moved the card: the ledger refused, the receipts were resolved,
-every card in the delivery stayed sendable, the event stayed `processing` with no
-recovery pass, and the real campaign classifier went on allowing marketing to a
-recipient no proof had ever touched. One contact change and one ordinary repeat
-proof of the same booking were enough.
+**A card that starts matching after step 1 is not this transaction's business,
+and no amount of re-reading could make it so.** A consent lock orders only the
+transactions that take it, and the client importer does not take one: it has no
+reason to know this phase exists. An earlier version re-compared the set and
+rolled the whole transaction back when it had moved, which was wrong twice over —
+it could not see a row the importer committed after the last comparison, and
+running out of restarts left every address in the delivery, including the ones
+whose cards never moved, with the ledger refusing and the flag saying sendable.
 
-Restricting the write to the locked ids makes a row lock after a consent lock
-unreachable. The re-check is what stops that from becoming a card quietly left
-behind: when the set has moved, the whole transaction **rolls back** — releasing
-every lock — and is started again from the top, where it locks the full set
-first. Nothing is skipped, nothing is written out of order, and the other
-addresses in the delivery are not abandoned. After a few restarts the projection
-reports the addresses as unsettled instead of claiming them: the ledger's refusal
-is durable and is what the consent guard reads, the reconciliation converges the
-remaining flag, and no acknowledgement goes out for a command whose own
-projection never landed.
-
+So the obligation is turned around, and it lives in `whatsapp_consent_cards`:
+**whoever writes a card's phone converges that card itself**. See
+*The card-writer protocol* below.
 Both halves were defects. A compare-and-set on the write narrowed the window but
 could not remove it: the gap that was left is between the last read and the
 **commit**, so a newer STOP committing there decided the outcome by commit order
@@ -273,6 +264,38 @@ its own, so binding the refusal before it would have left that transaction
 holding a consent lock while asking for a card row — the same inversion from the
 other side. The addresses it binds are read before the number changes, so the
 position does not change what is bound.
+
+### The card-writer protocol
+
+`Client.wa_opted_out` is what `message_planner`, the outbox worker and every
+campaign path actually read, and a card can start matching a refused address at
+any moment — long after any consent decision was made. So every path that
+creates a card or moves a phone onto an address calls
+`converge_cards_with_ledger` in the same transaction, with the row already held
+and the consent locks taken **last**:
+
+| path | when |
+| --- | --- |
+| `workers/inbox_worker.upsert_client` | after the Altegio import writes the row |
+| `workers/easyweek_inbox_worker.upsert_client` | after a card is created or its phone patched |
+| `easyweek_uuid_identity.resolve_webhook_identity` | after the business write and the UUID binding |
+| both consent projections | for the rows they locked |
+
+It only ever moves a card **to** refusing. Clearing a refusal needs the proven,
+strictly newer opt-in that only the ledger can establish, and that projection
+belongs to the inbox worker; a card that already refuses is never restamped,
+because `wa_opted_out_at` and `wa_opt_out_reason` say when and why somebody
+refused rather than when a writer noticed. No HTTP happens under those locks.
+
+Because every participant takes all of its card row locks before its first
+consent lock, no transaction anywhere asks for a card row while holding a
+consent lock, and the cycle that once made the projection a deadlock victim has
+no second edge.
+
+A writer outside that table — a manual card edit, a future import — can still
+put an unconverged row in front of a refusal. It is caught by the reconciliation
+below, which converges any card flag that disagrees with the ledger; and any new
+card writer is expected to call the same function.
 
 The compare-and-set stays on the write as a second line of defence, and it is
 the only protection on the one path that cannot hold the locks: a direct
@@ -611,19 +634,20 @@ Rules:
   and its monotonicity rules. The projection gets no private write path, so a
   run against a stale snapshot converges on the newer state instead of
   overwriting it, and a second run is a no-op.
-- It takes the same two locks in the same order as the inbox worker — card rows
-  by id, then the consent address — so a run and a live delivery queue behind
-  each other instead of one committing inside the other's window. It re-checks
-  the matching set under those locks and writes only the rows it locked, for the
-  same reason the live projection does; a candidate whose card set moved
-  restarts its own transaction, and one that keeps moving is counted as
-  `unsettled` rather than reported as a no-op.
-- A refusal it writes is also **projected onto the card flag**, in the refusing
-  direction only. Without that a run left the ledger refusing and
+- Each candidate is written in **two transactions**, for the same reason the
+  live path is split: the ledger first, under the address lock alone, and then
+  the card flags — card rows by id, then the consent address, writing only the
+  rows it locked. The refusal is therefore durable before any card is touched,
+  which is also what lets every writer that commits afterwards read it and
+  carry it; while the two shared one transaction there was an interleaving
+  nobody covered, and a run that gave up left a known STOP with no durable
+  refusal at all.
+- A refusal it writes is also projected onto the card flags it locked, in the
+  refusing direction only, through the same `converge_cards_with_ledger` every
+  card writer uses. `cards_converged` counts them.
+- Without that convergence a run left the ledger refusing and
   `Client.wa_opted_out` saying sendable, which is the refusal being ignored by
-  everything except the new consent guard. A card that already refuses is not
-  restamped: `wa_opted_out_at` and `wa_opt_out_reason` say when and why somebody
-  refused, not when a reconciliation noticed. Queued marketing jobs are **not**
+  everything except the new consent guard. Queued marketing jobs are **not**
   cancelled — that is one of the inbox worker's business actions and §46.4.4
   keeps this module out of them; the outbox re-reads the flag before it sends.
 - A historical START is never projected. Its authenticity is unrecoverable from
@@ -777,12 +801,14 @@ batch, and two callbacks naming the same identifiers in opposite payload order.
 The serialisation of the card projection is covered by starting the competing
 decision inside the projection's own window and then asserting, through
 `pg_locks`, that it is **waiting** — if it could run, the window would still be
-open. The card-set stabilisation is covered the same way, with the real identity
-path on both sides: a contact proof moves a card onto one of the delivery's
-addresses after the pre-lock, a second proof of the same booking takes that row
-and queues on the consent lock, and the test asserts the restart, the refusal on
-every matching card, the campaign classifier's verdict for the recipient no
-proof touched, and that the event finished. Reverting the fix reproduces the
+open. The card-writer protocol is covered with the **real writers**, not with a
+stand-in: the production Altegio importer moves an existing card onto a refused
+address and creates a fresh one there, the identity path moves a card inside a
+projection's own window, and a second proof of the same booking takes that row
+and queues on the consent lock. Each test asserts the ledger, the card flag, the
+reason label, `compute_excluded_reason`'s actual verdict, the event's status and
+the absence of any external send. Reverting the convergence leaves the flag
+false with the ledger refusing; reverting the id-scoped write reproduces the
 reported `deadlock detected` exactly — one process waiting for the advisory
 lock, the other for the row. The release of the delivery locks is asserted from inside the external
 call itself: the acknowledgement probes the batch header with

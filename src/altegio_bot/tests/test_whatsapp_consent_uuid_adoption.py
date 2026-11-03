@@ -210,9 +210,13 @@ async def test_the_binding_claims_nothing_about_who_the_person_is(session_maker,
         card = cards[0]
         assert card.company_id == TEST_LOCATION_ID
         assert card.altegio_client_id == TEST_CUSTOMER_ID
-        # The refusal did not become an opt-out on the card either: the ledger
-        # is where it lives, and the legacy flag is not written from it here.
-        assert card.wa_opted_out is False
+        # The card now CARRIES the refusal, which is the point of the card
+        # protocol: the ledger is the authority, but ``Client.wa_opted_out`` is
+        # what every campaign path reads, and a card adopted in front of a
+        # refusal that says nothing would let marketing through. Written in the
+        # refusing direction only, by the writer that holds the row.
+        assert card.wa_opted_out is True
+        assert card.wa_opt_out_reason == "wa:consent_ledger"
         assert await session.scalar(select(func.count()).select_from(WhatsAppConsentSuppression)) == 1
 
     decision = None
@@ -970,28 +974,33 @@ async def test_a_card_moving_onto_an_address_mid_projection_does_not_deadlock(se
     booking = _booking_of(payload)
 
     real = wa_worker._card_ids_matching
-    state: dict[str, object] = {"moved": False, "task": None, "locked_first": None, "restarts": 0}
+    state: dict[str, object] = {"moved": False, "task": None, "locked_first": None}
 
     async def _patched(session, phones, *, lock: bool):
         ids = await real(session, phones, lock=lock)
-        if lock:
-            if not state["moved"]:
-                state["moved"] = True
-                state["locked_first"] = set(ids)
-                # The first proof: it moves the card onto this delivery's first
-                # address and commits, entirely outside the projection.
-                assert await identity.resolve_webhook_identity(
-                    session_maker,
-                    event_id=_first_event,
-                    booking=booking,
-                    reader=Reader(payload, session_maker, check_lock=False),
-                )
-            else:
-                state["restarts"] = int(state["restarts"]) + 1
-        elif state["task"] is None:
+        if lock and not state["moved"]:
+            state["moved"] = True
+            state["locked_first"] = set(ids)
+            # The first proof: it moves the card onto this delivery's first
+            # address and commits, entirely outside the projection — and brings
+            # the ledger's refusal with it, because that is now the writer's
+            # obligation rather than something a later projection has to notice.
+            assert await identity.resolve_webhook_identity(
+                session_maker,
+                event_id=_first_event,
+                booking=booking,
+                reader=Reader(payload, session_maker, check_lock=False),
+            )
+        return ids
+
+    real_lock = wa_worker.lock_consent_addresses
+
+    async def _patched_lock(session, addresses):
+        locked = await real_lock(session, addresses)
+        if state["task"] is None:
             # The projection now holds the consent locks. The second proof takes
             # the moved card row and queues on the consent lock — which is the
-            # moment the old code asked for that same row.
+            # moment the old code asked for that same row from the other side.
             state["task"] = asyncio.create_task(
                 identity.resolve_webhook_identity(
                     session_maker,
@@ -1001,9 +1010,10 @@ async def test_a_card_moving_onto_an_address_mid_projection_does_not_deadlock(se
                 )
             )
             await _wait_until_a_transaction_is_queued(session_maker)
-        return ids
+        return locked
 
     monkeypatch.setattr(wa_worker, "_card_ids_matching", _patched)
+    monkeypatch.setattr(wa_worker, "lock_consent_addresses", _patched_lock)
     provider = _CaptureProvider()
     await _process_whatsapp(session_maker, delivery, provider)
     assert await asyncio.wait_for(state["task"], timeout=60) is True
@@ -1014,8 +1024,7 @@ async def test_a_card_moving_onto_an_address_mid_projection_does_not_deadlock(se
         moved_card_id = int(
             await session.scalar(select(Client.id).where(Client.phone_e164 == PHONE, Client.provider == "easyweek"))
         )
-    assert moved_card_id not in state["locked_first"]
-    assert int(state["restarts"]) >= 1, "the moved set has to force a restart"
+    assert moved_card_id not in state["locked_first"], "the pre-lock really did miss it"
 
     # Both refusals are durable and both cards agree with them.
     for address in (PHONE, THIRD_PHONE):
@@ -1096,12 +1105,14 @@ async def test_the_same_delivery_processed_again_changes_nothing(session_maker, 
     assert _marketing_verdict(third) == "opted_out"
 
 
-async def test_the_historical_projection_restarts_on_a_moved_card_set(session_maker, monkeypatch) -> None:
+async def test_the_historical_projection_survives_a_moved_card_set(session_maker, monkeypatch) -> None:
     """The same protocol on the reconciliation path.
 
-    Its write is scoped to the rows it locked and its set is re-checked under
-    the consent lock, so a card moving onto the candidate's address restarts the
-    candidate's transaction instead of taking a row lock out of order.
+    Its write is scoped to the rows it locked, so no row lock follows a consent
+    lock. A card moving onto the candidate's address in that window is not left
+    behind and does not cost the candidate its transaction: the proof that moves
+    it converges it against the ledger itself. The refusal lands once, the flag
+    lands with it, and nothing is reported as unsettled.
     """
     import altegio_bot.whatsapp_consent_projection as projection_module
 
@@ -1122,33 +1133,277 @@ async def test_the_historical_projection_restarts_on_a_moved_card_set(session_ma
     booking = _booking_of(payload)
 
     real = projection_module._card_ids_matching
-    state: dict[str, object] = {"moved": False, "restarts": 0}
+    state: dict[str, object] = {"moved": False, "locked_first": None}
 
     async def _patched(session, address, *, lock: bool):
         ids = await real(session, address, lock=lock)
-        if lock and address == PHONE:
-            if not state["moved"]:
-                state["moved"] = True
-                assert await identity.resolve_webhook_identity(
-                    session_maker,
-                    event_id=_first_event,
-                    booking=booking,
-                    reader=Reader(payload, session_maker, check_lock=False),
-                )
-            else:
-                state["restarts"] = int(state["restarts"]) + 1
+        if lock and address == PHONE and not state["moved"]:
+            state["moved"] = True
+            state["locked_first"] = set(ids)
+            assert await identity.resolve_webhook_identity(
+                session_maker,
+                event_id=_first_event,
+                booking=booking,
+                reader=Reader(payload, session_maker, check_lock=False),
+            )
         return ids
 
     monkeypatch.setattr(projection_module, "_card_ids_matching", _patched)
     report = await projection_module.project(session_maker, apply=True)
 
     assert state["moved"] is True
-    assert int(state["restarts"]) >= 1
-    assert report.refusals_unsettled == 0
-    assert report.cards_converged >= 1
+    assert state["locked_first"] == set(), "the pre-lock really did find no card"
+    assert report.refusals_written == 1
+    row = await _suppression(session_maker, PHONE)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
     async with session_maker() as session:
         moved = (
             await session.execute(select(Client).where(Client.phone_e164 == PHONE, Client.provider == "easyweek"))
         ).scalar_one()
     assert moved.wa_opted_out is True
-    assert moved.wa_opt_out_reason == "wa:consent_projection"
+    assert _marketing_verdict(moved) == "opted_out"
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=PHONE)
+    assert guard.allowed is False
+
+
+async def test_a_card_moved_onto_a_refused_address_arrives_already_refused(session_maker) -> None:
+    """The window the review reproduced, at its widest: no projection at all.
+
+    The STOP is applied, the projection runs and finds no card, and only
+    afterwards does the real Altegio importer move an existing card onto that
+    number. No re-check inside the projection could have covered this — the
+    projection was over. The importer asks the ledger itself, which is why the
+    flag every campaign path reads agrees with the refusal.
+    """
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    card_id = await _altegio_card(session_maker, "+4915100000955", altegio_client_id=994777)
+    await _refuse(session_maker, PHONE)
+
+    async with session_maker() as session:
+        async with session.begin():
+            moved = await altegio_upsert(
+                session,
+                1,
+                {"id": 994777, "name": "Moved", "phone": PHONE},
+            )
+    assert moved == card_id, "the real importer moved the existing card"
+
+    async with session_maker() as session:
+        card = await session.get(Client, card_id)
+    assert card.phone_e164 == PHONE
+    assert card.wa_opted_out is True
+    assert card.wa_opt_out_reason == "wa:consent_ledger"
+    assert _marketing_verdict(card) == "opted_out"
+
+
+async def test_a_brand_new_card_on_a_refused_address_is_refused_too(session_maker) -> None:
+    """The same obligation when the row is created rather than moved."""
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    await _refuse(session_maker, PHONE)
+    async with session_maker() as session:
+        async with session.begin():
+            created = await altegio_upsert(
+                session,
+                1,
+                {"id": 994888, "name": "Fresh", "phone": PHONE},
+            )
+
+    async with session_maker() as session:
+        card = await session.get(Client, created)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+
+
+async def test_a_card_moved_onto_an_address_with_no_refusal_stays_sendable(session_maker) -> None:
+    """The negative half: the protocol only ever moves TO refusing."""
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    card_id = await _altegio_card(session_maker, "+4915100000956", altegio_client_id=994999)
+    async with session_maker() as session:
+        async with session.begin():
+            await altegio_upsert(session, 1, {"id": 994999, "name": "Clean", "phone": PHONE})
+
+    async with session_maker() as session:
+        card = await session.get(Client, card_id)
+    assert card.phone_e164 == PHONE
+    assert card.wa_opted_out is False
+    assert card.wa_opt_out_reason is None
+    assert _marketing_verdict(card) is None
+
+
+async def test_the_importer_does_not_restamp_a_card_that_already_refuses(session_maker) -> None:
+    """``wa_opted_out_at`` says when somebody refused, not when an import ran."""
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    stamped = datetime.now(timezone.utc) - timedelta(days=9)
+    async with session_maker() as session:
+        async with session.begin():
+            card = Client(
+                provider="altegio",
+                company_id=1,
+                altegio_client_id=995111,
+                phone_e164="+4915100000957",
+                display_name="Already out",
+                raw={},
+                wa_opted_out=True,
+                wa_opted_out_at=stamped,
+                wa_opt_out_reason="wa:stop",
+            )
+            session.add(card)
+            await session.flush()
+            card_id = int(card.id)
+    await _refuse(session_maker, PHONE)
+
+    async with session_maker() as session:
+        async with session.begin():
+            await altegio_upsert(session, 1, {"id": 995111, "name": "Already out", "phone": PHONE})
+
+    async with session_maker() as session:
+        after = await session.get(Client, card_id)
+    assert after.wa_opted_out is True
+    assert after.wa_opted_out_at == stamped
+    assert after.wa_opt_out_reason == "wa:stop"
+
+
+async def test_a_stable_recipient_is_never_left_allowed_by_another_address_moving(session_maker, monkeypatch) -> None:
+    """The review's second scenario, with the real importer in every window.
+
+    One delivery carries a STOP for three addresses whose cards keep moving and
+    for one stable recipient. The projection used to roll its whole transaction
+    back when a card set moved and, after three attempts, give up — leaving even
+    the stable recipient with the ledger refusing and the card flag saying
+    sendable, the event `processed` with a `card_set_unstable` error and nothing
+    scheduled to finish the job.
+
+    There is no rollback any more, so the stable recipient is converged by the
+    projection and the moving ones by the importer that moves them. Every one of
+    the four ends refused, and the event carries no error.
+    """
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    movers = ["+4915100000961", "+4915100000962", "+4915100000963"]
+    stable = "+4915100000964"
+    parked = [
+        await _altegio_card(session_maker, f"+491510000097{index}", altegio_client_id=996000 + index)
+        for index in range(len(movers))
+    ]
+    stable_id = await _altegio_card(session_maker, stable, altegio_client_id=996100)
+    await _seed_whatsapp_sender(session_maker)
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "WABA-ADOPTION",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": WA_PNID},
+                            "messages": [
+                                {
+                                    "from": address.lstrip("+"),
+                                    "id": f"wamid.R5-{index}",
+                                    "timestamp": str(1_760_000_000 + index),
+                                    "type": "text",
+                                    "text": {"body": "STOP"},
+                                }
+                                for index, address in enumerate([*movers, stable])
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key="wa:r5-many",
+                status="received",
+                payload=payload,
+                inbound_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                received_at=now,
+            )
+            session.add(event)
+            await session.flush()
+            await record_inbound_receipts(
+                session,
+                dedupe_key=str(event.dedupe_key),
+                event_id=int(event.id),
+                payload=payload,
+                signature_verified=True,
+                observed_at=now,
+                allowed_phone_number_ids={WA_PNID},
+            )
+            delivery = int(event.id)
+
+    real = wa_worker._card_ids_matching
+    moved: list[str] = []
+
+    async def _patched(session, phones, *, lock: bool):
+        ids = await real(session, phones, lock=lock)
+        if lock and len(moved) < len(movers):
+            # One real card move per pass, through the production importer, in
+            # exactly the window the review used.
+            index = len(moved)
+            moved.append(movers[index])
+            async with session_maker() as writer:
+                async with writer.begin():
+                    await altegio_upsert(
+                        writer,
+                        1,
+                        {"id": 996000 + index, "name": "Mover", "phone": movers[index]},
+                    )
+        return ids
+
+    monkeypatch.setattr(wa_worker, "_card_ids_matching", _patched)
+    provider = _CaptureProvider()
+    await _process_whatsapp(session_maker, delivery, provider)
+
+    assert moved == movers[:1], "one window per projection transaction, and there is only one"
+    # Whatever moved and whatever did not, all four refusals are durable and all
+    # four cards agree with them.
+    for address in [*movers, stable]:
+        row = await _suppression(session_maker, address)
+        assert row is not None, address
+        assert row.state == CONSENT_STATE_OPTED_OUT, address
+    async with session_maker() as session:
+        event = await session.get(WhatsAppEvent, delivery)
+        stable_card = await session.get(Client, stable_id)
+        first_mover = await session.get(Client, parked[0])
+    assert event.status == "processed"
+    assert event.error is None
+    assert stable_card.wa_opted_out is True
+    assert _marketing_verdict(stable_card) == "opted_out"
+    assert first_mover.phone_e164 == movers[0]
+    assert first_mover.wa_opted_out is True
+    assert _marketing_verdict(first_mover) == "opted_out"
+    async with session_maker() as session:
+        for address in [*movers, stable]:
+            guard = await final_send_guard(session, phone=address)
+            assert guard.allowed is False, address
+
+
+async def test_the_importer_moving_a_card_twice_is_idempotent(session_maker) -> None:
+    """Running the same import again changes nothing and loses nothing."""
+    from altegio_bot.workers.inbox_worker import upsert_client as altegio_upsert
+
+    card_id = await _altegio_card(session_maker, "+4915100000981", altegio_client_id=997001)
+    await _refuse(session_maker, PHONE)
+    for _ in range(2):
+        async with session_maker() as session:
+            async with session.begin():
+                await altegio_upsert(session, 1, {"id": 997001, "name": "Twice", "phone": PHONE})
+
+    async with session_maker() as session:
+        card = await session.get(Client, card_id)
+        rows = list((await session.scalars(select(WhatsAppConsentSuppression))).all())
+    assert card.wa_opted_out is True
+    assert len(rows) == 1
+    assert _marketing_verdict(card) == "opted_out"

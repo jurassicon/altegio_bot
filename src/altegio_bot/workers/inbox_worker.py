@@ -26,6 +26,7 @@ from altegio_bot.perf import perf_log
 from altegio_bot.promo_discount_apply import should_suppress_promo_origin_record_update, try_apply_promo_discount
 from altegio_bot.service_filter import record_has_allowed_service
 from altegio_bot.settings import settings
+from altegio_bot.whatsapp_consent_cards import converge_cards_with_ledger
 
 logger = logging.getLogger("inbox_worker")
 TZ = ZoneInfo("Europe/Belgrade")
@@ -519,7 +520,25 @@ async def upsert_client(
         .returning(Client.id)
     )
     res = await session.execute(stmt)
-    return int(res.scalar_one())
+    client_id = int(res.scalar_one())
+
+    # §46.4.3 — this row may have just started matching a refusal that is
+    # already on disk, and the flag below is what every campaign path reads.
+    #
+    # An import moving a phone from one number to another is a real, ordinary
+    # writer that knows nothing about consent, so the consent locks could not
+    # order it: a card moved onto a refused address between a projection's read
+    # and its write was excluded from that write, the ledger refused, this flag
+    # stayed false, and `compute_excluded_reason` went on allowing marketing to
+    # somebody who had said stop. The obligation therefore sits here, with the
+    # transaction that holds the row: ask the ledger, and carry its refusal.
+    #
+    # Taken AFTER the row write, which is the one lock order this project keeps
+    # (card rows, then consent). Refusing direction only; nothing here can lift
+    # a refusal or restamp a card that already carries one.
+    if phone:
+        await converge_cards_with_ledger(session, addresses=[phone], card_ids=[client_id])
+    return client_id
 
 
 async def upsert_record(

@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
@@ -80,12 +80,17 @@ from altegio_bot.whatsapp_consent import (
     ledger_state,
     normalize_wa_address,
 )
+from altegio_bot.whatsapp_consent_cards import converge_cards_with_ledger
 
 logger = logging.getLogger("whatsapp_consent_projection")
 
 ORIGIN_CLIENT_FLAG = "client_wa_opted_out"
 ORIGIN_RECIPIENT_FLAG = "campaign_recipient_is_opted_out"
 ORIGIN_STORED_EVENT = "stored_whatsapp_event"
+
+# Why a card flag was set by a reconciliation run rather than by a message. An
+# operator reading the card should be able to tell the two apart.
+REASON_PROJECTION = "wa:consent_projection"
 
 # Why a candidate was listed but not projected.
 SKIP_ALREADY_SUPPRESSED = "already_suppressed"
@@ -174,7 +179,6 @@ class ProjectionReport:
     refusals_written: int = 0
     refusals_noop: int = 0
     refusals_superseded: int = 0
-    refusals_unsettled: int = 0
     cards_converged: int = 0
     newly_suppressed_addresses: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
@@ -202,7 +206,6 @@ class ProjectionReport:
                 "written": self.refusals_written,
                 "noop": self.refusals_noop,
                 "superseded": self.refusals_superseded,
-                "unsettled": self.refusals_unsettled,
                 "cards_converged": self.cards_converged,
                 "newly_suppressed_addresses": self.newly_suppressed_addresses,
                 "by_origin": dict(sorted(self.by_origin.items())),
@@ -228,17 +231,6 @@ def _bump(counter: dict[str, int], key: str) -> None:
     counter[key] = counter.get(key, 0) + 1
 
 
-class CardSetMoved(Exception):
-    """A card started matching this address after its rows were locked.
-
-    Raised so the candidate's transaction rolls back — releasing every lock it
-    holds — and is attempted again from the top. The new row cannot be locked
-    where it was noticed, because that lock would come AFTER the consent lock
-    and invert the one order this project keeps; and it cannot be left alone
-    either, because a card the ledger refuses must not read as sendable.
-    """
-
-
 async def _card_ids_matching(session: AsyncSession, address: str, *, lock: bool) -> set[int]:
     """The card rows this address matches right now, optionally locking them.
 
@@ -247,10 +239,11 @@ async def _card_ids_matching(session: AsyncSession, address: str, *, lock: bool)
     the inbox worker's projection take the same two in the same order, so a run
     of this reconciliation queues behind them instead of crossing them.
 
-    ``lock=False`` is the re-check under the consent lock. ``FOR UPDATE`` only
-    protects the rows that matched when it ran, and a concurrent contact proof
-    can move a card onto this address afterwards; the re-check is what turns the
-    locked set from an assumption into a checked fact.
+    ``lock=False`` is a plain read, for reporting. It is deliberately NOT used
+    to re-decide the write set: ``FOR UPDATE`` protects the rows that matched
+    when it ran, and a card that starts matching later arrives already carrying
+    the refusal, because every path that creates a card or moves a phone
+    converges it against the ledger itself (see ``whatsapp_consent_cards``).
     """
     variants = address_variants(address)
     if not variants:
@@ -259,47 +252,6 @@ async def _card_ids_matching(session: AsyncSession, address: str, *, lock: bool)
     if lock:
         statement = statement.with_for_update()
     return {int(value) for value in (await session.scalars(statement)).all()}
-
-
-async def _converge_cards(session: AsyncSession, address: str, *, card_ids: set[int], now: datetime) -> int:
-    """Bring the legacy card flag into line with a refusal that is now active.
-
-    The refusing direction only, and the reason it has to happen HERE is that
-    this module writes the ledger. Without it a run left the ledger refusing and
-    ``Client.wa_opted_out`` saying sendable — and that flag is what
-    ``message_planner``, the outbox worker and every campaign path read, so the
-    disagreement was the refusal being ignored by everything except the new
-    consent guard. It is the same projection the inbox worker performs, taken
-    under the same two locks, so the two cannot end up disagreeing.
-
-    A card that already refuses is left untouched: ``wa_opted_out_at`` and
-    ``wa_opt_out_reason`` say when and why somebody refused, and restamping them
-    from a reconciliation would overwrite that history with the time of the run.
-
-    Queued marketing jobs are deliberately NOT cancelled. That is one of the
-    inbox worker's business actions and §46.4.4 keeps this module out of them;
-    the outbox re-reads the flag before it sends, so the refusal still vetoes.
-
-    Restricted to ``card_ids`` — the rows this transaction locked before it took
-    the consent lock. Matching by phone alone could reach a card that started
-    matching afterwards, and taking that row's lock here would invert the order
-    and deadlock against the very contact proof that moved it.
-    """
-    variants = address_variants(address)
-    if not variants or not card_ids:
-        return 0
-    result = await session.execute(
-        update(Client)
-        .where(Client.phone_e164.in_(variants))
-        .where(Client.id.in_(sorted(card_ids)))
-        .where(Client.wa_opted_out.is_(False))
-        .values(
-            wa_opted_out=True,
-            wa_opted_out_at=now,
-            wa_opt_out_reason="wa:consent_projection",
-        )
-    )
-    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def _collect_client_flags(session: AsyncSession, report: ProjectionReport) -> list[RefusalCandidate]:
@@ -698,26 +650,7 @@ async def project(
     for candidate in candidates:
         if not candidate.projectable:
             continue
-        written = None
-        for attempt in range(_CARD_SET_ATTEMPTS):
-            try:
-                written = await _write_one_refusal(session_maker, candidate)
-            except CardSetMoved as moved:
-                logger.warning(
-                    "consent_projection: restarting a candidate, %s (attempt %s)",
-                    moved,
-                    attempt + 1,
-                )
-                continue
-            break
-        if written is None:
-            # The matching card set kept moving. The ledger write rolled back
-            # with it, so nothing half-applied is left behind, and the candidate
-            # is reported as unsettled rather than as a no-op.
-            logger.error("consent_projection: gave up on a candidate whose card set kept moving")
-            report.refusals_unsettled += 1
-            continue
-        outcome, converged, was_suppressed = written
+        outcome, converged, was_suppressed = await _write_one_refusal(session_maker, candidate)
         report.cards_converged += converged
         if outcome.applied:
             report.refusals_written += 1
@@ -741,30 +674,33 @@ async def project(
     return report
 
 
-# How many times one candidate's transaction is started again when the set of
-# matching card rows moved under its locks. Each restart needs another committed
-# contact change onto that address inside the span of two statements.
-_CARD_SET_ATTEMPTS = 3
-
-
 async def _write_one_refusal(
     session_maker: async_sessionmaker[AsyncSession],
     candidate: RefusalCandidate,
 ) -> tuple[DecisionOutcome, int, bool]:
-    """One candidate, one transaction, in the one lock order.
+    """One candidate, in TWO transactions, for the same reason the live path is.
 
-    Card rows first, then the consent address inside
-    :func:`apply_projected_refusal`, then the re-check that proves the locked
-    set still is the set being written, and only then the card write — scoped to
-    the rows that were locked. A restart releases every lock and takes the full
-    set again from the top, which a retry that kept its locks could not do.
+    The first writes the ledger under the address lock and nothing else, and
+    commits. The second brings the legacy card flags into line: card rows first,
+    then the consent lock, writing only the rows it locked.
+
+    The split is what closes the last window. A card writer can only carry a
+    refusal that is already on disk, so while the refusal and the card write
+    shared one transaction there was an interleaving nobody covered: a contact
+    proof taking the consent lock first read "no refusal", committed its moved
+    card unconverged, and the projection's own locked set — taken before that
+    commit — did not include it. With the refusal committed first, every writer
+    that commits afterwards reads it and converges its own row, and the rows
+    that already existed are converged here.
+
+    It also makes the refusal durable on its own: if the second transaction
+    fails, a known STOP is still recorded, and the next run converges the flag.
 
     Returns the ledger outcome, how many card flags were converged, and whether
     this person was already unsendable before the write.
     """
     async with session_maker() as session:
         async with session.begin():
-            locked_ids = await _card_ids_matching(session, candidate.wa_address, lock=True)
             before = await consent_decision(
                 session,
                 phone=candidate.wa_address,
@@ -783,15 +719,17 @@ async def _write_one_refusal(
                     notes={key: value for key, value in candidate.notes.items() if value is not None},
                 ),
             )
-            if await _card_ids_matching(session, candidate.wa_address, lock=False) != locked_ids:
-                raise CardSetMoved(f"{len(locked_ids)} card rows were locked, the match set has changed")
-            converged = 0
-            if outcome.state == CONSENT_STATE_OPTED_OUT:
-                converged = await _converge_cards(
+
+    converged = 0
+    if outcome.state == CONSENT_STATE_OPTED_OUT:
+        async with session_maker() as session:
+            async with session.begin():
+                locked_ids = await _card_ids_matching(session, candidate.wa_address, lock=True)
+                converged = await converge_cards_with_ledger(
                     session,
-                    candidate.wa_address,
+                    addresses=[candidate.wa_address],
                     card_ids=locked_ids,
-                    now=utcnow(),
+                    reason=REASON_PROJECTION,
                 )
     return outcome, converged, bool(before.suppressed)
 
@@ -873,7 +811,6 @@ __all__ = [
     "UNKNOWN_NO_ATTEMPT",
     "FailureCandidate",
     "ProjectionReport",
-    "CardSetMoved",
     "RefusalCandidate",
     "describe_failures",
     "project",

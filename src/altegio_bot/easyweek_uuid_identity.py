@@ -25,6 +25,7 @@ from altegio_bot.easyweek_migration.customers import normalized_international_ph
 from altegio_bot.easyweek_normalizer import NormalizedBooking, normalize_event
 from altegio_bot.models.models import Client, EasyWeekEvent
 from altegio_bot.whatsapp_consent import extend_refusal_to_uuid
+from altegio_bot.whatsapp_consent_cards import converge_cards_with_ledger
 
 
 class UUIDIdentityResolutionRequired(Exception):
@@ -212,20 +213,20 @@ async def resolve_webhook_identity(
                 client.wa_opt_out_reason = opted_out.wa_opt_out_reason
             # Opt-out, its audit, visits and every other branch stay intact.
         else:
-            session.add(
-                Client(
-                    provider="easyweek",
-                    company_id=booking.company_id,
-                    altegio_client_id=booking.customer_id,
-                    easyweek_customer_uuid=identity,
-                    phone_e164=proven_phone,
-                    display_name=booking.display_name,
-                    raw={},
-                    wa_opted_out=any(row.wa_opted_out for row in rows),
-                    wa_opted_out_at=next((row.wa_opted_out_at for row in rows if row.wa_opted_out), None),
-                    wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
-                )
+            client = Client(
+                provider="easyweek",
+                company_id=booking.company_id,
+                altegio_client_id=booking.customer_id,
+                easyweek_customer_uuid=identity,
+                phone_e164=proven_phone,
+                display_name=booking.display_name,
+                raw={},
+                wa_opted_out=any(row.wa_opted_out for row in rows),
+                wa_opted_out_at=next((row.wa_opted_out_at for row in rows if row.wa_opted_out), None),
+                wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
             )
+            session.add(client)
+            await session.flush()
         if stale_contact:
             # Consume the same event's business changes atomically with the
             # proven contact. Otherwise the next pass would restore/re-prove
@@ -249,4 +250,14 @@ async def resolve_webhook_identity(
         # were read BEFORE the number changed, so moving the call does not
         # change what is bound.
         await extend_refusal_to_uuid(session, addresses=consent_addresses, customer_uuid=identity)
+        # §46.4.3 — and the same obligation every card writer now carries: the
+        # card this proof just adopted or created may be standing in front of a
+        # refusal that is already on disk, and the flag below is what every
+        # campaign path reads. Asked with the rows already held and the consent
+        # locks already taken, so it adds no lock and no new order.
+        await converge_cards_with_ledger(
+            session,
+            addresses=consent_addresses,
+            card_ids={int(row.id) for row in rows if row.id is not None} | {int(client.id)},
+        )
         return True

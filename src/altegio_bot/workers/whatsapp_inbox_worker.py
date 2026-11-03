@@ -1272,28 +1272,22 @@ async def _apply_inbound_command_flags(
         # (cards under ``FOR UPDATE``, then — last of all — the consent address
         # locks), so this adds no cycle.
         #
-        # And the locked SET is then re-checked, because ``FOR UPDATE`` only
-        # protects the rows that matched when it ran. A concurrent, entirely
-        # legitimate contact proof can move a card ONTO one of these addresses
-        # afterwards; a write that matched by phone would then take that row's
-        # lock after the consent locks, inverting the order and deadlocking
-        # against the proof that moved it. The whole projection was the deadlock
-        # victim: the ledger refused, the receipts were resolved, every card in
-        # the delivery stayed sendable and the event stayed `processing` with no
-        # recovery pass to pick it up.
+        # The writes below touch only the ids locked here, so no row lock is
+        # ever taken after a consent lock. That is what keeps the one order
+        # (card rows, then consent) intact and what stops the projection from
+        # deadlocking against a contact proof that moves a card onto one of
+        # these addresses.
         #
-        # Two things close that. The writes below touch only the ids locked
-        # here, so no row lock can ever be taken after a consent lock; and the
-        # set is compared again under those locks, so a card that appeared is
-        # neither missed nor silently dropped — the transaction restarts and
-        # locks it first.
+        # A card that starts matching AFTER this read is deliberately not this
+        # transaction's business, and re-reading the set here would not make it
+        # so: a consent lock orders only the transactions that take it, and the
+        # client importer does not take one. The obligation sits with the writer
+        # instead — ``converge_cards_with_ledger`` is called by every path that
+        # creates a card or moves a phone, with the row already held and the
+        # consent locks taken last, so such a card arrives already carrying the
+        # refusal. See ``whatsapp_consent_cards``.
         locked_ids = await _card_ids_matching(session, effective, lock=True)
         await lock_consent_addresses(session, effective)
-        if await _card_ids_matching(session, effective, lock=False) != locked_ids:
-            raise _CardSetMoved(
-                f"{len(locked_ids)} card rows were locked, the match set has changed",
-                commands=effective,
-            )
 
     results: dict[str, CommandProjection] = {}
     for phone, cmd in effective.items():
@@ -1328,26 +1322,6 @@ async def _card_ids_matching(session: AsyncSession, phones: Collection[str], *, 
     if lock:
         statement = statement.with_for_update()
     return {int(value) for value in (await session.scalars(statement)).all()}
-
-
-class _CardSetMoved(Exception):
-    """A card started matching one of these addresses after it was locked.
-
-    Raised so the whole projection transaction rolls back — releasing every lock
-    it holds — and is attempted again from the top. Retrying is the only honest
-    answer available: the new row cannot be locked here, because that lock would
-    come AFTER the consent locks and invert the one order this project keeps;
-    skipping it would leave a card the ledger refuses reading as sendable; and
-    abandoning the transaction would leave every other address in the delivery
-    unconverged.
-
-    Carries the commands the attempt was about, so a caller that runs out of
-    attempts can still report them as not projected rather than as absent.
-    """
-
-    def __init__(self, message: str, *, commands: dict[str, str]) -> None:
-        super().__init__(message)
-        self.commands = dict(commands)
 
 
 # How many times an UNSERIALISED projection re-derives itself when the ledger
@@ -1452,13 +1426,6 @@ async def _project_ledger_onto_card(
     )
 
 
-# How many times the projection transaction is started again when the set of
-# matching card rows moved under its locks. Each retry needs another committed
-# contact change onto one of this delivery's addresses inside the span of two
-# statements, so a third one means something other than ordinary traffic.
-_CARD_SET_ATTEMPTS: Final = 3
-
-
 async def project_inbound_commands(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -1480,53 +1447,15 @@ async def project_inbound_commands(
     from the parsed payload, exactly as this worker read them before the
     receipts existed.
 
-    Started again, from the top, when the set of matching card rows moved under
-    the locks. The restart is the point: it releases every lock this transaction
-    held and then takes the full set again in the one order, which a retry that
-    kept its locks could not do.
+    One transaction, once. There is no retry loop and nothing to be left
+    unsettled: the set of card rows this transaction writes is the set it
+    locked, and a card that starts matching later carries the refusal from its
+    own writer rather than waiting for a projection to come back for it. An
+    earlier version restarted the whole transaction when that set moved, which
+    could run out of attempts and then leave every address in the delivery —
+    including the ones whose cards never moved — with the ledger refusing and
+    the card flag saying sendable.
     """
-    unsettled: dict[str, str] = {}
-    for attempt in range(_CARD_SET_ATTEMPTS):
-        try:
-            return await _project_inbound_commands_once(session_maker, event_id=event_id)
-        except _CardSetMoved as moved:
-            unsettled = moved.commands
-            logger.warning(
-                "consent projection restarting: %s event_id=%s attempt=%s",
-                moved,
-                event_id,
-                attempt + 1,
-            )
-    # Out of attempts. The ledger's refusal is already durable and is what the
-    # consent guard reads, so nothing this phase sends can reach these people;
-    # what is missing is the legacy flag on a card that keeps moving, and the
-    # historical reconciliation converges exactly that.
-    #
-    # Reported per address as a projection that did NOT settle, which is also
-    # what withholds the acknowledgement: confirming a command whose own
-    # projection never landed would be a sentence this database cannot back.
-    # The counters are zeroes because nothing was written, not because nothing
-    # matched.
-    logger.error("consent projection gave up: the card set kept moving event_id=%s", event_id)
-    return {
-        phone: CommandProjection(
-            command=cmd,
-            ledger_state=None,
-            opted_out=False,
-            clients_updated=0,
-            jobs_canceled=0,
-            agreed=False,
-            refusal_reason="card_set_unstable",
-        )
-        for phone, cmd in unsettled.items()
-    }
-
-
-async def _project_inbound_commands_once(
-    session_maker: async_sessionmaker[AsyncSession],
-    *,
-    event_id: int,
-) -> dict[str, CommandProjection]:
     async with session_maker() as session:
         async with session.begin():
             event = (

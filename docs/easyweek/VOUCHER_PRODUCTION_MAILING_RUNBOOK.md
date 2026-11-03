@@ -1632,10 +1632,11 @@ already in force is applied again on purpose, to move the boundary a later
 resubscribe has to beat, and is reported as a no-op because nothing about the
 person's state changed.
 
-`unsettled` counts candidates the run could not finish because the set of cards
-matching that address kept moving under its locks — an unusual, benign state: the
-ledger write rolls back with the attempt, so nothing half-applied is left, and a
-later run picks the candidate up again.
+A run writes each refusal in two steps — the ledger first, then the card flags
+it locked — so a refusal is durable even if the second step fails, and the next
+run converges the flag. A card that is moved onto a refused number by the
+ordinary client import carries the refusal itself, so it does not wait for a
+reconciliation at all.
 
 `superseded` never applies to a stored STOP message. A refusal somebody sent is
 not stale because of when this process received it — a signed START sent at
