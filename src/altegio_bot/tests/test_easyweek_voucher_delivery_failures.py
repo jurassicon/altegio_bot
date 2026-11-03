@@ -14,6 +14,7 @@ produce.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid as uuid_module
 from typing import Any
 
@@ -53,11 +54,13 @@ from altegio_bot.models.models import (
     VOUCHER_PRODUCTION_ITEM_READ,
     VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED,
     VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
+    EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
     MessageJob,
     OutboxMessage,
+    WhatsAppConsentSuppression,
     WhatsAppEvent,
 )
 from altegio_bot.settings import settings
@@ -1444,3 +1447,281 @@ async def test_a_delivered_in_the_same_payload_still_outranks_its_own_failure(
     assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
     assert facts[0].evidence.get("conflict") == CONFLICT_AFTER_SUCCESS
     assert item.evidence.get("confirmed_delivery_failure") is not True
+
+
+# ===========================================================================
+# Round 3, review fix 4 — the locks are gone before anything external happens
+# ===========================================================================
+
+
+def _mixed_delivery_payload(
+    *entries: tuple[str, str],
+    recipient: str,
+    inbound_text: str | None = None,
+    inbound_from: str = "4915177991001",
+    epoch: int = 1_760_000_500,
+) -> dict[str, Any]:
+    """One delivery carrying statuses and, optionally, an inbound message.
+
+    Meta really does combine them, and the combination is the whole point: the
+    status half locks voucher batch headers, the inbound half makes external
+    calls.
+    """
+    statuses: list[dict[str, Any]] = []
+    for wamid, status in entries:
+        entry: dict[str, Any] = {
+            "id": wamid,
+            "status": status,
+            "timestamp": str(epoch),
+            "recipient_id": recipient,
+        }
+        if status == "failed":
+            entry["errors"] = [{"code": 131026, "title": "Message undeliverable"}]
+        statuses.append(entry)
+    value: dict[str, Any] = {
+        "metadata": {"phone_number_id": SENDER_PNID},
+        "statuses": statuses,
+    }
+    if inbound_text is not None:
+        value["messages"] = [
+            {
+                "from": inbound_from,
+                "id": f"wamid.INBOUND-{inbound_text[:6]}",
+                "timestamp": str(epoch),
+                "type": "text",
+                "text": {"body": inbound_text},
+            }
+        ]
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "WABA-PROD", "changes": [{"field": "messages", "value": value}]}],
+    }
+
+
+class _LockProbingProvider:
+    """A provider that checks, at the moment of the ACK, that the locks are gone.
+
+    This is the assertion the review asks for, taken from inside the external
+    call itself: the acknowledgement is where a slow WhatsApp or Chatwoot
+    response used to park while the batch header was still held, and
+    ``FOR UPDATE NOWAIT`` from another session is exactly how the executor finds
+    out — ``55P03``, a refused claim, an acceptance that cannot be saved and an
+    operator STOP that cannot be applied.
+    """
+
+    def __init__(self, session_maker, batch_id: int, wamids: tuple[str, ...]) -> None:
+        self.session_maker = session_maker
+        self.batch_id = batch_id
+        self.wamids = wamids
+        self.header_free: list[bool] = []
+        self.messages_free: list[bool] = []
+        self.sent: list[tuple[int, str, str]] = []
+
+    async def _probe(self) -> None:
+        from sqlalchemy import text as sql_text
+
+        from altegio_bot.campaigns.easyweek_voucher_production.delivery_evidence import _MESSAGE_LOCK_DOMAIN
+
+        async with self.session_maker() as probe:
+            async with probe.begin():
+                try:
+                    await probe.execute(
+                        select(EasyWeekVoucherProductionBatch)
+                        .where(EasyWeekVoucherProductionBatch.id == self.batch_id)
+                        .with_for_update(nowait=True)
+                    )
+                    self.header_free.append(True)
+                except Exception:
+                    self.header_free.append(False)
+        async with self.session_maker() as probe:
+            async with probe.begin():
+                taken = True
+                for wamid in self.wamids:
+                    key = int.from_bytes(
+                        hashlib.sha256(f"{_MESSAGE_LOCK_DOMAIN}:{wamid}".encode("utf-8", "surrogatepass")).digest()[:8],
+                        "big",
+                        signed=True,
+                    )
+                    got = await probe.scalar(sql_text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key})
+                    taken = taken and bool(got)
+                self.messages_free.append(taken)
+
+    async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+        await self._probe()
+        self.sent.append((sender_id, phone_e164, text))
+        return f"wamid.ACK{len(self.sent)}"
+
+    async def send_template(self, *args: Any, **kwargs: Any) -> str:  # pragma: no cover - not used here
+        raise AssertionError("no template is sent from an inbound command")
+
+
+async def _seed_inbound_sender(session_maker) -> None:
+    from altegio_bot.models.models import WhatsAppSender
+
+    async with session_maker() as session:
+        async with session.begin():
+            existing = await session.scalar(
+                select(WhatsAppSender.id).where(WhatsAppSender.phone_number_id == SENDER_PNID)
+            )
+            if existing is None:
+                session.add(
+                    WhatsAppSender(
+                        company_id=1,
+                        sender_code="probe",
+                        phone_number_id=SENDER_PNID,
+                        display_phone="+4930000009",
+                        is_active=True,
+                    )
+                )
+
+
+async def _run_mixed(session_maker, payload: dict[str, Any], provider: Any) -> int:
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key=f"wa:mixed-{uuid_module.uuid4().hex}",
+                status="received",
+                query={},
+                headers={},
+                payload=payload,
+                inbound_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+            )
+            session.add(event)
+            await session.flush()
+            event_id = int(event.id)
+
+    original = worker_module.SessionLocal
+    try:
+        worker_module.SessionLocal = session_maker  # type: ignore[assignment]
+        await worker_module.process_one_event(event_id, provider)
+    finally:
+        worker_module.SessionLocal = original
+    return event_id
+
+
+@pytest.mark.parametrize("status_kind", ["sent", "delivered", "read", "failed"])
+async def test_a_batch_header_is_free_while_the_acknowledgement_is_in_flight(
+    session_maker, production_configuration, binding_key, status_kind: str
+) -> None:
+    """The regression of review fix 4, for every status kind in one payload.
+
+    Before this phase a ``sent`` callback locked nothing. With the callback
+    scope declared up front it locked the batch header — and the transaction
+    then went on to acknowledge an inbound STOP over the network, holding it. A
+    delay at Meta or Chatwoot became a refused claim for the whole batch.
+    """
+    wamid = "wamid.R3FREE-" + status_kind.upper()
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid)
+    await _seed_inbound_sender(session_maker)
+
+    provider = _LockProbingProvider(session_maker, batch_id, (wamid,))
+    await _run_mixed(
+        session_maker,
+        _mixed_delivery_payload((wamid, status_kind), recipient=PHONES[0].lstrip("+"), inbound_text="STOP"),
+        provider,
+    )
+
+    assert len(provider.sent) == 1, "the inbound STOP really was acknowledged"
+    assert provider.header_free == [True], "the batch header was still locked during the ACK"
+    assert provider.messages_free == [True], "the message identifier was still locked during the ACK"
+
+
+async def test_the_callback_facts_are_already_committed_before_the_acknowledgement(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Releasing the locks early does not mean deciding anything later.
+
+    The evidence is written and committed in its own transaction, so it is on
+    disk before the first external call — which is also what makes an
+    acknowledgement that fails unable to roll it back.
+    """
+    wamid = "wamid.R3COMMITTED"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid)
+    await _seed_inbound_sender(session_maker)
+
+    observed: list[int] = []
+
+    class _Observer(_LockProbingProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            async with self.session_maker() as probe:
+                observed.append(
+                    int(
+                        await probe.scalar(select(func.count()).select_from(EasyWeekVoucherProductionDeliveryFailure))
+                        or 0
+                    )
+                )
+            return await super().send(sender_id, phone_e164, text, contact_name)
+
+    provider = _Observer(session_maker, batch_id, (wamid,))
+    await _run_mixed(
+        session_maker,
+        _mixed_delivery_payload((wamid, "failed"), recipient=PHONES[0].lstrip("+"), inbound_text="STOP"),
+        provider,
+    )
+
+    assert observed == [1], "the failure fact was not committed before the ACK"
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    item = await _item(session_maker, batch_id, 1)
+    assert facts[0].item_id == int(item.id)
+
+
+async def test_a_failing_acknowledgement_keeps_the_evidence_and_sends_once(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """An external failure after the evidence is committed changes none of it."""
+    wamid = "wamid.R3ACKFAIL"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid)
+    await _seed_inbound_sender(session_maker)
+    attempts: list[str] = []
+
+    class _Broken:
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            attempts.append(text)
+            raise RuntimeError("meta is down")
+
+        async def send_template(self, *args: Any, **kwargs: Any) -> str:  # pragma: no cover
+            raise AssertionError("no template here")
+
+    event_id = await _run_mixed(
+        session_maker,
+        _mixed_delivery_payload((wamid, "failed"), recipient=PHONES[0].lstrip("+"), inbound_text="STOP"),
+        _Broken(),
+    )
+
+    assert len(attempts) == 1, "exactly one attempt, and no second POST"
+    facts = await _facts(session_maker)
+    assert len(facts) == 1
+    assert facts[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    item = await _item(session_maker, batch_id, 1)
+    assert item.delivered_at is None
+    # The refusal itself survived the failure, which is §46.4.7.
+    async with session_maker() as session:
+        suppression = (
+            await session.execute(
+                select(WhatsAppConsentSuppression).where(WhatsAppConsentSuppression.wa_address == "+4915177991001")
+            )
+        ).scalar_one()
+        event = await session.get(WhatsAppEvent, event_id)
+    assert suppression.state == "opted_out"
+    assert event.status == "processed"
+    assert event.error is not None and "Ack send failed" in event.error
+
+
+async def test_a_statuses_only_payload_still_records_everything(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """No inbound half: the separate transaction must not change the outcome."""
+    wamid = "wamid.R3ONLY"
+    batch_id = await _one_sent_one_claimed(session_maker, first_wamid=wamid)
+
+    await _run_mixed(
+        session_maker,
+        _mixed_delivery_payload((wamid, "delivered"), recipient=PHONES[0].lstrip("+")),
+        _SilentProvider(),
+    )
+
+    item = await _item(session_maker, batch_id, 1)
+    assert item.delivered_at is not None
+    assert item.status in {VOUCHER_PRODUCTION_ITEM_DELIVERED, VOUCHER_PRODUCTION_ITEM_READ}

@@ -1621,14 +1621,23 @@ and reports what it could not establish. Applying it can make people newly
 unsendable whose later resubscribe cannot be proven; the dry run states that
 count first.
 
-The report's numbers describe what the writes did, and three of them are worth
+The report's numbers describe what the writes did, and four of them are worth
 reading together: `written` is refusals that really landed, `superseded` is
-candidates the run declined because a proven opt-in for that address had been
-observed after the source's own moment, and `newly_suppressed_addresses` counts
-people who were sendable before the run and are not after it. A rerun is a
-no-op; a stored STOP newer than the refusal already in force is applied again on
-purpose, to move the boundary a later resubscribe has to beat, and is reported
-as a no-op because nothing about the person's state changed.
+**snapshots** the run declined because a proven opt-in for that address had been
+observed after the snapshot's own moment, `cards_converged` is how many
+`Client.wa_opted_out` flags the run brought into line with a refusal it wrote,
+and `newly_suppressed_addresses` counts people who were sendable before the run
+and are not after it. A rerun is a no-op; a stored STOP newer than the refusal
+already in force is applied again on purpose, to move the boundary a later
+resubscribe has to beat, and is reported as a no-op because nothing about the
+person's state changed.
+
+`superseded` never applies to a stored STOP message. A refusal somebody sent is
+not stale because of when this process received it — a signed START sent at
+10:10 can arrive at 10:30 behind a STOP received at 10:20 — so a stored STOP
+whose timestamp cannot be read is applied, recorded as being of unknown order
+and therefore unliftable, exactly as it would be if the inbox worker had reached
+it first. The two paths cannot answer differently about one message.
 
 Note: with `META_APP_SECRET` unconfigured, no resubscribe can lift a refusal in
 the new ledger, because no signature is checked and an unverified START grants

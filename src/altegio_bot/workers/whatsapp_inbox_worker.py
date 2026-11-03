@@ -92,6 +92,7 @@ from altegio_bot.whatsapp_consent import (
     apply_inbound_consent,
     ledger_matches_clause,
     ledger_state,
+    lock_consent_addresses,
 )
 from altegio_bot.whatsapp_inbound_commands import START_KEYWORDS as _START_KEYWORDS
 from altegio_bot.whatsapp_inbound_commands import STOP_KEYWORDS as _STOP_KEYWORDS
@@ -1183,6 +1184,8 @@ class CommandProjection:
 async def _apply_inbound_command_flags(
     session: AsyncSession,
     commands: list[tuple[str, str]],
+    *,
+    serialised: bool = False,
 ) -> dict[str, CommandProjection]:
     """Project the LEDGER's answer onto the legacy card state, per address.
 
@@ -1236,6 +1239,29 @@ async def _apply_inbound_command_flags(
             continue
         effective[phone] = cmd
 
+    if serialised:
+        # Everything this projection will touch, locked before the first read,
+        # in the one global order this project uses: the CARD ROWS first, by
+        # ascending id, and then every consent address, sorted.
+        #
+        # Both halves were defects. Without the address locks there was a window
+        # after the last read of the ledger: the historical projection could
+        # commit a newer STOP while this transaction still had an older
+        # permission in flight, and the commit order then decided whether the
+        # card contradicted the ledger. Re-reading could not close it, because
+        # the gap is between the last read and the COMMIT. Without a fixed order
+        # over the card rows, two deliveries naming the same people in different
+        # orders — [STOP A, STOP B, STOP C] against [STOP B, STOP A] — each held
+        # what the other was waiting for; PostgreSQL aborted one, and ordinary
+        # inbound has no recovery pass, so the addresses only that delivery
+        # mentioned were left with the ledger refusing and the card sendable.
+        #
+        # ``resolve_webhook_identity`` takes the same two in the same order
+        # (cards under ``FOR UPDATE``, then ``extend_refusal_to_uuid``'s address
+        # locks), so this adds no cycle.
+        await _lock_card_rows(session, effective)
+        await lock_consent_addresses(session, effective)
+
     results: dict[str, CommandProjection] = {}
     for phone, cmd in effective.items():
         results[phone] = await _project_ledger_onto_card(
@@ -1243,15 +1269,35 @@ async def _apply_inbound_command_flags(
             phone=phone,
             cmd=cmd,
             requested=requested.get(phone, {cmd}),
+            serialised=serialised,
         )
     return results
 
 
-# How many times a projection re-derives itself when the ledger moves under it.
-# Not a guess: every extra round needs another consent decision for the same
-# address to have committed inside the span of two statements, so a third one
-# means something other than ordinary traffic is happening and reporting
-# "the state changed" is more honest than writing anything.
+async def _lock_card_rows(session: AsyncSession, phones: Collection[str]) -> None:
+    """Lock every card row this projection may update, in ascending id order.
+
+    One statement for the whole set, which is the point: the order is a property
+    of the id and not of the order the commands arrived in, so two transactions
+    touching overlapping people always queue rather than cross. The command
+    order itself is untouched — it decides what is applied, not what is locked
+    first.
+
+    Rows are locked even when nothing ends up changing them. That is cheaper
+    than it looks (one indexed read) and it is what makes the queueing
+    deterministic.
+    """
+    variants = sorted({variant for phone in phones for variant in _phone_variants(phone)})
+    if not variants:
+        return
+    await session.execute(
+        select(Client.id).where(Client.phone_e164.in_(variants)).order_by(Client.id.asc()).with_for_update()
+    )
+
+
+# How many times an UNSERIALISED projection re-derives itself when the ledger
+# moves under it. Only the direct in-transaction path uses more than one: under
+# the locks nothing can move, so one pass is the whole story.
 _PROJECTION_ATTEMPTS: Final = 3
 
 
@@ -1261,30 +1307,34 @@ async def _project_ledger_onto_card(
     phone: str,
     cmd: str,
     requested: Collection[str] = (),
+    serialised: bool = False,
 ) -> CommandProjection:
-    """Derive one address's legacy card state from the ledger, then prove it held.
+    """Derive one address's legacy card state from the ledger and write it.
 
-    The race this closes, in order: a START's handler reads ``opted_in`` and
-    pauses; a new STOP is decided, committed, and projected as
-    ``wa_opted_out = True``; the paused handler resumes and writes ``False``
-    from its stale read. The ledger refused and the flag every marketing path
-    reads said sendable.
+    The race this has to close, in order: a START's handler reads ``opted_in``;
+    a newer STOP is decided and committed by somebody else; the handler writes
+    ``False`` anyway. The ledger refused and the flag every marketing path reads
+    said sendable.
 
-    So the write carries its premise (``expect_ledger``) and this loop checks
-    afterwards whether the ledger moved. Those two together are what make it
-    safe without a lock — and a lock is not available here, because the caller
-    goes on to acknowledge the customer over the network. ``consent_version``
-    only ever increases and never changes without the state changing with it, so
-    an unchanged version after the write proves the premise held at the moment
-    the row was touched: either the answer landed or there was no card to land
-    on. A moved version means the UPDATE was refused by its own condition —
-    nothing stale was written — and the answer is derived again from what the
-    ledger says now.
+    ``serialised`` is how that is closed, and it is the only way it can be. The
+    caller holds this address's consent lock and this person's card rows for the
+    whole transaction, so no decision about them can be made until it commits:
+    one read, one write, nothing in between and nothing after. A re-read cannot
+    substitute, because the window that was left was between the last read and
+    the COMMIT — a newer STOP committing there decided the outcome by commit
+    order alone.
+
+    Without ``serialised`` — the direct in-transaction path, whose caller goes
+    on to acknowledge the customer over the network and therefore may hold no
+    consent lock — the write instead carries its premise (``expect_ledger``) and
+    the answer is derived again if the ledger moved. That narrows the window to
+    "nothing stale is ever written" but cannot make the pair atomic, which is
+    why ``process_one_event`` does not use it.
     """
     state = LedgerState(None)
     wanted_out = cmd == "stop"
     asked_for = set(requested) or {cmd}
-    for _attempt in range(_PROJECTION_ATTEMPTS):
+    for _attempt in range(1 if serialised else _PROJECTION_ATTEMPTS):
         state = await ledger_state(session, phone=phone)
         if state.refuses:
             opted_out, settled_command = True, "stop"
@@ -1313,9 +1363,10 @@ async def _project_ledger_onto_card(
             only_when_unset=not matches_command,
             expect_ledger=state,
         )
-        settled = await ledger_state(session, phone=phone)
-        if (settled.state, settled.consent_version) != (state.state, state.consent_version):
-            continue
+        if not serialised:
+            settled = await ledger_state(session, phone=phone)
+            if (settled.state, settled.consent_version) != (state.state, state.consent_version):
+                continue
 
         canceled = await _cancel_marketing_jobs(session, phone_e164=phone) if opted_out else 0
         return CommandProjection(
@@ -1383,7 +1434,9 @@ async def project_inbound_commands(
             commands = await _inbound_commands(session, event, _extract_actions(payload))
             if not commands:
                 return {}
-            return await _apply_inbound_command_flags(session, commands)
+            # Serialised: this transaction makes no external call, so it can
+            # hold the consent locks from the first read to the commit.
+            return await _apply_inbound_command_flags(session, commands, serialised=True)
 
 
 def _ack_text(cmd: str) -> str:
@@ -5112,12 +5165,76 @@ async def recover_operator_relay_lifecycle(
     return stats
 
 
+async def apply_delivery_statuses(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    event_id: int,
+) -> str | None:
+    """Record one delivery's status callbacks, in a transaction of its own.
+
+    Why it is no longer inside the event transaction: that transaction goes on
+    to acknowledge the customer over WhatsApp and to mirror messages into
+    Chatwoot, and the callback path now declares its whole lock scope up front —
+    every message identifier the payload names and the production batch headers
+    behind them. Held across those calls, a slow external service blocked the
+    batch header: another session asking for it with ``FOR UPDATE NOWAIT`` got
+    ``55P03``, which is a refused claim, an acceptance that cannot be saved and
+    an operator STOP that cannot be applied to the batch. Before this phase a
+    ``sent`` callback took no such lock at all, so the regression was new.
+
+    The scope itself is unchanged — all identifiers, whatever their status, in
+    one order — because narrowing it is what the locks exist to prevent. What
+    changed is that the transaction COMMITS and releases them before anything
+    external happens.
+
+    Returns the error to record on the event, or ``None``. A failure here is
+    reported rather than raised for the same reason it was before: the old code
+    failed the event and skipped the inbound half, and that outcome is kept.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(WhatsAppEvent).where(WhatsAppEvent.id == event_id))
+            ).scalar_one_or_none()
+            if event is None:
+                return None
+            payload = event.payload or {}
+            if not isinstance(payload, dict):
+                return None
+            if _is_operator_relay(payload) or _is_chatwoot_origin(event, payload):
+                return None
+            statuses = _extract_statuses(payload)
+            if not statuses:
+                return None
+            logger.info(
+                "status_webhook: received %d status update(s) event_id=%s",
+                len(statuses),
+                event_id,
+            )
+            try:
+                run_ids = await _handle_delivery_statuses(session, event, statuses)
+            except Exception as exc:
+                logger.exception("WhatsApp delivery statuses failed id=%s", event_id)
+                return str(exc)
+            for run_id in run_ids:
+                try:
+                    await recompute_campaign_run_stats(session, run_id)
+                except Exception as exc:
+                    logger.warning(
+                        "status_webhook: recompute failed run_id=%s err=%s",
+                        run_id,
+                        exc,
+                    )
+    return None
+
+
 async def handle_event(
     session: AsyncSession,
     event: WhatsAppEvent,
     provider: WhatsAppProvider,
     *,
     projections: dict[str, CommandProjection] | None = None,
+    statuses_handled: bool = False,
 ) -> None:
     """Act on one stored event, inside the caller's transaction.
 
@@ -5159,7 +5276,12 @@ async def handle_event(
     # not change meaning when the configuration does. Filtering here would
     # instead drop real delivered/read callbacks for messages this deployment
     # genuinely sent before its allow list was configured.
-    statuses = [] if chatwoot_origin else _extract_statuses(payload)
+    # ``statuses_handled`` means ``apply_delivery_statuses`` has already
+    # recorded them in a committed transaction of its own and released its
+    # message and header locks, which is what keeps them out of the HTTP calls
+    # further down. A direct caller that has not done that gets the historical
+    # behaviour: statuses inside this transaction.
+    statuses = [] if (chatwoot_origin or statuses_handled) else _extract_statuses(payload)
     if statuses:
         logger.info(
             "status_webhook: received %d status update(s) event_id=%s",
@@ -5480,6 +5602,14 @@ async def process_one_event(
     # of letting an unread refusal look like permission.
     projections = await project_inbound_commands(SessionLocal, event_id=event_id)
 
+    # §46.3 — the delivery evidence, in a third transaction of its own, and for
+    # a reason of its own: it is the only part of this path that locks voucher
+    # batch headers, and the transaction below makes external calls. Committing
+    # here releases the message and header locks before the first of them, so a
+    # slow WhatsApp or Chatwoot response can no longer hold a batch against its
+    # own executor.
+    status_error = await apply_delivery_statuses(SessionLocal, event_id=event_id)
+
     with perf_log("whatsapp_inbox_worker", "process_event", event_id=event_id) as ctx:
         async with SessionLocal() as session:
             async with session.begin():
@@ -5496,8 +5626,25 @@ async def process_one_event(
                     origin=_event_origin_for_metrics(event, event.payload or {}),
                 )
 
+                if status_error is not None:
+                    # The statuses failed in their own transaction, so the
+                    # inbound half is skipped and the event is failed — exactly
+                    # what an exception in the status block used to do when both
+                    # halves shared one transaction.
+                    event.status = "failed"
+                    event.processed_at = utcnow()
+                    event.error = status_error
+                    ctx.update(outcome=event.status)
+                    return
+
                 try:
-                    await handle_event(session, event, provider, projections=projections)
+                    await handle_event(
+                        session,
+                        event,
+                        provider,
+                        projections=projections,
+                        statuses_handled=True,
+                    )
                     event.status = "processed"
                     event.processed_at = utcnow()
                 except Exception as exc:

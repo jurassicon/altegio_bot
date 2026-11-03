@@ -643,3 +643,109 @@ async def test_a_pending_link_is_not_moved_onto_another_identity(session_maker, 
 
     [receipt] = await _receipts(session_maker)
     assert receipt.linked_easyweek_customer_uuid == other
+
+
+# ===========================================================================
+# Round 3, review fix 2 — the receipt is read again under the locks
+# ===========================================================================
+
+
+async def test_the_proof_that_lands_between_the_read_and_the_locks_is_not_lost(session_maker, monkeypatch) -> None:
+    """The review's schedule, with the bridge really running inside the window.
+
+    The consent worker loads the receipts, then takes the address locks. In
+    between, the booking bridge proves a new number for this person, moves the
+    card and stamps the proven UUID onto the still-pending receipt. The worker
+    then went on with the ``None`` it had loaded BEFORE the locks existed — and a
+    second ``SELECT`` would not have helped, because an instance this session
+    already holds comes back from the identity map with its old attributes and
+    taking a lock refreshes nothing.
+
+    What that cost: a suppression bound to no UUID, written against a number no
+    card carries any more, and a resolved receipt — which the send guard does
+    not look at. The new number passed the guard.
+    """
+    import altegio_bot.whatsapp_consent as consent_module
+
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker, msg_id="wamid.R3GAP")
+    _booking_id, payload = await _capture_booking(session_maker)
+
+    real = consent_module._receipts_for_event
+    state = {"armed": True, "seen": None}
+
+    async def _patched(session, event, *, refresh: bool = False):
+        rows = await real(session, event, refresh=refresh)
+        if state["armed"] and not refresh:
+            # The discovery read: no lock is held yet, which is exactly the
+            # window. The bridge runs to completion in its own transactions.
+            state["armed"] = False
+            state["seen"] = [row.linked_easyweek_customer_uuid for row in rows]
+            await _adopt(session_maker, monkeypatch, payload)
+            await _move_the_card(session_maker)
+        return rows
+
+    monkeypatch.setattr(consent_module, "_receipts_for_event", _patched)
+    await _decide(session_maker, event_id)
+
+    assert state["armed"] is False
+    assert state["seen"] == [None], "the first read really did see no link"
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    assert row.banned_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+    assert row.evidence.get("uuid_binding") == "proven_uuid_link_on_receipt"
+
+    [receipt] = await _receipts(session_maker)
+    assert receipt.resolved_at is not None
+    assert receipt.resolution == "applied"
+    assert receipt.linked_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+
+    async with session_maker() as session:
+        assert await is_suppressed(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+        assert await is_suppressed(session, phone=NEW_PHONE)
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    assert guard.allowed is False
+    assert guard.reason == "consent_refusal_active"
+
+
+async def test_processing_the_same_event_again_after_that_window_changes_nothing(session_maker, monkeypatch) -> None:
+    """Idempotence across the re-read: a second pass is a no-op."""
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker, msg_id="wamid.R3GAP2")
+    _booking_id, payload = await _capture_booking(session_maker)
+    await _adopt(session_maker, monkeypatch, payload)
+    await _move_the_card(session_maker)
+
+    await _decide(session_maker, event_id)
+    first = await _suppression(session_maker)
+    assert first is not None
+    version, bound = int(first.consent_version), first.banned_easyweek_customer_uuid
+
+    await _decide(session_maker, event_id)
+    second = await _suppression(session_maker)
+    assert second is not None
+    assert int(second.consent_version) == version
+    assert second.banned_easyweek_customer_uuid == bound
+    async with session_maker() as session:
+        assert await is_suppressed(session, phone=NEW_PHONE)
+
+
+async def test_the_other_order_of_those_two_workers_is_also_safe(session_maker, monkeypatch) -> None:
+    """The bridge after the decision: the suppression finds the card itself."""
+    await _uuid_only_card(session_maker)
+    event_id = await _accept_without_deciding(session_maker, msg_id="wamid.R3GAP3")
+    _booking_id, payload = await _capture_booking(session_maker)
+
+    await _decide(session_maker, event_id)
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.banned_easyweek_customer_uuid == uuid.UUID(CUSTOMER)
+
+    await _adopt(session_maker, monkeypatch, payload)
+    await _move_the_card(session_maker)
+
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
+    assert guard.allowed is False

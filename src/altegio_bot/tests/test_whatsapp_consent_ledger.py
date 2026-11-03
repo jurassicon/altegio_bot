@@ -2006,48 +2006,51 @@ async def test_a_stop_is_ordered_against_the_opt_in_in_force(
 # ===========================================================================
 
 
-def _arm_competitor(monkeypatch: pytest.MonkeyPatch, competitor) -> dict[str, Any]:
-    """Run *competitor* in full the FIRST time the worker reads the ledger.
+def _arm_competitor(session_maker, monkeypatch: pytest.MonkeyPatch, competitor) -> dict[str, Any]:
+    """Start *competitor* the first time the projection reads the ledger.
 
-    This is the schedule from the review, written out exactly: the handler takes
-    its read, the competing decision lands and is projected completely, and only
-    then does the handler get on with writing what it read. The value handed
-    back is the one from BEFORE the competitor ran, which is what makes the read
-    stale rather than merely old.
+    As a TASK, and then wait until PostgreSQL reports it QUEUED. That wait is
+    the assertion: the projection holds this address's consent lock and this
+    person's card rows for its whole transaction, so nothing can decide anything
+    about them until it commits. Before that, the competitor ran to completion
+    inside this window and the outcome was decided by commit order.
 
-    Disarmed on the first use, so the competitor itself runs on the unpatched
-    path and nothing recurses.
+    The value handed back is the one from before the competitor was started, so
+    the read is as stale as it can be made — and under the locks that no longer
+    matters, which is the point.
     """
     real = worker_module.ledger_state
-    state: dict[str, Any] = {"armed": True, "stale": None}
+    state: dict[str, Any] = {"armed": True, "stale": None, "task": None}
 
     async def _patched(session: Any, *, phone: Any) -> Any:
         value = await real(session, phone=phone)
         if state["armed"]:
             state["armed"] = False
             state["stale"] = value
-            await competitor()
+            state["task"] = asyncio.create_task(competitor())
+            await _wait_until_a_transaction_is_queued(session_maker)
         return value
 
     monkeypatch.setattr(worker_module, "ledger_state", _patched)
     return state
 
 
-async def test_a_stale_read_cannot_write_its_answer_at_all(session_maker, monkeypatch) -> None:
-    """The write carries its premise, so one attempt is enough to prove it.
+async def test_a_competing_decision_cannot_land_inside_the_projection(session_maker, monkeypatch) -> None:
+    """The window of review fix 1A, reproduced and shown closed.
 
-    With the retry budget cut to a single pass there is nothing to converge: the
-    handler derives ``sendable`` from a read that a newer STOP has already
-    invalidated, and if that write could land the card would say sendable while
-    the ledger refused. Here it cannot land — the statement itself re-asks the
-    question — so the newer refusal survives and the command is reported as not
-    honoured.
+    The projection reads the ledger, writes the card and commits. A newer STOP
+    committing anywhere in between — a live delivery, or the historical
+    reconciliation — used to decide the outcome by commit order alone: the card
+    said sendable while the ledger refused, ``compute_excluded_reason`` allowed
+    the send, and the acknowledgement confirmed a subscription. Re-reading could
+    not close it, because the gap was between the last read and the COMMIT.
+
+    Here the competing STOP is proven to be waiting while the projection is in
+    flight, and the state afterwards is the one the ledger holds.
     """
-    monkeypatch.setattr(worker_module, "_PROJECTION_ATTEMPTS", 1)
     client_id = await _card(session_maker)
     provider = CaptureProvider()
 
-    # A refusal, then a proven opt-in: the ledger permits and the card is clear.
     await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2A", epoch=BASE_EPOCH))
     await _deliver(
         session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2B", epoch=BASE_EPOCH + 1800)
@@ -2062,106 +2065,34 @@ async def test_a_stale_read_cannot_write_its_answer_at_all(session_maker, monkey
             _message(text="STOP", msg_id="wamid.R2RACE", epoch=BASE_EPOCH + 3600),
         )
 
-    state = _arm_competitor(monkeypatch, _competing_stop)
+    state = _arm_competitor(session_maker, monkeypatch, _competing_stop)
     late = CaptureProvider()
     await _deliver(
         session_maker, monkeypatch, late, _message(text="START", msg_id="wamid.R2C", epoch=BASE_EPOCH + 2000)
     )
-
     assert state["armed"] is False
     assert state["stale"].state == CONSENT_STATE_OPTED_IN
+    await asyncio.wait_for(state["task"], timeout=60)
+
     row = await _suppression(session_maker)
     assert row is not None
     assert row.state == CONSENT_STATE_OPTED_OUT
     card = await _client_row(session_maker, client_id)
     assert card.wa_opted_out is True
     assert _marketing_verdict(card) == "opted_out"
-    # Nothing was confirmed to the customer either: what we would be confirming
-    # is no longer known to be true.
-    assert late.sent == []
     async with session_maker() as session:
         guard = await final_send_guard(session, phone=ADDRESS)
     assert guard.allowed is False
     assert guard.reason == GUARD_SUPPRESSED
 
 
-async def test_the_projection_converges_on_the_newer_decision(session_maker, monkeypatch) -> None:
-    """The same schedule with the real retry budget: it re-derives and settles."""
-    client_id = await _card(session_maker)
-    provider = CaptureProvider()
-    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2D", epoch=BASE_EPOCH))
-    await _deliver(
-        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2E", epoch=BASE_EPOCH + 1800)
-    )
-
-    async def _competing_stop() -> None:
-        await _deliver(
-            session_maker,
-            monkeypatch,
-            CaptureProvider(),
-            _message(text="STOP", msg_id="wamid.R2RACE2", epoch=BASE_EPOCH + 3600),
-        )
-
-    _arm_competitor(monkeypatch, _competing_stop)
-    await _deliver(
-        session_maker,
-        monkeypatch,
-        CaptureProvider(),
-        _message(text="START", msg_id="wamid.R2F", epoch=BASE_EPOCH + 2000),
-    )
-
-    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
-    card = await _client_row(session_maker, client_id)
-    assert card.wa_opted_out is True
-    assert _marketing_verdict(card) == "opted_out"
-
-
-async def test_the_reverse_schedule_also_settles_on_the_ledger(session_maker, monkeypatch) -> None:
-    """A STOP's projection overtaken by a proven newer START.
-
-    The mirror image, and it must come out the other way round: the START is
-    strictly newer and signed, so the settled answer is the opt-in, the card
-    follows it, and the STOP that lost is NOT acknowledged — telling somebody
-    they are unsubscribed when the settled state says otherwise is the same
-    defect in the other direction.
-    """
-    client_id = await _card(session_maker, opted_out=False)
-    provider = CaptureProvider()
-    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2G", epoch=BASE_EPOCH))
-    await _deliver(
-        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2H", epoch=BASE_EPOCH + 1800)
-    )
-    await _deliver(
-        session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2I", epoch=BASE_EPOCH + 2000)
-    )
-    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
-
-    async def _competing_start() -> None:
-        await _deliver(
-            session_maker,
-            monkeypatch,
-            CaptureProvider(),
-            _message(text="START", msg_id="wamid.R2RACE3", epoch=BASE_EPOCH + 7200),
-        )
-
-    _arm_competitor(monkeypatch, _competing_start)
-    late = CaptureProvider()
-    await _deliver(session_maker, monkeypatch, late, _message(text="STOP", msg_id="wamid.R2J", epoch=BASE_EPOCH + 2100))
-
-    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
-    card = await _client_row(session_maker, client_id)
-    assert card.wa_opted_out is False
-    assert _marketing_verdict(card) is None
-    assert late.sent == []
-
-
-async def test_a_concurrent_historical_projection_also_wins_over_a_stale_read(session_maker, monkeypatch) -> None:
+async def test_the_historical_projection_also_queues_behind_it(session_maker, monkeypatch) -> None:
     """The competitor does not have to be a live message.
 
-    ``project(apply=True)`` writes through the same ledger path, so a stored
-    historical STOP landing between a handler's read and its write is exactly
-    the same race — and the card must end up agreeing with the ledger, not with
-    the handler's view of it.
+    ``project(apply=True)`` writes through the same ledger path and now takes
+    the same two locks in the same order, so it queues behind the worker's
+    projection instead of landing inside it — and it brings the card flag with
+    its refusal, which is what keeps the two from disagreeing afterwards.
     """
     from altegio_bot.whatsapp_consent_projection import project
 
@@ -2185,21 +2116,74 @@ async def test_a_concurrent_historical_projection_also_wins_over_a_stale_read(se
                 )
             )
 
-    async def _run_projection() -> None:
-        await project(session_maker, apply=True)
+    reports: list[Any] = []
 
-    _arm_competitor(monkeypatch, _run_projection)
+    async def _run_projection() -> None:
+        reports.append(await project(session_maker, apply=True))
+
+    state = _arm_competitor(session_maker, monkeypatch, _run_projection)
     await _deliver(
         session_maker,
         monkeypatch,
         CaptureProvider(),
         _message(text="START", msg_id="wamid.R2M", epoch=BASE_EPOCH + 2000),
     )
+    assert state["armed"] is False
+    await asyncio.wait_for(state["task"], timeout=60)
 
     assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
     card = await _client_row(session_maker, client_id)
     assert card.wa_opted_out is True
     assert _marketing_verdict(card) == "opted_out"
+    assert reports and reports[0].cards_converged >= 1
+
+
+async def test_the_reverse_schedule_also_settles_on_the_ledger(session_maker, monkeypatch) -> None:
+    """The mirror image: a STOP's projection with a proven newer START behind it.
+
+    Serialisation decides this one, and it decides it in order. The START cannot
+    land inside the STOP's projection, so the STOP settles first and is
+    acknowledged as what it was at that moment — a refusal. The START then
+    takes the lock, lifts it, and the card follows. Two decisions, two true
+    sentences, in the order they were applied; what cannot happen any more is
+    one of them being committed over the other.
+    """
+    client_id = await _card(session_maker, opted_out=False)
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2G", epoch=BASE_EPOCH))
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R2H", epoch=BASE_EPOCH + 1800)
+    )
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R2I", epoch=BASE_EPOCH + 2000)
+    )
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_OUT
+
+    async def _competing_start() -> None:
+        await _deliver(
+            session_maker,
+            monkeypatch,
+            CaptureProvider(),
+            _message(text="START", msg_id="wamid.R2RACE3", epoch=BASE_EPOCH + 7200),
+        )
+
+    state = _arm_competitor(session_maker, monkeypatch, _competing_start)
+    late = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, late, _message(text="STOP", msg_id="wamid.R2J", epoch=BASE_EPOCH + 2100))
+    await asyncio.wait_for(state["task"], timeout=60)
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is False
+    assert _marketing_verdict(card) is None
+    # Acknowledged as the refusal it settled as, not as the opt-in that came
+    # after it. The one thing ruled out is a sentence that contradicts the
+    # record at the moment it is sent.
+    assert len(late.sent) == 1
+    assert "abgemeldet" in late.sent[0][2]
+    async with session_maker() as session:
+        guard = await final_send_guard(session, phone=ADDRESS)
+    assert guard.allowed is True
 
 
 async def test_a_permitted_new_start_still_lifts_the_refusal(session_maker, monkeypatch) -> None:
@@ -2225,17 +2209,40 @@ async def test_a_permitted_new_start_still_lifts_the_refusal(session_maker, monk
     assert guard.allowed is True
 
 
+async def test_a_failed_acknowledgement_does_not_undo_the_refusal(session_maker, monkeypatch) -> None:
+    """§46.4.7 — the projection is committed before the ack is even attempted."""
+
+    class _BrokenProvider(WhatsAppProvider):
+        async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+            raise RuntimeError("meta is down")
+
+    client_id = await _card(session_maker)
+    await _deliver(session_maker, monkeypatch, _BrokenProvider(), _message(text="STOP", msg_id="wamid.R3ACK"))
+
+    row = await _suppression(session_maker)
+    assert row is not None
+    assert row.state == CONSENT_STATE_OPTED_OUT
+    card = await _client_row(session_maker, client_id)
+    assert card.wa_opted_out is True
+    assert _marketing_verdict(card) == "opted_out"
+    async with session_maker() as session:
+        event = (await session.execute(select(WhatsAppEvent).order_by(WhatsAppEvent.id))).scalars().first()
+    assert event.error is not None and "Ack send failed" in event.error
+
+
 # ===========================================================================
 # Round 2, review fix 5A — one order over the whole set of address locks
 # ===========================================================================
 
 
-async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float = 15.0) -> None:
-    """Wait until PostgreSQL reports somebody queued on an advisory lock.
+async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float = 30.0) -> None:
+    """Block until PostgreSQL shows a transaction waiting for a lock.
 
-    The schedules below have to be exact, and "the other transaction is now
-    waiting" is a fact this database publishes. Polling ``pg_locks`` is how a
-    test observes it without a sleep that would pass or fail by luck.
+    A real wait rather than a sleep: the schedules here have to be exact, and
+    "the other transaction is now queued" is a fact this database reports.
+    ``pg_locks`` is the only way to observe it from outside, and every lock type
+    counts — the orders under test mix transaction-scoped advisory locks with
+    row locks on the card rows, and a wait for either one is a wait.
     """
     from sqlalchemy import text as sql_text
 
@@ -2243,12 +2250,10 @@ async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float =
     deadline = loop.time() + timeout
     while True:
         async with session_maker() as probe:
-            waiting = await probe.scalar(
-                sql_text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
-            )
+            waiting = await probe.scalar(sql_text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
         if int(waiting or 0) >= 1:
             return
-        assert loop.time() < deadline, "nothing ever queued on an advisory lock"
+        assert loop.time() < deadline, "nothing ever queued on a lock"
         await asyncio.sleep(0.05)
 
 
@@ -2691,3 +2696,150 @@ async def test_an_event_without_receipts_keeps_its_historical_handling(session_m
     assert (await _client_row(session_maker, client_id)).wa_opted_out is True
     assert len(provider.sent) == 1
     assert "abgemeldet" in provider.sent[0][2]
+
+
+# ===========================================================================
+# Round 3, review fix 1B — one order over the whole set of card rows
+# ===========================================================================
+
+THIRD_ADDRESS = "+4915177991003"
+THIRD_RAW_FROM = "4915177991003"
+
+
+async def _cards(session_maker, *addresses: str) -> dict[str, int]:
+    """One Altegio card per address, each with its own numeric id."""
+    created: dict[str, int] = {}
+    async with session_maker() as session:
+        async with session.begin():
+            for index, address in enumerate(addresses):
+                client = Client(
+                    provider="altegio",
+                    company_id=1,
+                    altegio_client_id=993000 + index,
+                    phone_e164=address,
+                    display_name=f"Card {index}",
+                    raw={},
+                    wa_opted_out=False,
+                )
+                session.add(client)
+                await session.flush()
+                created[address] = int(client.id)
+    return created
+
+
+async def test_two_deliveries_naming_the_same_people_do_not_deadlock(session_maker, monkeypatch) -> None:
+    """The mutual block of review fix 1B, reproduced and shown closed.
+
+    Two deliveries, [STOP A, STOP B, STOP C] and [STOP B, STOP A]. The card
+    writes used to happen in COMMAND order inside one transaction each, so the
+    first held A and wanted B while the second held B and wanted A. PostgreSQL
+    aborted one of them — and that is not a retryable delay here: ordinary
+    inbound has no recovery pass, the event stayed ``processing``, and C (named
+    by only one of the two deliveries) was left with the ledger refusing and the
+    card saying sendable.
+
+    The card rows are now locked for the whole set in one statement, in
+    ascending id order, so the second projection queues behind the first. The
+    order commands are APPLIED in is untouched.
+    """
+    await _seed_sender(session_maker)
+    cards = await _cards(session_maker, ADDRESS, OTHER_ADDRESS, THIRD_ADDRESS)
+
+    await _ingest(
+        session_maker,
+        _payload(
+            _message(text="STOP", sender=RAW_FROM, msg_id="wamid.R3A1"),
+            _message(text="STOP", sender=OTHER_RAW_FROM, msg_id="wamid.R3A2"),
+            _message(text="STOP", sender=THIRD_RAW_FROM, msg_id="wamid.R3A3"),
+        ),
+        monkeypatch=monkeypatch,
+    )
+    await _ingest(
+        session_maker,
+        _payload(
+            _message(text="STOP", sender=OTHER_RAW_FROM, msg_id="wamid.R3B1"),
+            _message(text="STOP", sender=RAW_FROM, msg_id="wamid.R3B2"),
+        ),
+        monkeypatch=monkeypatch,
+    )
+    first_event, second_event = await _event_ids(session_maker)
+
+    release = asyncio.Event()
+    paused = asyncio.Event()
+    real_set = worker_module._set_opt_out
+    pending = {"armed": True}
+
+    async def _patched(session: Any, **kwargs: Any) -> int:
+        affected = await real_set(session, **kwargs)
+        if pending["armed"] and kwargs.get("phone_e164") == ADDRESS:
+            pending["armed"] = False
+            paused.set()
+            await release.wait()
+        return affected
+
+    monkeypatch.setattr(worker_module, "_set_opt_out", _patched)
+
+    first = asyncio.create_task(_process(session_maker, CaptureProvider(), first_event))
+    await asyncio.wait_for(paused.wait(), timeout=30)
+    second = asyncio.create_task(_process(session_maker, CaptureProvider(), second_event))
+    # The second projection must be WAITING, not running: without one order over
+    # the card rows it would be holding B by now and the two would cross.
+    await _wait_until_a_transaction_is_queued(session_maker)
+    release.set()
+
+    await asyncio.wait_for(first, timeout=60)
+    await asyncio.wait_for(second, timeout=60)
+
+    for address in (ADDRESS, OTHER_ADDRESS, THIRD_ADDRESS):
+        row = await _suppression(session_maker, address)
+        assert row is not None, address
+        assert row.state == CONSENT_STATE_OPTED_OUT, address
+        card = await _client_row(session_maker, cards[address])
+        assert card.wa_opted_out is True, address
+        assert _marketing_verdict(card) == "opted_out", address
+
+    assert all(receipt.resolved_at is not None for receipt in await _receipts(session_maker))
+    async with session_maker() as session:
+        statuses = [
+            str(value)
+            for value in (await session.scalars(select(WhatsAppEvent.status).order_by(WhatsAppEvent.id))).all()
+        ]
+    assert statuses == ["processed", "processed"]
+
+
+async def test_a_refusal_in_one_delivery_does_not_revive_cancelled_jobs(session_maker, monkeypatch) -> None:
+    """A later START must not bring back what a refusal cancelled (§46.4.7)."""
+    from altegio_bot.models.models import MessageJob, Record
+
+    cards = await _cards(session_maker, ADDRESS)
+    async with session_maker() as session:
+        async with session.begin():
+            record = Record(company_id=1, altegio_record_id=773000, client_id=cards[ADDRESS], raw={})
+            session.add(record)
+            await session.flush()
+            session.add(
+                MessageJob(
+                    company_id=1,
+                    record_id=int(record.id),
+                    client_id=cards[ADDRESS],
+                    job_type="review_3d",
+                    status="queued",
+                    run_at=datetime.now(timezone.utc) + timedelta(days=3),
+                    dedupe_key="review_3d:773000",
+                    payload={},
+                )
+            )
+
+    provider = CaptureProvider()
+    await _deliver(session_maker, monkeypatch, provider, _message(text="STOP", msg_id="wamid.R3J1"))
+    async with session_maker() as session:
+        assert (await session.scalars(select(MessageJob.status))).all() == ["canceled"]
+
+    await _deliver(
+        session_maker, monkeypatch, provider, _message(text="START", msg_id="wamid.R3J2", epoch=BASE_EPOCH + 3600)
+    )
+
+    assert (await _suppression(session_maker)).state == CONSENT_STATE_OPTED_IN
+    assert (await _client_row(session_maker, cards[ADDRESS])).wa_opted_out is False
+    async with session_maker() as session:
+        assert (await session.scalars(select(MessageJob.status))).all() == ["canceled"]

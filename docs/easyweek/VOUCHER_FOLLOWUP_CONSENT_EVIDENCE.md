@@ -215,17 +215,36 @@ an acknowledgement that fails, a Chatwoot outage, an exception in the handler or
 the process dying, and it holds nothing while the handler makes its network
 calls.
 
-It is also a **compare-and-set**. Deriving the value and writing it are two
-statements, and between them another event's handler can decide and project a
-newer refusal — after which the older handler would write its stale answer over
-the newer one, leaving the ledger refusing while the flag every sender reads said
-sendable. The UPDATE therefore carries its premise: it lands only while the
-ledger still reads exactly as the value was derived from, and the writer re-reads
-afterwards and derives again if it moved. `consent_version` only increases and
-never changes without the state changing with it, so an unchanged version after
-the write proves the premise held. A lock across that gap is not an option — the
-same transaction used to go on to acknowledge the customer — and a stale
-projection simply cannot land.
+It is **serialised**, and that is the only thing that closes the gap. The
+transaction locks, before its first read:
+
+1. every **card row** of every address in the delivery, in one statement, in
+   ascending id order;
+2. every **consent address**, sorted.
+
+Both halves were defects. A compare-and-set on the write narrowed the window but
+could not remove it: the gap that was left is between the last read and the
+**commit**, so a newer STOP committing there decided the outcome by commit order
+alone — the ledger refusing while the flag every sender reads said sendable,
+`compute_excluded_reason` allowing the send, and the acknowledgement confirming a
+subscription. No extra `SELECT` and no number of retries can close that; holding
+the locks to the commit can, and this transaction may hold them because it makes
+no external call. And without one order over the card rows, two deliveries naming
+the same people in different orders — `[STOP A, STOP B, STOP C]` against
+`[STOP B, STOP A]` — each held what the other was waiting for: PostgreSQL aborted
+one, ordinary inbound has no recovery pass, so the event stayed `processing` and
+the address only that delivery mentioned kept a sendable card against a refusing
+ledger.
+
+The order the commands are **applied** in is untouched. Only the order the locks
+are taken in is fixed, and it is the same one `resolve_webhook_identity` and the
+historical reconciliation use: **cards → consent addresses → receipts →
+message jobs**.
+
+The compare-and-set stays on the write as a second line of defence, and it is
+the only protection on the one path that cannot hold the locks: a direct
+in-transaction call to `handle_event`, whose caller goes on to make external
+requests in the same transaction. `process_one_event` never uses that path.
 
 ### What the acknowledgement says
 
@@ -479,7 +498,16 @@ Its facts say `route_proven = false` instead.
   operation it could no longer describe. Sorting the failures after the header
   was already held could not help, because the header was the half taken first.
   After the scope is declared, no identifier lock is ever requested behind a
-  header lock. The
+  header lock. That scope is also why the delivery evidence is now recorded in a
+  **transaction of its own**, committed before the inbound half of the same
+  delivery runs: the inbound half acknowledges the customer and mirrors messages
+  into Chatwoot, and those locks must not be held across a network call. Before
+  this phase a `sent` callback took no header lock at all, so holding one through
+  an external request was a new way to block a batch — another session asking for
+  the header with `FOR UPDATE NOWAIT` got `55P03`, which is a refused claim, an
+  acceptance that cannot be saved and an operator STOP that cannot be applied.
+  The scope itself is not narrowed by status: narrowing it is what the locks
+  exist to prevent. The
   window it closes cannot be closed by re-reading: the callback looks for the
   slot before the identifier is committed and the acceptance looks for unmatched
   facts before the callback is committed, so both are correct about what they saw
@@ -550,6 +578,17 @@ Rules:
   and its monotonicity rules. The projection gets no private write path, so a
   run against a stale snapshot converges on the newer state instead of
   overwriting it, and a second run is a no-op.
+- It takes the same two locks in the same order as the inbox worker — card rows
+  by id, then the consent address — so a run and a live delivery queue behind
+  each other instead of one committing inside the other's window.
+- A refusal it writes is also **projected onto the card flag**, in the refusing
+  direction only. Without that a run left the ledger refusing and
+  `Client.wa_opted_out` saying sendable, which is the refusal being ignored by
+  everything except the new consent guard. A card that already refuses is not
+  restamped: `wa_opted_out_at` and `wa_opt_out_reason` say when and why somebody
+  refused, not when a reconciliation noticed. Queued marketing jobs are **not**
+  cancelled — that is one of the inbox worker's business actions and §46.4.4
+  keeps this module out of them; the outbox re-reads the flag before it sends.
 - A historical START is never projected. Its authenticity is unrecoverable from
   a sanitised stored event, so it could not lift a refusal even if it were
   applied, and writing it would create an opt-in record out of an unverifiable
@@ -566,16 +605,24 @@ Rules:
   the event-level status is what is known, and the report says so every run
   (`historical_per_message_route_unrecorded`).
 - **The decision is made again inside the write transaction**, under the address
-  lock, not only when the candidate was collected. Two halves of this were
-  defects. A source with no event time of its own — a card flag, a preview
-  snapshot, a stored message whose timestamp nobody can parse — used to be
-  written as a fresh refusal even after a proven opt-in for that address had
-  been observed later; and because such a refusal has no provable order, §46.4.4
-  then makes it permanent. It is now reported as
-  `superseded_by_proven_opt_in` / `projection_older_than_proven_opt_in` and
-  written nowhere. Both sides of that comparison are this process's own clock, so
-  no external timestamp is invented, and it is strictly per address: an opt-in
-  proven for another number of the same person is not an opt-in for this one.
+  lock, not only when the candidate was collected. A **snapshot** — a card flag
+  or a preview row — with no event time of its own used to be written as a fresh
+  refusal even after a proven opt-in for that address had been observed later;
+  and because such a refusal has no provable order, §46.4.4 then makes it
+  permanent. It is now reported as `superseded_by_proven_opt_in` /
+  `projection_older_than_proven_opt_in` and written nowhere. Both sides of that
+  comparison are this process's own clock, so no external timestamp is invented,
+  and it is strictly per address: an opt-in proven for another number of the same
+  person is not an opt-in for this one.
+- That rule applies to **snapshots only**. A stored STOP MESSAGE whose timestamp
+  cannot be read is not stale because of when this process happened to receive
+  it: a delivery can sit in a queue, and a signed START sent at 10:10 can arrive
+  at 10:30 behind a STOP received at 10:20. Dropping it on that basis made the
+  reconciliation and `apply_inbound_consent` reach different answers about one
+  and the same message — live processing applies it and refuses, while the
+  projection skipped it and the send went ahead. A real message goes through the
+  ordinary ledger rules, where an unknown order refuses, and the preview uses
+  the same predicate as the write.
 - A **stored STOP is applied even when a refusal is already active**, which is
   how the boundary a future START has to beat moves to the newest known
   refusal. The collection-time shortcut used to skip every candidate once any
@@ -686,8 +733,14 @@ rather than by repetition: a third transaction holds the first lock of the
 agreed order and the code under test must be queued on it **holding nothing**,
 which is the property that rules the cycle out. Each of them reproduces a real
 `deadlock detected` when the fix is reverted — the consent worker against the
-ingress, a mixed `delivered`/`failed` callback against the acceptance of another
-slot of the same batch, and two callbacks naming the same identifiers in
-opposite payload order. The stale-projection race is covered the same way: with
-the retry budget cut to one pass, a write derived from a read a newer refusal has
-already invalidated must not land at all.
+ingress, two deliveries naming the same people in different orders, a mixed
+`delivered`/`failed` callback against the acceptance of another slot of the same
+batch, and two callbacks naming the same identifiers in opposite payload order.
+
+The serialisation of the card projection is covered by starting the competing
+decision inside the projection's own window and then asserting, through
+`pg_locks`, that it is **waiting** — if it could run, the window would still be
+open. The release of the delivery locks is asserted from inside the external
+call itself: the acknowledgement probes the batch header with
+`FOR UPDATE NOWAIT` and the message identifier with `pg_try_advisory_xact_lock`,
+for every status kind including `sent`, and both must be free.

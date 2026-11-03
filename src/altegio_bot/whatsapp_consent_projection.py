@@ -46,12 +46,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
 from altegio_bot.models.models import (
     CONSENT_COMMAND_STOP,
+    CONSENT_STATE_OPTED_OUT,
     DELIVERY_FAILURE_REASON_API_REJECTED,
     DELIVERY_FAILURE_SOURCE_META_API,
     INBOUND_AUTHENTICITY_UNVERIFIED,
@@ -71,6 +72,7 @@ from altegio_bot.whatsapp_consent import (
     SOURCE_SUPPRESSION,
     SOURCE_SUPPRESSION_UUID,
     ProjectedRefusal,
+    address_variants,
     apply_projected_refusal,
     consent_decision,
     iter_payload_consent_commands,
@@ -171,6 +173,7 @@ class ProjectionReport:
     refusals_written: int = 0
     refusals_noop: int = 0
     refusals_superseded: int = 0
+    cards_converged: int = 0
     newly_suppressed_addresses: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
     by_origin: dict[str, int] = field(default_factory=dict)
@@ -197,6 +200,7 @@ class ProjectionReport:
                 "written": self.refusals_written,
                 "noop": self.refusals_noop,
                 "superseded": self.refusals_superseded,
+                "cards_converged": self.cards_converged,
                 "newly_suppressed_addresses": self.newly_suppressed_addresses,
                 "by_origin": dict(sorted(self.by_origin.items())),
                 "skipped": dict(sorted(self.skipped.items())),
@@ -219,6 +223,57 @@ class ProjectionReport:
 
 def _bump(counter: dict[str, int], key: str) -> None:
     counter[key] = counter.get(key, 0) + 1
+
+
+async def _lock_cards(session: AsyncSession, address: str) -> None:
+    """Lock this address's card rows, by ascending id, before its consent lock.
+
+    The one global order this project uses: card rows first, then the consent
+    address. ``resolve_webhook_identity`` and the inbox worker's projection take
+    the same two in the same order, so a run of this reconciliation queues
+    behind them instead of crossing them.
+    """
+    variants = address_variants(address)
+    if not variants:
+        return
+    await session.execute(
+        select(Client.id).where(Client.phone_e164.in_(variants)).order_by(Client.id.asc()).with_for_update()
+    )
+
+
+async def _converge_cards(session: AsyncSession, address: str, *, now: datetime) -> int:
+    """Bring the legacy card flag into line with a refusal that is now active.
+
+    The refusing direction only, and the reason it has to happen HERE is that
+    this module writes the ledger. Without it a run left the ledger refusing and
+    ``Client.wa_opted_out`` saying sendable — and that flag is what
+    ``message_planner``, the outbox worker and every campaign path read, so the
+    disagreement was the refusal being ignored by everything except the new
+    consent guard. It is the same projection the inbox worker performs, taken
+    under the same two locks, so the two cannot end up disagreeing.
+
+    A card that already refuses is left untouched: ``wa_opted_out_at`` and
+    ``wa_opt_out_reason`` say when and why somebody refused, and restamping them
+    from a reconciliation would overwrite that history with the time of the run.
+
+    Queued marketing jobs are deliberately NOT cancelled. That is one of the
+    inbox worker's business actions and §46.4.4 keeps this module out of them;
+    the outbox re-reads the flag before it sends, so the refusal still vetoes.
+    """
+    variants = address_variants(address)
+    if not variants:
+        return 0
+    result = await session.execute(
+        update(Client)
+        .where(Client.phone_e164.in_(variants))
+        .where(Client.wa_opted_out.is_(False))
+        .values(
+            wa_opted_out=True,
+            wa_opted_out_at=now,
+            wa_opt_out_reason="wa:consent_projection",
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def _collect_client_flags(session: AsyncSession, report: ProjectionReport) -> list[RefusalCandidate]:
@@ -572,16 +627,25 @@ async def project(
                 report.refusals_already_suppressed += 1
                 _bump(report.skipped, SKIP_ALREADY_SUPPRESSED)
                 continue
-            # A source with no event time of its own cannot override a proven
+            # A SNAPSHOT with no event time of its own cannot override a proven
             # opt-in for the SAME address that this process observed later. Per
             # address deliberately: an opt-in proven for another number of the
             # same person says nothing about this one, and the asymmetry only
             # ever runs in the refusing direction.
             #
-            # This is the preview of the rule. The decision that counts is made
-            # again inside the write transaction, under the address lock, so a
-            # START landing between the two is not missed.
-            if candidate.event_at is None:
+            # Scoped to snapshots, which is the fix. A stored STOP MESSAGE whose
+            # timestamp cannot be read is NOT stale because of when we received
+            # it: a signed START sent at 10:10 can arrive at 10:30, behind a
+            # STOP received at 10:20, and dropping that STOP here made this
+            # command's answer depend on whether the live worker or this
+            # reconciliation got to it. It goes through the ordinary ledger
+            # rules instead, where an unknown order refuses.
+            #
+            # This is the preview of the rule, and it is the same predicate the
+            # write uses. The decision that counts is made again inside the
+            # write transaction, under the address lock, so a START landing
+            # between the two is not missed.
+            if not candidate.carries_event_evidence and candidate.event_at is None:
                 state = await ledger_state(session, phone=candidate.wa_address)
                 if (
                     state.permits
@@ -610,6 +674,11 @@ async def project(
             continue
         async with session_maker() as session:
             async with session.begin():
+                # Card rows first, then the consent address inside
+                # ``apply_projected_refusal``: the one order, so this run and the
+                # inbox worker's projection serialise instead of leaving a window
+                # in which an older permission commits over a newer refusal.
+                await _lock_cards(session, candidate.wa_address)
                 before = await consent_decision(
                     session,
                     phone=candidate.wa_address,
@@ -624,9 +693,12 @@ async def project(
                         event_at=candidate.event_at,
                         authenticity=INBOUND_AUTHENTICITY_UNVERIFIED,
                         whatsapp_event_id=candidate.whatsapp_event_id,
+                        snapshot=not candidate.carries_event_evidence,
                         notes={key: value for key, value in candidate.notes.items() if value is not None},
                     ),
                 )
+                if outcome.state == CONSENT_STATE_OPTED_OUT:
+                    report.cards_converged += await _converge_cards(session, candidate.wa_address, now=utcnow())
         if outcome.applied:
             report.refusals_written += 1
             if not before.suppressed:

@@ -13,6 +13,7 @@ import uuid as uuid_module
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import pytest
 from sqlalchemy import func, select
 
 from altegio_bot.models.models import (
@@ -33,6 +34,7 @@ from altegio_bot.whatsapp_consent import (
     CONSENT_COMMAND_START,
     CONSENT_COMMAND_STOP,
     apply_consent_decision,
+    apply_inbound_consent,
     consent_decision,
     lock_consent_address,
 )
@@ -952,22 +954,149 @@ async def test_applying_the_new_rules_twice_still_changes_nothing(session_maker)
 
 
 async def test_a_proven_start_between_the_read_and_the_write_wins(session_maker, monkeypatch) -> None:
-    """The decision that counts is made inside the write transaction.
+    """A SNAPSHOT collected while it still looked live, overtaken by an opt-in.
 
-    A historical STOP whose timestamp nobody can parse is collected while the
-    ledger still refuses, so it is a live candidate. A proven START then lands
-    before the write. Deciding only at collection time would write the candidate
-    anyway — and because its order cannot be established, the refusal it created
-    would be one §46.4.4 makes permanent. Re-deciding under the address lock
-    does not write it at all.
+    This is the case the write-time re-decision exists for, and it has to be a
+    snapshot: a preview row copies a state, so one taken before a proven opt-in
+    has already been answered by it. Deciding only at collection time would
+    write it anyway — and since a snapshot carries no event time, the refusal it
+    created would be one §46.4.4 makes permanent.
     """
     import altegio_bot.whatsapp_consent as consent_module
     import altegio_bot.whatsapp_consent_projection as projection_module
 
     await _refuse_at(session_maker, offset=0)
-    payload = _stored_payload(text="стоп", msg_id="wamid.R4RACE", epoch=BASE_EPOCH + 600)
+    await _permit_at(session_maker, offset=600)
+    await _add_opted_out_recipient(
+        session_maker, ADDRESS, created_at=datetime.fromtimestamp(BASE_EPOCH + 1200, tz=timezone.utc)
+    )
+
+    real = projection_module.apply_projected_refusal
+    state = {"armed": True}
+
+    async def _patched(session: Any, refusal: Any) -> Any:
+        if state["armed"]:
+            state["armed"] = False
+            # A refusal and then a proven, strictly newer opt-in: the ledger has
+            # moved past this snapshot while the run was in flight.
+            await _refuse_at(session_maker, offset=1800)
+            await _permit_now(session_maker)
+        return await real(session, refusal)
+
+    monkeypatch.setattr(projection_module, "apply_projected_refusal", _patched)
+    report = await project(session_maker, apply=True)
+
+    assert state["armed"] is False
+    rows = await _suppressions(session_maker)
+    assert [row.state for row in rows] == [CONSENT_STATE_OPTED_IN]
+    # The whole point: no refusal of unknown order was created on top of the
+    # proven opt-in, so the person is not banned for good by a stale read.
+    assert rows[0].stop_event_time_unknown_at is None
+    assert report.refusals_superseded == 1
+    assert report.refusals_written == 0
+    assert report.cards_converged == 0
+    assert consent_module.NOOP_PROJECTION_SUPERSEDED == "projection_older_than_proven_opt_in"
+
+
+# ---------------------------------------------------------------------------
+# Round 3, review fix 3 — a stored message is not a snapshot
+# ---------------------------------------------------------------------------
+
+
+async def _delayed_start_setup(session_maker) -> int:
+    """The review's sequence: a STOP nobody can order, behind a late START.
+
+    * a known STOP, event and observed time 10:00;
+    * a stored STOP whose timestamp cannot be read, RECEIVED at 10:20;
+    * a signed START whose own event time is 10:10, received at 10:30.
+
+    The START is proven strictly newer than the refusal it lifts, so it applies.
+    What must not follow is that the stored STOP counts as stale: it was only
+    received earlier, which says nothing about when it was sent.
+    """
+    await _refuse_at(session_maker, offset=0)
+    payload = _stored_payload(text="стоп", msg_id="wamid.R3DELAY", epoch=BASE_EPOCH + 600)
     payload["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"] = "not-a-timestamp"
-    event_id = await _store_event(session_maker, payload, dedupe_key="wa:r4-race")
+    event_id = await _store_event(session_maker, payload, dedupe_key="wa:r3-delayed")
+    async with session_maker() as session:
+        async with session.begin():
+            event = await session.get(WhatsAppEvent, event_id)
+            event.received_at = datetime.fromtimestamp(BASE_EPOCH + 1200, tz=timezone.utc)
+
+    moment = datetime.fromtimestamp(BASE_EPOCH + 1800, tz=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, ADDRESS)
+            lifted = await apply_consent_decision(
+                session,
+                wa_address=ADDRESS,
+                command=CONSENT_COMMAND_START,
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source=CONSENT_SOURCE_INBOUND,
+                observed_at=moment,
+                event_at=datetime.fromtimestamp(BASE_EPOCH + 600, tz=timezone.utc),
+            )
+    assert lifted.applied, lifted
+    return event_id
+
+
+@pytest.mark.parametrize("path", ["projection", "live"])
+async def test_a_stored_stop_of_unknown_order_refuses_on_both_paths(session_maker, path: str) -> None:
+    """One message, two ways of reaching it, and they must agree.
+
+    The projection used to drop it — "received before the opt-in, therefore
+    stale" — while ``apply_inbound_consent`` applied it and refused. Whether
+    somebody could be messaged then depended on which of the two got to the
+    event first, which is the one thing §46.4.4 rules out: an unproven order is
+    not a permission.
+    """
+    event_id = await _delayed_start_setup(session_maker)
+
+    if path == "projection":
+        report = await project(session_maker, apply=True)
+        assert report.refusals_written == 1
+        assert report.refusals_superseded == 0
+    else:
+        await apply_inbound_consent(session_maker, event_id=event_id)
+
+    rows = await _suppressions(session_maker)
+    assert len(rows) == 1
+    assert rows[0].state == CONSENT_STATE_OPTED_OUT
+    assert rows[0].stop_event_time_unknown_at is not None
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, include_pending=False)
+    assert decision.suppressed is True
+
+    # And nothing can lift it afterwards: the order cannot be established.
+    moment = datetime.fromtimestamp(BASE_EPOCH + 99_999, tz=timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, ADDRESS)
+            outcome = await apply_consent_decision(
+                session,
+                wa_address=ADDRESS,
+                command=CONSENT_COMMAND_START,
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source=CONSENT_SOURCE_INBOUND,
+                observed_at=moment,
+                event_at=moment,
+            )
+    assert outcome.applied is False
+    assert outcome.reason == "stop_event_time_unproven"
+
+
+async def test_a_stored_stop_collected_before_a_concurrent_start_still_refuses(session_maker, monkeypatch) -> None:
+    """Collected while the ledger refused, written after a proven opt-in landed.
+
+    A snapshot in this position is dropped. A real message is not: it goes
+    through the ordinary ledger rules, and an unknown order refuses there.
+    """
+    import altegio_bot.whatsapp_consent_projection as projection_module
+
+    await _refuse_at(session_maker, offset=0)
+    payload = _stored_payload(text="стоп", msg_id="wamid.R3RACE2", epoch=BASE_EPOCH + 600)
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"] = "not-a-timestamp"
+    event_id = await _store_event(session_maker, payload, dedupe_key="wa:r3-race2")
     async with session_maker() as session:
         async with session.begin():
             event = await session.get(WhatsAppEvent, event_id)
@@ -987,13 +1116,81 @@ async def test_a_proven_start_between_the_read_and_the_write_wins(session_maker,
 
     assert state["armed"] is False
     rows = await _suppressions(session_maker)
-    assert [row.state for row in rows] == [CONSENT_STATE_OPTED_IN]
-    # The whole point: no refusal of unknown order was created on top of the
-    # proven opt-in, so the person is not banned for good by a stale read.
-    assert rows[0].stop_event_time_unknown_at is None
-    assert report.refusals_superseded == 1
-    assert report.refusals_written == 0
-    assert consent_module.NOOP_PROJECTION_SUPERSEDED == "projection_older_than_proven_opt_in"
+    assert [row.state for row in rows] == [CONSENT_STATE_OPTED_OUT]
+    assert rows[0].stop_event_time_unknown_at is not None
+    assert report.refusals_written == 1
+    assert report.refusals_superseded == 0
+
+
+async def test_the_projection_brings_the_card_flag_with_it(session_maker) -> None:
+    """A refusal this run writes also lands on the flag every sender reads.
+
+    Without it a run left the ledger refusing and ``Client.wa_opted_out`` saying
+    sendable, and that flag is what ``message_planner``, the outbox worker and
+    every campaign path read — so the refusal was ignored by everything except
+    the new consent guard.
+    """
+    from altegio_bot.campaigns.segment import compute_excluded_reason
+
+    await _store_event(
+        session_maker,
+        _stored_payload(text="стоп", msg_id="wamid.R3CARD", epoch=BASE_EPOCH),
+        dedupe_key="wa:r3-card",
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    provider="altegio",
+                    company_id=1,
+                    altegio_client_id=995111,
+                    phone_e164=ADDRESS,
+                    display_name="Sendable",
+                    raw={},
+                    wa_opted_out=False,
+                )
+            )
+
+    report = await project(session_maker, apply=True)
+
+    assert report.refusals_written == 1
+    assert report.cards_converged == 1
+    async with session_maker() as session:
+        card = (await session.execute(select(Client).where(Client.phone_e164 == ADDRESS))).scalar_one()
+    assert card.wa_opted_out is True
+    assert card.wa_opt_out_reason == "wa:consent_projection"
+    assert (
+        compute_excluded_reason(
+            wa_opted_out=bool(card.wa_opted_out),
+            phone_e164=card.phone_e164,
+            count_before=0,
+            lash_count=1,
+            attended_lash_count=1,
+        )
+        == "opted_out"
+    )
+
+
+async def test_a_card_that_already_refuses_is_not_restamped(session_maker) -> None:
+    """``wa_opted_out_at`` says when somebody refused, not when a run noticed."""
+    await _add_opted_out_card(session_maker, ADDRESS)
+    await _store_event(
+        session_maker,
+        _stored_payload(text="стоп", msg_id="wamid.R3KEEP", epoch=BASE_EPOCH),
+        dedupe_key="wa:r3-keep",
+    )
+    async with session_maker() as session:
+        before = (await session.execute(select(Client).where(Client.phone_e164 == ADDRESS))).scalar_one()
+        stamped, reason = before.wa_opted_out_at, before.wa_opt_out_reason
+
+    report = await project(session_maker, apply=True)
+
+    assert report.cards_converged == 0
+    async with session_maker() as session:
+        after = (await session.execute(select(Client).where(Client.phone_e164 == ADDRESS))).scalar_one()
+    assert after.wa_opted_out is True
+    assert after.wa_opted_out_at == stamped
+    assert after.wa_opt_out_reason == reason
 
 
 async def test_the_dry_run_of_the_new_rules_writes_nothing(session_maker) -> None:

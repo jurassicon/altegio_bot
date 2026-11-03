@@ -768,16 +768,36 @@ class ConsentApplication:
     reasons: tuple[str, ...] = ()
 
 
-async def _receipts_for_event(session: AsyncSession, event_id: int) -> list[WhatsAppInboundReceipt]:
-    return list(
-        (
-            await session.scalars(
-                select(WhatsAppInboundReceipt)
-                .where(WhatsAppInboundReceipt.whatsapp_event_id == event_id)
-                .order_by(WhatsAppInboundReceipt.message_index.asc())
-            )
-        ).all()
+async def _receipts_for_event(
+    session: AsyncSession,
+    event_id: int,
+    *,
+    refresh: bool = False,
+) -> list[WhatsAppInboundReceipt]:
+    """The receipts of one event, in message order.
+
+    ``refresh`` re-reads the mutable state of rows this session has already
+    loaded, and it is not a nicety. A second ``SELECT`` on its own returns the
+    EXISTING instances from the identity map with the attributes they had when
+    they were first read, so a row another transaction has since changed still
+    reads as it did before — and taking a lock does not refresh anything either.
+
+    That cost a refusal. The consent worker read the receipts, then took the
+    address locks; in between, the booking bridge proved a new number for the
+    person, moved the card and stamped the proven UUID onto the still-pending
+    receipt. The worker went on with its stale ``None``, wrote a suppression
+    bound to no UUID and resolved the receipt — after which the only record of
+    the link was a resolved row the send guard no longer looks at, and the new
+    number passed the guard.
+    """
+    statement = (
+        select(WhatsAppInboundReceipt)
+        .where(WhatsAppInboundReceipt.whatsapp_event_id == event_id)
+        .order_by(WhatsAppInboundReceipt.message_index.asc())
     )
+    if refresh:
+        statement = statement.execution_options(populate_existing=True)
+    return list((await session.scalars(statement)).all())
 
 
 async def _backfill_receipts(
@@ -1035,12 +1055,28 @@ async def apply_inbound_consent(
             # applied in message order, with STOP taking precedence by the
             # ledger's own rules. Only the order in which the locks are acquired
             # is fixed, and it is now the same one on both sides.
-            await lock_consent_addresses(session, (receipt.wa_address for receipt in receipts))
+            locked = set(await lock_consent_addresses(session, (receipt.wa_address for receipt in receipts)))
+
+            # And only now is the receipt state read for real. Everything above
+            # could be stale: the rows were loaded before the locks existed, and
+            # neither a lock nor a second SELECT refreshes an instance this
+            # session already holds. ``linked_easyweek_customer_uuid`` and
+            # ``resolved_at`` are exactly the two attributes another transaction
+            # may have changed in that window.
+            receipts = await _receipts_for_event(session, event_id, refresh=True)
 
             applied = refused = noop = 0
             reasons: list[str] = []
             for receipt in receipts:
                 if receipt.resolved_at is not None:
+                    continue
+                if receipt.wa_address not in locked:
+                    # An address the locks do not cover, which can only come
+                    # from a concurrent backfill of this same event. Left
+                    # unresolved on purpose: an unresolved receipt HOLDS sends,
+                    # so the fail-closed answer is to leave it for a pass that
+                    # locks it rather than to decide it unserialised.
+                    logger.warning("inbound receipt arrived outside the locked address set event_id=%s", event_id)
                     continue
                 if receipt.route_allowed is False:
                     # Belt to the ingress's braces. A refused route is already
@@ -1740,6 +1776,15 @@ class ProjectedRefusal:
     authenticity: str = INBOUND_AUTHENTICITY_UNVERIFIED
     whatsapp_event_id: int | None = None
     receipt_id: int | None = None
+    # Is this a SNAPSHOT of a state — a card flag, a preview row — rather than a
+    # message somebody sent? Load-bearing. A snapshot has no event of its own,
+    # so one taken before a proven opt-in is a copy of a state the ledger has
+    # already moved past and must not refuse again. A stored STOP MESSAGE is not
+    # a snapshot: its order may be unknown, but it is a refusal somebody really
+    # sent, and treating the moment we happened to RECEIVE it as proof that it
+    # is stale made this projection disagree with live processing about the same
+    # message.
+    snapshot: bool = False
     notes: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1772,14 +1817,24 @@ async def apply_projected_refusal(
     past the 10:00 one and a START at 10:30 lifted a refusal the database could
     prove was newer than it.
 
-    A source with no provable event time is therefore ordered against the moment
-    a proven opt-in for THIS address was observed. Both sides of that comparison
-    are this process's own clock, so nothing external is invented; and it is
-    strictly per address, because a proven opt-in on another number of the same
-    person is not an opt-in for this one.
+    A SNAPSHOT with no provable event time is therefore ordered against the
+    moment a proven opt-in for THIS address was observed. Both sides of that
+    comparison are this process's own clock, so nothing external is invented;
+    and it is strictly per address, because a proven opt-in on another number of
+    the same person is not an opt-in for this one.
+
+    A stored STOP MESSAGE is never ordered that way. That was the second mistake
+    in the same rule: a refusal somebody SENT is not stale because of when this
+    process happened to receive it. A delivery can sit in a queue — a signed
+    START sent at 10:10 can arrive at 10:30, behind a STOP whose own timestamp
+    is unreadable and which was received at 10:20 — and dropping the STOP on
+    that basis made this module disagree with :func:`apply_inbound_consent`
+    about one and the same message: live processing applies it and refuses,
+    while the reconciliation skipped it and the send went ahead. A real message
+    goes through the ordinary ledger rules, where an unknown order refuses.
     """
     await lock_consent_address(session, refusal.wa_address)
-    if refusal.event_at is None:
+    if refusal.snapshot and refusal.event_at is None:
         current = await _suppression_for_update(session, refusal.wa_address)
         if (
             current is not None
