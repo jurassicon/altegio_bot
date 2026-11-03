@@ -1644,10 +1644,19 @@ reconciliation at all.
 Live STOP processing locks matching cards, then queued marketing jobs, then
 consent addresses. The job set is selected for the whole delivery in id order;
 only those jobs can be cancelled in that transaction, with their current scope
-and queued status re-checked. Booking writers finish their job changes and HTTP
-requests before settling consent. This prevents a booking update and STOP from
-waiting on each other's job/consent locks. Later jobs still face the saved card
-refusal at Outbox's final check; historical reconciliation does not cancel jobs.
+and queued status re-checked. The Altegio planner uses the same id order for all
+existing system jobs of its record/company, in every status, before cancellation
+or dedupe upserts. Cancellation keeps its original scope and queued-only rule;
+the wider lock set also covers rows a later upsert can touch or revive.
+
+The live projection's card lock is `FOR NO KEY UPDATE`: it blocks other card
+writes but permits an Outbox insert's foreign-key reference to finish. This
+avoids a cycle through a running job that the booking planner must lock.
+Booking writers finish their job changes and HTTP requests before settling
+consent. Jobs created or made eligible after selection are outside the
+cancellation set. Outbox's final card check rejects a send when the card refusal
+is already committed at that check; this protocol does not retract an external
+send that has already begun. Historical reconciliation does not cancel jobs.
 
 `superseded` never applies to a stored STOP message. A refusal somebody sent is
 not stale because of when this process received it — a signed START sent at

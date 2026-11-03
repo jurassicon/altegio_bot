@@ -1004,7 +1004,7 @@ async def _set_opt_out(
     ``card_ids`` restricts the write to rows the caller has already locked, and
     it is what keeps the serialised path's lock order intact. Matching by phone
     alone could reach a card that started matching this address after the
-    caller's ``FOR UPDATE`` ran, and taking that row's lock here — after the
+    caller's card-lock query ran, and taking that row's lock here — after the
     consent locks — is exactly the inversion that deadlocked the projection
     against the contact proof that moved the card. ``None`` means the
     unserialised path, which holds no locks to be consistent with.
@@ -1326,7 +1326,11 @@ async def _card_ids_matching(session: AsyncSession, phones: Collection[str], *, 
         return set()
     statement = select(Client.id).where(Client.phone_e164.in_(variants)).order_by(Client.id.asc())
     if lock:
-        statement = statement.with_for_update()
+        # Only consent flags are written. NO KEY UPDATE still excludes phone
+        # and flag writers, but lets an in-flight Outbox insert prove its FK.
+        # FOR UPDATE would make that insert wait here while its job is held,
+        # closing a cycle through a booking planner waiting for that same job.
+        statement = statement.with_for_update(key_share=True)
     return {int(value) for value in (await session.scalars(statement)).all()}
 
 

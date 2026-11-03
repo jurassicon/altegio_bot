@@ -219,7 +219,7 @@ It is **serialised**. Before reading the consent decision, the live projection
 locks the whole delivery's matching rows in this order:
 
 1. every **card row** of every address in the delivery, in one statement, in
-   ascending id order;
+   ascending id order, using `FOR NO KEY UPDATE`;
 2. the matching **queued marketing `MessageJob` rows**, in ascending id order;
 3. every **consent address**, sorted.
 
@@ -235,9 +235,35 @@ after taking consent locks. This matters when a booking update has already
 locked a marketing job and is about to settle its card's consent: the projection
 must wait for that job **before** holding the consent lock the update needs.
 
+The Altegio `message_planner` takes its job locks in the **same id order**, once
+before its first cancellation or `add_job`, including on a create event. Its set
+is all existing `SYSTEM_JOB_TYPES` rows for the record and company, **in every
+status**.
+A later dedupe upsert can revive a cancelled/failed row, and `ON CONFLICT` locks
+even a row that its `WHERE` leaves unchanged. Locking only the currently queued
+rows would therefore leave a lower-id lock to be acquired after a higher one.
+The cancellation itself remains narrower: it touches only those locked ids that
+still match the original company, record, system type and `queued` predicates.
+The standalone cancellation helper takes the same ordered set when the caller
+has not already supplied it.
+
+The participating inbox writer already holds its card and record; the record
+write orders competing booking planners. This is a protocol for their existing
+job rows, not a claim to lock jobs that unrelated callers might insert later.
+Neither a bulk `UPDATE` nor a particular index scan guarantees row order: an
+ordinary update of `run_at` can make the visible tuple order differ from id order.
+
+The card lock deliberately permits **foreign-key references** while excluding
+other card writers. A running Outbox job may need a `KEY SHARE` lock on that card
+to insert its `OutboxMessage`. A stronger `FOR UPDATE` card lock could block that
+insert while the planner waits for the running job and the projection waits for
+the planner's job. `FOR NO KEY UPDATE` allows the reference to finish without
+allowing a concurrent phone/flag write. It does not weaken the final card veto.
+
 Jobs created or made eligible after the job selection are outside that
-cancellation set. This is not a promise to cancel future jobs: the atomically
-saved card refusal and the Outbox's final card check still prevent their send.
+cancellation set. Outbox's final card check rejects a send when the card refusal
+is already committed at that check. This protocol does not promise to cancel
+those later jobs or retract an external send that has already begun.
 
 **A card that starts matching after step 1 is outside the projection's locked
 set.** Its writer must converge it against the ledger before committing that
@@ -836,7 +862,7 @@ Not implemented, and not reachable by any flag:
 | Historical reconciliation, its limits, racing live ingress, route provenance | `tests/test_whatsapp_consent_projection.py` |
 | A refusal surviving a UUID proven later and a number change | `tests/test_whatsapp_consent_uuid_adoption.py` |
 | Consent locks outside HTTP and one address order across nested writers | `tests/test_whatsapp_consent_card_locks.py` |
-| Booking reassignment racing STOP and queued marketing job cancellation | `tests/test_whatsapp_consent_job_locks.py` |
+| Booking reassignment racing STOP, multi-job order, dedupe and Outbox foreign-key locks | `tests/test_whatsapp_consent_job_locks.py` |
 | Migration cycle, ORM parity, destructive-downgrade refusal, PG16 concurrency | `tests/test_easyweek_voucher_mailing_durability.py` |
 
 All are required. No marker, skip or xfail was added. A change to shared inbound
@@ -869,8 +895,12 @@ call itself: the acknowledgement probes the batch header with
 `FOR UPDATE NOWAIT` and the message identifier with `pg_try_advisory_xact_lock`,
 for every status kind including `sent`, and both must be free.
 
-The job-lock regression uses a real Altegio booking reassignment, its real job
-planner and a claimed WhatsApp STOP. It pauses the competing transactions at the
-job/consent boundary and requires both events to finish, both cards to refuse,
-and the queued marketing jobs to be cancelled without replaying external actions.
-Unexpected HTTP requests are blocked in this reproduction.
+The job-lock regressions use a real Altegio booking reassignment, its real job
+planner and a claimed WhatsApp STOP. They cover the job/consent boundary and
+multiple jobs whose visible tuple order differs from their id order after an
+ordinary `run_at` update. A SQL barrier fixes the scheduling window; a synthetic
+deadlock exception does not stand in for the database. Both events must finish,
+both cards must refuse, and the queued marketing jobs must be cancelled without
+replaying external actions. Further cases cover existing dedupe rows outside
+`queued` and a running Outbox job that needs a foreign-key reference to the card.
+Unexpected HTTP requests are blocked in these reproductions.
