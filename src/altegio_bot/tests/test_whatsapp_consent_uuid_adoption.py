@@ -20,6 +20,7 @@ written by hand, because the whole question is whether production reaches it.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -38,6 +39,7 @@ from altegio_bot.models.models import (
     WhatsAppConsentSuppression,
     WhatsAppEvent,
     WhatsAppInboundReceipt,
+    WhatsAppSender,
 )
 from altegio_bot.tests.easyweek_fixtures import TEST_CUSTOMER_ID, TEST_LOCATION_ID, booking_created
 from altegio_bot.tests.test_easyweek_uuid_identity_worker import CUSTOMER, PHONE, Reader
@@ -56,6 +58,7 @@ from altegio_bot.whatsapp_consent import (
     record_inbound_receipts,
 )
 from altegio_bot.workers import easyweek_inbox_worker as worker
+from altegio_bot.workers import whatsapp_inbox_worker as wa_worker
 
 NEW_PHONE = "+4915100000822"
 
@@ -749,3 +752,403 @@ async def test_the_other_order_of_those_two_workers_is_also_safe(session_maker, 
     async with session_maker() as session:
         guard = await final_send_guard(session, phone=NEW_PHONE, easyweek_customer_uuid=uuid.UUID(CUSTOMER))
     assert guard.allowed is False
+
+
+# ===========================================================================
+# Round 4, review fix 1 — the locked card set is a checked fact
+# ===========================================================================
+
+THIRD_PHONE = "+4915100000931"
+WA_PNID = "PNID-ADOPTION"
+
+
+async def _altegio_card(session_maker, phone: str, *, altegio_client_id: int = 994001) -> int:
+    """A plain Altegio recipient of the same delivery, untouched by any proof."""
+    async with session_maker() as session:
+        async with session.begin():
+            card = Client(
+                provider="altegio",
+                company_id=1,
+                altegio_client_id=altegio_client_id,
+                phone_e164=phone,
+                display_name="Third",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add(card)
+            await session.flush()
+            return int(card.id)
+
+
+async def _seed_whatsapp_sender(session_maker) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            existing = await session.scalar(select(WhatsAppSender.id).where(WhatsAppSender.phone_number_id == WA_PNID))
+            if existing is None:
+                session.add(
+                    WhatsAppSender(
+                        company_id=1,
+                        sender_code="adoption",
+                        phone_number_id=WA_PNID,
+                        display_phone="+4930000007",
+                        is_active=True,
+                    )
+                )
+
+
+def _two_stop_payload(first: str, second: str, *, epoch: int = 1_760_000_000) -> dict:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "WABA-ADOPTION",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": WA_PNID},
+                            "messages": [
+                                {
+                                    "from": address.lstrip("+"),
+                                    "id": f"wamid.R4-{index}",
+                                    "timestamp": str(epoch + index),
+                                    "type": "text",
+                                    "text": {"body": "STOP"},
+                                }
+                                for index, address in enumerate((first, second))
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+async def _accept_two_stops(session_maker, first: str, second: str) -> int:
+    """Store one delivery carrying a STOP for each of two people."""
+    now = datetime.now(timezone.utc)
+    payload = _two_stop_payload(first, second)
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key="wa:r4-two-stops",
+                status="received",
+                payload=payload,
+                inbound_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                received_at=now,
+            )
+            session.add(event)
+            await session.flush()
+            await record_inbound_receipts(
+                session,
+                dedupe_key=str(event.dedupe_key),
+                event_id=int(event.id),
+                payload=payload,
+                signature_verified=True,
+                observed_at=now,
+                allowed_phone_number_ids={WA_PNID},
+            )
+            return int(event.id)
+
+
+async def _store_captured(session_maker, payload: dict) -> int:
+    """A second captured event for the SAME booking, byte for byte."""
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                status="captured",
+                event_hint="booking-created",
+                auth_via="query",
+                payload_hash=f"synthetic-{uuid.uuid4().hex}",
+                payload=payload,
+                body_truncated=False,
+                booking_uuid=uuid.UUID(payload["uid"]),
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+class _CaptureProvider:
+    """Counts what would have been sent. Never sends."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str, str]] = []
+
+    async def send(self, sender_id: int, phone_e164: str, text: str, contact_name: str | None = None) -> str:
+        self.sent.append((sender_id, phone_e164, text))
+        return f"wamid.ACK{len(self.sent)}"
+
+    async def send_template(self, *args, **kwargs) -> str:  # pragma: no cover - never reached
+        raise AssertionError("an inbound command never sends a template")
+
+
+async def _process_whatsapp(session_maker, event_id: int, provider) -> None:
+    original = wa_worker.SessionLocal
+    try:
+        wa_worker.SessionLocal = session_maker  # type: ignore[assignment]
+        await wa_worker.process_one_event(event_id, provider)
+    finally:
+        wa_worker.SessionLocal = original
+
+
+async def _wait_until_a_transaction_is_queued(session_maker, *, timeout: float = 30.0) -> None:
+    """Wait until PostgreSQL reports a transaction waiting for a lock.
+
+    Every lock type counts: the orders under test mix transaction-scoped
+    advisory locks with row locks on the card rows, and a wait for either one is
+    a wait.
+    """
+    import asyncio
+
+    from sqlalchemy import text as sql_text
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with session_maker() as probe:
+            waiting = await probe.scalar(sql_text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
+        if int(waiting or 0) >= 1:
+            return
+        assert loop.time() < deadline, "nothing ever queued on a lock"
+        await asyncio.sleep(0.05)
+
+
+def _marketing_verdict(card: Client) -> str | None:
+    from altegio_bot.campaigns.segment import compute_excluded_reason
+
+    return compute_excluded_reason(
+        wa_opted_out=bool(card.wa_opted_out),
+        phone_e164=card.phone_e164,
+        count_before=0,
+        lash_count=1,
+        attended_lash_count=1,
+    )
+
+
+def _booking_of(payload: dict):
+    registry = identity.configured_easyweek_locations()
+    return worker.normalize_event(
+        event_hint="booking-created",
+        payload=payload,
+        body_truncated=False,
+        location_registry=registry.locations,
+    )
+
+
+async def test_a_card_moving_onto_an_address_mid_projection_does_not_deadlock(session_maker, monkeypatch) -> None:
+    """The review's schedule, with the real identity path on both sides.
+
+    One delivery carries a STOP for each of two people. When the projection
+    locks the cards it can find, only the second recipient has one — the
+    EasyWeek card of the proven UUID is still on another number. A legitimate
+    contact proof then moves that card ONTO the first address and commits, and a
+    second proof of the same booking takes the moved row and waits for the
+    consent lock the projection is holding.
+
+    ``FOR UPDATE`` only protected the rows that matched when it ran, and the
+    card write matched by phone — so it reached for the moved row's lock after
+    the consent locks, inverting the one order this project keeps. PostgreSQL
+    made the projection the victim: the ledger refused, the receipts were
+    resolved, BOTH cards stayed sendable, the event stayed `processing` with no
+    recovery pass, and the real campaign classifier went on allowing marketing
+    to the recipient no proof had ever touched.
+
+    Now the write touches only the locked ids, so no row lock can follow a
+    consent lock, and the set is compared again under those locks so the moved
+    card is neither missed nor dropped: the transaction restarts and locks it
+    first.
+    """
+    await _uuid_only_card(session_maker, phone=NEW_PHONE)
+    third_id = await _altegio_card(session_maker, THIRD_PHONE)
+    await _seed_whatsapp_sender(session_maker)
+    delivery = await _accept_two_stops(session_maker, PHONE, THIRD_PHONE)
+
+    _first_event, payload = await _capture_booking(session_maker)
+    second_event = await _store_captured(session_maker, payload)
+    booking = _booking_of(payload)
+
+    real = wa_worker._card_ids_matching
+    state: dict[str, object] = {"moved": False, "task": None, "locked_first": None, "restarts": 0}
+
+    async def _patched(session, phones, *, lock: bool):
+        ids = await real(session, phones, lock=lock)
+        if lock:
+            if not state["moved"]:
+                state["moved"] = True
+                state["locked_first"] = set(ids)
+                # The first proof: it moves the card onto this delivery's first
+                # address and commits, entirely outside the projection.
+                assert await identity.resolve_webhook_identity(
+                    session_maker,
+                    event_id=_first_event,
+                    booking=booking,
+                    reader=Reader(payload, session_maker, check_lock=False),
+                )
+            else:
+                state["restarts"] = int(state["restarts"]) + 1
+        elif state["task"] is None:
+            # The projection now holds the consent locks. The second proof takes
+            # the moved card row and queues on the consent lock — which is the
+            # moment the old code asked for that same row.
+            state["task"] = asyncio.create_task(
+                identity.resolve_webhook_identity(
+                    session_maker,
+                    event_id=second_event,
+                    booking=booking,
+                    reader=Reader(payload, session_maker, check_lock=False),
+                )
+            )
+            await _wait_until_a_transaction_is_queued(session_maker)
+        return ids
+
+    monkeypatch.setattr(wa_worker, "_card_ids_matching", _patched)
+    provider = _CaptureProvider()
+    await _process_whatsapp(session_maker, delivery, provider)
+    assert await asyncio.wait_for(state["task"], timeout=60) is True
+
+    # The pre-lock really did miss the card that later matched.
+    moved_card_id = None
+    async with session_maker() as session:
+        moved_card_id = int(
+            await session.scalar(select(Client.id).where(Client.phone_e164 == PHONE, Client.provider == "easyweek"))
+        )
+    assert moved_card_id not in state["locked_first"]
+    assert int(state["restarts"]) >= 1, "the moved set has to force a restart"
+
+    # Both refusals are durable and both cards agree with them.
+    for address in (PHONE, THIRD_PHONE):
+        row = await _suppression(session_maker, address)
+        assert row is not None, address
+        assert row.state == CONSENT_STATE_OPTED_OUT, address
+    async with session_maker() as session:
+        moved = await session.get(Client, moved_card_id)
+        third = await session.get(Client, third_id)
+        event = await session.get(WhatsAppEvent, delivery)
+        receipts = list(
+            (
+                await session.scalars(
+                    select(WhatsAppInboundReceipt).where(WhatsAppInboundReceipt.whatsapp_event_id == delivery)
+                )
+            ).all()
+        )
+    assert moved.wa_opted_out is True
+    assert third.wa_opted_out is True
+    assert _marketing_verdict(third) == "opted_out"
+    assert _marketing_verdict(moved) == "opted_out"
+    assert event.status == "processed"
+    assert [r.resolution for r in receipts] == ["applied", "applied"]
+    assert all(r.resolved_at is not None for r in receipts)
+    # Only the acknowledgement of the first message leaves, and nothing else:
+    # the provider is a double and no external request is made anywhere here.
+    assert len(provider.sent) == 1
+    assert "abgemeldet" in provider.sent[0][2]
+    async with session_maker() as session:
+        for address in (PHONE, THIRD_PHONE):
+            guard = await final_send_guard(session, phone=address)
+            assert guard.allowed is False, address
+
+
+async def test_the_same_delivery_processed_again_changes_nothing(session_maker, monkeypatch) -> None:
+    """The reverse schedule: the card has already moved before the delivery runs.
+
+    Nothing has to restart — the pre-lock finds both cards — and re-processing
+    the event is a no-op on both the ledger and the cards.
+    """
+    await _uuid_only_card(session_maker, phone=NEW_PHONE)
+    third_id = await _altegio_card(session_maker, THIRD_PHONE)
+    await _seed_whatsapp_sender(session_maker)
+
+    _first_event, payload = await _capture_booking(session_maker)
+    assert await identity.resolve_webhook_identity(
+        session_maker,
+        event_id=_first_event,
+        booking=_booking_of(payload),
+        reader=Reader(payload, session_maker, check_lock=False),
+    )
+
+    delivery = await _accept_two_stops(session_maker, PHONE, THIRD_PHONE)
+    provider = _CaptureProvider()
+    await _process_whatsapp(session_maker, delivery, provider)
+
+    async def _versions() -> list[tuple[str, int, bool]]:
+        async with session_maker() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(WhatsAppConsentSuppression).order_by(WhatsAppConsentSuppression.wa_address)
+                    )
+                ).all()
+            )
+            cards = list((await session.scalars(select(Client).order_by(Client.id))).all())
+        return [(str(r.wa_address), int(r.consent_version), r.state == CONSENT_STATE_OPTED_OUT) for r in rows] + [
+            (str(c.phone_e164), int(c.id), bool(c.wa_opted_out)) for c in cards
+        ]
+
+    before = await _versions()
+    await _process_whatsapp(session_maker, delivery, _CaptureProvider())
+    assert await _versions() == before
+
+    async with session_maker() as session:
+        third = await session.get(Client, third_id)
+    assert third.wa_opted_out is True
+    assert _marketing_verdict(third) == "opted_out"
+
+
+async def test_the_historical_projection_restarts_on_a_moved_card_set(session_maker, monkeypatch) -> None:
+    """The same protocol on the reconciliation path.
+
+    Its write is scoped to the rows it locked and its set is re-checked under
+    the consent lock, so a card moving onto the candidate's address restarts the
+    candidate's transaction instead of taking a row lock out of order.
+    """
+    import altegio_bot.whatsapp_consent_projection as projection_module
+
+    await _uuid_only_card(session_maker, phone=NEW_PHONE)
+    # A stored delivery nobody ever processed: the candidate this run is about.
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="wa:r4-historical",
+                    status="processed",
+                    payload=_stop_payload(PHONE, msg_id="wamid.R4HIST", epoch=1_760_000_000),
+                    received_at=now,
+                )
+            )
+    _first_event, payload = await _capture_booking(session_maker)
+    booking = _booking_of(payload)
+
+    real = projection_module._card_ids_matching
+    state: dict[str, object] = {"moved": False, "restarts": 0}
+
+    async def _patched(session, address, *, lock: bool):
+        ids = await real(session, address, lock=lock)
+        if lock and address == PHONE:
+            if not state["moved"]:
+                state["moved"] = True
+                assert await identity.resolve_webhook_identity(
+                    session_maker,
+                    event_id=_first_event,
+                    booking=booking,
+                    reader=Reader(payload, session_maker, check_lock=False),
+                )
+            else:
+                state["restarts"] = int(state["restarts"]) + 1
+        return ids
+
+    monkeypatch.setattr(projection_module, "_card_ids_matching", _patched)
+    report = await projection_module.project(session_maker, apply=True)
+
+    assert state["moved"] is True
+    assert int(state["restarts"]) >= 1
+    assert report.refusals_unsettled == 0
+    assert report.cards_converged >= 1
+    async with session_maker() as session:
+        moved = (
+            await session.execute(select(Client).where(Client.phone_e164 == PHONE, Client.provider == "easyweek"))
+        ).scalar_one()
+    assert moved.wa_opted_out is True
+    assert moved.wa_opt_out_reason == "wa:consent_projection"

@@ -1632,6 +1632,11 @@ already in force is applied again on purpose, to move the boundary a later
 resubscribe has to beat, and is reported as a no-op because nothing about the
 person's state changed.
 
+`unsettled` counts candidates the run could not finish because the set of cards
+matching that address kept moving under its locks — an unusual, benign state: the
+ledger write rolls back with the attempt, so nothing half-applied is left, and a
+later run picks the candidate up again.
+
 `superseded` never applies to a stored STOP message. A refusal somebody sent is
 not stale because of when this process received it — a signed START sent at
 10:10 can arrive at 10:30 behind a STOP received at 10:20 — so a stored STOP

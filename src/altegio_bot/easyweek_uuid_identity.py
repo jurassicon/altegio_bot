@@ -226,6 +226,11 @@ async def resolve_webhook_identity(
                     wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
                 )
             )
+        if stale_contact:
+            # Consume the same event's business changes atomically with the
+            # proven contact. Otherwise the next pass would restore/re-prove
+            # its obsolete phone forever. Captured payload remains untouched.
+            await apply_stale_contact(session, event, proven_phone)
         # §46.4.2 — the one moment this binding is justified. The UUID has just
         # been proven for this person against EasyWeek's own records, so an
         # existing phone-keyed refusal for any of those numbers is bound to it
@@ -233,10 +238,15 @@ async def resolve_webhook_identity(
         # writes a UUID onto a refusal and claims nothing about whose card this
         # is, which branch they belong to, or whether they are an EasyWeek
         # customer — and it never creates, lifts or weakens a refusal.
+        #
+        # LAST, after the business writes above, and that position is part of
+        # the project's one lock order: card rows first, consent addresses
+        # after them, never the other way round. ``apply_stale_contact`` runs
+        # the ordinary EasyWeek write for this event and touches card rows of
+        # its own, so taking the consent locks before it would have left this
+        # transaction holding a consent lock while asking for a card row — the
+        # inversion the consent projection deadlocked against. The addresses
+        # were read BEFORE the number changed, so moving the call does not
+        # change what is bound.
         await extend_refusal_to_uuid(session, addresses=consent_addresses, customer_uuid=identity)
-        if stale_contact:
-            # Consume the same event's business changes atomically with the
-            # proven contact. Otherwise the next pass would restore/re-prove
-            # its obsolete phone forever. Captured payload remains untouched.
-            await apply_stale_contact(session, event, proven_phone)
         return True

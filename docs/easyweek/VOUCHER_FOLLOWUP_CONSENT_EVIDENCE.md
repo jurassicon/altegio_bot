@@ -220,7 +220,32 @@ transaction locks, before its first read:
 
 1. every **card row** of every address in the delivery, in one statement, in
    ascending id order;
-2. every **consent address**, sorted.
+2. every **consent address**, sorted;
+
+and then, under both, it **compares the matching card set again**. The write
+touches only the ids locked in step 1.
+
+Those last two sentences are not belt and braces. `SELECT … FOR UPDATE` protects
+the rows that matched when it ran, and nothing more — a legitimate contact proof
+can move a card **onto** one of these addresses afterwards. A write that matched
+by phone would then reach for that row's lock after the consent locks, inverting
+the order, and PostgreSQL made the projection the deadlock victim against the
+very proof that moved the card: the ledger refused, the receipts were resolved,
+every card in the delivery stayed sendable, the event stayed `processing` with no
+recovery pass, and the real campaign classifier went on allowing marketing to a
+recipient no proof had ever touched. One contact change and one ordinary repeat
+proof of the same booking were enough.
+
+Restricting the write to the locked ids makes a row lock after a consent lock
+unreachable. The re-check is what stops that from becoming a card quietly left
+behind: when the set has moved, the whole transaction **rolls back** — releasing
+every lock — and is started again from the top, where it locks the full set
+first. Nothing is skipped, nothing is written out of order, and the other
+addresses in the delivery are not abandoned. After a few restarts the projection
+reports the addresses as unsettled instead of claiming them: the ledger's refusal
+is durable and is what the consent guard reads, the reconciliation converges the
+remaining flag, and no acknowledgement goes out for a command whose own
+projection never landed.
 
 Both halves were defects. A compare-and-set on the write narrowed the window but
 could not remove it: the gap that was left is between the last read and the
@@ -240,6 +265,14 @@ The order the commands are **applied** in is untouched. Only the order the locks
 are taken in is fixed, and it is the same one `resolve_webhook_identity` and the
 historical reconciliation use: **cards → consent addresses → receipts →
 message jobs**.
+
+`resolve_webhook_identity` takes its consent locks **last of all**, after the
+ordinary EasyWeek write for that event. That position is part of the order:
+`apply_stale_contact` runs the event's business changes and touches card rows of
+its own, so binding the refusal before it would have left that transaction
+holding a consent lock while asking for a card row — the same inversion from the
+other side. The addresses it binds are read before the number changes, so the
+position does not change what is bound.
 
 The compare-and-set stays on the write as a second line of defence, and it is
 the only protection on the one path that cannot hold the locks: a direct
@@ -580,7 +613,11 @@ Rules:
   overwriting it, and a second run is a no-op.
 - It takes the same two locks in the same order as the inbox worker — card rows
   by id, then the consent address — so a run and a live delivery queue behind
-  each other instead of one committing inside the other's window.
+  each other instead of one committing inside the other's window. It re-checks
+  the matching set under those locks and writes only the rows it locked, for the
+  same reason the live projection does; a candidate whose card set moved
+  restarts its own transaction, and one that keeps moving is counted as
+  `unsettled` rather than reported as a no-op.
 - A refusal it writes is also **projected onto the card flag**, in the refusing
   direction only. Without that a run left the ledger refusing and
   `Client.wa_opted_out` saying sendable, which is the refusal being ignored by
@@ -740,7 +777,14 @@ batch, and two callbacks naming the same identifiers in opposite payload order.
 The serialisation of the card projection is covered by starting the competing
 decision inside the projection's own window and then asserting, through
 `pg_locks`, that it is **waiting** — if it could run, the window would still be
-open. The release of the delivery locks is asserted from inside the external
+open. The card-set stabilisation is covered the same way, with the real identity
+path on both sides: a contact proof moves a card onto one of the delivery's
+addresses after the pre-lock, a second proof of the same booking takes that row
+and queues on the consent lock, and the test asserts the restart, the refusal on
+every matching card, the campaign classifier's verdict for the recipient no
+proof touched, and that the event finished. Reverting the fix reproduces the
+reported `deadlock detected` exactly — one process waiting for the advisory
+lock, the other for the row. The release of the delivery locks is asserted from inside the external
 call itself: the acknowledgement probes the batch header with
 `FOR UPDATE NOWAIT` and the message identifier with `pg_try_advisory_xact_lock`,
 for every status kind including `sent`, and both must be free.
