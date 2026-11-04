@@ -644,6 +644,10 @@ class _PlannerFakeSession:
     async def begin_nested(self) -> "_FakeSavepoint":
         return _FakeSavepoint()
 
+    async def scalars(self, *args: Any, **kwargs: Any) -> _EmptyResult:
+        """These create fixtures have no existing jobs for the ordered lock read."""
+        return _EmptyResult()
+
     async def execute(self, *args: Any, **kwargs: Any) -> _EmptyResult:
         """The post-migration ownership lookups the planner now performs.
 

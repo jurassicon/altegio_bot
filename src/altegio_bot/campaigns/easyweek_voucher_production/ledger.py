@@ -81,6 +81,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_delivery.binding import voucher_code_matches
+from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
 from altegio_bot.campaigns.easyweek_voucher_production.composition import source_proof_digest
 from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     PRODUCTION_SCHEMA_VERSION,
@@ -132,6 +133,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionStopRequest,
 )
 from altegio_bot.utils import utcnow
+from altegio_bot.whatsapp_consent import recipient_route_digest, sender_route_digest
 
 # The MAC domain of this phase. Shares §36's secret and §37.2's primitive, with
 # its own label, so a MAC written by any of the four phases can never verify
@@ -1888,6 +1890,8 @@ async def claim_send(
     meta_template_name: str,
     template_language: str,
     sender_id: int | None,
+    sender_phone_number_id: str | None = None,
+    destination_phone: str | None = None,
     honour_stop: bool = False,
 ) -> ClaimOutcome:
     """Reserve the ONE delivery of this slot, and write its intent, before sending.
@@ -1897,6 +1901,16 @@ async def claim_send(
     is written naming which approved template was used. None of them contains
     the message, the parameters or the code — there is deliberately nothing here
     from which a later process could re-render and re-send anything.
+
+    The route is frozen here too (§46.3, PR-22.1), as two one-way digests of the
+    Meta sender id and the destination number. Not the values: this table stores
+    neither a phone number nor a sender secret. The reason it has to be written
+    at the claim rather than looked up later is that both of its sources are
+    mutable — the client card's number can change and the sender configuration
+    can be repointed — and a confirmed failure has to be checked against the
+    route the message actually took. ``None`` for either side stays NULL and the
+    attempt simply proves no route, which is the honest outcome for a caller
+    that had nothing to freeze.
     """
     now = utcnow()
     intent = uuid_module.uuid4()
@@ -1949,6 +1963,8 @@ async def claim_send(
                     slot=row.slot,
                     outcome="claimed",
                     claimed_at=now,
+                    sender_phone_number_id_digest=sender_route_digest(sender_phone_number_id),
+                    recipient_digest=recipient_route_digest(destination_phone),
                 )
             )
             # As in `_claim`: the claimed slot is unresolved, so the header is
@@ -1997,6 +2013,8 @@ async def record_item_outcome(
     manual_cleanup_observed: bool = False,
     attempt_outcome: str | None = None,
     require_idle: bool = False,
+    proven_api_rejection: bool = False,
+    http_status: int | None = None,
 ) -> RecordOutcome:
     """Write what one slot's stage turned out to be — as a compare-and-set.
 
@@ -2012,12 +2030,33 @@ async def record_item_outcome(
 
     Timestamps are only ever set here, never cleared: an ``attempted_at`` is a
     fact about something that left this process.
+
+    Two §46.3 duties ride along, both inside this transaction's existing locks
+    rather than in a second one of their own:
+
+    * ``provider_message_id`` claims any failure fact that arrived BEFORE this
+      commit. A ``failed`` callback can overtake the write that records the
+      identifier, and binding it here means the very commit that makes it
+      bindable also binds it;
+    * ``proven_api_rejection`` records that META refused the request. Only the
+      caller's proven-rejection branch may pass it. ``send_rejected`` alone is
+      not that proof: this phase writes the same state for its own parameter
+      refusal, which never left the process.
     """
     if status not in VOUCHER_PRODUCTION_ITEM_STATUSES:
         raise ValueError("unknown voucher production item status")
     now = utcnow()
     async with session_maker() as session:
         async with session.begin():
+            if provider_message_id is not None:
+                # FIRST, before the header: this transaction is one half of the
+                # §46.3 binding protocol, and the callback handler takes the
+                # same lock before its own lookup. Taking it here, ahead of the
+                # header and item locks, keeps one global order
+                # (message → header → item) on both sides, so the protocol adds
+                # no cycle to the stage locks — and makes the early-callback
+                # window unreachable rather than merely unlikely.
+                await delivery_evidence.lock_message_identity(session, provider_message_id)
             header = await _header_by_id(session, batch_id, for_update=True)
             if header is None:
                 return RecordOutcome(False, RECORD_MISSING_ROW)
@@ -2106,6 +2145,22 @@ async def record_item_outcome(
                     attempt.reason_code = reason_code
                     attempt.provider_message_id = provider_message_id
                     attempt.completed_at = now
+            if provider_message_id is not None:
+                await session.flush()
+                await delivery_evidence.bind_unmatched_failures(
+                    session,
+                    item=row,
+                    provider_message_id=provider_message_id,
+                    observed_at=now,
+                )
+            if proven_api_rejection:
+                await session.flush()
+                await delivery_evidence.record_api_rejection(
+                    session,
+                    item=row,
+                    http_status=http_status,
+                    observed_at=now,
+                )
             row.updated_at = now
             await session.flush()
             await _settle_header(session, header, now=now)

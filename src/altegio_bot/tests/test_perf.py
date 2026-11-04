@@ -289,12 +289,30 @@ class _WAFakeSessionResult:
         return _FakeWAEvent()
 
 
+class _WAFakeScalars:
+    """An empty scalars result.
+
+    ``process_one_event`` makes the inbound refusal durable before it opens the
+    event transaction, and that pass reads the event's inbound receipts. This
+    event's payload is empty, so the honest answer is "no receipts" — and the
+    double has to be able to GIVE that answer rather than make the consent pass
+    unreachable, which would quietly stop these perf tests from covering the
+    real ordering.
+    """
+
+    def all(self) -> list[Any]:
+        return []
+
+
 class _WAFakeSession:
     def begin(self) -> _BeginCM:
         return _BeginCM()
 
     async def execute(self, *_: Any, **__: Any) -> _WAFakeSessionResult:
         return _WAFakeSessionResult()
+
+    async def scalars(self, *_: Any, **__: Any) -> _WAFakeScalars:
+        return _WAFakeScalars()
 
 
 class _WAFakeSessionLocalCM:
@@ -313,7 +331,7 @@ def test_wa_inbox_perf_enrichment(
     monkeypatch.setenv("PERF_LOGGING_ENABLED", "true")
     monkeypatch.setattr(wa_iw, "SessionLocal", lambda: _WAFakeSessionLocalCM())
 
-    async def fake_handle(session: Any, event: Any, provider: Any) -> None:
+    async def fake_handle(session: Any, event: Any, provider: Any, **_kwargs: Any) -> None:
         pass
 
     monkeypatch.setattr(wa_iw, "handle_event", fake_handle)
@@ -368,7 +386,7 @@ def test_wa_inbox_perf_chatwoot_origin(
 
     monkeypatch.setattr(wa_iw, "SessionLocal", lambda: _CWCM())
 
-    async def fake_handle(session: Any, event: Any, provider: Any) -> None:
+    async def fake_handle(session: Any, event: Any, provider: Any, **_kwargs: Any) -> None:
         pass
 
     monkeypatch.setattr(wa_iw, "handle_event", fake_handle)

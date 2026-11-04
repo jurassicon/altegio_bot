@@ -9,11 +9,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Final, Sequence
+from typing import Any, Collection, Final, Sequence
 
 from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.runner import recompute_campaign_run_stats
 from altegio_bot.chatwoot_affinity import AffinityOutcome, resolve_tenant_affinity
@@ -50,6 +50,7 @@ from altegio_bot.easyweek_policy import (
     normalize_provider,
 )
 from altegio_bot.models.models import (
+    INBOUND_AUTHENTICITY_SIGNED,
     PROVIDER_EASYWEEK,
     CampaignRecipient,
     Client,
@@ -57,6 +58,7 @@ from altegio_bot.models.models import (
     OutboxMessage,
     Record,
     WhatsAppEvent,
+    WhatsAppInboundReceipt,
     WhatsAppSender,
 )
 from altegio_bot.perf import perf_log
@@ -64,6 +66,8 @@ from altegio_bot.providers.base import ChatwootRoute, WhatsAppProvider
 from altegio_bot.providers.dummy import safe_send, safe_send_template
 from altegio_bot.services import meta_circuit
 from altegio_bot.services.meta_error_classifier import (
+    DELIVERY_PERMANENT_ERROR_CODES,
+    DELIVERY_TRANSIENT_ERROR_CODES,
     is_deterministic_meta_rejection,
     is_transient_provider_error,
     transient_error_reason,
@@ -82,6 +86,22 @@ from altegio_bot.webhooks.common import (
     resolve_chatwoot_general_inbox,
     resolve_chatwoot_tenant_inbox,
     safe_log_value,
+)
+from altegio_bot.whatsapp_consent import (
+    LedgerState,
+    apply_inbound_consent,
+    ledger_matches_clause,
+    ledger_state,
+    lock_consent_addresses,
+)
+from altegio_bot.whatsapp_inbound_commands import START_KEYWORDS as _START_KEYWORDS
+from altegio_bot.whatsapp_inbound_commands import STOP_KEYWORDS as _STOP_KEYWORDS
+from altegio_bot.whatsapp_inbound_commands import (
+    consent_command,
+    extract_message_text,
+    first_command_token,
+    normalize_command_text,
+    parse_event_timestamp,
 )
 from altegio_bot.whatsapp_window import is_whatsapp_customer_window_open, normalize_phone
 from altegio_bot.workers.promo_lead_handler import (
@@ -109,27 +129,11 @@ _DELIVERY_RETRY_DELAYS_SECONDS = (
 _DELIVERY_STATUS_ORDER = {"sent": 0, "delivered": 1, "read": 2}
 _SUCCESSFUL_DELIVERY_STATUSES = ("delivered", "read")
 
-_PERMANENT_DELIVERY_ERROR_CODES = {
-    131026,
-    131051,
-    131008,
-    131009,
-    100,
-    33,
-    132000,
-    132001,
-    132005,
-    132007,
-    132012,
-    132015,
-    132016,
-}
-_TRANSIENT_DELIVERY_ERROR_CODES = {
-    0,
-    131000,
-    131016,
-    131056,
-}
+# Defined in `services.meta_error_classifier` alongside the numeric-only
+# classifier the §46.3 evidence ledger uses, so the two cannot drift apart
+# about what a code means. Behaviour here is unchanged.
+_PERMANENT_DELIVERY_ERROR_CODES = DELIVERY_PERMANENT_ERROR_CODES
+_TRANSIENT_DELIVERY_ERROR_CODES = DELIVERY_TRANSIENT_ERROR_CODES
 _PERMANENT_DELIVERY_FAILURE_KEYWORDS = (
     "not a whatsapp user",
     "not registered on whatsapp",
@@ -165,24 +169,13 @@ _TRANSIENT_DELIVERY_FAILURE_KEYWORDS = (
     "overloaded",
 )
 
-STOP_KEYWORDS = {
-    "stop",
-    "unsubscribe",
-    "unsub",
-    "abmelden",
-    "отписка",
-    "отпиши",
-    "odjava",
-}
-
-START_KEYWORDS = {
-    "start",
-    "subscribe",
-    "anmelden",
-    "подписка",
-    "подпиши",
-    "prijava",
-}
+# Re-exported for existing importers. The sets, the tokenisation and the
+# Cyrillic «стоп» of §46.4.1 live in `whatsapp_inbound_commands`, because the
+# webhook ingress now has to reach the same verdict about the same message —
+# and two parsers that drift apart would drift in the direction of messaging
+# somebody who asked to be left alone.
+STOP_KEYWORDS = _STOP_KEYWORDS
+START_KEYWORDS = _START_KEYWORDS
 
 
 def _promo_keywords() -> frozenset[str]:
@@ -236,55 +229,29 @@ def _normalize_reply_context_id(value: Any) -> str | None:
     return value or None
 
 
-def _norm_text(raw: str | None) -> str:
-    if not raw:
-        return ""
-
-    text = raw.strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip(" \t\n\r.,!?:;\"'()[]{}")
-    return text
-
-
-def _extract_message_text(msg: dict[str, Any]) -> str:
-    # Every nested field is sender-controlled: `msg.get("text") or {}` does not
-    # protect against `"text": []`/`"text": "bad"` (truthy non-dict → .get()
-    # raises). mapping_or_empty degrades any non-dict to "" instead of a crash.
-    msg_type = msg.get("type")
-
-    if msg_type == "text":
-        text = mapping_or_empty(msg.get("text"))
-        return str(text.get("body") or "")
-
-    if msg_type == "button":
-        btn = mapping_or_empty(msg.get("button"))
-        return str(btn.get("text") or btn.get("payload") or "")
-
-    if msg_type == "interactive":
-        inter = mapping_or_empty(msg.get("interactive"))
-        btn_reply = mapping_or_empty(inter.get("button_reply"))
-        list_reply = mapping_or_empty(inter.get("list_reply"))
-        return str(
-            btn_reply.get("title") or btn_reply.get("id") or list_reply.get("title") or list_reply.get("id") or ""
-        )
-
-    return ""
+# Both aliases of the shared parser, kept under their historical private names
+# so existing importers and tests are untouched.
+_norm_text = normalize_command_text
+_extract_message_text = extract_message_text
 
 
 def _parse_command(text: str) -> str | None:
-    norm = _norm_text(text)
-    if not norm:
-        return None
+    """``"stop"``, ``"start"``, ``"promo"`` or ``None`` for one message.
 
-    first = norm.split(" ", 1)[0]
+    Consent is answered by the shared parser; the promo funnel keeps its own
+    settings-driven keywords here, because a marketing trigger has no business
+    being decided by the module that decides whether marketing is allowed.
 
-    if first in STOP_KEYWORDS:
-        return "stop"
+    Both read the SAME first token, so the two verdicts cannot disagree about
+    where the command ends — and a consent command always wins, which is the
+    order this project already had.
+    """
+    command = consent_command(text)
+    if command is not None:
+        return command
 
-    if first in START_KEYWORDS:
-        return "start"
-
-    if first in _promo_keywords():
+    token = first_command_token(text)
+    if token and token in _promo_keywords():
         return "promo"
 
     return None
@@ -1011,7 +978,37 @@ async def _set_opt_out(
     phone_e164: str,
     opted_out: bool,
     reason: str,
+    only_when_unset: bool = False,
+    expect_ledger: LedgerState | None = None,
+    card_ids: Collection[int] | None = None,
 ) -> int:
+    """Project a consent answer onto the legacy card flags.
+
+    ``only_when_unset`` is for CONVERGENCE rather than for a decision: it brings
+    a card that disagrees with the ledger into line without touching a card that
+    already agrees. The difference matters because ``wa_opted_out_at`` and
+    ``wa_opt_out_reason`` describe WHEN and WHY somebody refused, and restamping
+    them every time a refused START arrives would overwrite that history with
+    the time of the message that changed nothing.
+
+    ``expect_ledger`` is the premise this write rests on, carried INTO the
+    statement. Deriving the value and writing it are two statements, and a newer
+    STOP can be decided and projected between them by the handler of another
+    event — after which the older handler would write its stale answer over the
+    newer one, leaving the ledger refusing while this flag said sendable. A lock
+    held across the gap is not available: this transaction goes on to
+    acknowledge the customer over HTTP. So the UPDATE re-asks the question
+    itself, and lands only while the answer is still the one it was derived
+    from.
+
+    ``card_ids`` restricts the write to rows the caller has already locked, and
+    it is what keeps the serialised path's lock order intact. Matching by phone
+    alone could reach a card that started matching this address after the
+    caller's card-lock query ran, and taking that row's lock here — after the
+    consent locks — is exactly the inversion that deadlocked the projection
+    against the contact proof that moved the card. ``None`` means the
+    unserialised path, which holds no locks to be consistent with.
+    """
     variants = _phone_variants(phone_e164)
 
     if opted_out:
@@ -1028,6 +1025,12 @@ async def _set_opt_out(
         }
 
     stmt = update(Client).where(Client.phone_e164.in_(variants)).values(**values)
+    if card_ids is not None:
+        stmt = stmt.where(Client.id.in_(list(card_ids)))
+    if only_when_unset:
+        stmt = stmt.where(Client.wa_opted_out.is_(not opted_out))
+    if expect_ledger is not None:
+        stmt = stmt.where(ledger_matches_clause(phone_e164, expect_ledger))
 
     res = await session.execute(stmt)
     return int(getattr(res, "rowcount", 0) or 0)
@@ -1037,7 +1040,10 @@ async def _cancel_marketing_jobs(
     session: AsyncSession,
     *,
     phone_e164: str,
+    job_ids: Collection[int] | None = None,
 ) -> int:
+    if job_ids is not None and not job_ids:
+        return 0
     variants = _phone_variants(phone_e164)
 
     stmt = select(Client.id).where(Client.phone_e164.in_(variants))
@@ -1057,8 +1063,454 @@ async def _cancel_marketing_jobs(
             last_error="Canceled: client unsubscribed",
         )
     )
+    if job_ids is not None:
+        # The serialised projection may only write rows locked before consent.
+        # Keep the current phone, status and type predicates as well: an id is
+        # a lock boundary, not permission to cancel a different recipient's job.
+        upd = upd.where(MessageJob.id.in_(sorted(job_ids)))
     res2 = await session.execute(upd)
     return int(getattr(res2, "rowcount", 0) or 0)
+
+
+async def _event_receipts(session: AsyncSession, event: WhatsAppEvent) -> list[WhatsAppInboundReceipt]:
+    """The receipts the ingress wrote for this delivery, in message order.
+
+    Empty for every event stored before this phase existed, and for an event a
+    test or a recovery path created directly. Each caller below says what it
+    does in that case, and in every case it is what this worker did before the
+    receipts existed.
+    """
+    if event.id is None:
+        return []
+    return list(
+        (
+            await session.scalars(
+                select(WhatsAppInboundReceipt)
+                .where(WhatsAppInboundReceipt.whatsapp_event_id == int(event.id))
+                .order_by(WhatsAppInboundReceipt.message_index.asc())
+            )
+        ).all()
+    )
+
+
+async def _actions_on_allowed_routes(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Only the actions whose OWN message the ingress accepted.
+
+    Per message, which is the fix. Filtering by ADDRESS was wrong in a way that
+    had an outbound consequence: a delivery carrying a START on a refused sender
+    route and a STOP on an allowed one named an address with at least one
+    accepted message, so the whole address passed, the first action survived,
+    and the worker answered a positive acknowledgement — through the sender the
+    refused route named — while the ledger and the card were recording the
+    refusal.
+
+    Position is the join. ``_extract_actions`` and the receipt extractor both
+    walk entry → changes → messages and both skip exactly the messages whose
+    sender does not normalise, so the n-th action is the n-th receipt; the sender
+    address is compared on every row as the standing proof that it still is. A
+    delivery whose two readings do not line up yields NOTHING: that is a
+    disagreement about one payload, and acting on none of it is the honest
+    answer, never guessing which message a verdict belongs to.
+
+    An event with no receipts is returned untouched, which is the historical
+    contract exactly. Re-deciding an old delivery against today's allow list
+    would rewrite history in both directions — a route refused then becoming an
+    executable command now, one accepted then becoming a refusal.
+    """
+    receipts = await _event_receipts(session, event)
+    if not receipts:
+        return actions
+    by_index = {int(receipt.message_index): receipt for receipt in receipts}
+    allowed: list[dict[str, Any]] = []
+    for index, action in enumerate(actions):
+        receipt = by_index.get(index)
+        if receipt is None or str(receipt.wa_address) != str(action.get("phone_e164") or ""):
+            logger.warning(
+                "Inbound receipts do not line up with the payload for event id=%s; acting on none of it",
+                event.id,
+            )
+            return []
+        if receipt.route_allowed is False:
+            continue
+        allowed.append(action)
+    if len(by_index) != len(actions):
+        logger.warning(
+            "Inbound receipt count does not match the payload for event id=%s; acting on none of it",
+            event.id,
+        )
+        return []
+    return allowed
+
+
+async def _inbound_commands(
+    session: AsyncSession,
+    event: WhatsAppEvent,
+    actions: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """``(address, command)`` for every command this delivery may act on.
+
+    Read from the receipts when there are any, because they are the record of
+    what arrived AND of which routes were accepted — the same rows the durable
+    consent pass worked from, so the legacy card flags below cannot end up
+    disagreeing with the ledger about which messages existed. A refused route is
+    skipped here and nowhere else has to remember to skip it.
+
+    Falls back to the parsed actions for an event with no receipts, which is
+    what this worker read before the receipts existed.
+    """
+    receipts = await _event_receipts(session, event)
+    if receipts:
+        return [
+            (str(receipt.wa_address), str(receipt.command))
+            for receipt in receipts
+            if receipt.route_allowed is not False and receipt.command in ("stop", "start")
+        ]
+    pairs: list[tuple[str, str]] = []
+    for action in actions:
+        command = action.get("cmd")
+        phone = action.get("phone_e164")
+        if command in ("stop", "start") and isinstance(phone, str) and phone:
+            pairs.append((phone, command))
+    return pairs
+
+
+@dataclass(frozen=True)
+class CommandProjection:
+    """What one address's commands turned into, after the ledger had its say."""
+
+    # The command the SETTLED state corresponds to — "stop" when the ledger
+    # refuses, "start" when it has proven an opt-in — and therefore the one an
+    # acknowledgement may describe. Not the first command in the payload, and
+    # not necessarily the one that was asked for.
+    command: str
+    ledger_state: str | None
+    opted_out: bool
+    clients_updated: int
+    jobs_canceled: int
+    # Did this delivery actually ASK for the state that settled? ``False`` means
+    # the settled answer is one nobody in this delivery requested — a START the
+    # ledger refused, a STOP it proved to be a replay — and there is then
+    # nothing to confirm. Silence, rather than a sentence that contradicts the
+    # record.
+    agreed: bool
+    refusal_reason: str | None = None
+
+
+async def _apply_inbound_command_flags(
+    session: AsyncSession,
+    commands: list[tuple[str, str]],
+    *,
+    serialised: bool = False,
+) -> dict[str, CommandProjection]:
+    """Project the LEDGER's answer onto the legacy card state, per address.
+
+    §46.4.1: a webhook delivery may carry several messages from several people,
+    and a refusal in the second one counts exactly as much as one in the first.
+    This worker historically acted on ``actions[0]`` alone, so a STOP that
+    happened to arrive behind another message was recorded nowhere.
+
+    What is settled here is the LEGACY card state — ``Client.wa_opted_out`` and
+    the queued marketing jobs — which ``message_planner``, the outbox worker and
+    every campaign path still read. It is therefore not derived from the command
+    any more. It is derived from the durable consent decision, which
+    ``process_one_event`` has already committed before this transaction opened:
+
+    * the ledger refuses this address → the card refuses, converging a card that
+      disagreed without restamping one that already agreed;
+    * the ledger has PROVEN an opt-in → the card is cleared;
+    * the ledger has no row for this address → the historical behaviour of the
+      command stands. Nothing has been recorded about this number, so there is
+      no authoritative answer to follow, and refusing to clear a card here would
+      strand everybody whose only refusal predates this phase.
+
+    The defect this closes: ``opted_out = cmd == "stop"`` cleared the card for
+    ANY start, including one the ledger had just refused as unverified or as
+    older than the refusal it would lift. The ledger said opted_out, the card
+    said sendable, and the card is what the senders read.
+
+    STOP wins inside one delivery when the ledger has nothing recorded for that
+    address. Two commands from one person in one payload have no provable order
+    between them as far as THIS projection can tell — Meta's timestamps are
+    whole seconds and the array order is not a guarantee — so with no
+    authoritative answer the refusal is taken, which is the same asymmetry the
+    ledger applies and the same direction of error: an unnecessary opt-out costs
+    one unsent marketing message. Where the ledger HAS an answer, it decides,
+    and it decides by event time rather than by precedence.
+
+    What the customer is told is a separate question, answered by
+    ``CommandProjection.command`` and ``agreed``: the acknowledgement describes
+    the state that settled, and only when one of this delivery's accepted
+    messages asked for that state. Taking it from the first message in the
+    payload was its own defect — a delivery of [START, STOP] leaves somebody
+    opted out and used to confirm a subscription to them.
+    """
+    locked_ids: set[int] | None = None
+    locked_job_ids: set[int] | None = None
+    effective: dict[str, str] = {}
+    requested: dict[str, set[str]] = {}
+    for phone, cmd in commands:
+        if cmd not in ("stop", "start") or not phone:
+            continue
+        requested.setdefault(phone, set()).add(cmd)
+        if effective.get(phone) == "stop":
+            continue
+        effective[phone] = cmd
+
+    if serialised:
+        # Everything this projection will touch, locked before the consent read:
+        # CARD ROWS first, by
+        # ascending id, then queued marketing JOBS by id, then every consent
+        # address, sorted. This applies to START too: the ledger can refuse it.
+        #
+        # Both halves were defects. Without the address locks there was a window
+        # after the last read of the ledger: the historical projection could
+        # commit a newer STOP while this transaction still had an older
+        # permission in flight, and the commit order then decided whether the
+        # card contradicted the ledger. Re-reading could not close it, because
+        # the gap is between the last read and the COMMIT. Without a fixed order
+        # over the card rows, two deliveries naming the same people in different
+        # orders — [STOP A, STOP B, STOP C] against [STOP B, STOP A] — each held
+        # what the other was waiting for; PostgreSQL aborted one, and ordinary
+        # inbound has no recovery pass, so the addresses only that delivery
+        # mentioned were left with the ledger refusing and the card sendable.
+        #
+        # Card writers finish their business/job writes before taking consent.
+        # A record reassignment can touch a job of another matching card that
+        # this projection holds. Taking that job only after consent would leave
+        # the projection waiting for the writer's job and the writer waiting
+        # for consent. Wait for all jobs here, while consent is still free.
+        #
+        # The writes below touch only the card/job ids locked here. A broader
+        # UPDATE after consent could discover a new row and recreate the cycle.
+        #
+        # A card that starts matching after the read is covered by its writer's
+        # final consent section: that writer converges the flag atomically with
+        # the card change. Re-reading the set here would not close later arrivals.
+        locked_ids = await _card_ids_matching(session, effective, lock=True)
+        locked_job_ids = await _marketing_job_ids_matching(session, effective)
+        await lock_consent_addresses(session, effective)
+
+    results: dict[str, CommandProjection] = {}
+    for phone, cmd in effective.items():
+        results[phone] = await _project_ledger_onto_card(
+            session,
+            phone=phone,
+            cmd=cmd,
+            requested=requested.get(phone, {cmd}),
+            serialised=serialised,
+            card_ids=locked_ids,
+            job_ids=locked_job_ids,
+        )
+    return results
+
+
+def _phone_set(phones: Collection[str]) -> list[str]:
+    return sorted({variant for phone in phones for variant in _phone_variants(phone)})
+
+
+async def _card_ids_matching(session: AsyncSession, phones: Collection[str], *, lock: bool) -> set[int]:
+    """The card rows these addresses match right now, optionally locking them.
+
+    ``lock=True`` is the first step of the projection's protocol: one statement
+    for the whole set, in ascending id order, so two transactions touching
+    overlapping people always queue rather than cross. A plain read takes no
+    row locks. Writers of cards that start matching later converge their own
+    flags before committing; the projection writes only its locked set.
+    """
+    variants = _phone_set(phones)
+    if not variants:
+        return set()
+    statement = select(Client.id).where(Client.phone_e164.in_(variants)).order_by(Client.id.asc())
+    if lock:
+        # Only consent flags are written. NO KEY UPDATE still excludes phone
+        # and flag writers, but lets an in-flight Outbox insert prove its FK.
+        # FOR UPDATE would make that insert wait here while its job is held,
+        # closing a cycle through a booking planner waiting for that same job.
+        statement = statement.with_for_update(key_share=True)
+    return {int(value) for value in (await session.scalars(statement)).all()}
+
+
+async def _marketing_job_ids_matching(session: AsyncSession, phones: Collection[str]) -> set[int]:
+    """Lock this delivery's queued marketing jobs before any consent lock.
+
+    The subquery reads card ids without locking additional card rows. Only the
+    selected job ids may be cancelled later, with current scope/status checks.
+    Jobs appearing after this read remain subject to the committed card veto
+    and the outbox's check; they cannot be locked here after consent is taken.
+    """
+    variants = _phone_set(phones)
+    if not variants:
+        return set()
+    client_ids = select(Client.id).where(Client.phone_e164.in_(variants))
+    statement = (
+        select(MessageJob.id)
+        .where(MessageJob.client_id.in_(client_ids))
+        .where(MessageJob.status == "queued")
+        .where(MessageJob.job_type.in_(MARKETING_JOB_TYPES))
+        .order_by(MessageJob.id.asc())
+        .with_for_update()
+    )
+    return {int(value) for value in (await session.scalars(statement)).all()}
+
+
+# How many times an UNSERIALISED projection re-derives itself when the ledger
+# moves under it. Only the direct in-transaction path uses more than one: under
+# the locks nothing can move, so one pass is the whole story.
+_PROJECTION_ATTEMPTS: Final = 3
+
+
+async def _project_ledger_onto_card(
+    session: AsyncSession,
+    *,
+    phone: str,
+    cmd: str,
+    requested: Collection[str] = (),
+    serialised: bool = False,
+    card_ids: Collection[int] | None = None,
+    job_ids: Collection[int] | None = None,
+) -> CommandProjection:
+    """Derive one address's legacy card state from the ledger and write it.
+
+    The race this has to close, in order: a START's handler reads ``opted_in``;
+    a newer STOP is decided and committed by somebody else; the handler writes
+    ``False`` anyway. The ledger refused and the flag every marketing path reads
+    said sendable.
+
+    ``serialised`` is how that is closed, and it is the only way it can be. The
+    caller holds this address's consent lock and this person's card rows for the
+    whole transaction, so no decision about them can be made until it commits:
+    one read, one write, nothing in between and nothing after. A re-read cannot
+    substitute, because the window that was left was between the last read and
+    the COMMIT — a newer STOP committing there decided the outcome by commit
+    order alone.
+
+    Without ``serialised`` — the direct in-transaction path, whose caller goes
+    on to acknowledge the customer over the network and therefore may hold no
+    consent lock — the write instead carries its premise (``expect_ledger``) and
+    the answer is derived again if the ledger moved. That narrows the window to
+    "nothing stale is ever written" but cannot make the pair atomic, which is
+    why ``process_one_event`` does not use it.
+    """
+    state = LedgerState(None)
+    wanted_out = cmd == "stop"
+    asked_for = set(requested) or {cmd}
+    for _attempt in range(1 if serialised else _PROJECTION_ATTEMPTS):
+        state = await ledger_state(session, phone=phone)
+        if state.refuses:
+            opted_out, settled_command = True, "stop"
+        elif state.permits:
+            opted_out, settled_command = False, "start"
+        else:
+            # Nothing recorded about this number, so there is no authoritative
+            # answer to follow and the command's historical behaviour stands.
+            # Refusing to clear a card here would strand everybody whose only
+            # refusal predates this phase.
+            opted_out, settled_command = wanted_out, cmd
+        # Two different questions, and conflating them is what produced a
+        # positive acknowledgement for a refusal. The first decides whether the
+        # audit fields on the card may be restamped: only a card that disagrees
+        # with the ledger is converged, because ``wa_opted_out_at`` and
+        # ``wa_opt_out_reason`` describe when and why somebody refused. The
+        # second decides whether anything may be confirmed to the customer.
+        matches_command = opted_out == wanted_out
+        agreed = settled_command in asked_for
+
+        affected = await _set_opt_out(
+            session,
+            phone_e164=phone,
+            opted_out=opted_out,
+            reason=f"wa:{cmd}" if matches_command else "wa:consent_ledger",
+            only_when_unset=not matches_command,
+            expect_ledger=state,
+            card_ids=card_ids,
+        )
+        if not serialised:
+            settled = await ledger_state(session, phone=phone)
+            if (settled.state, settled.consent_version) != (state.state, state.consent_version):
+                continue
+
+        canceled = await _cancel_marketing_jobs(session, phone_e164=phone, job_ids=job_ids) if opted_out else 0
+        return CommandProjection(
+            command=settled_command,
+            ledger_state=state.state,
+            opted_out=opted_out,
+            clients_updated=affected,
+            jobs_canceled=canceled,
+            agreed=agreed,
+            refusal_reason=None if agreed else (state.last_refused_start_reason or "consent_ledger_disagrees"),
+        )
+
+    # The ledger is still moving. Nothing stale was written, the newer
+    # decision's own projection has already written the newer answer, and this
+    # command is reported as not honoured — which also means no acknowledgement,
+    # because what we would be confirming is no longer known to be true.
+    logger.warning("Consent state kept moving while projecting %s for one address", cmd)
+    return CommandProjection(
+        command="stop" if state.refuses else cmd,
+        ledger_state=state.state,
+        opted_out=state.refuses,
+        clients_updated=0,
+        jobs_canceled=0,
+        agreed=False,
+        refusal_reason="consent_state_changed",
+    )
+
+
+async def project_inbound_commands(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    event_id: int,
+) -> dict[str, CommandProjection]:
+    """Project one event's consent answers onto the legacy cards. Own transaction.
+
+    Called by ``process_one_event`` right after the durable consent write and
+    BEFORE the event transaction opens, for the same reason the consent write is
+    there: the projection then survives an acknowledgement that fails, a
+    Chatwoot outage, an unhandled exception in the handler and the process
+    dying. It used to live inside the event transaction, so any of those rolled
+    the card flags back while the ledger kept its decision.
+
+    No HTTP, no acknowledgement, no message, no Chatwoot call. That is what lets
+    it be a transaction of its own in the first place.
+
+    An event with no receipts keeps the historical contract: the commands come
+    from the parsed payload, exactly as this worker read them before the
+    receipts existed.
+
+    One transaction, once. There is no retry loop and nothing to be left
+    unsettled: the set of card rows this transaction writes is the set it
+    locked, and a card that starts matching later carries the refusal from its
+    own writer rather than waiting for a projection to come back for it. An
+    earlier version restarted the whole transaction when that set moved, which
+    could run out of attempts and then leave every address in the delivery —
+    including the ones whose cards never moved — with the ledger refusing and
+    the card flag saying sendable.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(WhatsAppEvent).where(WhatsAppEvent.id == event_id))
+            ).scalar_one_or_none()
+            if event is None:
+                return {}
+            payload = event.payload or {}
+            if not isinstance(payload, dict):
+                return {}
+            if _is_chatwoot_origin(event, payload):
+                # A mirror of a message Meta already delivered is the SAME
+                # message. Applying it twice would double a refusal and give a
+                # mirrored START a second attempt at undoing one.
+                return {}
+            commands = await _inbound_commands(session, event, _extract_actions(payload))
+            if not commands:
+                return {}
+            # Serialised: this transaction makes no external call, so it can
+            # hold the consent locks from the first read to the commit.
+            return await _apply_inbound_command_flags(session, commands, serialised=True)
 
 
 def _ack_text(cmd: str) -> str:
@@ -1218,6 +1670,12 @@ def _extract_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "provider_message_id": wamid.strip(),
                         "status": status,
                         "timestamp": st.get("timestamp"),
+                        # The PROVEN moment the status describes, kept apart
+                        # from the raw value and from when we saw it. ``None``
+                        # whenever it cannot be parsed into a plausible one, so
+                        # durable evidence records an unknown event time rather
+                        # than a number the sender chose.
+                        "event_at": parse_event_timestamp(st.get("timestamp"), observed_at=utcnow()),
                         "recipient_id": st.get("recipient_id"),
                         "phone_number_id": phone_number_id,
                         "error_code": first_error.get("code"),
@@ -1777,6 +2235,91 @@ async def _apply_voucher_production_status(session: AsyncSession, provider_messa
     return result.reason != voucher_production_ledger.RECORD_MISSING_ROW
 
 
+def _event_authenticity_verified(event: WhatsAppEvent | None) -> bool:
+    """Was this delivery's signature actually checked by the ingress?
+
+    Read from what the ingress wrote down and from nothing else. Deliberately
+    NOT re-derived from ``settings.meta_app_secret``: the secret may have been
+    configured after the event arrived, the signature header is stripped from
+    the stored copy on purpose, and a check that was never performed must not
+    become "verified" because one is configured now (§46.4.7).
+
+    An event this process has no row for, and every row written before this
+    phase existed, is unverified. The absence of a recorded check is not a check.
+    """
+    if event is None:
+        return False
+    return getattr(event, "inbound_authenticity", None) == INBOUND_AUTHENTICITY_SIGNED
+
+
+async def _apply_voucher_production_failure(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+) -> bool:
+    """Record a proven ``failed`` callback for the §42 production mailing.
+
+    The fifth hook, and the first one for ``failed``. Until now a failure about
+    a production slot reached the ordinary ``OutboxMessage`` lookup, found
+    nothing — those slots have no outbox row by design — and was logged and
+    dropped, so §46.3's "proven delivery failure" group had no evidence behind
+    it at all.
+
+    Returning ``True`` means this callback belonged to the phase and has been
+    accounted for, whatever the fact turned out to be: confirmed, conflicting
+    with a success, or naming a foreign route. It must then NOT fall through to
+    the generic handler, whose matching is looser and which knows nothing about
+    the frozen route — falling back to it would be a way around the stricter
+    check, which §46.3 rules out by name.
+
+    Like its delivered/read siblings it runs inside the caller's transaction and
+    is deliberately not behind the §42 fence: a failure is a fact about a
+    message already sent, not a new effect to fence off.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    outcome = await delivery_evidence.record_callback_failure(
+        session,
+        status=status,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.claimed:
+        logger.info(
+            "status_webhook: voucher production failure recorded match=%s class=%s stored=%s",
+            outcome.match_state,
+            outcome.failure_class,
+            outcome.stored,
+        )
+    return outcome.claimed
+
+
+async def _keep_unmatched_voucher_failure(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+) -> None:
+    """Keep a ``failed`` callback that nothing in this database owns yet.
+
+    Reached only after BOTH the production lookup and the ``OutboxMessage``
+    lookup came back empty, which is an ordinary momentary state: Meta can
+    deliver a status while the transaction that records the message id is still
+    in flight. §46.3 requires such an early callback to remain matchable rather
+    than be dropped, and the binding happens later on the exact identifier —
+    never by phone similarity or timestamp proximity.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    outcome = await delivery_evidence.record_unmatched_callback_failure(
+        session,
+        status=status,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.stored:
+        logger.info("status_webhook: unmatched failed callback kept for later binding")
+
+
 # The salt for the status-webhook diagnostic handle below. Domain-separated so
 # the same identifier logged by some future call site cannot be correlated with
 # these lines by digest alone.
@@ -1814,6 +2357,18 @@ async def _handle_delivery_statuses(
     event: WhatsAppEvent | None,
     statuses: list[dict[str, Any]],
 ) -> list[int]:
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    # §46.3 — every lock this transaction will need, taken before the first one
+    # of them is used. One Meta delivery can carry `delivered` for one message
+    # and `failed` for another of the same batch, and handling them one at a
+    # time took the batch header for the first and then asked for the second
+    # message's identifier lock — behind a concurrent acceptance that held that
+    # identifier and was waiting for the very same header. Declaring the scope
+    # up front means no identifier lock is ever requested behind a header lock,
+    # so the two orders cannot cross.
+    await delivery_evidence.lock_callback_scope(session, (status.get("provider_message_id") for status in statuses))
+
     updated_outbox_ids: list[int] = []
     outbox_id_to_new_status: dict[int, str] = {}
 
@@ -1848,6 +2403,15 @@ async def _handle_delivery_statuses(
         if kind in {"delivered", "read"} and await _apply_voucher_production_status(session, provider_message_id, kind):
             continue
 
+        # And the §42 mailing's PROVEN failures (§46.3), asked fifth. The four
+        # hooks above only run for delivered/read, so a `failed` callback about
+        # a production slot used to reach the outbox lookup below, match nothing
+        # and be dropped. It is claimed here instead, and once claimed it does
+        # not fall through: the generic handler matches more loosely and has no
+        # notion of this phase's frozen sender/recipient route.
+        if kind == "failed" and await _apply_voucher_production_failure(session, event, status):
+            continue
+
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
         if outbox is None:
             # Reached by every callback kind that nothing above claimed, which is
@@ -1870,6 +2434,12 @@ async def _handle_delivery_statuses(
                 _message_id_fingerprint(provider_message_id),
                 kind,
             )
+            if kind == "failed":
+                # Nobody owns this identifier yet, which for a failure is the
+                # one case that must not be a drop: §46.3 requires an early
+                # callback to stay matchable until the commit that records its
+                # message id can claim it.
+                await _keep_unmatched_voucher_failure(session, event, status)
             continue
 
         chain_resolution = None
@@ -4669,11 +5239,86 @@ async def recover_operator_relay_lifecycle(
     return stats
 
 
+async def apply_delivery_statuses(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    event_id: int,
+) -> str | None:
+    """Record one delivery's status callbacks, in a transaction of its own.
+
+    Why it is no longer inside the event transaction: that transaction goes on
+    to acknowledge the customer over WhatsApp and to mirror messages into
+    Chatwoot, and the callback path now declares its whole lock scope up front —
+    every message identifier the payload names and the production batch headers
+    behind them. Held across those calls, a slow external service blocked the
+    batch header: another session asking for it with ``FOR UPDATE NOWAIT`` got
+    ``55P03``, which is a refused claim, an acceptance that cannot be saved and
+    an operator STOP that cannot be applied to the batch. Before this phase a
+    ``sent`` callback took no such lock at all, so the regression was new.
+
+    The scope itself is unchanged — all identifiers, whatever their status, in
+    one order — because narrowing it is what the locks exist to prevent. What
+    changed is that the transaction COMMITS and releases them before anything
+    external happens.
+
+    Returns the error to record on the event, or ``None``. A failure here is
+    reported rather than raised for the same reason it was before: the old code
+    failed the event and skipped the inbound half, and that outcome is kept.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            event = (
+                await session.execute(select(WhatsAppEvent).where(WhatsAppEvent.id == event_id))
+            ).scalar_one_or_none()
+            if event is None:
+                return None
+            payload = event.payload or {}
+            if not isinstance(payload, dict):
+                return None
+            if _is_operator_relay(payload) or _is_chatwoot_origin(event, payload):
+                return None
+            statuses = _extract_statuses(payload)
+            if not statuses:
+                return None
+            logger.info(
+                "status_webhook: received %d status update(s) event_id=%s",
+                len(statuses),
+                event_id,
+            )
+            try:
+                run_ids = await _handle_delivery_statuses(session, event, statuses)
+            except Exception as exc:
+                logger.exception("WhatsApp delivery statuses failed id=%s", event_id)
+                return str(exc)
+            for run_id in run_ids:
+                try:
+                    await recompute_campaign_run_stats(session, run_id)
+                except Exception as exc:
+                    logger.warning(
+                        "status_webhook: recompute failed run_id=%s err=%s",
+                        run_id,
+                        exc,
+                    )
+    return None
+
+
 async def handle_event(
     session: AsyncSession,
     event: WhatsAppEvent,
     provider: WhatsAppProvider,
+    *,
+    projections: dict[str, CommandProjection] | None = None,
+    statuses_handled: bool = False,
 ) -> None:
+    """Act on one stored event, inside the caller's transaction.
+
+    ``projections`` is what ``process_one_event`` already committed onto the
+    legacy cards, in its own transaction, before this one opened. Passed in
+    rather than recomputed so the card state cannot be rolled back by an
+    acknowledgement that fails here. ``None`` means nobody has done it yet —
+    a direct caller — and it is then done in this transaction, by the same
+    function, with the same compare-and-set.
+    """
     payload = event.payload or {}
 
     # ------------------------------------------------------------------ #
@@ -4698,7 +5343,19 @@ async def handle_event(
     # ------------------------------------------------------------------ #
     # 1. Delivery status webhooks (value.statuses)                        #
     # ------------------------------------------------------------------ #
-    statuses = [] if chatwoot_origin else _extract_statuses(payload)
+    # Statuses are deliberately NOT filtered by the sender-route allow list.
+    # A status proves which message it is about by exact provider message id,
+    # and the §46.3 evidence path checks it against the route that slot's one
+    # attempt froze — a stronger check than the allow list, and one that does
+    # not change meaning when the configuration does. Filtering here would
+    # instead drop real delivered/read callbacks for messages this deployment
+    # genuinely sent before its allow list was configured.
+    # ``statuses_handled`` means ``apply_delivery_statuses`` has already
+    # recorded them in a committed transaction of its own and released its
+    # message and header locks, which is what keeps them out of the HTTP calls
+    # further down. A direct caller that has not done that gets the historical
+    # behaviour: statuses inside this transaction.
+    statuses = [] if (chatwoot_origin or statuses_handled) else _extract_statuses(payload)
     if statuses:
         logger.info(
             "status_webhook: received %d status update(s) event_id=%s",
@@ -4722,6 +5379,32 @@ async def handle_event(
     actions = _extract_actions(payload)
     if not actions:
         return
+
+    # The sender-route verdict of §46.4.1, read from what the ingress wrote
+    # down — per MESSAGE — rather than re-decided here against today's
+    # configuration. A refused message triggers none of what follows: not its
+    # command, not its Chatwoot mirror, not its promo branch and not an
+    # acknowledgement through the sender it named. The message that drives the
+    # handling below is therefore the first ACCEPTED one.
+    actions = await _actions_on_allowed_routes(session, event, actions)
+    if not actions:
+        logger.info("No message in event id=%s arrived on an accepted sender route", event.id)
+        return
+
+    # Every command in the delivery, before any early return below can skip
+    # past it: a payload of [ordinary text, STOP] used to reach the Chatwoot
+    # forward and return, leaving the refusal in the second message unrecorded.
+    #
+    # Chatwoot-origin events are excluded for the same reason they are excluded
+    # from the single-command path further down: a mirror of a message Meta
+    # already delivered is the SAME message, and applying it twice would double
+    # the effect of a refusal and give a mirrored START a second attempt at
+    # undoing one.
+    command_flags: dict[str, CommandProjection] = {}
+    if projections is not None:
+        command_flags = projections
+    elif not chatwoot_origin:
+        command_flags = await _apply_inbound_command_flags(session, await _inbound_commands(session, event, actions))
 
     action = actions[0]
     cmd = action.get("cmd")
@@ -4817,28 +5500,25 @@ async def handle_event(
             )
         return
 
+    projection: CommandProjection | None = None
     if cmd in ("stop", "start"):
-        reason = f"wa:{cmd}"
-        opted_out = cmd == "stop"
-
-        affected = await _set_opt_out(
-            session,
-            phone_e164=phone_e164,
-            opted_out=opted_out,
-            reason=reason,
-        )
-
-        canceled = 0
-        if opted_out:
-            canceled = await _cancel_marketing_jobs(session, phone_e164=phone_e164)
+        # Already applied above, for this address and for every other address
+        # in the delivery. Read back here for the historical log line, which is
+        # what an operator greps for — and for whether the ledger agreed, which
+        # decides the acknowledgement below.
+        projection = command_flags.get(phone_e164)
 
         logger.info(
-            "wa_cmd=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s event_id=%s",
+            "wa_cmd=%s effective=%s sender_phone_number_id=%s sender_id=%s clients_updated=%s jobs_canceled=%s "
+            "consent=%s agreed=%s event_id=%s",
             cmd,
+            projection.command if projection is not None else "-",
             safe_log_value(phone_number_id, limit=32),
             sender_id,
-            affected,
-            canceled,
+            projection.clients_updated if projection is not None else 0,
+            projection.jobs_canceled if projection is not None else 0,
+            projection.ledger_state if projection is not None else "-",
+            projection.agreed if projection is not None else "-",
             event.id,
         )
     else:
@@ -4850,11 +5530,36 @@ async def handle_event(
             event.id,
         )
 
+    if projection is not None and not projection.agreed:
+        # The ledger did not honour this command, so there is nothing to
+        # confirm. Telling a customer "you are subscribed again" while the
+        # durable answer still says opted_out would be the one outcome §46.4.7
+        # rules out by name — worse than silence, because it invites them to
+        # expect messages that will never be sent. The reason is recorded for an
+        # operator instead; an unverified deployment shows up here as
+        # ``start_authenticity_unproven`` every time.
+        event.error = f"Inbound command not honoured: {projection.refusal_reason}"
+        logger.info(
+            "wa_cmd=%s not acknowledged reason=%s event_id=%s",
+            cmd,
+            projection.refusal_reason,
+            event.id,
+        )
+        return
+
     if sender_id is None:
         event.error = "No sender found for incoming phone_number_id"
         return
 
-    ack = _ack_text(cmd)
+    # The acknowledgement answers the command that WON for this address, not the
+    # one that happened to be first in the payload. A delivery of [START, STOP]
+    # from one person leaves them opted out — the ledger says so and the card
+    # says so — and the old code still replied "you are subscribed again",
+    # because the text came from ``actions[0]`` while the refusal came from the
+    # projection. §46.4.7 rules that out by name: nothing may confirm a
+    # subscription when the settled state is a refusal.
+    ack_cmd = projection.command if projection is not None else cmd
+    ack = _ack_text(ack_cmd)
     msg_id, err = await safe_send(
         provider=provider,
         sender_id=sender_id,
@@ -4880,7 +5585,7 @@ async def handle_event(
             job_id=None,
             sender_id=sender_id,
             phone_e164=phone_e164,
-            template_code=f"wa_cmd_{cmd}",
+            template_code=f"wa_cmd_{ack_cmd}",
             language="de",
             body=ack,
             status="sent",
@@ -4891,7 +5596,7 @@ async def handle_event(
             meta=outbox_meta_with_chatwoot_route(
                 {
                     "source": "inbound_command",
-                    "command": cmd,
+                    "command": ack_cmd,
                     "inbound_text": text,
                     "whatsapp_event_id": event.id,
                 },
@@ -4927,6 +5632,58 @@ async def process_one_event(
             await _process_operator_relay_event(event_id, provider)
         return
 
+    # §46.4.6-7 — the refusal is made durable FIRST, in a transaction of its own.
+    #
+    # Before the event transaction below rather than inside it, and that order is
+    # the contract: a committed refusal cannot then be undone by an
+    # acknowledgement that fails to send, by a Chatwoot outage, by an unhandled
+    # exception in the handler, or by the process dying. The event transaction
+    # rolls back on failure — the consent write has already landed.
+    #
+    # It also holds no lock across HTTP, because nothing in it makes an HTTP
+    # request, and it is idempotent, so a recovery pass re-examining this event
+    # and a restart both converge instead of double-applying.
+    #
+    # A failure HERE is deliberately allowed to propagate: it means the refusal
+    # is not durable, the event stays `processing`/`received` for recovery, and
+    # its receipts stay unresolved — which holds sends for those people rather
+    # than letting an unread STOP look like permission.
+    consent = await apply_inbound_consent(SessionLocal, event_id=event_id)
+    if consent.applied or consent.refused:
+        logger.info(
+            "wa_consent: event_id=%s receipts=%s applied=%s refused=%s reasons=%s",
+            event_id,
+            consent.receipts,
+            consent.applied,
+            consent.refused,
+            ",".join(sorted(set(consent.reasons))) or "-",
+        )
+
+    # And then the legacy projection, in a second transaction of its own, still
+    # before the event transaction below. Two reasons it is here rather than
+    # inside the handler:
+    #
+    # * durability — ``Client.wa_opted_out`` and the cancelled marketing jobs
+    #   are what every existing sender reads, and leaving them inside the event
+    #   transaction meant a failed acknowledgement rolled them back while the
+    #   ledger kept its decision;
+    # * no lock and no premise is held across HTTP — this transaction makes no
+    #   network call at all, and the handler below makes them without holding
+    #   anything consent-related.
+    #
+    # A failure here propagates for the same reason the consent write's does:
+    # the receipts stay unresolved, which HOLDS sends for those people instead
+    # of letting an unread refusal look like permission.
+    projections = await project_inbound_commands(SessionLocal, event_id=event_id)
+
+    # §46.3 — the delivery evidence, in a third transaction of its own, and for
+    # a reason of its own: it is the only part of this path that locks voucher
+    # batch headers, and the transaction below makes external calls. Committing
+    # here releases the message and header locks before the first of them, so a
+    # slow WhatsApp or Chatwoot response can no longer hold a batch against its
+    # own executor.
+    status_error = await apply_delivery_statuses(SessionLocal, event_id=event_id)
+
     with perf_log("whatsapp_inbox_worker", "process_event", event_id=event_id) as ctx:
         async with SessionLocal() as session:
             async with session.begin():
@@ -4943,8 +5700,25 @@ async def process_one_event(
                     origin=_event_origin_for_metrics(event, event.payload or {}),
                 )
 
+                if status_error is not None:
+                    # The statuses failed in their own transaction, so the
+                    # inbound half is skipped and the event is failed — exactly
+                    # what an exception in the status block used to do when both
+                    # halves shared one transaction.
+                    event.status = "failed"
+                    event.processed_at = utcnow()
+                    event.error = status_error
+                    ctx.update(outcome=event.status)
+                    return
+
                 try:
-                    await handle_event(session, event, provider)
+                    await handle_event(
+                        session,
+                        event,
+                        provider,
+                        projections=projections,
+                        statuses_handled=True,
+                    )
                     event.status = "processed"
                     event.processed_at = utcnow()
                 except Exception as exc:

@@ -379,6 +379,7 @@ class TestHandleEventVisitAttendance:
     async def _run_handle(self, event: MagicMock) -> bool:
         """Run handle_event with mocked DB and return True if plan_jobs was called."""
         session = AsyncMock()
+        session.info = {}
 
         with (
             patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
@@ -424,6 +425,7 @@ class TestHandleEventVisitAttendance:
         event = self._make_event(visit_attendance=0, event_status="delete")
         event.payload["data"]["last_change_date"] = "2026-04-01T14:00:00+0200"
         session = AsyncMock()
+        session.info = {}
 
         with (
             patch("altegio_bot.workers.inbox_worker.upsert_client", new=AsyncMock(return_value=7)),
@@ -442,6 +444,7 @@ class TestHandleEventVisitAttendance:
     async def test_update_event_does_not_resolve_booking_created_at(self):
         event = self._make_event(visit_attendance=0, event_status="update")
         session = AsyncMock()
+        session.info = {}
         resolver = AsyncMock(side_effect=AssertionError("timestamp resolver must not run for update"))
 
         with (
@@ -487,6 +490,7 @@ class TestHandleEventPromoBookingCreatedAt:
     async def test_create_with_apply_disabled_does_not_create_expensive_resolver(self):
         event = self._make_create_event()
         session = AsyncMock()
+        session.info = {}
         record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
         try_apply = AsyncMock()
         fetch_mock = AsyncMock(side_effect=AssertionError("GET /record must not be called"))
@@ -514,6 +518,7 @@ class TestHandleEventPromoBookingCreatedAt:
     async def test_create_payload_create_date_passes_lazy_resolver_to_try_apply(self):
         event = self._make_create_event({"create_date": "2026-05-10 14:22:00"})
         session = AsyncMock()
+        session.info = {}
         record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
         try_apply = AsyncMock()
         fetch_mock = AsyncMock(side_effect=AssertionError("GET /record must not be called"))
@@ -541,6 +546,7 @@ class TestHandleEventPromoBookingCreatedAt:
     async def test_create_missing_payload_timestamp_passes_lazy_get_record_resolver(self):
         event = self._make_create_event()
         session = AsyncMock()
+        session.info = {}
         record = MagicMock(id=99, company_id=758285, altegio_record_id=123456789, is_deleted=False)
         try_apply = AsyncMock()
         fetch_mock = AsyncMock(return_value={"id": 123456789, "create_date": "2026-05-10 14:22:00"})
@@ -648,6 +654,7 @@ async def test_record_updated_simple_promo_marker_suppresses_plan_jobs() -> None
     """
     event = _make_update_event(comment="Note\n[PromoLead:42]")
     session = AsyncMock()
+    session.info = {}
     mock_record = _make_mock_record(comment="Note\n[PromoLead:42]")
     mock_plan = AsyncMock()
     suppress_mock = AsyncMock(return_value=True)
@@ -679,6 +686,7 @@ async def test_record_updated_manual_promo_marker_suppresses_plan_jobs() -> None
     comment = "Promo welcome_discount: Neukundenrabatt reserviert.\n[PromoLead:55:manual]"
     event = _make_update_event(comment=comment)
     session = AsyncMock()
+    session.info = {}
     mock_record = _make_mock_record(comment=comment)
     mock_plan = AsyncMock()
     suppress_mock = AsyncMock(return_value=True)
@@ -710,6 +718,7 @@ async def test_record_updated_no_promo_marker_calls_plan_jobs() -> None:
     comment = "Normale Buchungsnotiz"
     event = _make_update_event(comment=comment)
     session = AsyncMock()
+    session.info = {}
     mock_record = _make_mock_record(comment=comment)
     mock_plan = AsyncMock()
     suppress_mock = AsyncMock(return_value=False)
@@ -836,6 +845,8 @@ async def _noop_handle(
     mock_load = AsyncMock(return_value=(existing_rec, existing_svcs))
 
     session = AsyncMock()
+
+    session.info = {}
     session.get = AsyncMock(return_value=mock_record_obj)
     with (
         patch(

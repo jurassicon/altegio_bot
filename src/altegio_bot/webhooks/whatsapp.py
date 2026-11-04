@@ -12,13 +12,24 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from altegio_bot.db import SessionLocal
-from altegio_bot.models.models import WhatsAppEvent
+from altegio_bot.models.models import (
+    INBOUND_AUTHENTICITY_SIGNED,
+    INBOUND_AUTHENTICITY_UNVERIFIED,
+    WhatsAppEvent,
+)
 from altegio_bot.settings import settings
+from altegio_bot.utils import utcnow
 from altegio_bot.webhooks.common import (
     mask_query,
     postgres_safe_json_value,
     safe_headers,
     safe_log_value,
+)
+from altegio_bot.whatsapp_consent import record_inbound_receipts
+from altegio_bot.whatsapp_inbound_commands import (
+    allowed_sender_routes,
+    payload_sender_routes,
+    route_allowed,
 )
 
 logger = logging.getLogger("whatsapp_webhook")
@@ -42,32 +53,33 @@ def _payload_dedupe_key(payload: dict[str, Any]) -> str:
     return f"wa:{digest}"
 
 
-def _extract_phone_number_id(payload: dict[str, Any]) -> str | None:
-    try:
-        entry0 = (payload.get("entry") or [])[0]
-        changes0 = (entry0.get("changes") or [])[0]
-        value = changes0.get("value") or {}
-        metadata = value.get("metadata") or {}
-        pni = metadata.get("phone_number_id")
-        if pni is None:
-            return None
-        return str(pni)
-    except Exception:
-        return None
+def _route_decision(payload: dict[str, Any], allowed: set[str]) -> tuple[bool, str | None]:
+    """``(ignored, first_refused_route)`` for one delivery.
+
+    The rule per change is the historical one, unchanged. What changed is how a
+    payload of several changes is judged: it is ignored only when NONE of its
+    routes is one this deployment accepts.
+
+    Both halves of that were defects. A delivery whose first change named a
+    refused route was ignored whole, and a STOP from an allowed sender further
+    down it was never acted on — a lost refusal. The mirror case was worse: a
+    delivery whose first change named an allowed route was accepted whole, and a
+    START from a refused sender behind it got a free attempt at lifting
+    somebody's refusal. Each message now carries its own verdict on its receipt,
+    and the inbox worker reads that rather than re-deciding.
+    """
+    routes = payload_sender_routes(payload)
+    if not routes:
+        return False, None
+    refused = [route for route in routes if not route_allowed(route, allowed)]
+    if len(refused) < len(routes):
+        return False, None
+    return True, next((route for route in refused if route is not None), None)
 
 
 def _parse_allowed_phone_number_ids() -> set[str]:
-    raw = getattr(settings, "whatsapp_allowed_phone_number_ids", "")
-    ids: list[str] = []
-
-    if raw:
-        ids = [x.strip() for x in str(raw).split(",")]
-        ids = [x for x in ids if x]
-
-    if not ids and settings.meta_wa_phone_number_id:
-        ids = [str(settings.meta_wa_phone_number_id).strip()]
-
-    return {x for x in ids if x}
+    """Historical name, one definition. See ``allowed_sender_routes``."""
+    return allowed_sender_routes()
 
 
 def _verify_signature(
@@ -116,6 +128,18 @@ async def whatsapp_ingest(request: Request) -> Response:
 
     app_secret = getattr(settings, "meta_app_secret", "")
 
+    # Whether Meta's own HMAC was CHECKED for this very request, over these very
+    # bytes. It is recorded with the inbound receipts below and never derived
+    # again: the stored copy of the headers has the signature deliberately
+    # stripped out of it, so after this point the proof no longer exists
+    # anywhere and no later process may reconstruct one.
+    #
+    # An unconfigured ``meta_app_secret`` therefore means ``unverified`` rather
+    # than "fine" — §46.4.7: a check that is not configured is not a check, and
+    # a refusal arriving unverified still refuses while a START arriving
+    # unverified grants nothing.
+    signature_verified = False
+
     if app_secret:
         sig = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
         if not _verify_signature(
@@ -125,6 +149,7 @@ async def whatsapp_ingest(request: Request) -> Response:
         ):
             logger.warning("Webhook signature mismatch")
             raise HTTPException(status_code=403, detail="Bad signature")
+        signature_verified = True
 
     # Structural validation deliberately runs AFTER the signature check, so an
     # unsigned malformed body is still a 403 rather than a 400.
@@ -137,20 +162,19 @@ async def whatsapp_ingest(request: Request) -> Response:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="JSON payload must be an object")
 
-    pni = _extract_phone_number_id(payload)
     allowed = _parse_allowed_phone_number_ids()
+    ignored, refused_route = _route_decision(payload, allowed)
 
     status = "received"
     error: str | None = None
-    ignored = False
 
-    if pni is not None and allowed and pni not in allowed:
+    if ignored:
         status = "ignored"
-        ignored = True
         # pni приходит из payload: и в TEXT-колонку error, и в лог он попадает
         # только приведённым к безопасному виду.
-        error = f"Ignored: phone_number_id not allowed ({safe_log_value(pni, limit=64)})"
-        logger.info("Ignored webhook event phone_number_id=%s", safe_log_value(pni, limit=64))
+        shown = safe_log_value(refused_route, limit=64) if refused_route is not None else "unknown"
+        error = f"Ignored: phone_number_id not allowed ({shown})"
+        logger.info("Ignored webhook event phone_number_id=%s", shown)
 
     # Дедуп-ключ считается по ОРИГИНАЛЬНОМУ payload — санитизация ниже касается
     # только сохраняемой проекции, поэтому семантика дедупликации не меняется.
@@ -170,9 +194,40 @@ async def whatsapp_ingest(request: Request) -> Response:
                     query=mask_query(dict(request.query_params)),
                     headers=safe_headers(request, extra_deny=_META_SIGNATURE_HEADERS),
                     payload=postgres_safe_json_value(payload),
+                    inbound_authenticity=(
+                        INBOUND_AUTHENTICITY_SIGNED if signature_verified else INBOUND_AUTHENTICITY_UNVERIFIED
+                    ),
                 )
                 session.add(evt)
                 await session.flush()
+
+                # §46.4.6 — the durable boundary of inbound receipt.
+                #
+                # Written in THIS transaction, so it commits together with the
+                # event and before the 200 below. Once Meta has been told the
+                # delivery was accepted, the fact that these addresses said
+                # something is on disk: a stopped, slow or crashed inbox worker
+                # then leaves a HOLD for those people rather than a hole, and a
+                # STOP cannot be lost in the gap between accepting a webhook and
+                # processing it.
+                #
+                # It records, never decides. Consent itself is applied by the
+                # worker, through one code path, so there is no second mechanism
+                # here that could answer differently. The allow list is passed
+                # rather than a single verdict: each message is judged against
+                # its OWN sender route and a refused one is resolved on the spot,
+                # because nothing is ever going to act on it and a permanent hold
+                # would be a bug, not caution — while an allowed message in the
+                # same delivery keeps its hold.
+                await record_inbound_receipts(
+                    session,
+                    dedupe_key=dedupe_key,
+                    event_id=int(evt.id),
+                    payload=payload,
+                    signature_verified=signature_verified,
+                    observed_at=utcnow(),
+                    allowed_phone_number_ids=allowed,
+                )
 
             # phone_number_id сознательно НЕ возвращается: значение приходит из
             # тела и может быть некодируемым (непарный суррогат) — тогда

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Collection
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -122,15 +122,49 @@ def make_dedupe_key(
     return f"{job_type}:{company_id}:{rid}:{run_at.isoformat()}"
 
 
+async def _lock_record_jobs(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    record_id: int,
+) -> tuple[int, ...]:
+    """Lock the record's existing system jobs in the live STOP projection's order.
+
+    Status is deliberately unrestricted: later ``add_job`` calls can resurrect
+    canceled/failed rows, and ON CONFLICT locks even a row its WHERE leaves
+    unchanged. Locking only queued rows would let that later write take a lower
+    id after cancellation has already locked a higher one.
+
+    The inbox writer already holds its card and record. Its record lock orders
+    competing booking planners; this set covers their existing job rows, not
+    arbitrary jobs inserted by unrelated callers after the selection.
+    """
+    statement = (
+        select(MessageJob.id)
+        .where(MessageJob.company_id == company_id)
+        .where(MessageJob.record_id == record_id)
+        .where(MessageJob.job_type.in_(SYSTEM_JOB_TYPES))
+        .order_by(MessageJob.id.asc())
+        .with_for_update()
+    )
+    return tuple(int(value) for value in (await session.scalars(statement)).all())
+
+
 async def cancel_queued_jobs(
     session: AsyncSession,
     *,
     company_id: int,
     record_id: int,
     reason: str,
+    locked_job_ids: Collection[int] | None = None,
 ) -> int:
+    if locked_job_ids is None:
+        locked_job_ids = await _lock_record_jobs(session, company_id=company_id, record_id=record_id)
+    if not locked_job_ids:
+        return 0
     stmt = (
         update(MessageJob)
+        .where(MessageJob.id.in_(sorted(locked_job_ids)))
         .where(MessageJob.company_id == company_id)
         .where(MessageJob.record_id == record_id)
         .where(MessageJob.job_type.in_(SYSTEM_JOB_TYPES))
@@ -292,6 +326,12 @@ async def plan_jobs_for_record_event(
 
     now = utcnow().replace(microsecond=0)
 
+    # One acquisition for the whole plan, before cancellation OR a dedupe
+    # upsert, including create events. A bulk UPDATE has no row-order contract;
+    # following it with add_job could also lock older canceled rows out of order.
+    # Keep this before every job write and the caller's final consent section.
+    locked_job_ids = await _lock_record_jobs(session, company_id=cid, record_id=int(record_obj.id))
+
     if norm_status in ("update", "delete"):
         reason = "Canceled: rescheduled"
         if norm_status == "delete":
@@ -302,6 +342,7 @@ async def plan_jobs_for_record_event(
             company_id=cid,
             record_id=int(record_obj.id),
             reason=reason,
+            locked_job_ids=locked_job_ids,
         )
 
     job_type = _record_event_job_type(norm_status)

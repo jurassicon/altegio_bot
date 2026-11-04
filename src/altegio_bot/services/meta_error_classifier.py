@@ -209,3 +209,93 @@ def transient_error_reason(err: ErrorLike) -> tuple[str, str | None]:
         return "meta_code", "2"
 
     return "network", None
+
+
+# ---------------------------------------------------------------------------
+# Numeric-only classification (§46.3, PR-22.1)
+# ---------------------------------------------------------------------------
+# Everything above reads text, which is right for the outbox and relay paths:
+# a stored error string is all they have. It is exactly wrong for durable
+# failure evidence, because a Meta error title, message or detail can quote the
+# request it refused — for the voucher phase that means a code, a rendered body
+# or a customer's name — so none of it may be stored or classified from.
+#
+# These two sets are therefore the untrusted side reduced to integers, and they
+# are the SAME integers the WhatsApp status path already used: the sets moved
+# here so the worker and the evidence ledger cannot drift apart about what a
+# code means.
+
+DELIVERY_PERMANENT_ERROR_CODES = frozenset(
+    {
+        131026,
+        131051,
+        131008,
+        131009,
+        100,
+        33,
+        132000,
+        132001,
+        132005,
+        132007,
+        132012,
+        132015,
+        132016,
+    }
+)
+
+DELIVERY_TRANSIENT_ERROR_CODES = frozenset(
+    {
+        0,
+        131000,
+        131016,
+        131056,
+    }
+)
+
+DELIVERY_CLASS_PERMANENT = "permanent"
+DELIVERY_CLASS_TRANSIENT = "transient"
+DELIVERY_CLASS_UNKNOWN = "unknown"
+
+
+def parse_meta_error_code(value: object) -> int | None:
+    """One Meta error code as an integer, or ``None``.
+
+    ``None`` for anything that is not an integer in disguise — a title, a
+    sentence, a dict, a float, a bool. A free-text field must never end up
+    where a numeric code is expected, so the narrowing happens once, here, and
+    an unparseable value is recorded as absent rather than coerced.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("-"):
+            candidate = candidate[1:]
+            sign = -1
+        else:
+            sign = 1
+        if candidate.isdigit():
+            try:
+                return sign * int(candidate)
+            except ValueError:
+                return None
+    return None
+
+
+def classify_delivery_error_code(value: object) -> str:
+    """``permanent``, ``transient`` or ``unknown`` from the CODE alone.
+
+    An unknown code is ``unknown`` and never a guess. Whether a class allows a
+    later follow-up at all is a policy decision that lives with the audience, not
+    with the fact — this function only says what Meta's number means.
+    """
+    code = parse_meta_error_code(value)
+    if code is None:
+        return DELIVERY_CLASS_UNKNOWN
+    if code in DELIVERY_TRANSIENT_ERROR_CODES:
+        return DELIVERY_CLASS_TRANSIENT
+    if code in DELIVERY_PERMANENT_ERROR_CODES:
+        return DELIVERY_CLASS_PERMANENT
+    return DELIVERY_CLASS_UNKNOWN

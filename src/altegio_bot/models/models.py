@@ -1099,6 +1099,24 @@ class WhatsAppEvent(Base):
         index=True,
     )
 
+    # §46.4 / PR-22.1 — was Meta's HMAC CHECKED for this delivery, over these
+    # very bytes? Recorded by the ingress because only the ingress can know: the
+    # signature header is deliberately stripped from `headers` above, so after
+    # that point the proof is gone and no later process may reconstruct one from
+    # a sanitised copy.
+    #
+    # Needed on the EVENT, not only on the per-message receipts, because a
+    # delivery may carry no messages at all — a `statuses` payload has no
+    # receipt to hang this on, and a `failed` callback still has to be recorded
+    # with an honest statement of whether its delivery was authenticated.
+    #
+    # NULL on every row written before this phase, and NULL means unverified:
+    # the absence of a recorded check is not a check that passed.
+    inbound_authenticity: Mapped[str | None] = mapped_column(
+        String(24),
+        nullable=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Campaign models
@@ -4502,6 +4520,20 @@ class EasyWeekVoucherProductionBatchAttempt(Base):
     batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     slot: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # -- the route this attempt actually used, frozen at the claim ----------
+    # Digests, because the values are a Meta phone number id and a customer's
+    # phone number and this table stores neither. Written once, in the same
+    # committed transaction that spends the slot's one attempt, and never
+    # updated afterwards: a later failure fact has to be checked against the
+    # route the message really took, not against whichever sender the settings
+    # name today or whichever number the card carries now.
+    #
+    # NULL on every row written before this phase existed, and deliberately so.
+    # A historical attempt proved no route, and inventing one from today's
+    # configuration would manufacture evidence; its facts stay unknown instead.
+    sender_phone_number_id_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -5124,3 +5156,622 @@ class EasyWeekManualRecipientPlan(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# §46.4 / PR-22.1 — durable inbound consent and proven delivery failure
+# ---------------------------------------------------------------------------
+# Three facts this phase has nowhere to put, and one reason each.
+#
+# * ``whatsapp_inbound_receipts`` — WHAT ARRIVED, recorded where the signature
+#   was actually checked. The ingress deliberately drops the Meta signature
+#   header before it stores the event, so after that boundary authenticity can
+#   never be recovered: it has to be written down at the moment it is known.
+#   The row is also the durable "not resolved yet" marker, per message rather
+#   than per event, which is what lets a consent guard ask "is anything from
+#   this address still unprocessed?" without parsing stored payloads.
+#
+# * ``whatsapp_consent_suppressions`` — WHAT WE MAY DO, per normalised WhatsApp
+#   address, independent of any ``Client`` card. A refusal has to survive a
+#   person having no card at all, a card being created, imported or replaced,
+#   and their phone number changing; none of that is expressible as a column on
+#   ``clients``. It also carries the monotonic ``consent_version`` a later final
+#   send guard orders itself against.
+#
+# * ``easyweek_voucher_production_delivery_failures`` — WHAT WENT WRONG with one
+#   original send. Several contradictory facts may exist about one slot (an
+#   early callback, a duplicate, one naming a foreign sender), so they cannot
+#   collapse into a column on the slot, and one may arrive BEFORE the slot's
+#   message id is committed, so it has to be storable unmatched and bound later.
+#
+# A missing row in any of them means "not proven", never "allowed" and never
+# "no such event".
+
+CONSENT_COMMAND_STOP = "stop"
+CONSENT_COMMAND_START = "start"
+# An ordinary inbound message. Recorded because it still has to be resolved
+# before a send may proceed — a reply is not consent, but an unread reply may
+# be carrying a STOP this process has not looked at yet.
+CONSENT_COMMAND_NONE = "none"
+
+INBOUND_CONSENT_COMMANDS = (
+    CONSENT_COMMAND_STOP,
+    CONSENT_COMMAND_START,
+    CONSENT_COMMAND_NONE,
+)
+
+_INBOUND_CONSENT_COMMAND_SQL = ", ".join(f"'{value}'" for value in INBOUND_CONSENT_COMMANDS)
+
+# Meta's HMAC was configured AND matched the raw body of this very request.
+INBOUND_AUTHENTICITY_SIGNED = "signature_verified"
+# Everything else, and deliberately one single bucket: a request that carried no
+# signature, a deployment with no app secret configured, a replayed payload and
+# a historical row whose headers were already sanitised are all equally
+# unproven, and naming them apart would invite treating some of them as proof.
+INBOUND_AUTHENTICITY_UNVERIFIED = "unverified"
+
+INBOUND_AUTHENTICITIES = (
+    INBOUND_AUTHENTICITY_SIGNED,
+    INBOUND_AUTHENTICITY_UNVERIFIED,
+)
+
+_INBOUND_AUTHENTICITY_SQL = ", ".join(f"'{value}'" for value in INBOUND_AUTHENTICITIES)
+
+# What the consent writer did with this receipt. ``applied`` moved the ledger,
+# ``noop`` was already satisfied, ``refused`` carries a reason code and left the
+# ledger alone, and ``ignored_route`` is stamped by the ingress itself for an
+# event no worker will ever process.
+INBOUND_RESOLUTION_APPLIED = "applied"
+INBOUND_RESOLUTION_NOOP = "noop"
+INBOUND_RESOLUTION_REFUSED = "refused"
+INBOUND_RESOLUTION_IGNORED_ROUTE = "ignored_route"
+
+INBOUND_RESOLUTIONS = (
+    INBOUND_RESOLUTION_APPLIED,
+    INBOUND_RESOLUTION_NOOP,
+    INBOUND_RESOLUTION_REFUSED,
+    INBOUND_RESOLUTION_IGNORED_ROUTE,
+)
+
+_INBOUND_RESOLUTION_SQL = ", ".join(f"'{value}'" for value in INBOUND_RESOLUTIONS)
+
+CONSENT_STATE_OPTED_OUT = "opted_out"
+CONSENT_STATE_OPTED_IN = "opted_in"
+
+CONSENT_STATES = (CONSENT_STATE_OPTED_OUT, CONSENT_STATE_OPTED_IN)
+
+_CONSENT_STATE_SQL = ", ".join(f"'{value}'" for value in CONSENT_STATES)
+
+CONSENT_SOURCE_INBOUND = "inbound_command"
+CONSENT_SOURCE_PROJECTION = "historical_projection"
+
+CONSENT_SOURCES = (CONSENT_SOURCE_INBOUND, CONSENT_SOURCE_PROJECTION)
+
+_CONSENT_SOURCE_SQL = ", ".join(f"'{value}'" for value in CONSENT_SOURCES)
+
+
+class WhatsAppInboundReceipt(Base):
+    """One inbound WhatsApp message, as the ingress durably accepted it.
+
+    Written in the SAME transaction as its ``WhatsAppEvent``, before the 200 the
+    sender sees. That is what makes it a boundary: once Meta has been told the
+    delivery was accepted, the fact that this address said something is on disk
+    whatever happens to the worker afterwards.
+
+    It records authenticity because nothing downstream can. ``whatsapp_ingest``
+    verifies Meta's HMAC against the raw request body and then deliberately
+    strips the signature header out of the stored copy, so by the time any
+    worker, report or reconciliation looks at the event the proof is gone. A
+    later process must never "recover" it from a sanitised header, and with this
+    column it has no reason to try.
+
+    Resolution, not deletion
+    ------------------------
+    ``resolved_at`` is the pending marker. A row with it NULL means this address
+    has said something that consent has not accounted for yet, and a send guard
+    treats that as a hold rather than as permission. Rows are never removed:
+    the pending set drains by being resolved, which is a fact, not a cleanup.
+
+    ``receipt_key`` is its own durable identity, derived from the event's dedupe
+    key and this message's position. The foreign key is SET NULL rather than
+    RESTRICT, matching ``OutboxMessage.whatsapp_event_id``, so removing a stored
+    event cannot be blocked by this table — and cannot silently take the record
+    of what arrived with it either.
+    """
+
+    __tablename__ = "whatsapp_inbound_receipts"
+
+    __table_args__ = (
+        # Identity that survives the event row it came from.
+        UniqueConstraint("receipt_key", name="uq_wa_inbound_receipt_key"),
+        # And identity within one stored event, so re-ingesting the same payload
+        # cannot write a second receipt for the same message position.
+        UniqueConstraint("whatsapp_event_id", "message_index", name="uq_wa_inbound_receipt_event_message"),
+        CheckConstraint(
+            f"command IN ({_INBOUND_CONSENT_COMMAND_SQL})",
+            name="ck_wa_inbound_receipt_command",
+        ),
+        CheckConstraint(
+            f"authenticity IN ({_INBOUND_AUTHENTICITY_SQL})",
+            name="ck_wa_inbound_receipt_authenticity",
+        ),
+        CheckConstraint(
+            f"resolution IS NULL OR resolution IN ({_INBOUND_RESOLUTION_SQL})",
+            name="ck_wa_inbound_receipt_resolution",
+        ),
+        # Resolved and its outcome are one fact. A resolved row with no
+        # resolution could not be audited; a resolution with no timestamp could
+        # not be ordered against anything.
+        CheckConstraint(
+            "(resolved_at IS NULL) = (resolution IS NULL)",
+            name="ck_wa_inbound_receipt_resolution_paired",
+        ),
+        CheckConstraint("message_index >= 0", name="ck_wa_inbound_receipt_index"),
+        # The pending lookup: every send guard asks exactly this question.
+        Index(
+            "ix_wa_inbound_receipt_pending",
+            "wa_address",
+            postgresql_where=text("resolved_at IS NULL"),
+        ),
+        Index("ix_wa_inbound_receipt_address_observed", "wa_address", "observed_at"),
+        Index("ix_wa_inbound_receipt_event", "whatsapp_event_id"),
+        # A refused route is resolved the moment it is written, so the two are
+        # one fact and a row cannot claim to be both ignored and pending.
+        CheckConstraint(
+            "route_allowed IS NOT FALSE OR resolved_at IS NOT NULL",
+            name="ck_wa_inbound_receipt_refused_route_resolved",
+        ),
+        CheckConstraint(
+            "(linked_easyweek_customer_uuid IS NULL) = (linked_uuid_recorded_at IS NULL)",
+            name="ck_wa_inbound_receipt_linked_uuid_paired",
+        ),
+        # The guard's other pending lookup: everything still unaccounted for
+        # from a number this UUID was proven to use, including numbers no card
+        # carries any more.
+        Index(
+            "ix_wa_inbound_receipt_pending_uuid",
+            "linked_easyweek_customer_uuid",
+            postgresql_where=text("resolved_at IS NULL AND linked_easyweek_customer_uuid IS NOT NULL"),
+        ),
+        # Conflicting reuse of one Meta message identifier is a thing this
+        # phase must be able to SEE rather than a thing it forbids: two
+        # different payloads naming one wamid are both recorded, and the consent
+        # writer refuses to lift a ban on either.
+        Index(
+            "ix_wa_inbound_receipt_message",
+            "whatsapp_message_id",
+            postgresql_where=text("whatsapp_message_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    receipt_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    whatsapp_event_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    message_index: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # The normalised sender address of THIS message, never of the payload's
+    # first one: a payload may carry several messages from several people.
+    wa_address: Mapped[str] = mapped_column(String(32), nullable=False)
+    command: Mapped[str] = mapped_column(String(8), nullable=False)
+    authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # The sender route THIS message arrived on, as a one-way digest, and the
+    # verdict the ingress reached about it at the time.
+    #
+    # Both are provenance, and the second one is why the first is not enough:
+    # the allow list is configuration and can be changed, so re-deriving an old
+    # message's verdict from today's settings would silently rewrite history —
+    # a route that was refused when the message arrived would become an
+    # executable command, and one that was accepted would become a refusal. A
+    # NULL ``route_allowed`` is an honest "not recorded per message", which is
+    # what every row written before this column existed really is.
+    sender_route_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # Meta's own wamid for this message, when it supplied a usable one.
+    whatsapp_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # A proven NEGATIVE-CONSENT link, and nothing else.
+    #
+    # Written only by the booking bridge, at the one moment an EasyWeek customer
+    # UUID has just been proven for this person — and only onto a receipt that
+    # is still unresolved. It exists because the card's number may change before
+    # the inbox worker reaches this message: the refusal would then be recorded
+    # against a number no card names, and nothing would connect it to the new
+    # one. With this column the decision the worker eventually makes carries the
+    # link onto the suppression row, and a send guard for the new number can see
+    # that something from the old one is still unaccounted for.
+    #
+    # Never read as positive identity. Like ``banned_easyweek_customer_uuid`` it
+    # widens who must NOT be messaged (§46.4.2) and proves nothing about whose
+    # card this is, which branch they belong to, or whether they are an EasyWeek
+    # customer at all.
+    linked_easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    linked_uuid_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Two different times, deliberately never merged. ``observed_at`` is when
+    # this process accepted the delivery and is always known. ``event_at`` is
+    # what the sender said happened and is NULL unless it parsed as a plausible
+    # unix second — an unparseable, absent or absurd timestamp is not a time.
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class WhatsAppConsentSuppression(Base):
+    """The current marketing consent answer for one WhatsApp address.
+
+    Keyed by the address and nothing else
+    -------------------------------------
+    A ``Client`` card is the wrong place for this and always was. A person can
+    say STOP before any card exists, from a number that belongs to two cards in
+    two branches, or from a number that later moves to a different card — and in
+    every one of those cases the refusal has to be the thing that survives. So
+    the row is about the address, and a card being created, imported, merged or
+    replaced cannot touch it.
+
+    ``banned_easyweek_customer_uuid`` is a BAN EXTENSION, not an identity claim
+    ---------------------------------------------------------------------------
+    When the STOP arrives, any EasyWeek card matching that phone may name a
+    customer UUID, and that UUID is recorded here so the refusal follows the
+    person through a change of number. It must never be read the other way
+    round: a phone match does not prove who somebody is, which branch they
+    belong to, or that they are an EasyWeek customer at all. It is written only
+    when the match is unambiguous, and ``evidence`` says on what basis.
+
+    One direction is free, the other needs proof
+    --------------------------------------------
+    Moving to ``opted_out`` is always allowed: the cost of an unnecessary ban is
+    one marketing message nobody sent. Moving to ``opted_in`` is not, and the
+    last CHECK below enforces it in the database rather than in the writer: an
+    ``opted_in`` row whose decision was a START must carry a verified signature
+    and a proven event time, so an unsigned, replayed or time-unknown START is
+    not merely refused by code — it is unrepresentable.
+
+    ``consent_version`` is monotonic per address and bumps on every accepted
+    decision. A later final send guard reads it, and the executor re-reads it at
+    its claim: equal means nothing moved, higher means a decision landed in
+    between and the claim must refuse.
+    """
+
+    __tablename__ = "whatsapp_consent_suppressions"
+
+    __table_args__ = (
+        UniqueConstraint("wa_address", name="uq_wa_consent_address"),
+        CheckConstraint(f"state IN ({_CONSENT_STATE_SQL})", name="ck_wa_consent_state"),
+        CheckConstraint(
+            f"decision_command IN ('{CONSENT_COMMAND_STOP}', '{CONSENT_COMMAND_START}')",
+            name="ck_wa_consent_decision_command",
+        ),
+        CheckConstraint(
+            f"decision_authenticity IN ({_INBOUND_AUTHENTICITY_SQL})",
+            name="ck_wa_consent_decision_authenticity",
+        ),
+        CheckConstraint(f"decision_source IN ({_CONSENT_SOURCE_SQL})", name="ck_wa_consent_decision_source"),
+        CheckConstraint("consent_version >= 1", name="ck_wa_consent_version_positive"),
+        # A ban and the moment it started are one fact.
+        CheckConstraint(
+            f"(state = '{CONSENT_STATE_OPTED_OUT}') = (opted_out_at IS NOT NULL)",
+            name="ck_wa_consent_opt_out_paired",
+        ),
+        CheckConstraint(
+            "(banned_easyweek_customer_uuid IS NULL) = (banned_uuid_recorded_at IS NULL)",
+            name="ck_wa_consent_banned_uuid_paired",
+        ),
+        # The rule that makes an unproven START harmless at the schema level.
+        CheckConstraint(
+            f"decision_command <> '{CONSENT_COMMAND_START}' OR ("
+            f"state = '{CONSENT_STATE_OPTED_IN}' "
+            "AND decided_event_at IS NOT NULL "
+            f"AND decision_authenticity = '{INBOUND_AUTHENTICITY_SIGNED}')",
+            name="ck_wa_consent_start_needs_proof",
+        ),
+        Index(
+            "ix_wa_consent_active",
+            "wa_address",
+            postgresql_where=text(f"state = '{CONSENT_STATE_OPTED_OUT}'"),
+        ),
+        Index(
+            "ix_wa_consent_banned_uuid",
+            "banned_easyweek_customer_uuid",
+            postgresql_where=text("banned_easyweek_customer_uuid IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    wa_address: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    consent_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # -- the decision this state rests on, denormalised on purpose ----------
+    # The receipt is SET NULL on delete, so these columns are what keeps the
+    # refusal auditable when the stored event behind it is gone.
+    decision_command: Mapped[str] = mapped_column(String(8), nullable=False)
+    decision_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    decision_authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+    decision_receipt_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_inbound_receipts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    decided_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # The high-water marks each command has reached, kept apart from the current
+    # decision so an out-of-order replay can be recognised rather than guessed.
+    #
+    # ``last_start_*`` is AUDIT, and deliberately nothing else: it moves only
+    # for a START this ledger actually honoured, and no rule reads it. Deriving
+    # the opt-in boundary from it was a defect — the mark used to move for every
+    # START, rejected ones included, so an unsigned attempt could raise the time
+    # a later genuine STOP had to beat. That boundary is ``decided_event_at`` of
+    # the decision in force, and only that.
+    last_stop_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_stop_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_start_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_start_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # When a STOP was accepted whose OWN event time could not be proven.
+    #
+    # Load-bearing, and the reason is an ordering one. ``last_stop_event_at``
+    # only moves forward, so a later STOP with an unprovable time used to leave
+    # it reading the older, provable one — and a START merely had to beat THAT
+    # to lift a refusal nobody could order it against. With this column the
+    # unprovable STOP stays visible: "strictly newer" has no answer while it is
+    # set, and §46.4.4 says an unproven order is not a permission.
+    stop_event_time_unknown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    banned_easyweek_customer_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    banned_uuid_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Reason labels and shape facts only. Never a message body, never a name.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+DELIVERY_FAILURE_SOURCE_META_API = "meta_api_rejection"
+DELIVERY_FAILURE_SOURCE_CALLBACK = "status_callback"
+
+DELIVERY_FAILURE_SOURCES = (
+    DELIVERY_FAILURE_SOURCE_META_API,
+    DELIVERY_FAILURE_SOURCE_CALLBACK,
+)
+
+_DELIVERY_FAILURE_SOURCE_SQL = ", ".join(f"'{value}'" for value in DELIVERY_FAILURE_SOURCES)
+
+# Bound to one proven original attempt of one slot.
+DELIVERY_FAILURE_MATCH_CONFIRMED = "confirmed"
+# Nobody owns this identifier yet. Kept so a callback that overtook the commit
+# recording the message id is not lost, and bindable later on the exact id.
+DELIVERY_FAILURE_MATCH_UNMATCHED = "unmatched"
+# It names a slot but disagrees with it — a foreign sender or recipient, or a
+# failure arriving after delivered/read. Stored for audit; changes nothing.
+DELIVERY_FAILURE_MATCH_CONFLICTING = "conflicting"
+# It names the right slot and contradicts nothing, but the proof its SOURCE
+# requires is incomplete — an unsigned callback, or one about an attempt that
+# froze no route. Kept for audit, and deliberately not confirmed: "nothing
+# contradicts it" is not the same fact as "it is proven", and only the second
+# one may mark a slot.
+DELIVERY_FAILURE_MATCH_UNPROVEN = "unproven"
+
+DELIVERY_FAILURE_MATCH_STATES = (
+    DELIVERY_FAILURE_MATCH_CONFIRMED,
+    DELIVERY_FAILURE_MATCH_UNMATCHED,
+    DELIVERY_FAILURE_MATCH_CONFLICTING,
+    DELIVERY_FAILURE_MATCH_UNPROVEN,
+)
+
+_DELIVERY_FAILURE_MATCH_SQL = ", ".join(f"'{value}'" for value in DELIVERY_FAILURE_MATCH_STATES)
+
+DELIVERY_FAILURE_CLASS_PERMANENT = "permanent"
+DELIVERY_FAILURE_CLASS_TRANSIENT = "transient"
+DELIVERY_FAILURE_CLASS_UNKNOWN = "unknown"
+
+DELIVERY_FAILURE_CLASSES = (
+    DELIVERY_FAILURE_CLASS_PERMANENT,
+    DELIVERY_FAILURE_CLASS_TRANSIENT,
+    DELIVERY_FAILURE_CLASS_UNKNOWN,
+)
+
+_DELIVERY_FAILURE_CLASS_SQL = ", ".join(f"'{value}'" for value in DELIVERY_FAILURE_CLASSES)
+
+# Meta itself refused the POST, with its own error envelope, on a status it
+# decides before acting on the message.
+DELIVERY_FAILURE_REASON_API_REJECTED = "meta_api_rejected"
+# A `failed` delivery status webhook naming this exact message id.
+DELIVERY_FAILURE_REASON_CALLBACK_FAILED = "meta_callback_failed"
+
+DELIVERY_FAILURE_REASONS = (
+    DELIVERY_FAILURE_REASON_API_REJECTED,
+    DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
+)
+
+_DELIVERY_FAILURE_REASON_SQL = ", ".join(f"'{value}'" for value in DELIVERY_FAILURE_REASONS)
+
+
+class EasyWeekVoucherProductionDeliveryFailure(Base):
+    """One PROVEN failure fact about one original production voucher send.
+
+    What it is not
+    --------------
+    It is not permission to send again. Nothing in this table re-opens a slot;
+    the single-attempt CHECK on the slot is untouched and this row is written
+    beside it, never instead of it. §46.3 needs the FACT so a later phase can
+    offer an audience with a reason; whether a reason allows a follow-up at all
+    is a separate policy that does not live here.
+
+    It is also not a place for doubt. A timeout, a 429, an unreadable 2xx, a
+    2xx without a message id, a missing callback, accepted-only, an attempt that
+    never happened, a CREATE/PAY error and a local parameter refusal all mean
+    the same thing — unknown — and none of them writes a row. Only two things
+    do: Meta's own refusal of the request, and a ``failed`` status webhook
+    naming the exact message id.
+
+    Why the external error is reduced to numbers and labels
+    ------------------------------------------------------
+    A Meta error title, message or detail string can quote the request it
+    refused, which for this phase means a voucher code, a rendered body or a
+    customer's name. So the untrusted side of the fact is narrowed to one
+    integer: ``meta_error_code``, set only when the value really parsed as an
+    integer, NULL otherwise. The classification is derived from that integer
+    alone — never from the free text — which is why an unknown code produces
+    ``unknown`` rather than a guess.
+
+    Why it can exist before the slot does
+    -------------------------------------
+    Meta can deliver a status for a message id while the transaction that
+    records that id is still in flight. Such a callback arrives owned by nobody,
+    and dropping it would lose a real failure. It is therefore stored
+    ``unmatched`` on the identifier alone and bound when the acceptance commits.
+    Matching is only ever by exact proven identity — message id, intent, item —
+    and never by phone or by how close two timestamps happen to be.
+    """
+
+    __tablename__ = "easyweek_voucher_production_delivery_failures"
+
+    __table_args__ = (
+        # Idempotency. The same fact delivered twice is one row, and the key is
+        # computed from the proven contents of the fact rather than from when it
+        # arrived, so a duplicate is recognised however late it is.
+        UniqueConstraint("fact_key", name="uq_ew_voucher_failure_fact"),
+        ForeignKeyConstraint(
+            ["item_id"],
+            ["easyweek_voucher_production_batch_items.id"],
+            name="fk_ew_voucher_failure_item",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["easyweek_voucher_production_batch_attempts.id"],
+            name="fk_ew_voucher_failure_attempt",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(f"source IN ({_DELIVERY_FAILURE_SOURCE_SQL})", name="ck_ew_voucher_failure_source"),
+        CheckConstraint(f"reason_code IN ({_DELIVERY_FAILURE_REASON_SQL})", name="ck_ew_voucher_failure_reason"),
+        CheckConstraint(f"match_state IN ({_DELIVERY_FAILURE_MATCH_SQL})", name="ck_ew_voucher_failure_match"),
+        CheckConstraint(f"failure_class IN ({_DELIVERY_FAILURE_CLASS_SQL})", name="ck_ew_voucher_failure_class"),
+        CheckConstraint(
+            f"authenticity IN ({_INBOUND_AUTHENTICITY_SQL})",
+            name="ck_ew_voucher_failure_authenticity",
+        ),
+        # A confirmed fact names the slot it is about. An unmatched one cannot,
+        # by definition — that is what makes it unmatched.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_CONFIRMED}' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_failure_confirmed_has_item",
+        ),
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_UNMATCHED}' OR item_id IS NULL",
+            name="ck_ew_voucher_failure_unmatched_has_no_item",
+        ),
+        # An unproven fact knows which slot it was tested against — that is the
+        # difference between it and an unmatched one.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_UNPROVEN}' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_failure_unproven_has_item",
+        ),
+        # And a confirmed CALLBACK carries the two proofs §46.3 asks of it: the
+        # signature the ingress checked, and the route the attempt froze. An
+        # API rejection has its own contract — this process observed Meta refuse
+        # its own request, so no webhook signature exists to require.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_FAILURE_MATCH_CONFIRMED}' "
+            f"OR source <> '{DELIVERY_FAILURE_SOURCE_CALLBACK}' "
+            f"OR (authenticity = '{INBOUND_AUTHENTICITY_SIGNED}' AND route_proven)",
+            name="ck_ew_voucher_failure_callback_confirmed_proof",
+        ),
+        # A callback is about a message id; an API refusal happens before any id
+        # exists and is tied to the committed intent instead.
+        CheckConstraint(
+            f"source <> '{DELIVERY_FAILURE_SOURCE_CALLBACK}' OR provider_message_id IS NOT NULL",
+            name="ck_ew_voucher_failure_callback_has_message",
+        ),
+        CheckConstraint(
+            f"source <> '{DELIVERY_FAILURE_SOURCE_META_API}' OR intent_uuid IS NOT NULL",
+            name="ck_ew_voucher_failure_api_has_intent",
+        ),
+        # Route proof is all-or-nothing per side, and its absence is honest:
+        # a historical attempt stored no route, so its facts say unknown rather
+        # than claiming the sender the settings happen to name today.
+        CheckConstraint(
+            "NOT route_proven OR (observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL)",
+            name="ck_ew_voucher_failure_route_proven",
+        ),
+        Index("ix_ew_voucher_failure_item", "item_id"),
+        Index(
+            "ix_ew_voucher_failure_message",
+            "provider_message_id",
+            postgresql_where=text("provider_message_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_ew_voucher_failure_unmatched",
+            "provider_message_id",
+            postgresql_where=text(f"match_state = '{DELIVERY_FAILURE_MATCH_UNMATCHED}'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    fact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    match_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    failure_class: Mapped[str] = mapped_column(String(16), nullable=False)
+    authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # -- the exact original attempt this is about ---------------------------
+    item_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    intent_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # -- the route the FACT names, as digests, and whether it was provable --
+    observed_sender_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    observed_recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_proven: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # -- the untrusted side, reduced to one integer -------------------------
+    meta_error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Two different times, never merged: when we saw it, and when the event is
+    # PROVEN to have happened. The second is NULL whenever it cannot be proven.
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    whatsapp_event_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("whatsapp_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Reason labels and shape facts only. No raw provider response, no body, no
+    # voucher code, no personal parameter and no Meta error text.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

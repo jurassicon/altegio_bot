@@ -1579,3 +1579,122 @@ the singleton test record exist. An unconsumed approval and a test stopped befor
 issuance are still evidence. Close the fences, retain the records and use a
 reviewed forward fix. Do not convert zero to a paid price, delete rows or rotate
 keys to force rollback.
+
+## 16. Unsubscribes and proven delivery failures (PR-22.1)
+
+The contract for these lives in `VOUCHER_FOLLOWUP_CONSENT_EVIDENCE.md`. Three
+things changed that an operator of this mailing should know:
+
+**`стоп` is now an unsubscribe**, equal to `stop` in every respect, and every
+message of a webhook delivery counts rather than only the first. An unsubscribe
+is now durable without a client card, survives a card being created or replaced
+and a number change, and is checked at the one shared veto point this mailing
+already passes through — so a refused recipient is refused in the composition
+read, the freeze and the per-item claim alike, with its own reason code.
+
+**A `failed` callback is now recorded** as a fact about the original send, bound
+to that send's frozen sender and recipient route. It is evidence, not permission:
+it re-opens nothing, the one-attempt limit is untouched, and no retry exists.
+`send_rejected` on its own is still not proof — this mailing writes that status
+for its own parameter refusal too.
+
+A callback is only `confirmed` when its delivery's signature was verified **and**
+the route matches the one that slot's single attempt froze. Without either it is
+kept as `unproven` and marks nothing, so on a deployment with no
+`META_APP_SECRET` the failure evidence will read `unproven` rather than
+`confirmed`. Meta's own rejection of the POST keeps its own contract — this
+process watched it happen — and is confirmed without any webhook signature.
+
+**Before any follow-up is considered**, run the historical reconciliation dry
+and read its report, then apply it as a separate explicit step:
+
+```bash
+uv run python -m altegio_bot.scripts.reconcile_whatsapp_consent
+```
+
+```bash
+uv run python -m altegio_bot.scripts.reconcile_whatsapp_consent --apply
+```
+
+It writes nothing without `--apply`, makes no external request, replays nothing,
+and reports what it could not establish. Applying it can make people newly
+unsendable whose later resubscribe cannot be proven; the dry run states that
+count first.
+
+The report's numbers describe what the writes did, and four of them are worth
+reading together: `written` is refusals that really landed, `superseded` is
+**snapshots** the run declined because a proven opt-in for that address had been
+observed after the snapshot's own moment, `cards_converged` is how many
+`Client.wa_opted_out` flags the run brought into line with a refusal it wrote,
+and `newly_suppressed_addresses` counts people who were sendable before the run
+and are not after it. A rerun is a no-op; a stored STOP newer than the refusal
+already in force is applied again on purpose, to move the boundary a later
+resubscribe has to beat, and is reported as a no-op because nothing about the
+person's state changed.
+
+A run writes each refusal in two steps — the ledger first, then the card flags
+it locked — so a refusal is durable even if the second step fails. The next run
+finishes the card half: an address whose ledger already refuses is still checked
+against its cards, and one that is still marked sendable is repaired without
+writing the evidence again. `card_recovery` counts those, which is how a repeat
+of the evidence is told apart from a repair of the flags. A card that is moved onto a refused number by the
+ordinary client import carries the refusal itself, so it does not wait for a
+reconciliation at all.
+
+Live STOP processing locks matching cards, then queued marketing jobs, then
+consent addresses. The job set is selected for the whole delivery in id order;
+only those jobs can be cancelled in that transaction, with their current scope
+and queued status re-checked. The Altegio planner uses the same id order for all
+existing system jobs of its record/company, in every status, before cancellation
+or dedupe upserts. Cancellation keeps its original scope and queued-only rule;
+the wider lock set also covers rows a later upsert can touch or revive.
+
+Outbox uses the same id order when returning a claimed batch's remainder after
+token expiry: it locks the supplied ids still in `processing`, without skipping
+locked rows, and returns only those ids to `queued` after re-checking their
+status. Both steps stay in one transaction, so this return cannot take the
+planner's job locks in the opposite order.
+
+The live projection's card lock is `FOR NO KEY UPDATE`: it blocks other card
+writes but permits an Outbox insert's foreign-key reference to finish. This
+avoids a cycle through a running job that the booking planner must lock.
+Booking writers finish their job changes and HTTP requests before settling
+consent. Jobs created or made eligible after selection are outside the
+cancellation set. Outbox's final card check rejects a send when the card refusal
+is already committed at that check; this protocol does not retract an external
+send that has already begun. Historical reconciliation does not cancel jobs.
+
+`superseded` never applies to a stored STOP message. A refusal somebody sent is
+not stale because of when this process received it — a signed START sent at
+10:10 can arrive at 10:30 behind a STOP received at 10:20 — so a stored STOP
+whose timestamp cannot be read is applied, recorded as being of unknown order
+and therefore unliftable, exactly as it would be if the inbox worker had reached
+it first. The two paths cannot answer differently about one message.
+
+Note: with `META_APP_SECRET` unconfigured, no resubscribe can lift a refusal in
+the new ledger, because no signature is checked and an unverified START grants
+nothing. Such a START is no longer acknowledged either — confirming a
+subscription the ledger refused would be worse than silence — and the reason is
+recorded on the stored event as `start_authenticity_unproven`. The card flag of
+somebody with no ledger refusal at all keeps its historical behaviour, so an
+ordinary resubscribe still works for them. Configuring the secret is what makes
+a resubscribe work for everybody.
+
+What a customer is told always describes the state that settled for their
+number, and only when one of their accepted messages asked for it. A delivery
+carrying both commands therefore gets the unsubscribe confirmation when the
+refusal wins and the subscription confirmation when a proven, strictly newer
+START wins; a command the ledger did not honour gets silence and a reason on the
+event. An acknowledgement never leaves through a sender route this deployment
+does not accept, even when another message in the same delivery arrived on one
+that it does.
+
+A refusal whose own event time could never be established — every refusal
+projected from a legacy card flag, and any STOP whose timestamp Meta sent
+unparseably — cannot be lifted by a START at all, because "strictly newer" has no
+answer. Those people are unsubscribed for good as far as this mailing is
+concerned; an operator who needs to reverse one has to do it deliberately, as a
+data change, not through a message.
+
+No follow-up audience, text, confirmation, ledger or send exists at this stage,
+and none is reachable by a flag.

@@ -656,6 +656,7 @@ async def test_update_webhook_skips_promo_apply() -> None:
 
     mock_try_apply = AsyncMock()
     session = AsyncMock()
+    session.info = {}
 
     event = MagicMock()
     event.company_id = _COMPANY

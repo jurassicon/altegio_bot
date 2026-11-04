@@ -24,6 +24,8 @@ from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.customers import normalized_international_phone
 from altegio_bot.easyweek_normalizer import NormalizedBooking, normalize_event
 from altegio_bot.models.models import Client, EasyWeekEvent
+from altegio_bot.whatsapp_consent import extend_refusal_to_uuid
+from altegio_bot.whatsapp_consent_cards import note_card_write, settle_card_writes
 
 
 class UUIDIdentityResolutionRequired(Exception):
@@ -184,6 +186,12 @@ async def resolve_webhook_identity(
                 )
             ):
                 return False
+        # Read BEFORE anything below changes a number: a refusal recorded
+        # against the number this person used to have has to keep applying once
+        # the card moves to the new one, and after the write that number is no
+        # longer on any card to find it by.
+        consent_addresses = {proven_phone, captured_phone} | {row.phone_e164 for row in rows}
+
         branch_rows = [row for row in rows if row.company_id == booking.company_id]
         if len(branch_rows) > 1:
             return False
@@ -205,23 +213,55 @@ async def resolve_webhook_identity(
                 client.wa_opt_out_reason = opted_out.wa_opt_out_reason
             # Opt-out, its audit, visits and every other branch stay intact.
         else:
-            session.add(
-                Client(
-                    provider="easyweek",
-                    company_id=booking.company_id,
-                    altegio_client_id=booking.customer_id,
-                    easyweek_customer_uuid=identity,
-                    phone_e164=proven_phone,
-                    display_name=booking.display_name,
-                    raw={},
-                    wa_opted_out=any(row.wa_opted_out for row in rows),
-                    wa_opted_out_at=next((row.wa_opted_out_at for row in rows if row.wa_opted_out), None),
-                    wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
-                )
+            client = Client(
+                provider="easyweek",
+                company_id=booking.company_id,
+                altegio_client_id=booking.customer_id,
+                easyweek_customer_uuid=identity,
+                phone_e164=proven_phone,
+                display_name=booking.display_name,
+                raw={},
+                wa_opted_out=any(row.wa_opted_out for row in rows),
+                wa_opted_out_at=next((row.wa_opted_out_at for row in rows if row.wa_opted_out), None),
+                wa_opt_out_reason=next((row.wa_opt_out_reason for row in rows if row.wa_opted_out), None),
             )
+            session.add(client)
+            await session.flush()
         if stale_contact:
             # Consume the same event's business changes atomically with the
             # proven contact. Otherwise the next pass would restore/re-prove
             # its obsolete phone forever. Captured payload remains untouched.
+            #
+            # This is also where this transaction's external calls happen — the
+            # ordinary EasyWeek write reads the multi-service snapshot over HTTP
+            # — so the whole consent section below is deliberately after it.
             await apply_stale_contact(session, event, proven_phone)
+
+        # Every card this transaction touched, remembered for the consent
+        # section below. Noting is local: no lock, no query.
+        for row in rows:
+            if row.id is not None:
+                note_card_write(session, card_id=int(row.id), phone=row.phone_e164)
+        note_card_write(session, card_id=int(client.id), phone=client.phone_e164)
+
+        # ONE sorted acquisition for every consent address this transaction
+        # needs — the cards it wrote and the addresses the refusal is bound to.
+        # Sorting inside each helper was not enough: the nested client upsert
+        # used to take the proven number's lock and the binding below the old
+        # number's, so an ingress holding the old one and waiting for the proven
+        # one closed a cycle. Consent locks are the last locks taken here, and
+        # nothing external happens after this point.
+        await settle_card_writes(session, extra_addresses=consent_addresses)
+        # §46.4.2 — the one moment this binding is justified. The UUID has just
+        # been proven for this person against EasyWeek's own records, so an
+        # existing phone-keyed refusal for any of those numbers is bound to it
+        # and keeps applying after the number changes. Ban extension only: it
+        # writes a UUID onto a refusal and claims nothing about whose card this
+        # is, which branch they belong to, or whether they are an EasyWeek
+        # customer — and it never creates, lifts or weakens a refusal.
+        #
+        # The addresses were read BEFORE the number changed, which is what makes
+        # this position safe, and the acquisition above already holds every one
+        # of them: this call queues for nothing and adds no order of its own.
+        await extend_refusal_to_uuid(session, addresses=consent_addresses, customer_uuid=identity)
         return True
