@@ -1490,6 +1490,32 @@ async def terminal_stop_active(session_maker: async_sessionmaker[AsyncSession], 
         return await _stop_is_terminal_schema(session, batch_id=batch_id)
 
 
+async def stop_facts_in_session(session: AsyncSession, *, batch_id: int) -> tuple[bool, int]:
+    """``(active, generation)`` inside a transaction the CALLER owns.
+
+    The same two facts :func:`stop_generation` returns, without opening a second
+    session for them. Added for the §46.2 follow-up preview, which has to read
+    the stop state and the generation in the one transaction that stores its
+    snapshot: a preview is not permission, so it takes no lock here, and the
+    generation it stamps is what lets a later phase notice that the stop moved
+    after the preview was taken.
+    """
+    return await _stop_facts_locked(session, batch_id=batch_id)
+
+
+async def terminal_stop_active_in_session(session: AsyncSession, *, batch_id: int) -> bool:
+    """Is this batch under a §45.4 terminal stop, in the caller's transaction?
+
+    Exactly :func:`terminal_stop_active`, reusing the caller's session. The stop
+    semantics stay in this module — an active stop plus a current fixed product
+    schema — so the follow-up preview cannot acquire its own opinion about what
+    a terminal stop is.
+    """
+    if not await _stop_is_active_locked(session, batch_id=batch_id):
+        return False
+    return await _stop_is_terminal_schema(session, batch_id=batch_id)
+
+
 async def stop_is_active(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> bool:
     """Is a stop in force? A standalone read, for the pre-claim shortcut.
 
@@ -2484,7 +2510,9 @@ __all__ = [
     "request_stop",
     "resettle",
     "stop_generation",
+    "stop_facts_in_session",
     "terminal_stop_active",
+    "terminal_stop_active_in_session",
     "stop_is_active",
     "stop_state",
 ]

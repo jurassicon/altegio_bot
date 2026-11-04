@@ -23,8 +23,10 @@ import re
 from datetime import timedelta
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import select
 
+import altegio_bot.settings as settings_module
 from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
@@ -3324,3 +3326,124 @@ async def test_the_booking_report_shows_a_previews_real_size(
     assert "ещё не зафиксирована" in stage
     assert await page.locator("#report-rows tr[data-slot]").count() == 0
     assert_no_page_errors(page)
+
+
+async def test_followup_preview_real_browser_operator_path(page, monkeypatch, session_maker):
+    """§46.6, in Chromium: original mailing → groups → interval → text → check.
+
+    Every step is the operator's own. The follow-up page is reached by clicking
+    the link on the mailing page rather than by a URL assembled from a database
+    read, the groups are ticked, the interval is typed, the button is clicked,
+    and the page is then asserted to show the composition it computed. That is
+    the difference between proving the interface works and proving the contract
+    behind it does — and §43's R3 defect was exactly a right contract behind a
+    screen that dead-ended.
+
+    What this also proves, and could not be proved any other way: there is no
+    control on this screen that sends anything, the banner saying so is visible
+    to a real renderer, and the page carries no voucher code, phone number or
+    customer identifier.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings,
+        "easyweek_voucher_delivery_hmac_key",
+        SecretStr("k" * 48),
+        raising=False,
+    )
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    # The live Meta half, which the page and the action both reach after closing
+    # their read session.
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "index": 1}, {"state": "read", "index": 2}],
+    )
+
+    # The operator starts where they always start: the mailing's own page.
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}")
+    await opened.click("text=Повторное сообщение: предпросмотр")
+    await opened.wait_for_url(re.compile(rf"/ops/voucher-mailings/{batch_id}/followup$"), timeout=15_000)
+
+    body = await opened.inner_text("body")
+    assert "Доступен только предпросмотр" in body
+    assert "[Vorname]" in body
+    # No control on this page can send anything.
+    buttons = await opened.inner_text("body")
+    for forbidden in ("Отправить", "Подтвердить отправку"):
+        assert forbidden not in buttons
+
+    # Nothing is selected by default, and the check refuses an empty choice.
+    assert await opened.is_checked("#group-delivered_unread") is False
+    assert await opened.is_checked("#group-read") is False
+    assert await opened.is_checked("#group-confirmed_failure") is False
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-result').textContent.includes('группу')",
+        timeout=15_000,
+    )
+
+    # Now the operator's real choice: one group, and an explicit interval.
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.body.innerText.includes('Сохранённый предпросмотр')",
+        timeout=15_000,
+    )
+
+    final = await opened.inner_text("body")
+    assert "подходят для повторного сообщения" in final
+    assert "Минимальный интервал после исходной попытки: 14 дн." in final
+    # The read slot was not selected, so it is not part of this proposal.
+    assert "Прочитано (подтверждено)" in final  # the checkbox label stays on screen
+    for forbidden in ("+4915100", "Person 1", "wamid.", "00000001-1111"):
+        assert forbidden not in final, forbidden
+    assert_no_page_errors(opened)
+
+    # And the server kept its side of the bargain: one stored version, nothing
+    # sent, no second attempt anywhere.
+    from altegio_bot.models.models import (
+        EasyWeekVoucherFollowupPreview,
+        EasyWeekVoucherProductionBatchItem,
+        MessageJob,
+        OutboxMessage,
+    )
+
+    async with session_maker() as session:
+        stored = list((await session.execute(select(EasyWeekVoucherFollowupPreview))).scalars())
+        jobs = list((await session.execute(select(MessageJob))).scalars())
+        outbox = list((await session.execute(select(OutboxMessage))).scalars())
+        attempts = list(
+            (await session.execute(select(EasyWeekVoucherProductionBatchItem.send_attempt_count))).scalars()
+        )
+    assert len(stored) == 1
+    assert stored[0].included_count == 1
+    assert (jobs, outbox) == ([], [])
+    assert set(attempts) == {1}

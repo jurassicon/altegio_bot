@@ -863,7 +863,7 @@ async def _backfill_receipts(
     return await _receipts_for_event(session, int(event.id))
 
 
-def _is_chatwoot_sourced(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
+def is_chatwoot_sourced(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     """A Chatwoot mirror or operator relay, which must not execute commands.
 
     Deliberately the same two markers the inbox worker uses for inbound loop
@@ -1018,7 +1018,7 @@ async def apply_inbound_consent(
             payload = event.payload or {}
             if not isinstance(payload, dict):
                 return ConsentApplication(event_id=event_id, skipped_reason="payload_not_object")
-            if _is_chatwoot_sourced(event, payload):
+            if is_chatwoot_sourced(event, payload):
                 return ConsentApplication(event_id=event_id, skipped_reason="chatwoot_sourced")
 
             receipts = await _receipts_for_event(session, event_id)
@@ -1925,6 +1925,7 @@ __all__ = [
     "extract_inbound_receipts",
     "final_send_guard",
     "is_suppressed",
+    "is_chatwoot_sourced",
     "iter_payload_consent_commands",
     "ledger_matches_clause",
     "ledger_state",

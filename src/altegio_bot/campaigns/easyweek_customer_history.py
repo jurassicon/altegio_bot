@@ -222,6 +222,192 @@ def _meta_value(meta: dict[str, Any], key: str) -> int | None:
     return value if type(value) is int else None
 
 
+async def _collect_customer_history(
+    reader: CustomerHistoryReader,
+    *,
+    customer_uuid: uuid.UUID,
+    paced: Callable[[], Awaitable[None]],
+) -> tuple[dict[uuid.UUID, _Booking] | None, str | None, LiveProofDisposition, int]:
+    """Every booking of one customer card, or why the set could not be trusted.
+
+    Lifted out of :func:`prove_customer_booking_history` unchanged, so a second
+    caller with a different POLICY can reuse the same READ. The strictness is
+    the valuable part and must not be reimplemented anywhere else: the page
+    index, the page size, ``last_page`` against ``total``, every page's row
+    count, a page cap, a total that stays the same across pages, per-row
+    identity, duplicate booking uuids, and finally the collected count against
+    the declared total. Any one of them failing makes the whole set unusable,
+    which is why this returns ``None`` instead of a short list.
+
+    ``None`` is NEVER "this customer has no bookings". An empty history is an
+    empty dict, behind a complete and structurally valid zero-row response.
+    """
+    rows: dict[uuid.UUID, _Booking] = {}
+    expected_total: int | None = None
+    expected_last: int | None = None
+    pages_read = 0
+    page = 1
+    while True:
+        await paced()
+        try:
+            payload = await reader.list_customer_bookings(
+                str(customer_uuid), page=page, per_page=CUSTOMER_BOOKINGS_PER_PAGE
+            )
+        except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
+            result = _api_refusal(exc, stage="history", pages_read=pages_read)
+            return None, result.reason, result.disposition, pages_read
+        pages_read += 1
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("data"), list)
+            or not isinstance(payload.get("meta"), dict)
+        ):
+            return None, HISTORY_PAGINATION_INCOMPLETE, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+        data = payload["data"]
+        meta = payload["meta"]
+        current = _meta_value(meta, "current_page")
+        last = _meta_value(meta, "last_page")
+        per_page = _meta_value(meta, "per_page")
+        total = _meta_value(meta, "total")
+        if (
+            current != page
+            or last is None
+            or last < 1
+            or per_page != CUSTOMER_BOOKINGS_PER_PAGE
+            or total is None
+            or total < 0
+            or last != max(1, (total + CUSTOMER_BOOKINGS_PER_PAGE - 1) // CUSTOMER_BOOKINGS_PER_PAGE)
+        ):
+            return None, HISTORY_PAGINATION_INCONSISTENT, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+        if last > MAX_CUSTOMER_HISTORY_PAGES:
+            return None, HISTORY_PAGINATION_UNBOUNDED, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+        if expected_total is None:
+            expected_total, expected_last = total, last
+        elif total != expected_total or last != expected_last:
+            return None, HISTORY_PAGINATION_INCONSISTENT, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+        expected_count = 0 if total == 0 else min(CUSTOMER_BOOKINGS_PER_PAGE, total - (page - 1) * per_page)
+        if expected_count < 0 or len(data) != expected_count:
+            return None, HISTORY_PAGINATION_INCOMPLETE, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+        for raw_row in data:
+            row, row_reason = _history_row(raw_row, customer_uuid=customer_uuid)
+            if row is None:
+                return (
+                    None,
+                    row_reason or HISTORY_ROW_MALFORMED,
+                    LiveProofDisposition.PERMANENT_REFUSAL,
+                    pages_read,
+                )
+            if row.booking_uuid in rows:
+                return None, HISTORY_DUPLICATE_BOOKING_UUID, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+            rows[row.booking_uuid] = row
+        if page == last:
+            break
+        page += 1
+
+    if expected_total is None or len(rows) != expected_total:
+        return None, HISTORY_PAGINATION_INCOMPLETE, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
+    return rows, None, LiveProofDisposition.READY, pages_read
+
+
+@dataclass(frozen=True)
+class CustomerBookingSet:
+    """One customer's complete booking set, for a caller with its own policy.
+
+    ``complete`` is the only licence to draw a negative conclusion from
+    ``bookings``. While it is ``False`` the caller knows nothing about this
+    customer's bookings — not "none", not "some" — and ``reason`` says which
+    part of the read could not be trusted.
+    """
+
+    complete: bool
+    identity_current: bool
+    bookings: tuple[_Booking, ...] = ()
+    reason: str | None = None
+    disposition: LiveProofDisposition = LiveProofDisposition.PERMANENT_REFUSAL
+    pages_read: int = 0
+
+    @property
+    def retryable_uncertainty(self) -> bool:
+        return self.disposition is LiveProofDisposition.RETRYABLE_UNCERTAINTY
+
+
+async def read_customer_bookings(
+    reader: CustomerHistoryReader,
+    *,
+    customer_uuid: uuid.UUID,
+    pause: Callable[[float], Awaitable[None]] | None = None,
+    pause_sec: float = 0.0,
+) -> CustomerBookingSet:
+    """Prove one customer card's identity, then read every booking it has.
+
+    Why this exists beside :func:`prove_customer_booking_history`
+    ------------------------------------------------------------
+    That function answers PR-15's question — "is this person still a first-time
+    visitor, with exactly one completed visit and nothing booked ahead?" — and
+    its ``completed_visits_not_one`` refusal is part of that answer rather than
+    a fault in the data. A §46.2 follow-up audience asks something different
+    about people who already earned and were sent a voucher: they may well have
+    come back since, and a second completed visit must not read as a failed
+    proof. Reusing the PR-15 verdict would have excluded exactly the recipients
+    a follow-up is about, for a reason belonging to another campaign's
+    eligibility rule.
+
+    So the READ is shared and the POLICY is not. This returns the facts; the
+    caller decides what they mean.
+
+    Keyed on the customer uuid alone, with no ``location`` argument, and
+    deliberately: EasyWeek's customer booking list is workspace-wide, so a
+    booking at any configured branch of the same workspace is visible here.
+    That is what §46.5 asks of the booking question, which spans branches even
+    though the send audience does not.
+
+    Strictly read-only — ``get_customer`` and ``list_customer_bookings``, no
+    mutation, no database access and no lock. The caller must not hold a row
+    lock or an advisory lock across this call.
+    """
+
+    async def paced() -> None:
+        if pause is not None:
+            await pause(pause_sec)
+
+    try:
+        customer_payload = await reader.get_customer(str(customer_uuid))
+    except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
+        result = _api_refusal(exc, stage="customer")
+        return CustomerBookingSet(
+            complete=False,
+            identity_current=False,
+            reason=result.reason,
+            disposition=result.disposition,
+        )
+    observed = _customer_uuid(customer_payload)
+    if observed is None:
+        return CustomerBookingSet(complete=False, identity_current=False, reason=CUSTOMER_RESPONSE_MALFORMED)
+    if observed != customer_uuid:
+        # The card this uuid resolves to belongs to somebody else. Never
+        # silently followed: §46.1 forbids substituting the addressee.
+        return CustomerBookingSet(complete=False, identity_current=False, reason=CUSTOMER_UUID_MISMATCH)
+
+    rows, reason, disposition, pages_read = await _collect_customer_history(
+        reader, customer_uuid=customer_uuid, paced=paced
+    )
+    if rows is None:
+        return CustomerBookingSet(
+            complete=False,
+            identity_current=True,
+            reason=reason,
+            disposition=disposition,
+            pages_read=pages_read,
+        )
+    return CustomerBookingSet(
+        complete=True,
+        identity_current=True,
+        bookings=tuple(rows.values()),
+        disposition=LiveProofDisposition.READY,
+        pages_read=pages_read,
+    )
+
+
 async def prove_customer_booking_history(
     reader: CustomerHistoryReader,
     *,
@@ -261,111 +447,18 @@ async def prove_customer_booking_history(
     if observed_customer_uuid != source.customer_uuid:
         return _refusal(CUSTOMER_UUID_MISMATCH, source_booking_current=True)
 
-    rows: dict[uuid.UUID, _Booking] = {}
-    expected_total: int | None = None
-    expected_last: int | None = None
-    pages_read = 0
-    page = 1
-    while True:
-        await paced()
-        try:
-            payload = await reader.list_customer_bookings(
-                str(source.customer_uuid), page=page, per_page=CUSTOMER_BOOKINGS_PER_PAGE
-            )
-        except Exception as exc:  # noqa: BLE001
-            result = _api_refusal(exc, stage="history", pages_read=pages_read)
-            return CustomerLiveProof(
-                **{
-                    **result.__dict__,
-                    "source_booking_current": True,
-                    "customer_identity_current": True,
-                }
-            )
-        pages_read += 1
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("data"), list)
-            or not isinstance(payload.get("meta"), dict)
-        ):
-            return _refusal(
-                HISTORY_PAGINATION_INCOMPLETE,
-                source_booking_current=True,
-                customer_identity_current=True,
-                pages_read=pages_read,
-            )
-        data = payload["data"]
-        meta = payload["meta"]
-        current = _meta_value(meta, "current_page")
-        last = _meta_value(meta, "last_page")
-        per_page = _meta_value(meta, "per_page")
-        total = _meta_value(meta, "total")
-        if (
-            current != page
-            or last is None
-            or last < 1
-            or per_page != CUSTOMER_BOOKINGS_PER_PAGE
-            or total is None
-            or total < 0
-            or last != max(1, (total + CUSTOMER_BOOKINGS_PER_PAGE - 1) // CUSTOMER_BOOKINGS_PER_PAGE)
-        ):
-            return _refusal(
-                HISTORY_PAGINATION_INCONSISTENT,
-                source_booking_current=True,
-                customer_identity_current=True,
-                pages_read=pages_read,
-            )
-        if last > MAX_CUSTOMER_HISTORY_PAGES:
-            return _refusal(
-                HISTORY_PAGINATION_UNBOUNDED,
-                source_booking_current=True,
-                customer_identity_current=True,
-                pages_read=pages_read,
-            )
-        if expected_total is None:
-            expected_total, expected_last = total, last
-        elif total != expected_total or last != expected_last:
-            return _refusal(
-                HISTORY_PAGINATION_INCONSISTENT,
-                source_booking_current=True,
-                customer_identity_current=True,
-                pages_read=pages_read,
-            )
-        expected_count = 0 if total == 0 else min(CUSTOMER_BOOKINGS_PER_PAGE, total - (page - 1) * per_page)
-        if expected_count < 0 or len(data) != expected_count:
-            return _refusal(
-                HISTORY_PAGINATION_INCOMPLETE,
-                source_booking_current=True,
-                customer_identity_current=True,
-                pages_read=pages_read,
-            )
-        for raw_row in data:
-            row, row_reason = _history_row(raw_row, customer_uuid=source.customer_uuid)
-            if row is None:
-                return _refusal(
-                    row_reason or HISTORY_ROW_MALFORMED,
-                    source_booking_current=True,
-                    customer_identity_current=True,
-                    pages_read=pages_read,
-                )
-            if row.booking_uuid in rows:
-                return _refusal(
-                    HISTORY_DUPLICATE_BOOKING_UUID,
-                    source_booking_current=True,
-                    customer_identity_current=True,
-                    pages_read=pages_read,
-                )
-            rows[row.booking_uuid] = row
-        if page == last:
-            break
-        page += 1
-
-    if expected_total is None or len(rows) != expected_total:
+    rows_or_none, collect_reason, collect_disposition, pages_read = await _collect_customer_history(
+        reader, customer_uuid=source.customer_uuid, paced=paced
+    )
+    if rows_or_none is None:
         return _refusal(
-            HISTORY_PAGINATION_INCOMPLETE,
+            collect_reason or HISTORY_PAGINATION_INCOMPLETE,
+            disposition=collect_disposition,
             source_booking_current=True,
             customer_identity_current=True,
             pages_read=pages_read,
         )
+    rows = rows_or_none
     history_source = rows.get(source.booking_uuid)
     if history_source is None:
         return _refusal(

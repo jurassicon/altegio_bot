@@ -5775,3 +5775,232 @@ class EasyWeekVoucherProductionDeliveryFailure(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# §46.2 / §46.10 — the EasyWeek voucher follow-up PREVIEW contract (PR-22.2)
+# ---------------------------------------------------------------------------
+# A preview is a proposal, not a permission. Nothing here reserves or spends a
+# send attempt, and nothing here is a claim: the execution ledger, its global
+# single-attempt key and its terminal tombstones belong to PR-22.3. What these
+# two tables do carry is the source/dedupe contract that stage will build on, so
+# that it can be written without inventing identity after the fact.
+
+FOLLOWUP_GROUP_READ = "read"
+FOLLOWUP_GROUP_DELIVERED = "delivered_unread"
+FOLLOWUP_GROUP_FAILED = "confirmed_failure"
+
+FOLLOWUP_GROUPS = (
+    FOLLOWUP_GROUP_READ,
+    FOLLOWUP_GROUP_DELIVERED,
+    FOLLOWUP_GROUP_FAILED,
+)
+
+# A slot of the original mailing that belongs to NONE of the three groups: never
+# attempted, accepted and never heard of again, locally refused, timed out, or
+# holding only an unproven failure fact. Deliberately NOT in ``FOLLOWUP_GROUPS``,
+# because it is not selectable and not an audience — it is how a stored snapshot
+# accounts for a slot it could prove nothing about, instead of filing that slot
+# under a group whose evidence it does not have.
+FOLLOWUP_GROUP_UNPROVEN = "unproven"
+
+FOLLOWUP_ROW_GROUP_CODES = FOLLOWUP_GROUPS + (FOLLOWUP_GROUP_UNPROVEN,)
+
+_FOLLOWUP_GROUP_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_ROW_GROUP_CODES)
+
+# What a preview says about one source slot. ``unknown`` is its own answer and
+# never folded into ``excluded``: "we could not establish it" is a different
+# fact from "it does not qualify", and §46.5 requires an operator to see which.
+FOLLOWUP_ROW_INCLUDED = "included"
+FOLLOWUP_ROW_EXCLUDED = "excluded"
+FOLLOWUP_ROW_UNKNOWN = "unknown"
+
+FOLLOWUP_ROW_DECISIONS = (
+    FOLLOWUP_ROW_INCLUDED,
+    FOLLOWUP_ROW_EXCLUDED,
+    FOLLOWUP_ROW_UNKNOWN,
+)
+
+_FOLLOWUP_ROW_DECISION_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_ROW_DECISIONS)
+
+
+class EasyWeekVoucherFollowupPreview(Base):
+    """One immutable version of a follow-up preview for one original batch.
+
+    Immutable by construction: a row is written once and never updated. Looking
+    at a preview again does not touch it, and an explicit recalculation inserts
+    the NEXT version beside it — so an operator can always see what the earlier
+    proposal actually said, and a later stage can tell which proposal it is
+    acting on.
+
+    It binds itself to the exact source it was computed from. ``batch_id`` plus
+    ``source_frozen_digest`` name one frozen original mailing; ``stop_generation``
+    names the stop counter that batch had when the evidence was read, so a
+    preview built before a terminal operator STOP can never read as one built
+    after it. ``checked_at`` and ``valid_until`` say when the proofs were taken
+    and how long the contract is treated as current: a snapshot is not a
+    standing permission to send.
+
+    Nothing personal is stored. Reason codes, counts and one-way digests only —
+    no phone number, no name, no voucher code, no rendered BODY, no raw provider
+    identifier.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_previews"
+
+    __table_args__ = (
+        # One version number per source batch, so two concurrent operators
+        # cannot both believe they wrote version N.
+        UniqueConstraint("batch_id", "version", name="uq_ew_followup_preview_batch_version"),
+        CheckConstraint("version >= 1", name="ck_ew_followup_preview_version"),
+        # §46.2 — the interval is the operator's explicit decision. No default is
+        # invented anywhere, and a missing, zero or negative value cannot be
+        # represented at all.
+        CheckConstraint("min_interval_seconds > 0", name="ck_ew_followup_preview_interval_positive"),
+        # §46.3 — an empty selection is not "all". A preview without a group is
+        # not a narrower preview; it is not a preview.
+        CheckConstraint("jsonb_array_length(selected_groups) >= 1", name="ck_ew_followup_preview_groups_present"),
+        CheckConstraint(
+            "included_count >= 0 AND excluded_count >= 0 AND unknown_count >= 0",
+            name="ck_ew_followup_preview_counts_non_negative",
+        ),
+        CheckConstraint("valid_until > checked_at", name="ck_ew_followup_preview_validity_window"),
+        Index("ix_ew_followup_preview_batch", "batch_id", "version"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- the source this preview is about ----------------------------------
+    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider: Mapped[str] = _provider_column()
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    location_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    # The original request schema (3 or 4) and the frozen digest of that exact
+    # batch. A preview is only ever valid for the snapshot it read.
+    source_request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_frozen_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The batch's stop counter when the evidence was read (§45.4).
+    stop_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- what the operator chose -------------------------------------------
+    selected_groups: Mapped[list] = mapped_column(JSONB, nullable=False)
+    min_interval_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # -- the exact message contract ----------------------------------------
+    # Identity, language, category, parameter order and a digest of the BODY.
+    # The text itself is a local contract; this records WHICH contract, never a
+    # rendered message.
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    meta_template_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_language: Mapped[str] = mapped_column(String(8), nullable=False)
+    template_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_parameter_order: Mapped[list] = mapped_column(JSONB, nullable=False)
+    template_body_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Did a live Meta read prove the APPROVED status in THIS evaluation?
+    template_meta_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # -- how it was decided -------------------------------------------------
+    contract_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_policy_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # -- what it found ------------------------------------------------------
+    included_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    excluded_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unknown_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Deterministic over the INCLUDED composition and the contract that produced
+    # it, so a later stage can prove it is acting on this exact proposal.
+    composition_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- who asked ----------------------------------------------------------
+    operator_principal: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # Safe aggregates only: reason histograms and counts.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekVoucherFollowupPreviewRow(Base):
+    """One source slot as one preview version judged it.
+
+    Every slot the selected groups reached is written down, included or not,
+    because the excluded ones are the half an operator has to be able to read:
+    §46.8 asks for counts by group AND the reasons, and a row that simply
+    vanished would be indistinguishable from one nobody looked at.
+
+    The uniqueness here is the source/dedupe contract PR-22.3 will claim
+    against. Within one version an included recipient appears once per source
+    slot, once per canonical customer UUID and once per original entitlement, so
+    a duplicated card, a second representation of the same person or a re-read of
+    the same voucher cannot become two follow-up messages later.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_preview_rows"
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["preview_id"],
+            ["easyweek_voucher_followup_previews.id"],
+            ondelete="CASCADE",
+            name="fk_ew_followup_preview_row_preview",
+        ),
+        UniqueConstraint("preview_id", "source_item_id", name="uq_ew_followup_preview_row_item"),
+        CheckConstraint(f"group_code IN ({_FOLLOWUP_GROUP_SQL})", name="ck_ew_followup_preview_row_group"),
+        CheckConstraint(f"decision IN ({_FOLLOWUP_ROW_DECISION_SQL})", name="ck_ew_followup_preview_row_decision"),
+        # An included row needs no reason; everything else must say why.
+        CheckConstraint(
+            f"(decision = '{FOLLOWUP_ROW_INCLUDED}') = (reason_code IS NULL)",
+            name="ck_ew_followup_preview_row_reason_paired",
+        ),
+        # The dedupe contract, enforced by the database rather than by the
+        # writer: one included row per person and per original entitlement.
+        Index(
+            "uq_ew_followup_preview_row_included_customer",
+            "preview_id",
+            "easyweek_customer_uuid",
+            unique=True,
+            postgresql_where=text(f"decision = '{FOLLOWUP_ROW_INCLUDED}'"),
+        ),
+        Index(
+            "uq_ew_followup_preview_row_included_entitlement",
+            "preview_id",
+            "source_entitlement_digest",
+            unique=True,
+            postgresql_where=text(f"decision = '{FOLLOWUP_ROW_INCLUDED}'"),
+        ),
+        Index("ix_ew_followup_preview_row_preview", "preview_id", "decision"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    preview_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # -- the immutable source links ----------------------------------------
+    source_batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_slot: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    # A one-way handle over the ORIGINAL voucher artifact's identity — its HMAC
+    # and key id — never the code and never a new entitlement.
+    source_entitlement_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # A one-way handle over the proven recipient, so a row can be compared
+    # without storing a number.
+    # NULL where the original attempt froze no route, which a historical slot
+    # honestly did. An empty string would claim a digest that does not exist.
+    recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The proven moment the original attempt happened: the interval anchor.
+    source_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    group_code: Mapped[str] = mapped_column(String(24), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Safe facts only: booleans, reason labels and counts.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

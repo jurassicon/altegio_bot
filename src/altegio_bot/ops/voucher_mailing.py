@@ -1102,6 +1102,10 @@ async def page_mailing(request: Request, batch_id: int) -> str:
   Preview <a href="/ops/campaigns/{preview_run_id}">#{preview_run_id}</a>.
   Период кампании — это волна, за которую положен ваучер, а не месяц отправки.
   <a href="/ops/voucher-mailings/report?batch_id={batch_id}">Компактный отчёт и записи после отправки</a>.
+  <!-- §46.6. The one way into the follow-up stage, and it leads to a PREVIEW:
+       there is no send for a repeat message in this version, and that page says
+       so in its own banner. Nothing here changes what this page can do. -->
+  <a href="/ops/voucher-mailings/{batch_id}/followup">Повторное сообщение: предпросмотр</a>.
 </p>
 {_issuer_banner()}
 {_readiness_block(await _readiness(schema_version))}

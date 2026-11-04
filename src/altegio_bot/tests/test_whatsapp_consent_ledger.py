@@ -1011,7 +1011,7 @@ def test_the_consent_writer_and_the_worker_agree_about_chatwoot_origin() -> None
     """
     from types import SimpleNamespace
 
-    from altegio_bot.whatsapp_consent import _is_chatwoot_sourced
+    from altegio_bot.whatsapp_consent import is_chatwoot_sourced
 
     cases = (
         ("chatwoot:mirror-1", {"_chatwoot": {"source": "mirror"}}),
@@ -1023,7 +1023,7 @@ def test_the_consent_writer_and_the_worker_agree_about_chatwoot_origin() -> None
     for dedupe_key, payload in cases:
         event = SimpleNamespace(dedupe_key=dedupe_key, payload=payload, id=1)
         worker_says = worker_module._is_chatwoot_origin(event, payload) or worker_module._is_operator_relay(payload)
-        assert _is_chatwoot_sourced(event, payload) == worker_says, (dedupe_key, payload)
+        assert is_chatwoot_sourced(event, payload) == worker_says, (dedupe_key, payload)
 
 
 async def test_the_refusal_is_already_durable_when_the_handler_runs(session_maker, monkeypatch) -> None:

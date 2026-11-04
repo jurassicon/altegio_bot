@@ -1696,5 +1696,87 @@ answer. Those people are unsubscribed for good as far as this mailing is
 concerned; an operator who needs to reverse one has to do it deliberately, as a
 data change, not through a message.
 
-No follow-up audience, text, confirmation, ledger or send exists at this stage,
-and none is reachable by a flag.
+At that stage no follow-up audience, text, confirmation, ledger or send existed,
+and none was reachable by a flag. Section 17 is what changed since.
+
+## 17. Follow-up PREVIEW (PR-22.2) — and what is still not implemented
+
+The contract lives in `VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md`. Read it before
+using this section on a production audience.
+
+### Implemented now
+
+One screen per original mailing, reached from that mailing's own page:
+«Повторное сообщение: предпросмотр». On it an operator selects one or more of
+the three groups of the original mailing's recipients, states explicitly how much
+time must have passed since the original send attempt, reads the exact repeat
+text with placeholders, and presses one button to check the composition. The
+answer is how many people are eligible, who is excluded, who could not be
+established, and the reason for each in words.
+
+The result is stored as an immutable, versioned snapshot. Pressing the button
+again adds the next version and leaves the previous one exactly as it was.
+
+What the server proves before anybody is included: the batch is one of the fixed
+€10 products composed from earned visits, with the branch's own confirmed sender
+and no terminal stop; the recipient is still the same person on the same number
+that the original attempt actually went to; the chosen minimum interval has
+passed, measured from the proven original attempt; the original voucher is still
+something a message may point at; the §46.4 consent aggregate allows it, with
+pending inbound holding rather than passing; the person has not replied since;
+and a live, fully paginated, read-only EasyWeek read shows no new booking after
+the attempt and no active booking ahead, across every configured branch of the
+workspace.
+
+### What this is NOT
+
+**There is no sending.** No send button, no send confirmation, no endpoint, no
+queue, no job, no executor, and no path through the generic dispatch, the Outbox
+or the old follow-up worker. A stored preview authorises nothing: it is evidence
+of what was true at its check time, it expires after 24 hours, and it neither
+spends nor reserves a send attempt. The original mailing's ledger, its one-attempt
+limit, its stop rules and its booking report are untouched.
+
+Reading a preview changes nothing. A check that fails leaves the previous
+snapshot visibly stale rather than looking current.
+
+### Before this is used on a production audience
+
+Five things, none of them done by this stage:
+
+1. **Finish the historical consent reconciliation** of section 16. At the last
+   diagnosis it was **not** finished: 29 244 WhatsApp events carried a payload,
+   the dry run covered 20 000 of them (`truncated=true`, `applied=false`), 2
+   potentially new refusal addresses were found in the scanned part, and the
+   suppression table was empty. **An empty suppression table is not proof of
+   consent.** This is a separate mandatory owner step.
+2. **Create and approve the follow-up Meta template**
+   (`kitilash_ka_new_client_voucher_followup_v1`, `de`, MARKETING, one BODY,
+   positional parameters) in Meta's own interface, and add its local row. This
+   application does not create or modify Meta templates, and will not send free
+   text instead. Until both exist the preview answers
+   `followup_template_unproven`, which is the honest state of the prerequisite.
+3. **Decide the failure-admissibility policy.** The shipped
+   `followup-failure-policy-v1` admits nothing, so the group «Подтверждённая
+   ошибка» yields zero by design. A waiting time and a list of permitted Meta
+   error codes have not been invented here; they are an owner decision, and a
+   permanent block, a policy restriction, an unknown reason and an unresolved
+   sender or template problem can never be admitted whatever that decision is.
+4. **Decide the delivered/read authenticity question.** The `delivered`/`read`
+   path does not record callback authenticity, while the failure path requires a
+   verified signature. The delivered and read groups therefore rest on exact
+   message-identity linkage. Nothing in the preview depends on the answer,
+   because the preview sends nothing.
+5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
+   claim, the terminal tombstones, the executor and the follow-up callbacks all
+   belong to that stage. The source and dedupe contract it will claim against is
+   already in the schema — at most one included row per source slot, per
+   canonical customer uuid and per original entitlement within one preview
+   version.
+
+### Migration
+
+One additive revision, `b7d41f9c0a52`, over `a1c4e7b25d80`. Two new tables and
+nothing else: no existing column altered, no consent row, delivery fact, attempt
+counter, HMAC byte or financial value touched. Its downgrade refuses, before any
+DDL, while any preview is stored.

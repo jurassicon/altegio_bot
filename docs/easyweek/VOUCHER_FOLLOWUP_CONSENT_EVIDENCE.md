@@ -10,8 +10,9 @@ follow-up text, no follow-up ledger and no follow-up executor is part of this
 stage, and the send path for one is not open.
 
 Read with `VOUCHER_PRODUCTION_MAILING_RUNBOOK.md` (how the original mailing is
-operated) and `VOUCHER_MAILING_BOOKING_REPORT.md` (what the local report does
-and does not prove).
+operated), `VOUCHER_MAILING_BOOKING_REPORT.md` (what the local report does and
+does not prove) and `VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md` (PR-22.2, which
+consumes this evidence to compose a preview — and still sends nothing).
 
 ---
 
