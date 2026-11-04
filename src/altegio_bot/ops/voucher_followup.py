@@ -171,6 +171,35 @@ _REASON_LABELS: Final[dict[str, str]] = {
     "followup_entitlement_invalid": "Исходный ваучер возвращён, закрыт вручную или его состояние не урегулировано.",
     "followup_entitlement_unproven": "Привязку исходного ваучера подтвердить не удалось.",
     "followup_duplicate_source": "Этот же человек или этот же ваучер уже включены в состав по другой позиции.",
+    "followup_historical_stop_unaccounted": (
+        "В сохранённых событиях есть отписка этого человека, которая ещё не учтена. "
+        "До завершения исторической сверки такой адресат не считается доступным."
+    ),
+    "followup_historical_consent_unproven": (
+        "Проверку сохранённых событий на неучтённые отписки завершить не удалось, "
+        "поэтому историческое состояние согласия не установлено ни для кого."
+    ),
+    "followup_status_evidence_unproven": (
+        "Статус доставки или прочтения не подтверждён достаточным сохранённым доказательством: "
+        "нет проверенной подлинности обратного вызова либо не совпадает маршрут исходной попытки. "
+        "Запись о рассылке при этом не меняется."
+    ),
+    "followup_booking_creation_unproven": (
+        "Есть запись, дата визита которой позже исходной отправки, а дату её создания подтвердить не удалось. "
+        "Без даты создания правило «новая запись после рассылки» применить нельзя."
+    ),
+    "followup_booking_capture_unproven": (
+        "Даты создания записей для этого человека не установлены: не удалось связать его "
+        "с числовым идентификатором EasyWeek, не настроены филиалы, либо просмотр событий не завершён."
+    ),
+    "followup_entitlement_unreadable": (
+        "Исходный заказ прочитать не удалось: таймаут, нечитаемый ответ или другой заказ. "
+        "Это не означает, что ваучер действителен."
+    ),
+    "followup_group_moved_out_of_selection": (
+        "Пока выполнялись внешние проверки, этот адресат перешёл в группу, которая не была выбрана. "
+        "В состав он не включается, и его место никем не занимается."
+    ),
 }
 
 
@@ -378,41 +407,94 @@ def _rows_table(rows: tuple[preview_module.PreviewRowView, ...]) -> str:
     )
 
 
-def _stored_block(stored: preview_module.StoredPreview | None) -> str:
-    """The saved proposal, with its freshness stated rather than implied.
+_DRIFT_LABELS: Final[dict[str, str]] = {
+    "template_body": "текст повторного сообщения изменился",
+    "template_code": "изменился код шаблона",
+    "template_name": "изменилось имя шаблона Meta",
+    "template_language": "изменился язык шаблона",
+    "template_category": "изменилась категория шаблона",
+    "template_parameters": "изменился порядок подстановок",
+    "contract_version": "изменилась версия контракта предпросмотра",
+    "failure_policy": "изменилась версия политики причин ошибок",
+    "source_composition": "изменился зафиксированный состав исходной рассылки",
+    "source_stop_generation": "исходная рассылка была остановлена после этой проверки",
+}
 
-    A stale snapshot is shown as stale and never quietly as current: §46.6 asks
-    for exactly that, because a failed check must not leave an old preview
-    looking like today's answer.
+
+def _stored_block(
+    stored: preview_module.StoredPreview | None,
+    *,
+    currency: preview_module.SnapshotCurrency | None,
+) -> str:
+    """The saved proposal, with its standing stated rather than implied.
+
+    §46.6 asks the page to keep three things apart, and this block says all
+    three in words: what the check found WHEN it ran, how long that snapshot is
+    treated as current, and whether anything holds today. A green "проверки
+    актуальны" is shown only when the snapshot is young AND the message
+    contract, the policy and the source batch are still the ones it was computed
+    under AND nothing blocks a follow-up right now — so a failed refresh, a
+    paused template or a stop since cannot leave a stale result looking fresh.
     """
     if stored is None:
         return (
             "<div class='alert alert-light border'>Предпросмотр ещё не сохранялся. "
             "Выберите группы и интервал, затем проверьте состав.</div>"
         )
-    fresh = stored.is_fresh()
-    css = "alert-success" if fresh else "alert-warning"
-    freshness = (
-        "Проверки актуальны." if fresh else "Срок действия этих проверок истёк — состав нужно пересчитать заново."
-    )
+    assert currency is not None
+    if currency.current:
+        css, standing = "alert-success", "Эти проверки актуальны."
+    elif not currency.fresh:
+        css, standing = (
+            "alert-warning",
+            "Срок действия этих проверок истёк. Ниже — исторический результат; состав нужно пересчитать.",
+        )
+    elif currency.blocked_now is not None:
+        css, standing = (
+            "alert-danger",
+            "Сейчас повторное сообщение по этой рассылке запрещено. Ниже — исторический результат проверки.",
+        )
+    elif not currency.template_proven_now:
+        css, standing = (
+            "alert-warning",
+            "Текст повторного сообщения сейчас не подтверждён. Ниже — исторический результат проверки.",
+        )
+    else:
+        changes = ", ".join(_DRIFT_LABELS.get(item, item) for item in currency.drift)
+        css, standing = (
+            "alert-warning",
+            "Условия изменились после этой проверки "
+            f"({changes}). Ниже — исторический результат; состав нужно пересчитать.",
+        )
+
     groups = ", ".join(_GROUP_LABELS.get(group, group) for group in stored.selected_groups)
     days = stored.min_interval_seconds / 86400
+    text_block = (
+        "<div class='small mt-2'>Текст, с которым считался этот состав, совпадает с текущим.</div>"
+        if currency.text_restorable
+        else (
+            "<div class='small mt-2'><b>Текст повторного сообщения с тех пор изменился.</b> "
+            "Сохранён только его отпечаток, а не сам текст, поэтому прежний текст показать нельзя; "
+            "текущий текст относится не к этому составу.</div>"
+        )
+    )
     return f"""
 <div class="alert {css}">
-  <div><b>Сохранённый предпросмотр, версия {int(stored.version)}.</b> {_esc(freshness)}</div>
+  <div><b>Результат проверки, версия {int(stored.version)}.</b> {_esc(standing)}</div>
   <div class="small mt-1">
     Группы: {_esc(groups)}.<br>
     Минимальный интервал после исходной попытки: {days:.0f} дн.<br>
-    Проверено: {_esc(stored.checked_at.strftime("%d.%m.%Y %H:%M UTC"))},
-    действительно до: {_esc(stored.valid_until.strftime("%d.%m.%Y %H:%M UTC"))}.<br>
+    Проверено: {_esc(stored.checked_at.strftime("%d.%m.%Y %H:%M UTC"))};
+    снимок считается актуальным до {_esc(stored.valid_until.strftime("%d.%m.%Y %H:%M UTC"))}.<br>
     Версия контракта: <code>{_esc(stored.contract_version)}</code>,
     политика причин ошибок: <code>{_esc(stored.failure_policy_version)}</code>.
   </div>
+  {text_block}
 </div>
 <div class="row g-2 mb-3">
   <div class="col"><div class="card"><div class="card-body py-2">
     <div class="h4 mb-0">{int(stored.included_count)}</div>
-    <div class="small text-muted">подходят для повторного сообщения</div>
+    <div class="small text-muted">подходили для повторного сообщения</div>
   </div></div></div>
   <div class="col"><div class="card"><div class="card-body py-2">
     <div class="h4 mb-0">{int(stored.excluded_count)}</div>
@@ -422,6 +504,13 @@ def _stored_block(stored: preview_module.StoredPreview | None) -> str:
     <div class="h4 mb-0">{int(stored.unknown_count)}</div>
     <div class="small text-muted">не удалось установить</div>
   </div></div></div>
+</div>
+<div class="small text-muted mb-2">
+  Это числа на момент проверки. {
+        "Они подтверждены и сейчас."
+        if currency.current
+        else "Они НЕ подтверждены заново: это историческая запись проверки, а не текущая готовность."
+    }
 </div>
 {_rows_table(stored.rows)}
 """
@@ -441,7 +530,8 @@ def _template_block(proof: message.FollowupTemplateProof) -> str:
   </div>
   <pre class="bg-light border rounded p-2 mt-2 mb-1 small text-wrap">{_esc(message.safe_example())}</pre>
   <div class="small text-muted">
-    В квадратных скобках — подстановки. Реальные имена, ссылки, номера и коды на этой странице не показываются.
+    Это текущий утверждённый текст. В квадратных скобках — подстановки;
+    реальные имена, ссылки, номера и коды на этой странице не показываются.
     Текст одинаково верен для всех трёх групп: он не утверждает, что человек получил или прочитал первое сообщение.
   </div>
   {blocker}
@@ -471,6 +561,13 @@ async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
         await preview_module.prove_meta_followup_template()
         if local_template
         else message.FollowupTemplateProof(proven=False, reason="followup_template_unproven")
+    )
+    # Whether the saved result may be presented as current, decided on the
+    # server from the stored contract rather than from its age alone.
+    currency = (
+        preview_module.assess_snapshot(stored, gate=gate, template_proven_now=template.proven)
+        if stored is not None
+        else None
     )
 
     csrf = _csrf_for(request)
@@ -540,7 +637,7 @@ async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
   </button>
   <div class="small text-muted mt-2" id="followup-result"></div>
 </div></div>
-{_stored_block(stored)}
+{_stored_block(stored, currency=currency)}
 <div class="card"><div class="card-body small text-muted">
   <b>Что означают результаты.</b>
   Отсутствие отметки о прочтении не доказывает, что человек не прочитал сообщение.
@@ -581,9 +678,10 @@ document.getElementById('followup-check')?.addEventListener('click', async (even
       window.location.reload();
       return;
     }}
-    out.textContent = (data.detail || '') + ' ' + (data.reasons || []).join(', ');
+    out.textContent = 'Проверка не выполнена, предыдущий результат не изменился. '
+      + (data.detail || '') + ' ' + (data.reasons || []).join(', ');
   }} catch (error) {{
-    out.textContent = 'Проверка не выполнена. Предыдущий предпросмотр не изменился.';
+    out.textContent = 'Проверка не выполнена, предыдущий результат не изменился.';
   }} finally {{
     button.disabled = false;
   }}

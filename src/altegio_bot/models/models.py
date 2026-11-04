@@ -5778,6 +5778,126 @@ class EasyWeekVoucherProductionDeliveryFailure(Base):
 
 
 # ---------------------------------------------------------------------------
+# §46.3 — durable evidence for a PROVEN positive status (PR-22.2)
+# ---------------------------------------------------------------------------
+# The production ledger has always moved a slot to ``delivered``/``read`` on a
+# callback matched by exact message id, and that is the right contract for the
+# MAILING's own record: it is a fact about a message already sent, and losing it
+# would corrupt the history of a mailing that really happened.
+#
+# §46.3 asks a stricter question of anything that wants to SEND again: a status
+# counts only "из проверенного inbound-контекста с точным sender и message ID".
+# The transition itself records neither, and the proof is gone by the time any
+# later reader looks — the ingress verifies Meta's HMAC against the raw body and
+# then strips the signature header out of the stored copy.
+#
+# So the proof is written down beside the transition, in its own table, and the
+# slot's own columns, counters and statistics are left exactly as they were. A
+# historical slot has no row here, which is the honest answer: its status is the
+# mailing's record and not evidence for a new send.
+
+DELIVERY_RECEIPT_KIND_DELIVERED = "delivered"
+DELIVERY_RECEIPT_KIND_READ = "read"
+
+DELIVERY_RECEIPT_KINDS = (DELIVERY_RECEIPT_KIND_DELIVERED, DELIVERY_RECEIPT_KIND_READ)
+
+_DELIVERY_RECEIPT_KIND_SQL = ", ".join(f"'{value}'" for value in DELIVERY_RECEIPT_KINDS)
+
+
+class EasyWeekVoucherProductionDeliveryReceipt(Base):
+    """One PROVEN positive status about one original production voucher send.
+
+    What makes a row here, and nothing less: a ``delivered`` or ``read`` status
+    whose delivery signature the ingress verified, naming the exact message id
+    of this slot, on a route equal to the one that slot's single attempt froze.
+    A callback missing any of the three is not written — it is not evidence —
+    while the slot's own transition is applied exactly as before.
+
+    It carries no authority of its own. Nothing here re-opens a slot, changes a
+    counter, or claims a send: it records that a status was proven, and whether
+    a later phase may act on that is a separate decision elsewhere.
+    """
+
+    __tablename__ = "easyweek_voucher_production_delivery_receipts"
+
+    __table_args__ = (
+        # Idempotency, computed from the proven contents of the fact rather than
+        # from when it arrived, so a duplicate delivery is recognised however
+        # late it is and a Resend adds nothing.
+        UniqueConstraint("fact_key", name="uq_ew_voucher_receipt_fact"),
+        ForeignKeyConstraint(
+            ["item_id"],
+            ["easyweek_voucher_production_batch_items.id"],
+            name="fk_ew_voucher_receipt_item",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id"],
+            ["easyweek_voucher_production_batch_attempts.id"],
+            name="fk_ew_voucher_receipt_attempt",
+            ondelete="RESTRICT",
+        ),
+        # Named here rather than inline on the column, so the ORM and the
+        # migration agree on the constraint's NAME as well as its shape — the
+        # drift guard compares names, and an auto-generated one would differ.
+        ForeignKeyConstraint(
+            ["whatsapp_event_id"],
+            ["whatsapp_events.id"],
+            name="fk_ew_voucher_receipt_event",
+            ondelete="SET NULL",
+        ),
+        CheckConstraint(f"kind IN ({_DELIVERY_RECEIPT_KIND_SQL})", name="ck_ew_voucher_receipt_kind"),
+        CheckConstraint(
+            f"authenticity IN ({_INBOUND_AUTHENTICITY_SQL})",
+            name="ck_ew_voucher_receipt_authenticity",
+        ),
+        # A stored row IS the proof, so the three parts §46.3 asks for are
+        # required by the database rather than by whoever writes it: the
+        # verified signature, and both halves of a route that matched.
+        CheckConstraint(
+            f"authenticity = '{INBOUND_AUTHENTICITY_SIGNED}'",
+            name="ck_ew_voucher_receipt_signed",
+        ),
+        CheckConstraint(
+            "route_proven AND observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL",
+            name="ck_ew_voucher_receipt_route_proven",
+        ),
+        Index("ix_ew_voucher_receipt_item_kind", "item_id", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    fact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    slot: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # The route the CALLBACK named, as one-way digests, proven equal to the one
+    # the attempt froze. Never the values: this table holds no phone number and
+    # no sender secret.
+    observed_sender_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_recipient_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    route_proven: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+    whatsapp_event_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # Two different times, never merged: when we saw it, and when the event is
+    # proven to have happened. The second is NULL when it cannot be proven.
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Labels and shape facts only. No raw provider response, no body, no code.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # §46.2 / §46.10 — the EasyWeek voucher follow-up PREVIEW contract (PR-22.2)
 # ---------------------------------------------------------------------------
 # A preview is a proposal, not a permission. Nothing here reserves or spends a
@@ -5871,9 +5991,14 @@ class EasyWeekVoucherFollowupPreview(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     # -- the source this preview is about ----------------------------------
+    #
+    # Deliberately NO ``provider`` column, for the same reason
+    # ``easyweek_voucher_production_stop_requests`` has none: this row names a
+    # batch, and that batch already says which provider it belongs to. A second
+    # copy here would be decoration that could disagree with it, and the §PR-3
+    # boundary test guards exactly that.
     batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    provider: Mapped[str] = _provider_column()
     company_id: Mapped[int] = mapped_column(Integer, nullable=False)
     location_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
     # The original request schema (3 or 4) and the frozen digest of that exact

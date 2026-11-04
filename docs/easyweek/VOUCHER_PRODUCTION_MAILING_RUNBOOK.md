@@ -1718,15 +1718,27 @@ The result is stored as an immutable, versioned snapshot. Pressing the button
 again adds the next version and leaves the previous one exactly as it was.
 
 What the server proves before anybody is included: the batch is one of the fixed
-€10 products composed from earned visits, with the branch's own confirmed sender
-and no terminal stop; the recipient is still the same person on the same number
-that the original attempt actually went to; the chosen minimum interval has
-passed, measured from the proven original attempt; the original voucher is still
-something a message may point at; the §46.4 consent aggregate allows it, with
-pending inbound holding rather than passing; the person has not replied since;
-and a live, fully paginated, read-only EasyWeek read shows no new booking after
-the attempt and no active booking ahead, across every configured branch of the
-workspace.
+€10 products of schema 3/4 — composed from earned visits, from an operator's
+manual selection or from both — with the branch's own confirmed sender and no
+terminal stop; the recipient is still the same person on the same number the
+original attempt actually went to, proven through the link their own basis
+carries; the delivered or read status they are selected by carries recorded
+proof of a verified callback on that frozen route; the chosen minimum interval
+has passed, measured from the proven original attempt; the original order is
+read back and its voucher proven, including a real check of the stored MAC
+against the code the order carries; the §46.4 consent aggregate allows it, and
+no refusal of theirs is sitting unaccounted in the stored-event backlog; the
+person has not replied since; and the bookings say nothing against it — no
+booking **created** after the attempt (from the captured creation deliveries,
+cancelled ones included) and no active booking ahead (from the live, fully
+paginated history), across every configured branch of the workspace.
+
+Everything unestablished is reported as «не установлено» with its own reason,
+never as eligible. A saved result is shown as current only while it is young
+**and** the message contract, the policy and the source batch are still the ones
+it was computed under **and** nothing blocks a follow-up right now; otherwise it
+is shown as a historical result that needs recomputing, and a text that has
+changed since is not passed off as the text that composition was built with.
 
 ### What this is NOT
 
@@ -1745,11 +1757,17 @@ snapshot visibly stale rather than looking current.
 Five things, none of them done by this stage:
 
 1. **Finish the historical consent reconciliation** of section 16. At the last
-   diagnosis it was **not** finished: 29 244 WhatsApp events carried a payload,
-   the dry run covered 20 000 of them (`truncated=true`, `applied=false`), 2
-   potentially new refusal addresses were found in the scanned part, and the
-   suppression table was empty. **An empty suppression table is not proof of
-   consent.** This is a separate mandatory owner step.
+   diagnosis supplied by the owner it was **not** finished: the stored-event
+   scan was incomplete and unapplied, and the suppression table was empty. **An
+   empty suppression table is not proof of consent.** This is a separate
+   mandatory owner step, and no number from that diagnosis is built into the
+   code.
+
+   The preview protects itself in the meantime: it scans the unaccounted stored
+   events for the recipients it is about, blocks anybody whose refusal is
+   sitting there unprocessed, and reports «не установлено» for everybody if that
+   scan cannot be completed. That is a fail-closed precondition, not a
+   replacement for running the projection.
 2. **Create and approve the follow-up Meta template**
    (`kitilash_ka_new_client_voucher_followup_v1`, `de`, MARKETING, one BODY,
    positional parameters) in Meta's own interface, and add its local row. This
@@ -1762,11 +1780,13 @@ Five things, none of them done by this stage:
    error codes have not been invented here; they are an owner decision, and a
    permanent block, a policy restriction, an unknown reason and an unresolved
    sender or template problem can never be admitted whatever that decision is.
-4. **Decide the delivered/read authenticity question.** The `delivered`/`read`
-   path does not record callback authenticity, while the failure path requires a
-   verified signature. The delivered and read groups therefore rest on exact
-   message-identity linkage. Nothing in the preview depends on the answer,
-   because the preview sends nothing.
+4. **Expect a small audience from mailings sent before this deploy.** A
+   `delivered`/`read` status now records its §46.3 proof — the verified
+   signature and the matching route — beside the slot's own transition, but only
+   for callbacks that arrive from now on. Slots of an older mailing have a
+   status and no proof, so a preview reports them as «не установлено». That is
+   the honest answer; the owner decides whether to wait for proven callbacks or
+   to confine the first follow-up to a mailing sent after this deploy.
 5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
    claim, the terminal tombstones, the executor and the follow-up callbacks all
    belong to that stage. The source and dedupe contract it will claim against is

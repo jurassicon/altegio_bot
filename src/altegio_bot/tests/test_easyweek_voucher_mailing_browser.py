@@ -3362,6 +3362,12 @@ async def test_followup_preview_real_browser_operator_path(page, monkeypatch, se
         raising=False,
     )
 
+    # The configured branch registry, which the booking CREATION capture needs
+    # in order to know which branches of the workspace the question covers.
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import location_map as followup_location_map
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
     booking_reader = FakeHistoryReader()
     templates = TemplateReader()
 
@@ -3414,12 +3420,14 @@ async def test_followup_preview_real_browser_operator_path(page, monkeypatch, se
     await opened.fill("#followup-interval", "14")
     await opened.click("#followup-check")
     await opened.wait_for_function(
-        "() => document.body.innerText.includes('Сохранённый предпросмотр')",
+        "() => document.body.innerText.includes('Результат проверки')",
         timeout=15_000,
     )
 
     final = await opened.inner_text("body")
-    assert "подходят для повторного сообщения" in final
+    assert "подходили для повторного сообщения" in final
+    # §46.6: the standing of the result is stated, not implied.
+    assert "Эти проверки актуальны" in final
     assert "Минимальный интервал после исходной попытки: 14 дн." in final
     # The read slot was not selected, so it is not part of this proposal.
     assert "Прочитано (подтверждено)" in final  # the checkbox label stays on screen
@@ -3447,3 +3455,88 @@ async def test_followup_preview_real_browser_operator_path(page, monkeypatch, se
     assert stored[0].included_count == 1
     assert (jobs, outbox) == ([], [])
     assert set(attempts) == {1}
+
+
+async def test_followup_stored_result_standing_in_a_real_browser(page, monkeypatch, session_maker):
+    """§46.6 in Chromium: a saved result never looks newly confirmed.
+
+    The operator saves a preview, the follow-up template is then paused in Meta,
+    and the page is reopened. What must be visible is a historical result with
+    its standing stated — not the green block, and not the current text passed
+    off as the text that composition was computed with.
+
+    The same page is then checked at phone width, because §46.8 keeps the
+    screen usable on both and a block that only fits a laptop is not usable.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        approved_meta_templates,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False
+    )
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('Результат проверки')", timeout=15_000)
+    assert "Эти проверки актуальны" in await opened.inner_text("body")
+
+    # The template is paused in Meta between two page loads, which is exactly
+    # the case a TTL-only freshness rule cannot see.
+    paused = approved_meta_templates()
+    paused[0]["status"] = "PAUSED"
+    templates.templates = paused
+
+    await opened.reload()
+    body = await opened.inner_text("body")
+    assert "Эти проверки актуальны" not in body
+    assert "сейчас не подтверждён" in body
+    assert "НЕ подтверждены заново" in body
+    # And nothing personal appears on the historical block either.
+    for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
+        assert forbidden not in body, forbidden
+
+    # Phone width: the page still renders its three counters and its banner.
+    await opened.set_viewport_size({"width": 390, "height": 844})
+    await opened.reload()
+    narrow = await opened.inner_text("body")
+    assert "Доступен только предпросмотр" in narrow
+    assert "исключены" in narrow
+    overflow = await opened.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 1, overflow
+    assert_no_page_errors(opened)

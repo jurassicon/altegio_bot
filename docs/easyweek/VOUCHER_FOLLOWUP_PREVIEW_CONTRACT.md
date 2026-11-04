@@ -29,9 +29,19 @@ Checked on the server for every request, not by hiding a control:
   (schemas 3 and 4). Schemas 1 and 2 are the historical 15 € contract, keep
   their own older rules, and are refused by name
   (`followup_batch_schema_unsupported`);
-- its recipient basis is the earned one. A canary, a snapshot ledger, a
-  manually composed batch or an Altegio campaign is refused by name
-  (`followup_batch_scope_unsupported`);
+- its composition basis is one a production batch can carry:
+  `earned_first_visit`, `operator_manual_selection` or `mixed`. §46.2 keeps the
+  first version to the fixed €10 batches of schema 3/4 with proven own bindings
+  and does **not** narrow the audience to one basis: a manually selected
+  recipient of a production mailing received the same approved message from the
+  same sender as an earned one, and what differs is only which link proves their
+  identity. That is proven per slot — an earned row by the booking its voucher
+  was earned on, a manual row by the operator-proven customer uuid on the
+  campaign row — and a slot whose basis has moved since is
+  `followup_identity_conflict`. A canary, a snapshot ledger, an owner test and
+  an Altegio campaign are other kinds of mailing with their own tables and are
+  refused by provider and schema (`followup_batch_scope_unsupported`,
+  `followup_batch_schema_unsupported`);
 - it carries a frozen composition digest;
 - the branch's own WhatsApp sender is configured and active, and its Meta
   identifier digests to the route the batch's attempts froze
@@ -134,15 +144,15 @@ In order, cheap and local first, the one external step last:
    `followup_evidence_unproven`, `followup_sender_unproven`);
 3. **interval** — section 4 (`followup_interval_not_elapsed`);
 4. **failure policy**, for the third group only — section 3;
-5. **entitlement** — the ORIGINAL artifact. An explicitly refunded, cleaned or
-   unsettled slot is excluded (`followup_entitlement_invalid`). A slot whose MAC,
-   key id or order uuid is missing, or whose MAC was written under a key this
-   deployment no longer holds, is `followup_entitlement_unproven`: nothing is
-   wrong with the voucher, the **proof** is gone. §45.4 is respected in full —
-   EasyWeek owns validity, and an artifact that simply carries no activation or
-   expiry date is the ordinary shape of a correct voucher, never a new
-   prohibition. No new voucher, entitlement, CREATE, PAY, code replacement,
-   validity extension or promise of an unverified balance exists here;
+5. **entitlement** — the ORIGINAL artifact, read and proven rather than
+   inferred from the presence of its binding columns. Locally: an explicitly
+   refunded, cleaned or unsettled slot is excluded
+   (`followup_entitlement_invalid`), and a slot whose MAC, key id or order uuid
+   is missing, or whose MAC was written under a key this deployment no longer
+   holds, is `followup_entitlement_unproven` — nothing is wrong with the
+   voucher, the **proof** is gone. Then one exact read-only GET of that order
+   (see section 5a). No new voucher, entitlement, CREATE, PAY, code replacement,
+   validity extension, refund or promise of an unverified balance exists here;
 6. **consent** — the PR-22.1 aggregate unchanged: the suppression ledger for
    this address and for every address a card of this uuid holds, a refusal bound
    to the uuid, `Client.wa_opted_out` on **any** matching card including another
@@ -151,7 +161,23 @@ In order, cheap and local first, the one external step last:
    inbound **holds** (`followup_consent_pending_inbound`) — a busy worker queue
    is not a reason to write to somebody who may have just said stop; a gap is
    `followup_consent_unknown`. An ordinary reply, a new booking and a delivery
-   status are never opt-in, and the proven-START rules are untouched;
+   status are never opt-in, and the proven-START rules are untouched.
+
+   And then §46.4.4's backlog, which none of those sources can see. A WhatsApp
+   event stored before PR-22.1 existed has no receipt, no suppression row and no
+   card flag — a «стоп» the old keyword set could not even recognise is
+   invisible to the whole aggregate. One bounded, read-only pass per preview
+   therefore scans the stored events that have **no receipts at all**, with the
+   same extractor the live ingress uses, asked only about the numbers this
+   batch's recipients are known by (the campaign row's and the uuid's card).
+   A refusal it finds that the ledger does not already hold is
+   `followup_historical_stop_unaccounted`; a truncated pass is
+   `followup_historical_consent_unproven` for **everybody**, because a partial
+   answer about a backlog is not an answer. The scan writes nothing, runs no
+   reconciliation and acknowledges nothing: §46.4.4 keeps the projection a
+   separate explicit operation, and a Chatwoot mirror, an `ignored` route and a
+   historical START are all excluded for the reasons that operation excludes
+   them. An empty suppression table is therefore not read as consent;
 7. **replies** — a proven reply from the addressee after the original attempt
    excludes (`followup_customer_replied`). The reply need not mention the first
    message. The receipt's signature must have been verified by the ingress and
@@ -171,14 +197,62 @@ Inclusion needs proof of every condition. Exclusion needs proof of one.
 Everything in between is `unknown`, which is a third answer and never a quiet
 yes.
 
+### 5a. The original artifact, read and proven
+
+§46.6 requires the original artifact to be read and proven, with its HMAC, its
+key id and its own schema's contract. The preview therefore performs one exact
+read-only `GET` of the slot's `target_order_uuid` and reuses the §42 stage
+preconditions rather than reimplementing them:
+
+* the body must describe the order that was asked about — a 200 is not proof;
+* the order's `comment` must equal the slot's reconciliation marker;
+* `observe_artifact` against the **slot's own** schema contract: schema 3 is the
+  paid €10 product and schema 4 the free gift certificate, and §46.6 forbids
+  applying one's conditions to the other;
+* an observed refund, or a refunded/cancelled order state, excludes; an unknown
+  or malformed state is unproven;
+* the documented validity signals of §45.4 — an explicit `is_expired`, an
+  `expired` status, an `expires_at` or `valid_until` already past — exclude. The
+  **absence** of individual dates blocks nothing: it is the ordinary shape of a
+  correct voucher under this contract;
+* the real MAC check. The code is read out of the order through the same proof
+  the payment gate uses and compared with the slot's stored binding by
+  `ledger.binding_matches`, which also pins the batch, the slot, the template
+  uuid and the order. A rotated key, another order or another code all fail it,
+  the MAC never leaves the ledger, and the code is never stored, returned or
+  logged.
+
+An unreadable answer, a timeout or a body about another order is
+`followup_entitlement_unreadable` — never "probably still valid". The read takes
+no database handle; the MAC check opens its own short session afterwards.
+
 ### Locks, the network, and the re-check
 
-The external step holds no database session, no row lock and no advisory lock —
-by construction, because that phase has no database handle. After it, and before
-the snapshot is stored, every included row's mutable local facts are asked again:
-consent (compared against the fingerprint the first pass recorded, so a state
-that moved at all demotes the row), replies, and the original batch's terminal
-stop. A terminal stop found there refuses the whole save; nothing is stored.
+The external steps hold no database session, no row lock and no advisory lock —
+by construction, because that phase has no database handle. After them, and
+before the snapshot is stored, the mutable local facts are asked again:
+
+* the original batch's **terminal stop**, the branch **sender**, and the local
+  **template row**. Those are contract facts of the whole preview, so a change
+  refuses the save outright — a composition must not be stored under a sender or
+  a message contract that no longer holds;
+* each included row's **source facts**: the attempt, the proven receipts and the
+  confirmed failures are re-read and the group is resolved again. A `read`
+  callback can land while the booking read is in flight. §46.5 allows a move
+  between two groups the operator ALREADY selected when the approved message
+  contract is the same, and the **actual** group is what gets stored; a move out
+  of the selection is `followup_group_moved_out_of_selection`, and a selection
+  whose groups do not share one contract refuses the save;
+* each included row's **identity and address**, re-proven against the row's own
+  basis;
+* **consent**, compared against the fingerprint the first pass recorded, so a
+  state that moved at all demotes the row even when the new answer still reads
+  "allowed";
+* **replies**.
+
+A row that loses eligibility is excluded with a reason and its place is filled by
+nobody: §46.5 forbids substituting another recipient, so the stored composition
+may be smaller than the first pass expected.
 
 The preview takes **no** consent address lock, which is the one place it differs
 from a send: a claim must be serialised against concurrent writers, while a
@@ -186,23 +260,61 @@ preview must not delay an arriving STOP by so much as one transaction. The
 PR-22.1 lock order is therefore untouched, and PR-22.3's locked guard remains the
 thing that serialises an actual send.
 
-### One approximation, stated plainly
+### The two booking dates, kept apart
 
-EasyWeek's live booking rows carry no creation time, so "booked after the
-attempt" is read off the **appointment** time. A booking created before the
-attempt for a date after it is therefore treated as new. That can only
-over-exclude, never under-exclude.
+§46.5 names two exclusions that rest on two different facts, and the
+implementation keeps them separate:
 
-### One asymmetry inherited from PR-22.1
+* **a booking created after the original attempt** — read off the provider's own
+  `booking_created_at`, taken from the captured `booking-created` deliveries the
+  §PR-17 booking report already validates. Cancelled ones count, and the
+  appointment time is irrelevant: a booking made the day after the mailing to
+  record a visit that already happened is exactly the engagement this rule is
+  about;
+* **an existing active booking ahead** — read off the appointment time in the
+  live, fully paginated history, whenever it was made.
 
-The `delivered`/`read` transition path does not record callback authenticity
-today, while the failure path requires a verified signature. The delivered and
-read groups therefore rest on exact message-identity linkage — the slot's own
-`provider_message_id`, which exists only because Meta answered this process with
-it — and not on a stored signature proof. Before any production follow-up is
-sent, the owner decides whether that is sufficient or whether the delivered/read
-path must record authenticity as the failure path does. Nothing in this stage
-depends on the answer, because this stage sends nothing.
+Reading the appointment time as the creation time is wrong in **both**
+directions, and an earlier revision of this document wrongly claimed it could
+only over-exclude. It cannot: a booking made in advance for a later date and
+then cancelled was called new although nothing had happened since the mailing,
+and a booking made after the mailing for a visit already past was left included.
+Both are covered by regression tests.
+
+The webhook's ARRIVAL time is never read as the creation time. A capture whose
+`booking_created_at` cannot be parsed is rejected by the report's own validator
+rather than falling back to `received_at`.
+
+Absence of a captured creation is never absence of a booking. When a booking the
+live read can see has an appointment after the attempt and no proven creation,
+the row is `followup_booking_creation_unproven`; when the person's numeric
+EasyWeek id cannot be bridged to their proven uuid, when the branch registry is
+not configured, or when the bounded capture scan truncated, the row is
+`followup_booking_capture_unproven`. Both are `unknown`, never `included`.
+
+### Proven `delivered` / `read`
+
+§46.3 asks a status for a verified inbound context with an exact sender and
+message id before it may become an audience. The slot's `delivered_at` and
+`read_at` are the **mailing's own record** — applied on an exact message-id
+match, deliberately outside the §42 fence, because dropping a status about a
+message already sent would corrupt the history of a mailing that really
+happened — and they are not that proof: the transition records neither the
+signature nor the route, and the ingress strips Meta's signature header out of
+the stored copy, so no later reader can recover it.
+
+So the proof is written beside the transition, in
+`easyweek_voucher_production_delivery_receipts`. A row is written only for a
+callback whose delivery signature the ingress verified, naming the slot's exact
+message id, on a route equal to the one that slot's single attempt froze; the
+table's own CHECK constraints require all three, so a stored row **is** the
+proof. The slot's columns, counters and statistics are untouched, and the
+transition still applies when no proof can be recorded.
+
+A slot with a status and no proof is `followup_status_evidence_unproven` —
+including every historical slot, which is the honest answer. It is never demoted
+to the weaker group instead: that would state something weaker than the
+mailing's record and stronger than what is proven.
 
 ## 6. The message
 
@@ -275,10 +387,23 @@ decision and a safe reason code.
   version as superseded, because the current one is simply the highest.
 - Changing the groups, the interval, the template or the policy version changes
   the digest, and therefore requires a new snapshot.
-- Validity is 24 hours. A stale snapshot is shown as stale and never quietly as
-  current; a failed check never leaves an old preview looking like today's
-  answer. **A snapshot is not a send permission**: it is evidence of what was
-  true at its check time.
+- Validity is 24 hours, and age is only one of three things that decide whether
+  a saved result may be presented as current. The server also compares the
+  stored contract with today's — the template code, Meta name, language,
+  category, parameter order and **body digest**, the failure-policy version, the
+  preview contract version, the source batch's frozen digest and its stop
+  generation — and asks whether anything blocks a follow-up right now (a
+  terminal stop, a missing sender, a template that is no longer proven). Only
+  the conjunction reads as "these checks hold"; everything else is shown as a
+  historical result that needs recomputing, with the reason named. So a paused
+  template, a stop since, an expired window or a refused refresh cannot leave a
+  stale block looking fresh.
+- The stored snapshot keeps the body's **digest** and not the body. When the
+  digest no longer matches, the page says the old text cannot be shown and that
+  the current text belongs to a different composition; it never substitutes
+  today's text for the one a stored composition was computed with.
+- **A snapshot is not a send permission**: it is evidence of what was true at its
+  check time.
 - A preview neither spends nor reserves a send attempt, and creating one twice
   must not block anybody permanently — the dedupe contract is scoped to **one**
   version. Within a version the database itself enforces at most one included
@@ -291,12 +416,21 @@ decision and a safe reason code.
 
 ### Migration
 
-`b7d41f9c0a52`, one Alembic head over `a1c4e7b25d80`. Additive and narrow: two
-new tables, no column of an existing table altered, no consent row, delivery
-fact, attempt counter, HMAC byte or financial value touched. Its `downgrade()`
-locks both tables, counts stored previews and **refuses before any DDL** if any
-exist. Upgrade from scratch, `downgrade -1` and re-upgrade were verified on a
-disposable PostgreSQL 16.
+`b7d41f9c0a52`, one Alembic head over `a1c4e7b25d80`. Additive and narrow:
+three new tables — the two preview tables and
+`easyweek_voucher_production_delivery_receipts` — with no column of an existing
+table altered and no consent row, delivery fact, attempt counter, HMAC byte or
+financial value touched. Its `downgrade()` locks all three, counts the stored
+previews and the stored receipts, and **refuses before any DDL** if either
+exists: a receipt is evidence about a message that really was delivered and its
+proof cannot be recovered once dropped, which is §46.9's rule. Upgrade from
+scratch, `downgrade -1` and re-upgrade were verified on a disposable
+PostgreSQL 16.
+
+The preview header deliberately carries **no** `provider` column, for the same
+reason `easyweek_voucher_production_stop_requests` has none: the row names a
+batch, and that batch already says which provider it belongs to. The §PR-3
+boundary test enforces that.
 
 ## 8. The operator's path
 
@@ -379,22 +513,47 @@ asserted against the rules themselves and against the database's own refusal,
 and they remain in the code as defence in depth for historical rows and for the
 later stage that will compose from more than one source.
 
+The first review round's seven findings each have their own reproductions, all
+of which failed before the fix: a stored «СТОП» with no receipt, flag or
+suppression row; a booking made before the attempt for a later date and then
+cancelled, and one made after the attempt for a visit already past; a callback
+on this slot's message id with an unverified signature or a foreign
+sender/recipient; an order that was refunded, expired, rewritten or whose code
+does not match the stored MAC; a `read` callback arriving while the booking read
+is in flight with only `delivered_unread` selected; a manual and a mixed
+schema-3/4 production batch; and a paused template, a changed body digest, a
+stop since and an expired window each leaving a saved result shown as
+historical rather than current.
+
 ## 11. Rollout prerequisites — NOT satisfied
 
 Before any production follow-up audience is used, independently of this stage:
 
 1. **The historical consent reconciliation is NOT finished.** At the last
-   diagnosis 29 244 WhatsApp events carried a payload, the dry run covered
-   20 000 of them (`truncated=true`, `applied=false`), 2 potentially new refusal
-   addresses were found in the scanned part, and the suppression table was
-   empty. **The absence of suppression rows is not proof of consent.** This is a
-   separate mandatory owner step and is not marked complete by this stage;
-   its `--apply` is not run during development.
+   diagnosis supplied by the owner the stored-event scan was incomplete and
+   unapplied, and the suppression table was empty. **The absence of suppression
+   rows is not proof of consent.** This is a separate mandatory owner step; it
+   is not marked complete by this stage, no diagnostic number from it is
+   hard-coded anywhere, and its `--apply` is not run during development.
+
+   The preview no longer depends on that step having been taken before it is
+   safe to open: it performs its own bounded, read-only completeness check for
+   the recipients it is about (section 5), blocks an addressee whose stored
+   refusal is unaccounted, and reports `unknown` for everybody when that check
+   cannot be completed. Finishing the reconciliation is still required before a
+   production audience is used — the per-preview check is a fail-closed
+   precondition, not a substitute for the projection.
 2. **The follow-up Meta template does not exist.** It must be created and
    approved by its owner, and its local row added (section 6).
 3. **There is no proven failure-admissibility policy** (section 3), so the third
    group yields zero until the owner decides one.
-4. **The delivered/read authenticity asymmetry** (section 5) is an owner
-   decision.
+4. **Positive statuses need their proof recorded going forward.** The
+   `delivered`/`read` path now writes the §46.3 proof beside the transition, but
+   only for callbacks that arrive from now on. Every slot of a mailing already
+   sent has a status and no proof, and is therefore `unknown` in a preview. That
+   is the honest answer and not a defect to work around; a production audience
+   built from an older mailing will be correspondingly small until its slots
+   receive proven callbacks, and the owner decides whether to wait for that or
+   to confine the first follow-up to a mailing sent after this deploy.
 5. **Sending is not implemented** (section 9). A stored preview authorises
    nothing.

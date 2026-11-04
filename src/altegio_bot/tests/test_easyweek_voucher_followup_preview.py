@@ -44,10 +44,12 @@ from altegio_bot.campaigns.easyweek_voucher_followup.failure_policy import (
     FailurePolicy,
 )
 from altegio_bot.campaigns.easyweek_voucher_followup.groups import SourceEvidence, resolve_group
+from altegio_bot.campaigns.easyweek_voucher_followup.historical_consent import scan_historical_refusals
 from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     BATCH_SCHEMA_UNSUPPORTED,
-    BATCH_SCOPE_UNSUPPORTED,
     BATCH_TERMINAL_STOP,
+    BOOKING_CAPTURE_UNPROVEN,
+    BOOKING_CREATION_UNPROVEN,
     CONSENT_PENDING_INBOUND,
     CONSENT_REFUSED,
     CONSENT_UNKNOWN,
@@ -55,15 +57,20 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     CUSTOMER_REPLIED,
     ENTITLEMENT_INVALID,
     ENTITLEMENT_UNPROVEN,
+    ENTITLEMENT_UNREADABLE,
     EVIDENCE_UNPROVEN,
     FAILURE_POLICY_UNPROVEN,
     FOLLOWUP_GROUP_DELIVERED,
     FOLLOWUP_GROUP_FAILED,
     FOLLOWUP_GROUP_READ,
+    FOLLOWUP_ROW_EXCLUDED,
     FOLLOWUP_ROW_INCLUDED,
     FOLLOWUP_ROW_UNKNOWN,
     FUTURE_BOOKING_ACTIVE,
+    GROUP_MOVED_OUT_OF_SELECTION,
     GROUPS_REQUIRED,
+    HISTORICAL_CONSENT_UNPROVEN,
+    HISTORICAL_STOP_UNACCOUNTED,
     HISTORY_UNPROVEN,
     IDENTITY_CONFLICT,
     INTERVAL_NOT_ELAPSED,
@@ -71,6 +78,7 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     NEW_BOOKING_AFTER_ATTEMPT,
     SENDER_UNPROVEN,
     SOURCE_ATTEMPT_UNPROVEN,
+    STATUS_EVIDENCE_UNPROVEN,
     TEMPLATE_UNPROVEN,
     canonical_groups,
 )
@@ -94,11 +102,13 @@ from altegio_bot.models.models import (
     FOLLOWUP_GROUP_UNPROVEN,
     INBOUND_AUTHENTICITY_SIGNED,
     INBOUND_AUTHENTICITY_UNVERIFIED,
+    RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     VOUCHER_PRODUCTION_ITEM_AMBIGUOUS,
     VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED,
     VOUCHER_PRODUCTION_ITEM_SEND_REJECTED,
     VOUCHER_PRODUCTION_ITEM_SEND_UNKNOWN,
+    CampaignRecipient,
     Client,
     EasyWeekVoucherFollowupPreview,
     EasyWeekVoucherFollowupPreviewRow,
@@ -106,6 +116,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
+    EasyWeekVoucherProductionDeliveryReceipt,
     WhatsAppConsentSuppression,
     WhatsAppInboundReceipt,
 )
@@ -113,11 +124,18 @@ from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     ATTEMPTED_AT,
     NOW,
+    PHONE_NUMBER_ID,
     SENDER_DIGEST,
     TemplateReader,
+    location_map,
+    order_uuid_for,
     person,
+    seed_booking_cancelled,
+    seed_booking_created,
     seed_sender_and_template,
     seed_source_batch,
+    voucher_code_for,
+    voucher_order,
 )
 
 THIRTY_DAYS = 30 * 24 * 60 * 60
@@ -145,17 +163,52 @@ class FakeHistoryReader:
         history_error: Exception | None = None,
         truncate: bool = False,
         wrong_customer: str | None = None,
+        orders: dict[str, dict[str, Any]] | None = None,
+        order_error: Exception | None = None,
+        order_changes: dict[str, Any] | None = None,
+        batch_id: int = 1,
+        schema_version: str = "4",
+        # slot -> which synthetic person occupies it, when a test seeded a
+        # batch whose slots are not the first N people.
+        people: dict[int, int] | None = None,
     ) -> None:
         self.bookings = bookings or {}
         self.customer_error = customer_error
         self.history_error = history_error
         self.truncate = truncate
         self.wrong_customer = wrong_customer
+        self.orders = orders or {}
+        self.order_error = order_error
+        self.order_changes = order_changes or {}
+        self.batch_id = batch_id
+        self.schema_version = schema_version
+        self.people = people or {}
         self.customer_calls: list[str] = []
         self.history_calls: list[tuple[str, int]] = []
+        self.order_calls: list[str] = []
 
     async def get_booking(self, booking_uuid: str) -> dict[str, Any]:  # pragma: no cover - unused here
         raise AssertionError("the follow-up preview must not read a source booking directly")
+
+    async def get_order(self, order_uuid: str) -> dict[str, Any]:
+        """The ORIGINAL order, as §46.6's artifact proof reads it back."""
+        self.order_calls.append(order_uuid)
+        if self.order_error is not None:
+            raise self.order_error
+        override = self.orders.get(order_uuid)
+        if override is not None:
+            return override
+        head = order_uuid.split("-", 1)[0]
+        batch_id, slot = int(head[:4]), int(head[4:])
+        who = person(self.people.get(slot, slot))
+        return voucher_order(
+            order_uuid=order_uuid,
+            marker=f"marker-{batch_id}-{slot}",
+            customer_uuid=who["customer_uuid"],
+            code=voucher_code_for(slot),
+            schema_version=self.schema_version,
+            **self.order_changes,
+        )
 
     async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
         self.customer_calls.append(customer_uuid)
@@ -207,9 +260,16 @@ def booking(
 
 @pytest.fixture
 def binding_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The voucher MAC key the fixtures' artifacts were bound under."""
+    """The voucher MAC key the fixtures' artifacts were bound under.
+
+    The configured branch registry comes with it, because every preview needs
+    one: the booking CREATION capture judges a delivery against the configured
+    branches of this workspace, and a deployment without a registry cannot
+    establish the branch scope at all.
+    """
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
 
 
 @pytest.fixture
@@ -231,6 +291,7 @@ async def build(
     groups: tuple[str, ...] = (FOLLOWUP_GROUP_DELIVERED,),
     interval: int = FOURTEEN_DAYS,
     reader: Any = None,
+    order_reader: Any = None,
     templates: Any = None,
     now: datetime = NOW,
     policy: Any = CURRENT_FAILURE_POLICY,
@@ -245,6 +306,7 @@ async def build(
             operator_principal=operator,
         ),
         booking_reader=reader if reader is not None else FakeHistoryReader(),
+        order_reader=order_reader,
         template_reader=templates if templates is not None else TemplateReader(),
         policy=policy,
         now=now,
@@ -302,6 +364,10 @@ def _evidence(**changes: Any) -> SourceEvidence:
         "attempt_sender_digest": SENDER_DIGEST,
         "attempt_recipient_digest": "r" * 64,
         "confirmed_failures": (),
+        # The §46.3 proof, present by default so that a test about something
+        # else is not silently a test about a missing receipt.
+        "delivered_receipt_proven": True,
+        "read_receipt_proven": True,
     }
     base.update(changes)
     return SourceEvidence(**base)
@@ -563,13 +629,74 @@ async def test_the_schema_of_the_historical_15_eur_contract_is_refused(session_m
     assert (outcome.created, outcome.reason) == (False, BATCH_SCHEMA_UNSUPPORTED)
 
 
-async def test_a_manually_composed_batch_is_refused_by_name(session_maker, binding_key, no_network) -> None:
+@pytest.mark.parametrize("schema", ["3", "4"])
+async def test_a_manual_production_slot_is_supported(session_maker, binding_key, no_network, schema: str) -> None:
+    """§46.2 puts schema 3/4 production batches in scope, not one basis.
+
+    A manually selected recipient of a production mailing received the same
+    approved message from the same sender as an earned one. What differs is
+    which link proves their identity — the operator-proven customer uuid on the
+    campaign row rather than the booking the voucher was earned on — and that is
+    checked per slot.
+    """
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(
-        session_maker, slots=[{"state": "delivered"}], recipient_basis=RECIPIENT_BASIS_MANUAL
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL}],
+        schema_version=schema,
     )
+    outcome = await build(session_maker, batch_id=batch_id, reader=FakeHistoryReader(schema_version=schema))
+    assert outcome.created is True, outcome.reason
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_mixed_production_batch_judges_each_slot_on_its_own_basis(
+    session_maker, binding_key, no_network
+) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[
+            {"state": "delivered", "index": 1, "basis": RECIPIENT_BASIS_EARNED},
+            {"state": "delivered", "index": 2, "basis": RECIPIENT_BASIS_MANUAL},
+        ],
+    )
+    async with session_maker() as session:
+        header = (await session.execute(select(EasyWeekVoucherProductionBatch))).scalar_one()
+        assert header.recipient_basis == "mixed"
     outcome = await build(session_maker, batch_id=batch_id)
-    assert (outcome.created, outcome.reason) == (False, BATCH_SCOPE_UNSUPPORTED)
+    assert outcome.created is True, outcome.reason
+    assert outcome.included == 2
+
+
+async def test_a_manual_slot_with_a_substituted_uuid_is_an_identity_conflict(
+    session_maker, binding_key, no_network
+) -> None:
+    """A manual row is proven by its uuid, and a matching phone is not a proof."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker, slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL}]
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            recipient = (await session.execute(select(CampaignRecipient))).scalar_one()
+            recipient.easyweek_customer_uuid = uuid_module.UUID("44444444-1111-4111-8111-111111111111")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == IDENTITY_CONFLICT
+
+
+async def test_a_slot_whose_basis_moved_is_an_identity_conflict(session_maker, binding_key, no_network) -> None:
+    """The slot was composed under one basis; the campaign row now says another."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    async with session_maker() as session:
+        async with session.begin():
+            item = (await session.execute(select(EasyWeekVoucherProductionBatchItem))).scalar_one()
+            item.recipient_basis = RECIPIENT_BASIS_MANUAL
+            item.source_booking_uuid = None
+            item.source_proof_digest = None
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == IDENTITY_CONFLICT
 
 
 async def test_a_terminal_stop_forbids_creating_the_preview(session_maker, binding_key, no_network) -> None:
@@ -1027,28 +1154,196 @@ async def test_a_chatwoot_mirror_produces_no_receipt_and_no_reply(session_maker,
 # ---------------------------------------------------------------------------
 
 
-async def test_a_new_booking_after_the_attempt_excludes_even_when_cancelled(
+async def test_a_booking_created_after_the_attempt_excludes_even_when_cancelled(
     session_maker, binding_key, no_network
 ) -> None:
+    """§46.5's first rule, on the CREATION date.
+
+    The appointment is in the past and the booking was cancelled, so neither
+    the appointment-time rule nor the future-booking rule says anything. What
+    excludes is that the person made it after the mailing went out.
+    """
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
     who = person(1)
+    new_booking = booking(
+        index=2,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=new_booking["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=new_booking["uuid"],
+        numeric_customer_id=who["numeric_id"],
+    )
     reader = FakeHistoryReader(
         bookings={
             who["customer_uuid"]: [
                 booking(index=1, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=5)),
-                booking(
-                    index=2,
-                    customer_uuid=who["customer_uuid"],
-                    start=ATTEMPTED_AT + timedelta(days=2),
-                    canceled=True,
-                    completed=False,
-                ),
+                new_booking,
             ]
         }
     )
     outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_booking_created_before_the_attempt_is_not_new(session_maker, binding_key, no_network) -> None:
+    """The first review reproduction: made in advance, appointed after, cancelled.
+
+    Nothing happened since the mailing. Reading the appointment time as the
+    creation time called this a new booking and excluded the person wrongly.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    old_booking = booking(
+        index=3,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=3),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=old_booking["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=10),
+        # Heard about late, which must not become the creation time.
+        received_at=ATTEMPTED_AT + timedelta(hours=1),
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [old_booking]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_booking_created_after_the_attempt_for_a_past_visit_excludes(
+    session_maker, binding_key, no_network
+) -> None:
+    """The second review reproduction, the other way round.
+
+    The appointment is before the anchor, so an appointment-time rule left this
+    person included — although they booked, and came, after the mailing.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    retro = booking(
+        index=4,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(hours=2),
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=retro["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [retro]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_creation_exactly_on_the_boundary_is_not_after_it(session_maker, binding_key, no_network) -> None:
+    """Created at the same instant as the attempt is not created after it."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    edge = booking(index=5, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=1))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=edge["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT,
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [edge]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_booking_after_the_attempt_with_no_creation_evidence_is_unknown(
+    session_maker, binding_key, no_network
+) -> None:
+    """Neither verdict is available, so neither is claimed."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    unknown_origin = booking(
+        index=6,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [unknown_origin]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_a_reassigned_booking_has_no_attributable_creation(session_maker, binding_key, no_network) -> None:
+    """Two deliveries disagree about whose booking it is, so it proves nothing."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    moved = booking(
+        index=7,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=4),
+    )
+    # Another delivery of the SAME booking names somebody else.
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"] + 1,
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [moved]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_a_person_with_no_numeric_id_has_no_creation_evidence(session_maker, binding_key, no_network) -> None:
+    """EasyWeek's booking webhooks name a number; without one, nothing bridges."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    async with session_maker() as session:
+        async with session.begin():
+            card = (
+                await session.execute(select(Client).where(Client.easyweek_customer_uuid.is_not(None)).limit(1))
+            ).scalar_one()
+            card.altegio_client_id = None
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_an_unconfigured_branch_registry_has_no_creation_evidence(session_maker, monkeypatch, no_network) -> None:
+    """Without a registry the branch scope of the question is unknown."""
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", "{}", raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
 
 
 async def test_an_active_future_booking_excludes(session_maker, binding_key, no_network) -> None:
@@ -1137,7 +1432,8 @@ async def test_a_card_that_resolves_to_somebody_else_is_unknown(session_maker, b
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
 
 
-async def test_a_missing_booking_reader_is_unknown_not_an_empty_history(session_maker, binding_key, no_network) -> None:
+async def test_no_configured_reader_proves_neither_artifact_nor_history(session_maker, binding_key, no_network) -> None:
+    """With no EasyWeek read at all, both external proofs are unknown."""
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
     outcome = await preview_module.create_preview(
@@ -1149,6 +1445,28 @@ async def test_a_missing_booking_reader_is_unknown_not_an_empty_history(session_
             operator_principal="o",
         ),
         booking_reader=None,
+        template_reader=TemplateReader(),
+        now=NOW,
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    # The artifact proof comes first, so its reason is the one reported.
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNREADABLE
+
+
+async def test_a_missing_booking_reader_is_unknown_not_an_empty_history(session_maker, binding_key, no_network) -> None:
+    """The artifact proves out and the booking history cannot be read at all."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    outcome = await preview_module.create_preview(
+        session_maker,
+        spec=preview_module.PreviewSpec(
+            batch_id=batch_id,
+            groups=(FOLLOWUP_GROUP_DELIVERED,),
+            min_interval_seconds=FOURTEEN_DAYS,
+            operator_principal="o",
+        ),
+        booking_reader=None,
+        order_reader=FakeHistoryReader(),
         template_reader=TemplateReader(),
         now=NOW,
     )
@@ -1237,7 +1555,7 @@ def test_an_invalid_entitlement_status_excludes(status: str) -> None:
         status=status,
         voucher_code_hmac="a" * 64,
         hmac_key_id="test-key-1",
-        target_order_uuid="00000001-3333-4333-8333-333333333333",
+        target_order_uuid=order_uuid_for(1, 1),
         configured_key_id="test-key-1",
     )
     assert (verdict.proven, verdict.reason) == (False, ENTITLEMENT_INVALID)
@@ -1280,7 +1598,7 @@ def test_a_binding_that_cannot_be_re_proven_is_unproven(changes: dict[str, Any])
         "status": "delivered",
         "voucher_code_hmac": "a" * 64,
         "hmac_key_id": "test-key-1",
-        "target_order_uuid": "00000001-3333-4333-8333-333333333333",
+        "target_order_uuid": order_uuid_for(1, 1),
         "configured_key_id": "test-key-1",
     }
     kwargs.update(changes)
@@ -1737,3 +2055,926 @@ async def test_the_booking_read_happens_with_no_session_open(session_maker, bind
     outcome = await build(session_maker, batch_id=batch_id, reader=ProbingReader())
     assert outcome.created is True
     assert probed == [True]
+
+
+# ---------------------------------------------------------------------------
+# The historical opt-out backlog (§46.4.4)
+# ---------------------------------------------------------------------------
+
+
+async def _stored_event(
+    session_maker,
+    *,
+    dedupe_key: str,
+    address: str,
+    text: str,
+    status: str = "processed",
+    received: datetime | None = None,
+    payload: dict[str, Any] | None = None,
+) -> int:
+    """One stored WhatsApp delivery, exactly as the ingress would have kept it.
+
+    No receipt is written, which is the whole point: an event stored before
+    PR-22.1 existed has none, and every source the follow-up consults is silent
+    about it.
+    """
+    from altegio_bot.models.models import WhatsAppEvent
+
+    body = payload or {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "metadata": {"phone_number_id": PHONE_NUMBER_ID},
+                            "messages": [
+                                {
+                                    "from": address.lstrip("+"),
+                                    "id": f"wamid.{dedupe_key}",
+                                    "type": "text",
+                                    "text": {"body": text},
+                                    "timestamp": str(int((received or ATTEMPTED_AT).timestamp())),
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    async with session_maker() as session:
+        async with session.begin():
+            event = WhatsAppEvent(
+                dedupe_key=dedupe_key,
+                payload=body,
+                query={},
+                headers={},
+                status=status,
+                received_at=received or ATTEMPTED_AT,
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+async def test_an_unaccounted_cyrillic_stop_blocks_the_recipient(session_maker, binding_key, no_network) -> None:
+    """The reproduction: a stored «СТОП» with no receipt, flag or suppression.
+
+    Every source PR-22.1 built reads clean — the ledger holds nothing, the card
+    is not flagged, the campaign row is not opted out, there is no pending
+    inbound — and the person has nevertheless told us to stop.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-1",
+        address=person(1)["phone"],
+        text="СТОП",
+    )
+    async with session_maker() as session:
+        # Proof that the finding is about a real gap and not about a seeded
+        # refusal: nothing else in the database refuses this person.
+        suppressions = (
+            await session.execute(select(func.count()).select_from(WhatsAppConsentSuppression))
+        ).scalar_one()
+        receipts = (await session.execute(select(func.count()).select_from(WhatsAppInboundReceipt))).scalar_one()
+        flagged = (
+            await session.execute(select(func.count()).select_from(Client).where(Client.wa_opted_out.is_(True)))
+        ).scalar_one()
+    assert (suppressions, receipts, flagged) == (0, 0, 0)
+
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert outcome.created is True
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+    assert outcome.included == 0
+
+
+async def test_a_latin_stop_in_the_backlog_blocks_too(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="legacy-2", address=person(1)["phone"], text="stop please")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_a_truncated_backlog_scan_is_unknown_for_everybody(session_maker, binding_key, no_network) -> None:
+    """A partial answer about a backlog is not an answer."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="noise-1", address="+4915100777777", text="guten Tag")
+    await _stored_event(session_maker, dedupe_key="noise-2", address="+4915100777778", text="guten Tag")
+    async with session_maker() as session:
+        scan = await scan_historical_refusals(session, addresses=[person(1)["phone"]], limit=1)
+    assert scan.complete is False
+    assert scan.truncated is True
+    assert any("truncated" in gap for gap in scan.gaps)
+
+    outcome = await preview_module.create_preview(
+        session_maker,
+        spec=preview_module.PreviewSpec(
+            batch_id=batch_id,
+            groups=(FOLLOWUP_GROUP_DELIVERED,),
+            min_interval_seconds=FOURTEEN_DAYS,
+            operator_principal="o",
+        ),
+        booking_reader=FakeHistoryReader(),
+        template_reader=TemplateReader(),
+        now=NOW,
+        historical_event_limit=1,
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == HISTORICAL_CONSENT_UNPROVEN
+
+
+async def test_an_empty_suppression_table_is_not_proof_of_consent(session_maker, binding_key, no_network) -> None:
+    """The sentence the runbook insists on, as an executable check.
+
+    The backlog holds this person's refusal and the suppression table is empty.
+    An implementation that read "no rows, therefore allowed" would include them.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="legacy-3", address=person(1)["phone"], text="стоп")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert outcome.included == 0
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_an_accounted_historical_stop_does_not_block_twice(session_maker, binding_key, no_network) -> None:
+    """A stored STOP the ledger already refuses is accounted for.
+
+    The consent aggregate excludes that person on its own, with its own reason;
+    the backlog scan has nothing to add and must not invent a second one.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="legacy-4", address=person(1)["phone"], text="стоп")
+    await _suppress(session_maker, address=person(1)["phone"])
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == CONSENT_REFUSED
+
+
+async def test_a_correctly_processed_history_does_not_block(session_maker, binding_key, no_network) -> None:
+    """An event with receipts was accounted for when it arrived."""
+    from altegio_bot.models.models import WhatsAppEvent
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    event_id = await _stored_event(
+        session_maker,
+        dedupe_key="handled-1",
+        address=person(1)["phone"],
+        text="hallo",
+        received=ATTEMPTED_AT - timedelta(days=2),
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppInboundReceipt(
+                    receipt_key="handled-1:0",
+                    whatsapp_event_id=event_id,
+                    message_index=0,
+                    wa_address=person(1)["phone"],
+                    command=CONSENT_COMMAND_NONE,
+                    authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    route_allowed=True,
+                    observed_at=ATTEMPTED_AT - timedelta(days=2),
+                    resolved_at=ATTEMPTED_AT - timedelta(days=2),
+                    resolution="noop",
+                )
+            )
+    # And the event itself is excluded from the backlog, so the scan is cheap.
+    async with session_maker() as session:
+        scan = await scan_historical_refusals(session, addresses=[person(1)["phone"]])
+    assert scan.complete is True
+    assert scan.scanned_events == 0
+    assert scan.unaccounted == frozenset()
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+    assert WhatsAppEvent is not None  # the import is the point of the seed above
+
+
+async def test_a_chatwoot_mirror_in_the_backlog_is_not_a_second_refusal(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="chatwoot:9", address=person(1)["phone"], text="стоп")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_refused_route_in_the_backlog_does_not_block(session_maker, binding_key, no_network) -> None:
+    """An ``ignored`` delivery named no route this deployment accepts."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-5",
+        address=person(1)["phone"],
+        text="стоп",
+        status="ignored",
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_historical_start_is_not_read_as_permission(session_maker, binding_key, no_network) -> None:
+    """A START in the backlog neither blocks nor clears a refusal."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="legacy-6", address=person(1)["phone"], text="стоп")
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-7",
+        address=person(1)["phone"],
+        text="start",
+        received=ATTEMPTED_AT + timedelta(days=1),
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_the_backlog_scan_writes_nothing_at_all(session_maker, binding_key, no_network) -> None:
+    """§46.4.4 keeps the projection a separate explicit operation."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _stored_event(session_maker, dedupe_key="legacy-8", address=person(1)["phone"], text="стоп")
+    before = await _side_effect_counters(session_maker)
+    await build(session_maker, batch_id=batch_id)
+    await build(session_maker, batch_id=batch_id)
+    after = await _side_effect_counters(session_maker)
+    async with session_maker() as session:
+        suppressions = (
+            await session.execute(select(func.count()).select_from(WhatsAppConsentSuppression))
+        ).scalar_one()
+        receipts = (await session.execute(select(func.count()).select_from(WhatsAppInboundReceipt))).scalar_one()
+        flagged = (
+            await session.execute(select(func.count()).select_from(Client).where(Client.wa_opted_out.is_(True)))
+        ).scalar_one()
+    assert after["items"] == before["items"]
+    # No suppression written, no receipt backfilled, no card flag projected.
+    assert (suppressions, receipts, flagged) == (0, 0, 0)
+
+
+async def test_the_stored_snapshot_records_the_backlog_scan(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await build(session_maker, batch_id=batch_id)
+    async with session_maker() as session:
+        stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
+    facts = stored.evidence["historical_consent"]
+    assert facts["complete"] is True
+    assert facts["unaccounted_count"] == 0
+    assert "scanned_events" in facts
+
+
+# ---------------------------------------------------------------------------
+# Proven delivered/read (§46.3)
+# ---------------------------------------------------------------------------
+
+
+def _status(**changes: Any) -> dict[str, Any]:
+    """One status callback as the worker hands it to the evidence writer."""
+    base: dict[str, Any] = {
+        "provider_message_id": "wamid.b1s1",
+        "phone_number_id": PHONE_NUMBER_ID,
+        "recipient_id": person(1)["phone"],
+        "event_at": ATTEMPTED_AT + timedelta(minutes=1),
+    }
+    base.update(changes)
+    return base
+
+
+@pytest.mark.parametrize("kind", ["delivered", "read"])
+async def test_a_signed_callback_on_the_frozen_route_leaves_proof(
+    session_maker, binding_key, no_network, kind: str
+) -> None:
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    await seed_source_batch(session_maker, slots=[{"state": kind, "receipt_proven": False}])
+    async with session_maker() as session:
+        async with session.begin():
+            outcome = await delivery_evidence.record_status_receipt(
+                session, status=_status(), kind=kind, signature_verified=True
+            )
+    assert outcome.stored is True
+    async with session_maker() as session:
+        rows = list((await session.execute(select(EasyWeekVoucherProductionDeliveryReceipt))).scalars())
+    assert [row.kind for row in rows] == [kind]
+    assert rows[0].authenticity == INBOUND_AUTHENTICITY_SIGNED
+    assert rows[0].route_proven is True
+
+
+@pytest.mark.parametrize(
+    "changes,signed",
+    [
+        ({}, False),
+        ({"phone_number_id": "999999999999999"}, True),
+        ({"recipient_id": "+4915100099999"}, True),
+        ({"phone_number_id": None, "recipient_id": None}, True),
+        ({"provider_message_id": ""}, True),
+    ],
+)
+async def test_a_callback_without_the_three_proofs_leaves_none(
+    session_maker, binding_key, no_network, changes: dict[str, Any], signed: bool
+) -> None:
+    """An unverified signature, a foreign sender, a foreign recipient, or a
+    callback that names no route at all. None of them is evidence, and the
+    stricter check is not bypassable by omitting the fields."""
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    await seed_source_batch(session_maker, slots=[{"state": "delivered", "receipt_proven": False}])
+    async with session_maker() as session:
+        async with session.begin():
+            outcome = await delivery_evidence.record_status_receipt(
+                session, status=_status(**changes), kind="delivered", signature_verified=signed
+            )
+    assert outcome.stored is False
+    assert outcome.reason is not None
+    async with session_maker() as session:
+        stored = (
+            await session.execute(select(func.count()).select_from(EasyWeekVoucherProductionDeliveryReceipt))
+        ).scalar_one()
+    assert stored == 0
+
+
+async def test_the_same_callback_twice_stores_one_proof(session_maker, binding_key, no_network) -> None:
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    await seed_source_batch(session_maker, slots=[{"state": "delivered", "receipt_proven": False}])
+    for _ in range(3):
+        async with session_maker() as session:
+            async with session.begin():
+                await delivery_evidence.record_status_receipt(
+                    session, status=_status(), kind="delivered", signature_verified=True
+                )
+    async with session_maker() as session:
+        stored = (
+            await session.execute(select(func.count()).select_from(EasyWeekVoucherProductionDeliveryReceipt))
+        ).scalar_one()
+    assert stored == 1
+
+
+async def test_a_historical_status_without_proof_is_unknown(session_maker, binding_key, no_network) -> None:
+    """The reproduction: the slot says delivered and nothing proves it.
+
+    Never demoted to another group either — that would state something weaker
+    than the mailing's own record and stronger than what is proven.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered", "receipt_proven": False}])
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == STATUS_EVIDENCE_UNPROVEN
+
+
+async def test_a_historical_read_without_proof_is_unknown(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "read", "receipt_proven": False}])
+    outcome = await build(session_maker, batch_id=batch_id, groups=(FOLLOWUP_GROUP_READ, FOLLOWUP_GROUP_DELIVERED))
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == STATUS_EVIDENCE_UNPROVEN
+
+
+async def test_a_proof_for_another_slots_route_does_not_carry(session_maker, binding_key, no_network) -> None:
+    """A proof is bound to the route the attempt froze, not to the batch."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[
+            {"state": "delivered", "index": 1},
+            {"state": "delivered", "index": 2, "receipt_proven": False},
+        ],
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+    assert reason_for(outcome, 2) == STATUS_EVIDENCE_UNPROVEN
+
+
+async def test_the_status_path_still_advances_a_slot_without_proof(session_maker, binding_key, no_network) -> None:
+    """§46.3 does not weaken the MAILING's own record.
+
+    An unsigned callback still moves the slot — dropping a status about a
+    message already sent would corrupt the history of a mailing that happened —
+    and simply leaves no proof for a later send to rest on.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as production_ledger_module
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    await seed_source_batch(session_maker, slots=[{"state": "accepted", "receipt_proven": False}])
+    async with session_maker() as session:
+        async with session.begin():
+            result = await production_ledger_module.apply_webhook_transition(
+                session, provider_message_id="wamid.b1s1", status="delivered"
+            )
+    assert result.applied is True
+    async with session_maker() as session:
+        item = (await session.execute(select(EasyWeekVoucherProductionBatchItem))).scalar_one()
+        receipts = (
+            await session.execute(select(func.count()).select_from(EasyWeekVoucherProductionDeliveryReceipt))
+        ).scalar_one()
+    assert item.status == "delivered"
+    assert item.delivered_at is not None
+    assert receipts == 0
+
+
+# ---------------------------------------------------------------------------
+# The ORIGINAL artifact, read and proven (§46.6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("schema", ["3", "4"])
+async def test_a_correct_original_artifact_proves_out(session_maker, binding_key, no_network, schema: str) -> None:
+    """Both fixed products, each under its OWN contract.
+
+    Schema 3 is the paid €10 product and schema 4 the free gift certificate;
+    their prices and settlement differ, and §46.6 forbids applying one's
+    conditions to the other.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version=schema)
+    reader = FakeHistoryReader(schema_version=schema)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+    assert reader.order_calls == [order_uuid_for(batch_id, 1)]
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+    # The stored row keeps the shape facts, and the verified binding among them.
+    assert row.evidence["artifact"]["binding_verified"] is True
+    assert row.evidence["artifact"]["schema_version"] == schema
+
+
+async def test_a_schema_4_order_does_not_prove_a_schema_3_slot(session_maker, binding_key, no_network) -> None:
+    """The historical contract keeps its own conditions."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version="3")
+    # The order describes the FREE gift product while the slot is the paid one.
+    reader = FakeHistoryReader(schema_version="4")
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) != FOLLOWUP_ROW_INCLUDED
+
+
+@pytest.mark.parametrize(
+    "changes,expected",
+    [
+        ({"status": "refunded"}, ENTITLEMENT_INVALID),
+        ({"status": "cancelled"}, ENTITLEMENT_INVALID),
+        ({"status": "something_new"}, ENTITLEMENT_UNPROVEN),
+    ],
+)
+async def test_an_order_that_says_the_voucher_is_gone_excludes(
+    session_maker, binding_key, no_network, changes: dict[str, Any], expected: str
+) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = FakeHistoryReader(order_changes=changes)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == expected
+
+
+@pytest.mark.parametrize(
+    "voucher_changes",
+    [
+        {"is_expired": True},
+        {"status": "expired"},
+        {"expires_at": "2026-09-15T00:00:00+00:00"},
+        {"valid_until": "2026-09-15T00:00:00+00:00"},
+    ],
+)
+async def test_an_explicitly_expired_artifact_excludes(
+    session_maker, binding_key, no_network, voucher_changes: dict[str, Any]
+) -> None:
+    """The provider saying so, which is a different fact from it saying nothing."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+    )
+    order["vouchers"][0].update(voucher_changes)
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_INVALID
+
+
+async def test_an_artifact_with_no_individual_dates_still_proves_out(session_maker, binding_key, no_network) -> None:
+    """§45.4: silence about dates is the ordinary shape of a correct voucher."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+    )
+    assert "expires_at" not in order["vouchers"][0]
+    assert "valid_until" not in order["vouchers"][0]
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_another_order_under_the_same_uuid_is_not_this_artifact(session_maker, binding_key, no_network) -> None:
+    """A 200 is not proof the body describes what was asked about."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    other = voucher_order(
+        order_uuid="99999999-3333-4333-8333-333333333333",
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+    )
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): other})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNREADABLE
+
+
+async def test_a_rewritten_marker_is_not_this_phases_order(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = FakeHistoryReader(order_changes={"comment": "somebody else's order"})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNPROVEN
+
+
+async def test_a_code_that_does_not_match_the_stored_mac_is_unproven(session_maker, binding_key, no_network) -> None:
+    """The real HMAC check, not a key-id comparison.
+
+    Everything else about the order is correct: the right uuid, the right
+    marker, the right customer, the right voucher line. Only the code differs,
+    and a verdict that only compared key identifiers would include this person.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = FakeHistoryReader(order_changes={})
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code="FOLLOWUP-TEST-CODE-9999",
+    )
+    reader.orders[order_uuid_for(batch_id, 1)] = order
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNPROVEN
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+    assert row.evidence["artifact"]["binding_verified"] is False
+
+
+async def test_the_same_key_id_with_a_different_key_is_unproven(
+    session_maker, binding_key, no_network, monkeypatch
+) -> None:
+    """A MAC made under another secret, with the identifier unchanged."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    # Same id, different secret: the stored MAC was computed with the first.
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("q" * 48), raising=False)
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNPROVEN
+
+
+async def test_a_rotated_key_id_is_unproven_before_any_read(session_maker, binding_key, no_network) -> None:
+    """A binding written under a key this deployment no longer holds.
+
+    Caught locally, so the preview spends no request on it.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered", "hmac_key_id": "an-older-key"}])
+    reader = FakeHistoryReader()
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNPROVEN
+    assert reader.order_calls == []
+
+
+@pytest.mark.parametrize("failure", ["timeout", "unreadable"])
+async def test_an_unreadable_order_is_unknown_not_valid(session_maker, binding_key, no_network, failure: str) -> None:
+    from altegio_bot.easyweek_client import EasyWeekRetryableError
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    error: Exception = (
+        EasyWeekRetryableError("timeout", operation="get_order")
+        if failure == "timeout"
+        else RuntimeError("truncated body")
+    )
+    reader = FakeHistoryReader(order_error=error)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == ENTITLEMENT_UNREADABLE
+
+
+async def test_the_artifact_proof_makes_no_mutation_and_no_send(session_maker, binding_key, no_network) -> None:
+    """§46.6: no CREATE, no PAY, no refund, no replacement code, no send."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    before = await _side_effect_counters(session_maker)
+
+    class MutationRefusingReader(FakeHistoryReader):
+        async def create_order(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+            raise AssertionError("the preview must not create an order")
+
+        async def pay_order(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+            raise AssertionError("the preview must not pay an order")
+
+        async def refund_order(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+            raise AssertionError("the preview must not refund an order")
+
+    outcome = await build(session_maker, batch_id=batch_id, reader=MutationRefusingReader())
+    assert outcome.created is True
+    after = await _side_effect_counters(session_maker)
+    assert after["items"] == before["items"]
+    assert (after["jobs"], after["outbox"], after["attempts"]) == (
+        before["jobs"],
+        before["outbox"],
+        before["attempts"],
+    )
+
+
+async def test_the_order_read_happens_with_no_session_open(session_maker, binding_key, no_network) -> None:
+    """The MAC check opens its own session only after the order came back."""
+    from sqlalchemy import text
+
+    probed: list[bool] = []
+
+    class ProbingOrderReader(FakeHistoryReader):
+        async def get_order(self, order_uuid: str) -> dict[str, Any]:
+            async with session_maker() as probe:
+                async with probe.begin():
+                    await probe.execute(text("SELECT 1 FROM easyweek_voucher_production_batch_items FOR UPDATE NOWAIT"))
+            probed.append(True)
+            return await super().get_order(order_uuid)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    outcome = await build(session_maker, batch_id=batch_id, reader=ProbingOrderReader())
+    assert outcome.created is True
+    assert probed == [True]
+
+
+# ---------------------------------------------------------------------------
+# The full re-check before the snapshot (§46.5)
+# ---------------------------------------------------------------------------
+
+
+class _DuringRead(FakeHistoryReader):
+    """A booking read that performs one local change while it is in flight.
+
+    The window §46.5 is about: the external proof takes time, and the local
+    facts behind the composition can move while it does.
+    """
+
+    def __init__(self, session_maker: Any, change: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.session_maker = session_maker
+        self.change = change
+        self.fired = False
+
+    async def list_customer_bookings(self, customer_uuid: str, page: int, per_page: int = 50) -> dict[str, Any]:
+        if not self.fired:
+            self.fired = True
+            await self.change(self.session_maker)
+        return await super().list_customer_bookings(customer_uuid, page, per_page)
+
+
+async def _arrive_read_callback(session_maker: Any) -> None:
+    """A proven ``read`` lands for slot 1 while the bookings are being read."""
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as production_ledger_module
+
+    async with session_maker() as session:
+        async with session.begin():
+            await production_ledger_module.apply_webhook_transition(
+                session, provider_message_id="wamid.b1s1", status="read"
+            )
+            await delivery_evidence.record_status_receipt(
+                session,
+                status=_status(event_at=ATTEMPTED_AT + timedelta(minutes=5)),
+                kind="read",
+                signature_verified=True,
+            )
+
+
+async def test_a_late_read_is_excluded_when_only_delivered_was_selected(session_maker, binding_key, no_network) -> None:
+    """The review reproduction.
+
+    The operator asked for «доставлено, прочтение не подтверждено». While the
+    bookings were being read the read receipt arrived, so this person is no
+    longer in that group — and the snapshot must not store them as if they were.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _arrive_read_callback)
+    outcome = await build(session_maker, batch_id=batch_id, groups=(FOLLOWUP_GROUP_DELIVERED,), reader=reader)
+    assert outcome.created is True
+    assert outcome.included == 0
+    assert reason_for(outcome, 1) == GROUP_MOVED_OUT_OF_SELECTION
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+    assert row.decision == FOLLOWUP_ROW_EXCLUDED
+
+
+async def test_a_late_read_moves_between_two_selected_groups(session_maker, binding_key, no_network) -> None:
+    """§46.5 allows the move when both groups were chosen and share the text.
+
+    The row stays included and the stored group is the ACTUAL one, so the
+    snapshot does not claim a status the evidence no longer supports.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _arrive_read_callback)
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        groups=(FOLLOWUP_GROUP_READ, FOLLOWUP_GROUP_DELIVERED),
+        reader=reader,
+    )
+    assert outcome.included == 1
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+    assert row.decision == FOLLOWUP_ROW_INCLUDED
+    assert row.group_code == FOLLOWUP_GROUP_READ
+
+
+async def _move_the_number(session_maker: Any) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            card = (
+                await session.execute(select(Client).where(Client.easyweek_customer_uuid.is_not(None)).limit(1))
+            ).scalar_one()
+            card.phone_e164 = "+4915100055555"
+
+
+async def test_an_address_that_moves_during_the_read_is_caught(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _move_the_number)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == IDENTITY_CONFLICT
+
+
+async def _adopt_the_uuid(session_maker: Any) -> None:
+    async with session_maker() as session:
+        async with session.begin():
+            card = (
+                await session.execute(select(Client).where(Client.easyweek_customer_uuid.is_not(None)).limit(1))
+            ).scalar_one()
+            card.easyweek_customer_uuid = uuid_module.UUID("33333333-1111-4111-8111-111111111111")
+
+
+async def test_a_uuid_binding_that_moves_during_the_read_is_caught(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _adopt_the_uuid)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == IDENTITY_CONFLICT
+
+
+async def _disable_the_sender(session_maker: Any) -> None:
+    from altegio_bot.models.models import WhatsAppSender
+
+    async with session_maker() as session:
+        async with session.begin():
+            sender = (await session.execute(select(WhatsAppSender))).scalar_one()
+            sender.is_active = False
+
+
+async def test_a_sender_disabled_during_the_read_refuses_the_save(session_maker, binding_key, no_network) -> None:
+    """A contract fact of the whole preview, so the save is refused."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _disable_the_sender)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert (outcome.created, outcome.reason) == (False, SENDER_UNPROVEN)
+    async with session_maker() as session:
+        stored = (await session.execute(select(func.count()).select_from(EasyWeekVoucherFollowupPreview))).scalar_one()
+    assert stored == 0
+
+
+async def _repoint_the_sender(session_maker: Any) -> None:
+    from altegio_bot.models.models import WhatsAppSender
+
+    async with session_maker() as session:
+        async with session.begin():
+            sender = (await session.execute(select(WhatsAppSender))).scalar_one()
+            sender.phone_number_id = "222222222222222"
+
+
+async def test_a_sender_repointed_during_the_read_refuses_the_save(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _repoint_the_sender)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert (outcome.created, outcome.reason) == (False, SENDER_UNPROVEN)
+
+
+async def _disable_the_template(session_maker: Any) -> None:
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(MessageTemplate).where(MessageTemplate.code == message.FOLLOWUP_TEMPLATE_CODE)
+                )
+            ).scalar_one()
+            row.is_active = False
+
+
+async def test_a_template_disabled_during_the_read_refuses_the_save(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _disable_the_template)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert (outcome.created, outcome.reason) == (False, TEMPLATE_UNPROVEN)
+    async with session_maker() as session:
+        stored = (await session.execute(select(func.count()).select_from(EasyWeekVoucherFollowupPreview))).scalar_one()
+    assert stored == 0
+
+
+async def _rewrite_the_template_body(session_maker: Any) -> None:
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(MessageTemplate).where(MessageTemplate.code == message.FOLLOWUP_TEMPLATE_CODE)
+                )
+            ).scalar_one()
+            row.body = "Hallo {client_name}, etwas ganz anderes: {booking_link}."
+
+
+async def test_a_template_body_changed_during_the_read_refuses_the_save(session_maker, binding_key, no_network) -> None:
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    reader = _DuringRead(session_maker, _rewrite_the_template_body)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert (outcome.created, outcome.reason) == (False, TEMPLATE_UNPROVEN)
+
+
+async def test_a_row_that_loses_eligibility_is_not_replaced(session_maker, binding_key, no_network) -> None:
+    """§46.5: the place of an excluded row is filled by nobody.
+
+    Two slots are selected and one of them says stop during the read. The
+    stored composition is smaller — never topped up from the group the operator
+    did not choose, and never from the unknown rows.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[
+            {"state": "delivered", "index": 1},
+            {"state": "delivered", "index": 2},
+            {"state": "read", "index": 3},
+        ],
+    )
+
+    async def stop_the_first(maker: Any) -> None:
+        await _suppress(maker, address=person(1)["phone"])
+
+    reader = _DuringRead(session_maker, stop_the_first)
+    outcome = await build(session_maker, batch_id=batch_id, groups=(FOLLOWUP_GROUP_DELIVERED,), reader=reader)
+    assert outcome.included == 1
+    assert reason_for(outcome, 1) == CONSENT_REFUSED
+    assert decision_for(outcome, 2) == FOLLOWUP_ROW_INCLUDED
+    # Slot 3 is in a group nobody selected, so it is not part of this preview.
+    assert {row.slot for row in outcome.rows} == {1, 2}
+
+
+async def test_the_rechecks_of_stop_consent_and_reply_still_hold(session_maker, binding_key, no_network) -> None:
+    """The three the first round already had, kept alongside the new ones."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    async def stop_during(maker: Any) -> None:
+        await _suppress(maker, address=person(1)["phone"])
+
+    outcome = await build(session_maker, batch_id=batch_id, reader=_DuringRead(session_maker, stop_during))
+    assert reason_for(outcome, 1) == CONSENT_REFUSED
+
+    async def reply_during(maker: Any) -> None:
+        await _receipt(
+            maker,
+            address=person(2)["phone"],
+            key="reply-during-recheck",
+            observed=ATTEMPTED_AT + timedelta(days=1),
+        )
+
+    other_batch, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered", "index": 2}])
+    second = await build(
+        session_maker,
+        batch_id=other_batch,
+        reader=_DuringRead(session_maker, reply_during, people={1: 2}),
+    )
+    assert reason_for(second, 1) == CUSTOMER_REPLIED

@@ -2199,7 +2199,14 @@ async def _apply_voucher_batch_status(session: AsyncSession, provider_message_id
     return result.reason != voucher_batch_ledger.RECORD_MISSING_ROW
 
 
-async def _apply_voucher_production_status(session: AsyncSession, provider_message_id: str, kind: str) -> bool:
+async def _apply_voucher_production_status(
+    session: AsyncSession,
+    provider_message_id: str,
+    kind: str,
+    *,
+    event: WhatsAppEvent | None = None,
+    status: dict[str, Any] | None = None,
+) -> bool:
     """Record a delivered/read callback for the §42 production voucher mailing.
 
     The same contract as its three siblings and for the same reason: a
@@ -2229,6 +2236,26 @@ async def _apply_voucher_production_status(session: AsyncSession, provider_messa
     )
     if result.applied:
         logger.info("status_webhook: voucher production mailing advanced to %s", kind)
+        # §46.3: the slot's status is the mailing's own record and is applied
+        # above whatever else is true. What a LATER send may rest on is the
+        # proof beside it — the verified signature and the frozen route — and
+        # that is recorded here, or not at all when it cannot be proven.
+        if status is not None:
+            from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+            receipt = await delivery_evidence.record_status_receipt(
+                session,
+                status=status,
+                kind=kind,
+                whatsapp_event_id=int(event.id) if event is not None else None,
+                signature_verified=_event_authenticity_verified(event),
+            )
+            if not receipt.stored:
+                logger.info(
+                    "status_webhook: voucher production %s status left no §46.3 proof (%s)",
+                    kind,
+                    receipt.reason,
+                )
         return True
     # A refused write is either "not ours" — fall through — or "ours, and
     # already at or past this status", which is handled and done.
@@ -2400,7 +2427,9 @@ async def _handle_delivery_statuses(
         # is the only place a production slot's delivered/read can ever be
         # observed, and it keeps working with the §42 fence shut: a status
         # about a message already sent is not a new effect to fence off.
-        if kind in {"delivered", "read"} and await _apply_voucher_production_status(session, provider_message_id, kind):
+        if kind in {"delivered", "read"} and await _apply_voucher_production_status(
+            session, provider_message_id, kind, event=event, status=status
+        ):
             continue
 
         # And the §42 mailing's PROVEN failures (§46.3), asked fifth. The four

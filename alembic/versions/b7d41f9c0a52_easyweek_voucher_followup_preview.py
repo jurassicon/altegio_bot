@@ -10,6 +10,11 @@ of truth a preview reads; a preview never writes back into it.
   operator chose, the exact message contract, when the proofs were taken, how
   long they are treated as current, the counts and a deterministic digest of the
   included composition.
+* ``easyweek_voucher_production_delivery_receipts`` — the durable proof §46.3
+  asks of a POSITIVE status before it may become an audience: the verified
+  signature and the route the callback named, written beside the slot's own
+  transition. The slot's columns, counters and statistics are untouched, and a
+  historical slot simply has no row, which is the honest answer.
 * ``easyweek_voucher_followup_preview_rows`` — one row per source slot the
   selected groups reached, included or not, with a safe reason code. Its partial
   unique indexes ARE the source/dedupe contract PR-22.3 will claim against: one
@@ -36,11 +41,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 PREVIEWS = "easyweek_voucher_followup_previews"
 ROWS = "easyweek_voucher_followup_preview_rows"
+RECEIPTS = "easyweek_voucher_production_delivery_receipts"
 
 # The three selectable audiences plus ``unproven``, which is how a stored row
 # accounts for a slot none of the three can be proven for.
 _GROUPS = "'read', 'delivered_unread', 'confirmed_failure', 'unproven'"
 _DECISIONS = "'included', 'excluded', 'unknown'"
+
+# The two positive statuses a receipt can prove, and the authenticity vocabulary
+# shared with the inbound receipts of PR-22.1.
+_RECEIPT_KINDS_SQL = "kind IN ('delivered', 'read')"
+_RECEIPT_AUTHENTICITY_SQL = "authenticity IN ('signature_verified', 'unverified')"
 
 
 def upgrade() -> None:
@@ -49,7 +60,6 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
         sa.Column("batch_id", sa.BigInteger(), nullable=False),
         sa.Column("campaign_run_id", sa.BigInteger(), nullable=False),
-        sa.Column("provider", sa.String(32), nullable=False, server_default="easyweek"),
         sa.Column("company_id", sa.Integer(), nullable=False),
         sa.Column("location_uuid", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("source_request_schema_version", sa.String(16), nullable=False),
@@ -139,6 +149,56 @@ def upgrade() -> None:
     op.create_index("ix_ew_followup_preview_row_preview", ROWS, ["preview_id", "decision"])
 
 
+    op.create_table(
+        RECEIPTS,
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("fact_key", sa.String(64), nullable=False),
+        sa.Column("kind", sa.String(16), nullable=False),
+        sa.Column("authenticity", sa.String(24), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("attempt_id", sa.BigInteger(), nullable=True),
+        sa.Column("batch_id", sa.BigInteger(), nullable=False),
+        sa.Column("slot", sa.Integer(), nullable=False),
+        sa.Column("provider_message_id", sa.String(128), nullable=False),
+        sa.Column("observed_sender_digest", sa.String(64), nullable=False),
+        sa.Column("observed_recipient_digest", sa.String(64), nullable=False),
+        sa.Column("route_proven", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("whatsapp_event_id", sa.BigInteger(), nullable=True),
+        sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("event_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("evidence", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("fact_key", name="uq_ew_voucher_receipt_fact"),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["easyweek_voucher_production_batch_items.id"],
+            name="fk_ew_voucher_receipt_item",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["attempt_id"],
+            ["easyweek_voucher_production_batch_attempts.id"],
+            name="fk_ew_voucher_receipt_attempt",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["whatsapp_event_id"],
+            ["whatsapp_events.id"],
+            name="fk_ew_voucher_receipt_event",
+            ondelete="SET NULL",
+        ),
+        sa.CheckConstraint(_RECEIPT_KINDS_SQL, name="ck_ew_voucher_receipt_kind"),
+        sa.CheckConstraint(_RECEIPT_AUTHENTICITY_SQL, name="ck_ew_voucher_receipt_authenticity"),
+        # A stored row IS the proof, so the database requires all three parts.
+        sa.CheckConstraint("authenticity = 'signature_verified'", name="ck_ew_voucher_receipt_signed"),
+        sa.CheckConstraint(
+            "route_proven AND observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL",
+            name="ck_ew_voucher_receipt_route_proven",
+        ),
+    )
+    op.create_index("ix_ew_voucher_receipt_item_kind", RECEIPTS, ["item_id", "kind"])
+
+
 def downgrade() -> None:
     """Refuse while any preview exists, and refuse BEFORE any DDL.
 
@@ -151,7 +211,7 @@ def downgrade() -> None:
     land between the count and the drop.
     """
     bind = op.get_bind()
-    for table in (ROWS, PREVIEWS):
+    for table in (ROWS, PREVIEWS, RECEIPTS):
         bind.execute(sa.text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
     stored = bind.execute(sa.text(f"SELECT count(*) FROM {PREVIEWS}")).scalar_one()
     if int(stored or 0):
@@ -160,7 +220,20 @@ def downgrade() -> None:
             f"{int(stored)} preview version(s) are stored. "
             "Remove them deliberately first if that is really intended."
         )
+    # And the proven positive statuses. A receipt is evidence about a message
+    # that really was delivered, recorded once and unrecoverable afterwards —
+    # the ingress strips the signature it was proven with — so §46.9's rule
+    # applies: a destructive downgrade refuses while such facts exist.
+    receipts = bind.execute(sa.text(f"SELECT count(*) FROM {RECEIPTS}")).scalar_one()
+    if int(receipts or 0):
+        raise RuntimeError(
+            "refusing to drop the delivery receipt table: "
+            f"{int(receipts)} proven status fact(s) are stored, and their proof "
+            "cannot be recovered once dropped."
+        )
 
+    op.drop_index("ix_ew_voucher_receipt_item_kind", table_name=RECEIPTS)
+    op.drop_table(RECEIPTS)
     op.drop_index("ix_ew_followup_preview_row_preview", table_name=ROWS)
     op.drop_index("uq_ew_followup_preview_row_included_entitlement", table_name=ROWS)
     op.drop_index("uq_ew_followup_preview_row_included_customer", table_name=ROWS)

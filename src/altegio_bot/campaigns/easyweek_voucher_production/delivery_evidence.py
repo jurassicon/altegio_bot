@@ -74,12 +74,14 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
     DELIVERY_FAILURE_SOURCE_META_API,
+    DELIVERY_RECEIPT_KINDS,
     INBOUND_AUTHENTICITY_SIGNED,
     INBOUND_AUTHENTICITY_UNVERIFIED,
     EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
+    EasyWeekVoucherProductionDeliveryReceipt,
 )
 from altegio_bot.services.meta_error_classifier import (
     DELIVERY_CLASS_UNKNOWN,
@@ -245,20 +247,25 @@ def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else "none"
 
 
-async def _insert_fact(session: AsyncSession, values: dict[str, Any]) -> int | None:
+async def _insert_fact(
+    session: AsyncSession,
+    values: dict[str, Any],
+    *,
+    table: Any = EasyWeekVoucherProductionDeliveryFailure,
+) -> int | None:
     """Insert one fact, idempotently on ``fact_key``.
 
     ``ON CONFLICT DO NOTHING`` rather than a read-then-write: two callbacks can
     be processed concurrently by two workers, and losing the race on a unique
     index must be a no-op rather than an exception that fails a whole batch of
     status updates.
+
+    ``table`` defaults to the failure ledger, which every existing caller
+    means; the positive-status receipts of §46.3 share the same key column and
+    the same conflict rule, so they share this one insert rather than growing a
+    second copy of it that could drift.
     """
-    stmt = (
-        pg_insert(EasyWeekVoucherProductionDeliveryFailure)
-        .values(**values)
-        .on_conflict_do_nothing(index_elements=["fact_key"])
-        .returning(EasyWeekVoucherProductionDeliveryFailure.id)
-    )
+    stmt = pg_insert(table).values(**values).on_conflict_do_nothing(index_elements=["fact_key"]).returning(table.id)
     return (await session.execute(stmt)).scalars().first()
 
 
@@ -660,6 +667,124 @@ async def _store(
     )
 
 
+# ---------------------------------------------------------------------------
+# §46.3 — the proof behind a POSITIVE status
+# ---------------------------------------------------------------------------
+_RECEIPT_DOMAIN: Final = "altegio_bot/easyweek_voucher_production/delivery_receipt/v1"
+
+
+@dataclass(frozen=True)
+class ReceiptOutcome:
+    """Whether a positive status left proof behind, and why not when it did not."""
+
+    stored: bool
+    reason: str | None = None
+
+
+async def record_status_receipt(
+    session: AsyncSession,
+    *,
+    status: dict[str, Any],
+    kind: str,
+    whatsapp_event_id: int | None = None,
+    signature_verified: bool = False,
+    observed_at: datetime | None = None,
+) -> ReceiptOutcome:
+    """Record the PROOF behind one ``delivered``/``read`` callback (§46.3).
+
+    Written beside the slot's own transition, never instead of it. The ledger
+    keeps applying the status exactly as before — it is the record of a mailing
+    that really happened — and this adds, for the cases where it can be proven,
+    the two things that record does not keep: that the delivery's signature was
+    verified, and that the route the callback named is the one this slot's single
+    attempt froze.
+
+    Nothing is written unless all three parts hold. A callback with no verified
+    signature is an unattributed claim; one naming a foreign sender or recipient
+    is about somebody else's message; one that names no route at all cannot be
+    compared with a route we did freeze, and the stricter check must not be
+    bypassable by omitting fields. In each case the slot keeps its status and
+    gains no proof, which is what makes a later audience fail closed.
+
+    Runs inside the CALLER's transaction, re-taking locks it already holds, and
+    is idempotent: the key is computed from the proven contents of the fact, so
+    a Resend or a duplicate delivery adds nothing.
+    """
+    if kind not in DELIVERY_RECEIPT_KINDS:
+        raise ValueError("unsupported status receipt kind")
+    now = observed_at or utcnow()
+    provider_message_id = str(status.get("provider_message_id") or "").strip()
+    if not provider_message_id:
+        return ReceiptOutcome(False, SKIPPED_NO_MESSAGE_ID)
+    if not signature_verified:
+        return ReceiptOutcome(False, UNPROVEN_CALLBACK_UNVERIFIED)
+
+    await lock_message_identity(session, provider_message_id)
+    with session.no_autoflush:
+        located = await _locate_item(session, provider_message_id)
+    if located is None:
+        return ReceiptOutcome(False, SKIPPED_NOT_OURS)
+
+    batch_id, _slot = located
+    item = (
+        await session.execute(
+            select(EasyWeekVoucherProductionBatchItem)
+            .where(EasyWeekVoucherProductionBatchItem.batch_id == batch_id)
+            .where(EasyWeekVoucherProductionBatchItem.provider_message_id == provider_message_id)
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        return ReceiptOutcome(False, SKIPPED_NOT_OURS)
+
+    attempt = await _attempt_for(session, item)
+    observed_sender = sender_route_digest(status.get("phone_number_id"))
+    observed_recipient = recipient_route_digest(status.get("recipient_id"))
+    route_proven, conflict = _route_verdict(
+        attempt,
+        observed_sender_digest=observed_sender,
+        observed_recipient_digest=observed_recipient,
+    )
+    if not route_proven:
+        # A foreign route, an unverifiable one, or an attempt that froze none.
+        # All three leave the status without proof, honestly.
+        return ReceiptOutcome(False, conflict or UNPROVEN_ROUTE_UNKNOWN)
+    assert observed_sender is not None and observed_recipient is not None
+
+    event_at = status.get("event_at") if isinstance(status.get("event_at"), datetime) else None
+    fact_key = _fact_key(
+        (
+            _RECEIPT_DOMAIN,
+            kind,
+            provider_message_id,
+            observed_sender,
+            observed_recipient,
+            _iso(event_at),
+        )
+    )
+    inserted = await _insert_fact(
+        session,
+        {
+            "fact_key": fact_key,
+            "kind": kind,
+            "authenticity": INBOUND_AUTHENTICITY_SIGNED,
+            "item_id": int(item.id),
+            "attempt_id": int(attempt.id) if attempt is not None else None,
+            "batch_id": int(item.batch_id),
+            "slot": int(item.slot),
+            "provider_message_id": provider_message_id,
+            "observed_sender_digest": observed_sender,
+            "observed_recipient_digest": observed_recipient,
+            "route_proven": True,
+            "whatsapp_event_id": whatsapp_event_id,
+            "observed_at": now,
+            "event_at": event_at,
+            "evidence": {"source": DELIVERY_FAILURE_SOURCE_CALLBACK},
+        },
+        table=EasyWeekVoucherProductionDeliveryReceipt,
+    )
+    return ReceiptOutcome(inserted is not None)
+
+
 async def record_api_rejection(
     session: AsyncSession,
     *,
@@ -813,7 +938,9 @@ __all__ = [
     "bind_unmatched_failures",
     "lock_callback_scope",
     "lock_message_identity",
+    "ReceiptOutcome",
     "record_api_rejection",
+    "record_status_receipt",
     "record_callback_failure",
     "record_unmatched_callback_failure",
 ]

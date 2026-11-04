@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -48,6 +49,7 @@ from altegio_bot.ops.auth import SESSION_COOKIE
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     TemplateReader,
+    location_map,
     seed_sender_and_template,
     seed_source_batch,
 )
@@ -70,10 +72,17 @@ def no_network() -> Any:
         yield mock
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def binding_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The voucher MAC key and the configured branch registry.
+
+    Autouse, because every route here reaches the preview and the preview needs
+    both: the MAC to re-prove a binding, and the registry to know which
+    branches the booking question covers.
+    """
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
     monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
 
 
 @pytest.fixture
@@ -436,3 +445,162 @@ async def test_an_unconfigured_easyweek_is_unknown_not_a_500(
     assert payload["accepted"] is True
     assert (payload["included"], payload["unknown"]) == (0, 1)
     assert payload["booking_reads"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Honest standing of a stored result (§46.6)
+# ---------------------------------------------------------------------------
+
+
+async def _store_one(ops_client: Any, batch_id: int) -> dict[str, Any]:
+    response = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def test_a_saved_result_reads_as_current_right_after_the_check(
+    session_maker, ops_client, no_network, seams
+) -> None:
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "Эти проверки актуальны" in body
+    assert "подтверждены и сейчас" in body
+
+
+async def test_a_paused_template_stops_the_result_reading_as_current(
+    session_maker, ops_client, no_network, monkeypatch, seams
+) -> None:
+    """§46.6: a template that is no longer APPROVED cannot leave a green block."""
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import approved_meta_templates
+
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+
+    paused = approved_meta_templates()
+    paused[0]["status"] = "PAUSED"
+    seams["templates"].templates = paused
+
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "Эти проверки актуальны" not in body
+    assert "сейчас не подтверждён" in body
+    assert "исторический результат" in body
+    assert "НЕ подтверждены заново" in body
+
+
+async def test_a_changed_body_hides_the_old_text_rather_than_substituting(
+    session_maker, ops_client, no_network, monkeypatch, seams
+) -> None:
+    """The stored digest no longer matches, so the old text cannot be shown."""
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+
+    async with session_maker() as session:
+        async with session.begin():
+            stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
+            # The snapshot is immutable; this stands in for the contract having
+            # moved underneath it, which is what the page must notice.
+            stored.template_body_digest = "0" * 64
+
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "текст повторного сообщения изменился" in body
+    assert "прежний текст показать нельзя" in body
+    assert "Эти проверки актуальны" not in body
+
+
+async def test_a_terminal_stop_after_the_check_stops_the_green_block(
+    session_maker, ops_client, no_network, seams
+) -> None:
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as production_ledger
+
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+    await production_ledger.request_stop(session_maker, batch_id=batch_id, requested_by="operator")
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "Эти проверки актуальны" not in body
+    assert "сейчас повторное сообщение по этой рассылке запрещено" in body.lower()
+    assert "НЕ подтверждены заново" in body
+
+
+async def test_a_refused_refresh_leaves_the_stored_result_untouched(
+    session_maker, ops_client, no_network, seams
+) -> None:
+    """A 409 changes nothing, and the page does not pretend otherwise."""
+    from altegio_bot.campaigns.easyweek_voucher_production import ledger as production_ledger
+
+    batch_id = await _batch(session_maker)
+    first = await _store_one(ops_client, batch_id)
+    await production_ledger.request_stop(session_maker, batch_id=batch_id, requested_by="operator")
+
+    refused = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    assert refused.status_code == 409
+    assert refused.json()["reasons"] == ["followup_batch_terminal_stop"]
+
+    async with session_maker() as session:
+        rows = list((await session.execute(select(EasyWeekVoucherFollowupPreview))).scalars())
+    assert len(rows) == 1
+    assert rows[0].composition_digest == first["composition_digest"]
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "исторический результат" in body
+
+
+async def test_the_page_states_that_a_refused_check_keeps_the_old_result(
+    session_maker, ops_client, no_network, seams
+) -> None:
+    """The sentence the browser shows on a failed check, present in the page."""
+    batch_id = await _batch(session_maker)
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "предыдущий результат не изменился" in body
+
+
+async def test_an_expired_snapshot_is_shown_as_expired(session_maker, ops_client, no_network, seams) -> None:
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+    async with session_maker() as session:
+        async with session.begin():
+            stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
+            stored.checked_at = stored.checked_at - timedelta(days=5)
+            stored.valid_until = stored.valid_until - timedelta(days=5)
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "Срок действия этих проверок истёк" in body
+    assert "Эти проверки актуальны" not in body
+
+
+# ---------------------------------------------------------------------------
+# The historical backlog is not bypassable through the API (§46.4.4)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_direct_api_call_cannot_bypass_the_backlog_gate(session_maker, ops_client, no_network, seams) -> None:
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import person
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import _stored_event
+
+    batch_id = await _batch(session_maker)
+    await _stored_event(session_maker, dedupe_key="legacy-api-1", address=person(1)["phone"], text="СТОП")
+    payload = await _store_one(ops_client, batch_id)
+    assert payload["included"] == 0
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    # The reason reaches the page in words, not only as a code.
+    assert "отписка этого человека, которая ещё не учтена" in body
+    assert "followup_historical_stop_unaccounted" in body
+
+
+async def test_neither_the_page_nor_the_check_applies_a_reconciliation(
+    session_maker, ops_client, no_network, seams
+) -> None:
+    """§46.4.4 keeps the projection a separate, explicit operation."""
+    from altegio_bot.models.models import WhatsAppConsentSuppression, WhatsAppInboundReceipt
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import person
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import _stored_event
+
+    batch_id = await _batch(session_maker)
+    await _stored_event(session_maker, dedupe_key="legacy-api-2", address=person(1)["phone"], text="стоп")
+    for _ in range(2):
+        await ops_client.get(PAGE.format(batch_id=batch_id))
+        await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    async with session_maker() as session:
+        suppressions = (
+            await session.execute(select(func.count()).select_from(WhatsAppConsentSuppression))
+        ).scalar_one()
+        receipts = (await session.execute(select(func.count()).select_from(WhatsAppInboundReceipt))).scalar_one()
+    assert (suppressions, receipts) == (0, 0)

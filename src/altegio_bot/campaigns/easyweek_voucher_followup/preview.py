@@ -51,7 +51,7 @@ import logging
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Final, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -64,6 +64,13 @@ from altegio_bot.campaigns.easyweek_customer_history import (
     read_customer_bookings as _read_customer_bookings,
 )
 from altegio_bot.campaigns.easyweek_voucher_followup import followup_template_contract as message
+from altegio_bot.campaigns.easyweek_voucher_followup.artifact_proof import (
+    prove_source_artifact as _prove_source_artifact,
+)
+from altegio_bot.campaigns.easyweek_voucher_followup.booking_evidence import (
+    CapturedCreations,
+    load_creation_evidence,
+)
 from altegio_bot.campaigns.easyweek_voucher_followup.eligibility import (
     BookingVerdict,
     RowFacts,
@@ -82,23 +89,37 @@ from altegio_bot.campaigns.easyweek_voucher_followup.failure_policy import (
     FailurePolicy,
 )
 from altegio_bot.campaigns.easyweek_voucher_followup.groups import SourceEvidence, resolve_group
+from altegio_bot.campaigns.easyweek_voucher_followup.historical_consent import (
+    MAX_SCANNED_EVENTS as HISTORICAL_SCAN_LIMIT,
+)
+from altegio_bot.campaigns.easyweek_voucher_followup.historical_consent import (
+    HistoricalConsentScan,
+    scan_historical_refusals,
+)
 from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     BATCH_NOT_FOUND,
     BATCH_NOT_FROZEN,
     BATCH_SCHEMA_UNSUPPORTED,
     BATCH_SCOPE_UNSUPPORTED,
     BATCH_TERMINAL_STOP,
+    BOOKING_CAPTURE_UNPROVEN,
     CONTRACT_VERSION,
     DUPLICATE_SOURCE,
     FOLLOWUP_ROW_EXCLUDED,
     FOLLOWUP_ROW_INCLUDED,
     FOLLOWUP_ROW_UNKNOWN,
+    GROUP_MOVED_OUT_OF_SELECTION,
     GROUPS_REQUIRED,
+    HISTORICAL_CONSENT_UNPROVEN,
+    HISTORICAL_STOP_UNACCOUNTED,
     HISTORY_UNPROVEN,
+    IDENTITY_CONFLICT,
     INTERVAL_NOT_ELAPSED,
     INTERVAL_REQUIRED,
     PREVIEW_VALIDITY_SECONDS,
     SENDER_UNPROVEN,
+    SOURCE_ATTEMPT_UNPROVEN,
+    STATUS_EVIDENCE_UNPROVEN,
     TEMPLATE_UNPROVEN,
     canonical_groups,
 )
@@ -106,19 +127,31 @@ from altegio_bot.campaigns.easyweek_voucher_production import ledger as producti
 from altegio_bot.easyweek_voucher_production_contract import is_current_fixed_contract
 from altegio_bot.models.models import (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
+    DELIVERY_RECEIPT_KIND_DELIVERED,
+    DELIVERY_RECEIPT_KIND_READ,
     FOLLOWUP_GROUP_UNPROVEN,
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
+    RECIPIENT_BASIS_MANUAL,
+    CampaignRecipient,
+    Client,
     EasyWeekVoucherFollowupPreview,
     EasyWeekVoucherFollowupPreviewRow,
     EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
+    EasyWeekVoucherProductionDeliveryReceipt,
 )
 from altegio_bot.utils import utcnow
+from altegio_bot.whatsapp_consent import normalize_wa_address
 
 logger = logging.getLogger("easyweek_voucher_followup_preview")
+
+# What a production header stores when its composition carries both bases. The
+# value lives in the §42 composition read; named here so neither this module nor
+# a test repeats the literal.
+RECIPIENT_BASIS_PRODUCTION_MIXED: Final = "mixed"
 
 __all__ = [
     "BatchGate",
@@ -126,6 +159,8 @@ __all__ = [
     "PreviewRowView",
     "PreviewSpec",
     "StoredPreview",
+    "SnapshotCurrency",
+    "assess_snapshot",
     "batch_gate",
     "create_preview",
     "latest_preview",
@@ -133,10 +168,22 @@ __all__ = [
     "prove_meta_followup_template",
 ]
 
-# The recipient bases a follow-up preview supports. §46.1 keeps the audience to
-# the original earned mailing; a manually assembled batch was composed by hand
-# under its own rules and is not re-derivable from this evidence.
-SUPPORTED_RECIPIENT_BASES = frozenset({RECIPIENT_BASIS_EARNED})
+# The composition bases a follow-up preview supports, at the BATCH header.
+#
+# All three a production batch can carry. §46.2 keeps the first version to the
+# fixed €10 batches of schema 3/4 "с доказанными собственными bindings" and
+# puts schema 1/2, canary and snapshot ledgers out of scope; it does not narrow
+# the audience to one composition basis, and a manually selected recipient of a
+# production mailing received the same approved message from the same sender as
+# an earned one. What differs is which link proves their identity, and that is
+# proven per slot by ``resolve_identity`` against the row's own basis.
+#
+# A canary, a snapshot ledger, an owner test and an Altegio campaign are other
+# kinds of mailing with their own tables, and the batch gate refuses them by
+# provider and schema rather than by basis.
+SUPPORTED_RECIPIENT_BASES = frozenset(
+    {RECIPIENT_BASIS_EARNED, RECIPIENT_BASIS_MANUAL, RECIPIENT_BASIS_PRODUCTION_MIXED}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +375,8 @@ class StoredPreview:
     unknown_count: int
     composition_digest: str
     operator_principal: str
+    # The source batch's frozen state, as the snapshot recorded it.
+    source_frozen_digest: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     rows: tuple[PreviewRowView, ...] = ()
 
@@ -340,6 +389,113 @@ class StoredPreview:
         """
         moment = now or utcnow()
         return moment < self.valid_until
+
+
+# ---------------------------------------------------------------------------
+# Is a stored snapshot still the current answer? (§46.6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SnapshotCurrency:
+    """How much of a stored preview may still be presented as current.
+
+    Three separate things, kept apart because an operator acts on them
+    differently and §46.6 asks the page to distinguish them:
+
+    * ``fresh`` — the snapshot is inside the validity window it recorded. That
+      is a statement about AGE and nothing else;
+    * ``contract_matches`` — the message contract, the failure policy, the
+      preview contract version and the source batch's frozen state are still
+      the ones the snapshot was computed under. A snapshot computed under a
+      different text is a historical record, however young it is;
+    * ``blocked_now`` — something forbids a follow-up for this batch right now:
+      a terminal stop, a sender that is gone, a template that is no longer
+      proven. The old counts stay true as history and say nothing about today.
+
+    ``current`` is the conjunction, and only that may be shown as "these checks
+    hold". Everything else is shown as a past result that needs recomputing.
+    """
+
+    fresh: bool
+    contract_matches: bool
+    template_proven_now: bool
+    blocked_now: str | None = None
+    # Why the contract no longer matches. Safe labels, for the screen.
+    drift: tuple[str, ...] = ()
+
+    @property
+    def current(self) -> bool:
+        return self.fresh and self.contract_matches and self.template_proven_now and self.blocked_now is None
+
+    @property
+    def text_restorable(self) -> bool:
+        """May today's text be shown AS the text of this snapshot?
+
+        Only when the body digest still matches. A snapshot stores the digest
+        and not the body — a body is personal once rendered and large once
+        stored — so when the digest has moved the old text cannot be shown at
+        all, and §46.6 requires saying so rather than substituting the new one.
+        """
+        return "template_body" not in self.drift
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "fresh": self.fresh,
+            "contract_matches": self.contract_matches,
+            "template_proven_now": self.template_proven_now,
+            "blocked_now": self.blocked_now,
+            "drift": list(self.drift),
+            "current": self.current,
+            "text_restorable": self.text_restorable,
+        }
+
+
+def assess_snapshot(
+    stored: StoredPreview,
+    *,
+    gate: BatchGate,
+    template_proven_now: bool,
+    policy: FailurePolicy = CURRENT_FAILURE_POLICY,
+    now: datetime | None = None,
+) -> SnapshotCurrency:
+    """Compare one stored snapshot with what is true right now.
+
+    A pure comparison: it reads nothing and writes nothing, and it never
+    modifies the snapshot — §46.5 keeps a stored version immutable, so this
+    answers a question ABOUT it instead.
+    """
+    drift: list[str] = []
+    if stored.template_body_digest != message.body_digest():
+        drift.append("template_body")
+    if stored.template_code != message.FOLLOWUP_TEMPLATE_CODE:
+        drift.append("template_code")
+    if stored.meta_template_name != message.FOLLOWUP_META_TEMPLATE_NAME:
+        drift.append("template_name")
+    if stored.template_language != message.FOLLOWUP_TEMPLATE_LANGUAGE:
+        drift.append("template_language")
+    if stored.template_category != message.FOLLOWUP_TEMPLATE_CATEGORY:
+        drift.append("template_category")
+    if tuple(stored.template_parameter_order) != message.FOLLOWUP_TEMPLATE_FIELDS:
+        drift.append("template_parameters")
+    if stored.contract_version != CONTRACT_VERSION:
+        drift.append("contract_version")
+    if stored.failure_policy_version != policy.version:
+        drift.append("failure_policy")
+    if gate.frozen_digest and stored.source_frozen_digest != gate.frozen_digest:
+        drift.append("source_composition")
+    if int(stored.stop_generation) != int(gate.stop_generation):
+        # The original batch has been stopped (or stopped again) since. The
+        # composition was computed in knowledge of a different stop.
+        drift.append("source_stop_generation")
+
+    return SnapshotCurrency(
+        fresh=stored.is_fresh(now=now),
+        contract_matches=not drift,
+        template_proven_now=bool(template_proven_now),
+        blocked_now=None if gate.allowed else gate.reason,
+        drift=tuple(drift),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +644,27 @@ async def _confirmed_failures(session: AsyncSession, *, batch_id: int) -> dict[i
     return {item_id: tuple(facts) for item_id, facts in found.items()}
 
 
+async def _proven_receipts(session: AsyncSession, *, batch_id: int) -> dict[int, set[str]]:
+    """Which positive statuses of this batch carry §46.3's proof, by item id.
+
+    A stored receipt IS the proof — the database requires the verified
+    signature and both halves of a matching route — so reading the rows is
+    enough and no verdict is recomputed here.
+    """
+    rows = (
+        await session.execute(
+            select(
+                EasyWeekVoucherProductionDeliveryReceipt.item_id,
+                EasyWeekVoucherProductionDeliveryReceipt.kind,
+            ).where(EasyWeekVoucherProductionDeliveryReceipt.batch_id == int(batch_id))
+        )
+    ).all()
+    proven: dict[int, set[str]] = {}
+    for item_id, kind in rows:
+        proven.setdefault(int(item_id), set()).add(str(kind))
+    return proven
+
+
 async def _attempts(session: AsyncSession, *, batch_id: int) -> dict[int, EasyWeekVoucherProductionBatchAttempt]:
     """The one attempt per slot, by item id.
 
@@ -509,6 +686,65 @@ async def _attempts(session: AsyncSession, *, batch_id: int) -> dict[int, EasyWe
     return found
 
 
+async def _batch_items(session: AsyncSession, *, batch_id: int) -> list[EasyWeekVoucherProductionBatchItem]:
+    """Every slot of one batch, in slot order. One reader, so two callers agree."""
+    return list(
+        (
+            await session.execute(
+                select(EasyWeekVoucherProductionBatchItem)
+                .where(EasyWeekVoucherProductionBatchItem.batch_id == int(batch_id))
+                .order_by(EasyWeekVoucherProductionBatchItem.slot.asc())
+            )
+        ).scalars()
+    )
+
+
+async def _candidate_addresses(session: AsyncSession, *, batch_id: int) -> set[str]:
+    """Every number this batch's recipients are known by, normalised.
+
+    Both sides of the identity, because the §46.4.4 backlog is about PEOPLE and
+    a number can have moved since the mailing: the campaign row's number, and
+    the number on the EasyWeek card of each slot's proven uuid. A refusal sent
+    from either is this person's refusal.
+
+    One query pair for the whole batch. The result is the question the bounded
+    stored-event scan is given, which is what keeps that scan narrow.
+    """
+    rows = list(
+        (
+            await session.execute(
+                select(CampaignRecipient.phone_e164, EasyWeekVoucherProductionBatchItem.easyweek_customer_uuid)
+                .join(
+                    EasyWeekVoucherProductionBatchItem,
+                    EasyWeekVoucherProductionBatchItem.campaign_recipient_id == CampaignRecipient.id,
+                )
+                .where(EasyWeekVoucherProductionBatchItem.batch_id == int(batch_id))
+            )
+        ).all()
+    )
+    addresses: set[str] = set()
+    uuids: set[uuid_module.UUID] = set()
+    for phone, customer_uuid in rows:
+        normalised = normalize_wa_address(phone)
+        if normalised is not None:
+            addresses.add(normalised)
+        if customer_uuid is not None:
+            uuids.add(customer_uuid)
+    if uuids:
+        cards = (
+            await session.execute(
+                select(Client.phone_e164)
+                .where(Client.provider == PROVIDER_EASYWEEK)
+                .where(Client.easyweek_customer_uuid.in_(sorted(uuids)))
+            )
+        ).scalars()
+        for phone in cards:
+            normalised = normalize_wa_address(phone)
+            if normalised is not None:
+                addresses.add(normalised)
+    return addresses
+
+
 async def _local_phase(
     session: AsyncSession,
     *,
@@ -517,19 +753,18 @@ async def _local_phase(
     policy: FailurePolicy,
     now: datetime,
     configured_key_id: str | None,
+    historical: HistoricalConsentScan,
+    creations: CapturedCreations,
 ) -> list[RowFacts]:
-    """Decide everything that can be decided without a network request."""
-    items = list(
-        (
-            await session.execute(
-                select(EasyWeekVoucherProductionBatchItem)
-                .where(EasyWeekVoucherProductionBatchItem.batch_id == int(spec.batch_id))
-                .order_by(EasyWeekVoucherProductionBatchItem.slot.asc())
-            )
-        ).scalars()
-    )
+    """Decide everything that can be decided without a network request.
+
+    ``historical`` is the one bounded pass over the stored-event backlog
+    (§46.4.4), taken once for the whole preview rather than per row.
+    """
+    items = await _batch_items(session, batch_id=int(spec.batch_id))
     attempts = await _attempts(session, batch_id=int(spec.batch_id))
     failures = await _confirmed_failures(session, batch_id=int(spec.batch_id))
+    receipts = await _proven_receipts(session, batch_id=int(spec.batch_id))
 
     decided: list[RowFacts] = []
     for item in items:
@@ -547,6 +782,8 @@ async def _local_phase(
             attempt_sender_digest=(attempt.sender_phone_number_id_digest if attempt is not None else None),
             attempt_recipient_digest=(attempt.recipient_digest if attempt is not None else None),
             confirmed_failures=failures.get(int(item.id), ()),
+            delivered_receipt_proven=DELIVERY_RECEIPT_KIND_DELIVERED in receipts.get(int(item.id), set()),
+            read_receipt_proven=DELIVERY_RECEIPT_KIND_READ in receipts.get(int(item.id), set()),
         )
         group = resolve_group(evidence, expected_sender_digest=gate.sender_digest)
         facts = RowFacts(
@@ -600,6 +837,9 @@ async def _local_phase(
             campaign_recipient_id=int(item.campaign_recipient_id),
             company_id=int(gate.company_id or 0),
             campaign_run_id=int(gate.campaign_run_id or 0),
+            # The SLOT's own basis, not the header's: a mixed batch has both,
+            # and each row is proven against the link its basis actually has.
+            recipient_basis=str(item.recipient_basis or ""),
             expected_customer_uuid=item.easyweek_customer_uuid,
             expected_source_booking_uuid=item.source_booking_uuid,
             attempt_recipient_digest=evidence.attempt_recipient_digest,
@@ -642,6 +882,20 @@ async def _local_phase(
             decided.append(facts)
             continue
 
+        # §46.4.4: the historical backlog, before the audience is opened. The
+        # aggregate above reads the ledger, the cards and the recipient
+        # snapshot, and every one of those is silent about a refusal that is
+        # still sitting unaccounted in a stored event.
+        if not historical.complete:
+            # Not established for anybody, so not permission for anybody.
+            facts.unknown(HISTORICAL_CONSENT_UNPROVEN, historical_consent=list(historical.gaps))
+            decided.append(facts)
+            continue
+        if historical.blocks(identity.address):
+            facts.exclude(HISTORICAL_STOP_UNACCOUNTED)
+            decided.append(facts)
+            continue
+
         assert item.send_attempted_at is not None
         if await has_replied_since(
             session,
@@ -659,6 +913,17 @@ async def _local_phase(
         # left, and it is the only reason this row costs a request.
         facts.notes["pending_booking_proof"] = True
         facts.notes["address"] = identity.address
+        # What the external artifact proof needs, read here so that phase holds
+        # no database handle. The schema is the SLOT's own: §46.6 forbids
+        # applying a newer contract's conditions to a historical one.
+        facts.notes["batch_id"] = int(spec.batch_id)
+        facts.notes["schema_version"] = gate.schema_version
+        facts.notes["target_order_uuid"] = str(item.target_order_uuid) if item.target_order_uuid else None
+        facts.notes["reconciliation_marker"] = str(item.reconciliation_marker or "")
+        # The local half of the booking question, resolved now and carried: the
+        # creation capture is a database read and must not be taken while the
+        # external read is in flight.
+        facts.creations = creations.for_slot(int(item.slot), reason=BOOKING_CAPTURE_UNPROVEN)
         decided.append(facts)
 
     return decided
@@ -669,28 +934,58 @@ async def _local_phase(
 # ---------------------------------------------------------------------------
 
 
-async def _booking_phase(
+async def _external_phase(
     candidates: Sequence[RowFacts],
     *,
     reader: CustomerHistoryReader | None,
+    order_reader: Any | None,
+    session_maker: async_sessionmaker[AsyncSession],
     now: datetime,
     read_bookings: Callable[..., Any] = _read_customer_bookings,
+    prove_artifact: Callable[..., Any] = _prove_source_artifact,
 ) -> tuple[int, bool]:
-    """Prove the bookings of every row that is still a candidate.
+    """The two external proofs, for every row that is still a candidate.
 
-    No session, no transaction, no lock — by construction rather than by care:
-    this function has no database handle to hold one with.
+    The artifact first (§46.6) and the bookings second (§46.5), because a slot
+    whose original voucher is gone needs no booking read at all.
 
-    A missing reader is not an empty history. Without a configured EasyWeek
-    read every candidate becomes ``unknown``, which is the honest answer and
-    the one §46.5 demands: an API failure may never turn into "this person has
-    no bookings".
+    No transaction and no lock is held across either request. The MAC check
+    inside the artifact proof opens its own short read session once the order
+    has already come back, which is why ``session_maker`` is passed rather than
+    a session.
+
+    A missing reader is never an empty answer. Without a configured EasyWeek
+    read every candidate becomes ``unknown``, which is what §46.5 and §46.6
+    both demand: an API failure may not turn into "this person has no bookings"
+    or into "this voucher is still fine".
     """
     reads = 0
     retryable = False
     for facts in candidates:
         if not facts.notes.get("pending_booking_proof"):
             continue
+        # §46.6: the ORIGINAL artifact, read and proven rather than inferred
+        # from the presence of its binding columns.
+        artifact = await prove_artifact(
+            order_reader,
+            session_maker=session_maker,
+            batch_id=int(facts.notes["batch_id"]),
+            slot=int(facts.slot),
+            schema_version=str(facts.notes["schema_version"]),
+            target_order_uuid=facts.notes.get("target_order_uuid"),
+            reconciliation_marker=str(facts.notes.get("reconciliation_marker") or ""),
+            easyweek_customer_uuid=facts.easyweek_customer_uuid,
+            now=now,
+        )
+        facts.notes["artifact"] = dict(artifact.observations)
+        if not artifact.proven:
+            assert artifact.reason is not None
+            if artifact.unknown:
+                facts.unknown(artifact.reason)
+            else:
+                facts.exclude(artifact.reason)
+            continue
+
         if reader is None:
             facts.unknown(HISTORY_UNPROVEN, booking_proof="reader_unavailable")
             continue
@@ -706,6 +1001,7 @@ async def _booking_phase(
         reads += 1
         verdict: BookingVerdict = booking_verdict(
             bookings,
+            creations=facts.creations,
             attempted_at=facts.source_attempted_at,
             now=now,
         )
@@ -716,7 +1012,10 @@ async def _booking_phase(
         assert verdict.reason is not None
         if verdict.unknown:
             retryable = retryable or bookings.retryable_uncertainty
-            facts.unknown(HISTORY_UNPROVEN, booking_reason=verdict.reason)
+            # The reason is the verdict's own: "the history could not be read"
+            # and "this booking's creation is not proven" are different missing
+            # facts, and an operator acts on them differently.
+            facts.unknown(verdict.reason, booking_reason=verdict.detail or verdict.reason)
         else:
             facts.exclude(verdict.reason)
     return reads, retryable
@@ -732,6 +1031,7 @@ async def _recheck_and_dedupe(
     *,
     gate: BatchGate,
     decided: Sequence[RowFacts],
+    selected_groups: Sequence[str],
 ) -> str | None:
     """Re-prove the mutable local facts, then apply the dedupe contract.
 
@@ -746,7 +1046,24 @@ async def _recheck_and_dedupe(
       demoted, even if the new answer still reads "allowed": the preview would
       otherwise carry a fingerprint that no longer describes it, and PR-22.3's
       locked guard compares exactly that;
-    * a reply may have arrived after the first pass looked.
+    * a reply may have arrived after the first pass looked;
+    * the SOURCE FACTS of the attempt may have moved. A ``read`` callback can
+      land while the booking read is in flight, and a row proven ``delivered``
+      a moment ago is then in a different group. §46.5 allows a move between
+      two groups the operator ALREADY selected, provided the approved message
+      contract is the same and the remaining conditions hold, and requires a
+      new preview otherwise — so the actual group is recorded and a move out of
+      the selection is an exclusion with a reason, never a quiet relabelling;
+    * identity may have moved: a number reassigned, a card adopted by another
+      uuid, a basis changed. Each one means this row is about somebody else now;
+    * the SENDER and the local TEMPLATE row may have changed or been disabled.
+      Those are contract facts shared by the whole preview rather than one row,
+      so an incompatible change refuses the save instead of quietly storing a
+      composition under a contract that no longer exists.
+
+    A row that loses eligibility here is excluded with a reason and its place is
+    not filled: §46.5 forbids adding anybody in its stead, and the stored
+    composition may therefore be smaller than the first pass expected.
 
     Then one version's dedupe: at most one included row per source slot, per
     canonical customer uuid and per original entitlement. The partial unique
@@ -761,10 +1078,85 @@ async def _recheck_and_dedupe(
     if await production_ledger.terminal_stop_active_in_session(session, batch_id=int(gate.batch_id or 0)):
         return BATCH_TERMINAL_STOP
 
+    # The contract facts the whole preview rests on, re-proven once. A change
+    # here is not a per-row exclusion: the composition would be stored under a
+    # message contract or a sender that no longer holds, so the save is refused
+    # and an explicit recalculation is required.
+    if not await local_template_row_proven(session, company_id=int(gate.company_id or 0)):
+        return TEMPLATE_UNPROVEN
+    sender_now = await _confirmed_sender_digest(session, company_id=int(gate.company_id or 0))
+    if sender_now is None or sender_now != gate.sender_digest:
+        return SENDER_UNPROVEN
+
+    # The source facts, re-read for the whole batch in one pass rather than per
+    # row: a late callback is the case this exists for, and it moves rows.
+    items = {int(item.id): item for item in await _batch_items(session, batch_id=int(gate.batch_id or 0))}
+    attempts = await _attempts(session, batch_id=int(gate.batch_id or 0))
+    failures = await _confirmed_failures(session, batch_id=int(gate.batch_id or 0))
+    receipts = await _proven_receipts(session, batch_id=int(gate.batch_id or 0))
+
     seen_customers: set[uuid_module.UUID] = set()
     seen_entitlements: set[str] = set()
     for facts in sorted(decided, key=lambda row: row.slot):
         if not facts.included:
+            continue
+
+        item = items.get(facts.item_id)
+        if item is None:
+            facts.unknown(IDENTITY_CONFLICT, recheck="source_row_missing")
+            continue
+
+        attempt = attempts.get(facts.item_id)
+        evidence = SourceEvidence(
+            item_id=facts.item_id,
+            slot=facts.slot,
+            status=str(item.status or ""),
+            send_attempt_count=int(item.send_attempt_count or 0),
+            send_attempted_at=item.send_attempted_at,
+            delivered_at=item.delivered_at,
+            read_at=item.read_at,
+            item_message_id=item.provider_message_id,
+            attempt_message_id=(attempt.provider_message_id if attempt is not None else None),
+            attempt_sender_digest=(attempt.sender_phone_number_id_digest if attempt is not None else None),
+            attempt_recipient_digest=(attempt.recipient_digest if attempt is not None else None),
+            confirmed_failures=failures.get(facts.item_id, ()),
+            delivered_receipt_proven=DELIVERY_RECEIPT_KIND_DELIVERED in receipts.get(facts.item_id, set()),
+            read_receipt_proven=DELIVERY_RECEIPT_KIND_READ in receipts.get(facts.item_id, set()),
+        )
+        group_now = resolve_group(evidence, expected_sender_digest=gate.sender_digest)
+        if not group_now.proven:
+            facts.unknown(group_now.reason or STATUS_EVIDENCE_UNPROVEN, recheck="source_facts_changed")
+            continue
+        if group_now.group != facts.group.group:
+            if group_now.group not in selected_groups:
+                # Moved out of what the operator chose. Not this preview's
+                # audience any more, and not silently relabelled either.
+                facts.exclude(GROUP_MOVED_OUT_OF_SELECTION, recheck="source_facts_changed")
+                continue
+            if message.template_code_for_groups(sorted({group_now.group, facts.group.group})) is None:
+                # Two selected groups whose approved texts differ. §46.5 allows
+                # the move only under one contract, so the save is refused.
+                return TEMPLATE_UNPROVEN
+            # Allowed, and the ACTUAL group is what gets stored.
+            facts.group = group_now
+        if int(item.send_attempt_count or 0) != int(facts.evidence.send_attempt_count or 0) or (
+            item.send_attempted_at != facts.source_attempted_at
+        ):
+            facts.unknown(SOURCE_ATTEMPT_UNPROVEN, recheck="source_attempt_changed")
+            continue
+
+        identity = await resolve_identity(
+            session,
+            campaign_recipient_id=facts.campaign_recipient_id,
+            company_id=int(gate.company_id or 0),
+            campaign_run_id=int(gate.campaign_run_id or 0),
+            recipient_basis=str(item.recipient_basis or ""),
+            expected_customer_uuid=item.easyweek_customer_uuid,
+            expected_source_booking_uuid=item.source_booking_uuid,
+            attempt_recipient_digest=evidence.attempt_recipient_digest,
+        )
+        if not identity.proven or identity.address != facts.notes.get("address"):
+            facts.unknown(identity.reason or IDENTITY_CONFLICT, recheck="identity_changed")
             continue
 
         address = facts.notes.get("address")
@@ -854,10 +1246,13 @@ async def create_preview(
     *,
     spec: PreviewSpec,
     booking_reader: CustomerHistoryReader | None,
+    order_reader: Any | None = None,
     template_reader: Any | None = None,
     policy: FailurePolicy = CURRENT_FAILURE_POLICY,
     now: datetime | None = None,
     read_bookings: Callable[..., Any] = _read_customer_bookings,
+    prove_artifact: Callable[..., Any] = _prove_source_artifact,
+    historical_event_limit: int = HISTORICAL_SCAN_LIMIT,
 ) -> PreviewOutcome:
     """Compute one new immutable preview version, or say why there is none.
 
@@ -878,6 +1273,26 @@ async def create_preview(
             return PreviewOutcome(False, gate.reason)
         local_template = await local_template_row_proven(session, company_id=int(gate.company_id or 0))
         configured_key_id = _configured_binding_key_id()
+        # §46.4.4, once for the whole preview: one bounded, read-only pass over
+        # the stored events nothing has accounted for, asked only about the
+        # numbers this batch's recipients are known by. It writes nothing and
+        # runs no reconciliation.
+        historical = await scan_historical_refusals(
+            session,
+            addresses=await _candidate_addresses(session, batch_id=int(spec.batch_id)),
+            limit=int(historical_event_limit),
+            now=moment,
+        )
+        # The booking CREATION capture (§46.5), also local and also once for
+        # the whole batch. Separate from the live read on purpose: creation
+        # times come from stored deliveries, appointment times from the live
+        # history, and collapsing the two is the defect this closes.
+        creations = await load_creation_evidence(
+            session,
+            items=await _batch_items(session, batch_id=int(spec.batch_id)),
+            now=moment,
+            unproven_reason=BOOKING_CAPTURE_UNPROVEN,
+        )
         decided = await _local_phase(
             session,
             gate=gate,
@@ -885,6 +1300,8 @@ async def create_preview(
             policy=policy,
             now=moment,
             configured_key_id=configured_key_id,
+            historical=historical,
+            creations=creations,
         )
 
     # An unproven message contract blocks the whole preview. §46.4 forbids
@@ -902,17 +1319,20 @@ async def create_preview(
         return PreviewOutcome(False, TEMPLATE_UNPROVEN, template=template)
 
     # Phase 2: the only network step, with no session open.
-    reads, retryable = await _booking_phase(
+    reads, retryable = await _external_phase(
         decided,
         reader=booking_reader,
+        order_reader=order_reader if order_reader is not None else booking_reader,
+        session_maker=session_maker,
         now=moment,
         read_bookings=read_bookings,
+        prove_artifact=prove_artifact,
     )
 
     # Phase 3: one write transaction.
     async with session_maker() as session:
         async with session.begin():
-            refusal = await _recheck_and_dedupe(session, gate=gate, decided=decided)
+            refusal = await _recheck_and_dedupe(session, gate=gate, decided=decided, selected_groups=spec.groups)
             if refusal is not None:
                 return PreviewOutcome(False, refusal, template=template)
 
@@ -939,7 +1359,6 @@ async def create_preview(
             snapshot = EasyWeekVoucherFollowupPreview(
                 batch_id=int(spec.batch_id),
                 campaign_run_id=int(gate.campaign_run_id or 0),
-                provider=PROVIDER_EASYWEEK,
                 company_id=int(gate.company_id or 0),
                 location_uuid=gate.location_uuid,
                 source_request_schema_version=gate.schema_version,
@@ -965,6 +1384,8 @@ async def create_preview(
                 composition_digest=digest,
                 operator_principal=str(spec.operator_principal or "")[:128],
                 evidence={
+                    "historical_consent": historical.as_safe_dict(),
+                    "booking_creation_capture": creations.as_safe_dict(),
                     "booking_reads": int(reads),
                     "retryable_uncertainty": bool(retryable),
                     "source_status": gate.status,
@@ -1027,6 +1448,7 @@ _SAFE_NOTE_KEYS = frozenset(
         "booking_pages_read",
         "booking_proof",
         "booking_reason",
+        "artifact",
         "consent_gaps",
         "consent_sources",
         "failure_policy",
@@ -1120,6 +1542,7 @@ async def latest_preview(
         unknown_count=int(row.unknown_count),
         composition_digest=str(row.composition_digest),
         operator_principal=str(row.operator_principal or ""),
+        source_frozen_digest=str(row.source_frozen_digest or ""),
         evidence=dict(row.evidence or {}),
         rows=tuple(
             PreviewRowView(

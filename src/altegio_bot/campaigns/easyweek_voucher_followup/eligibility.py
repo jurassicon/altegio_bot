@@ -51,9 +51,12 @@ from altegio_bot.campaigns.easyweek_customer_history import (
     CustomerBookingSet,
     LiveProofDisposition,
 )
+from altegio_bot.campaigns.easyweek_voucher_followup.booking_evidence import SlotCreations
 from altegio_bot.campaigns.easyweek_voucher_followup.failure_policy import FailurePolicy
 from altegio_bot.campaigns.easyweek_voucher_followup.groups import GroupVerdict, SourceEvidence, resolve_group
 from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
+    BOOKING_CAPTURE_UNPROVEN,
+    BOOKING_CREATION_UNPROVEN,
     CONSENT_PENDING_INBOUND,
     CONSENT_REFUSED,
     CONSENT_UNKNOWN,
@@ -71,6 +74,8 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
 from altegio_bot.models.models import (
     INBOUND_AUTHENTICITY_SIGNED,
     PROVIDER_EASYWEEK,
+    RECIPIENT_BASIS_EARNED,
+    RECIPIENT_BASIS_MANUAL,
     VOUCHER_PRODUCTION_ITEM_AMBIGUOUS,
     VOUCHER_PRODUCTION_ITEM_MANUALLY_CLEANED,
     VOUCHER_PRODUCTION_ITEM_REFUND_CLAIMED,
@@ -90,6 +95,7 @@ from altegio_bot.whatsapp_consent import (
 
 __all__ = [
     "ENTITLEMENT_INVALID_STATUSES",
+    "SUPPORTED_ITEM_BASES",
     "BookingVerdict",
     "ConsentSnapshot",
     "EntitlementVerdict",
@@ -120,6 +126,27 @@ ENTITLEMENT_INVALID_STATUSES = frozenset(
         VOUCHER_PRODUCTION_ITEM_AMBIGUOUS,
     }
 )
+
+
+# Which per-slot bases this phase supports. §46.2 keeps the first version to
+# the fixed €10 production batches with proven own bindings; those batches can
+# be composed from earned visits, from an operator's manual selection, or from
+# both, and nothing in §46 narrows the audience to one of them. A canary, a
+# snapshot ledger, an owner test and an Altegio campaign stay out — they are
+# other kinds of mailing, refused at the batch gate by name.
+SUPPORTED_ITEM_BASES = frozenset({RECIPIENT_BASIS_EARNED, RECIPIENT_BASIS_MANUAL})
+
+
+def _as_uuid(value: object) -> uuid_module.UUID | None:
+    """One canonical uuid, or ``None``. Never a guess from a partial value."""
+    if isinstance(value, uuid_module.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid_module.UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -188,6 +215,7 @@ async def resolve_identity(
     campaign_recipient_id: int,
     company_id: int,
     campaign_run_id: int,
+    recipient_basis: str,
     expected_customer_uuid: uuid_module.UUID,
     expected_source_booking_uuid: object = None,
     attempt_recipient_digest: str | None,
@@ -195,24 +223,32 @@ async def resolve_identity(
     """Re-prove the addressee from the ledger's own links, UUID first.
 
     The UUID is the identity and the phone number is an attribute of it — that
-    asymmetry is the whole check. An earned campaign row does not carry a
-    customer uuid of its own (the shared CHECK reserves that column for the
-    manual basis), so the person is resolved the way §46.4.2 resolves them
-    everywhere else: through the EasyWeek card of the uuid the slot recorded.
+    asymmetry is the whole check, and it holds for both bases a production batch
+    can carry.
 
-    Five ways this says no, and each one is a case §46.1 names:
+    What differs between them is only which link the campaign row offers, and
+    the shared schema decides that rather than this module: an EARNED row carries
+    the booking its voucher was earned on and no customer uuid of its own, while
+    a MANUAL row carries the uuid an operator proved and no booking. So each
+    basis is checked against the link it actually has, and a row whose basis this
+    phase does not support is refused rather than guessed at.
+
+    Six ways this says no, and each one is a case §46.1 and §46.5 name:
 
     * the campaign row behind the slot is gone, or belongs to another workspace,
       company or run. Nothing here reaches across workspaces;
-    * it no longer names the booking the slot was composed from. The proof the
-      voucher was earned on has moved, so this row is about something else now;
-    * the recorded uuid resolves to no card, or to more than one. An ambiguous
-      identity is unknown, never "probably the first one";
-    * that card's number is not the number on the campaign row. Somebody's
-      phone has changed hands or been reassigned, and §46.1 is explicit that a
+    * its basis is not the one the slot was composed under, or is not a basis
+      this phase supports;
+    * an EARNED row no longer names the booking the slot was composed from, or a
+      MANUAL row no longer names the proven customer. The proof the slot rests on
+      has moved, so this row is about something else now;
+    * the recorded uuid resolves to no EasyWeek card, or to more than one. An
+      ambiguous identity is unknown, never "probably the first one";
+    * that card's number is not the number on the campaign row. Somebody's phone
+      has changed hands or been reassigned, and §46.1 is explicit that a
       follow-up may not be handed to whoever owns a matching number now;
-    * the number no longer digests to the route the original attempt froze.
-      Same substitution seen from the other side, and the reason the digest is
+    * the number no longer digests to the route the original attempt froze. The
+      same substitution seen from the other side, and the reason the digest is
       compared rather than the number: the attempt deliberately stored no phone,
       so this re-proves the route without either side holding one.
     """
@@ -225,11 +261,20 @@ async def resolve_identity(
         or int(recipient.campaign_run_id or 0) != int(campaign_run_id)
     ):
         return RecipientIdentity(False, IDENTITY_CONFLICT)
-
-    expected_booking = str(expected_source_booking_uuid) if expected_source_booking_uuid else None
-    observed_booking = str(recipient.source_booking_uuid) if recipient.source_booking_uuid else None
-    if expected_booking is not None and observed_booking != expected_booking:
+    if recipient_basis not in SUPPORTED_ITEM_BASES or str(recipient.recipient_basis or "") != recipient_basis:
         return RecipientIdentity(False, IDENTITY_CONFLICT)
+
+    if recipient_basis == RECIPIENT_BASIS_EARNED:
+        expected_booking = str(expected_source_booking_uuid) if expected_source_booking_uuid else None
+        observed_booking = str(recipient.source_booking_uuid) if recipient.source_booking_uuid else None
+        if expected_booking is None or observed_booking != expected_booking:
+            return RecipientIdentity(False, IDENTITY_CONFLICT)
+    else:
+        # The manual basis. Its campaign row names the customer uuid an
+        # operator proved, and the slot must still agree with it; a phone that
+        # merely matches proves nothing positive here (§46.4.2).
+        if _as_uuid(recipient.easyweek_customer_uuid) != expected_customer_uuid:
+            return RecipientIdentity(False, IDENTITY_CONFLICT)
 
     address = normalize_wa_address(recipient.phone_e164)
     if address is None:
@@ -511,11 +556,14 @@ async def has_replied_since(
 
 @dataclass(frozen=True)
 class BookingVerdict:
-    """What the live, fully paginated booking read says about this person."""
+    """What the two booking reads together say about this person."""
 
     proven: bool
     reason: str | None = None
     unknown: bool = False
+    # The underlying proof's own reason, when there is one worth keeping. Never
+    # the row's reason code: that stays in this phase's safe vocabulary.
+    detail: str | None = None
     booking_count: int = 0
     pages_read: int = 0
 
@@ -523,61 +571,92 @@ class BookingVerdict:
 def booking_verdict(
     bookings: CustomerBookingSet,
     *,
+    creations: SlotCreations,
     attempted_at: datetime,
     now: datetime,
 ) -> BookingVerdict:
-    """Apply §46.5's booking rules to a complete booking set.
+    """Apply §46.5's two booking rules to a complete booking set.
 
-    Separated from the read on purpose — the read is shared with PR-15, the
-    policy is not — and separated from the network, so every case below is
-    testable without a transport.
+    Separated from both reads on purpose — the live read is shared with PR-15
+    and the creation capture with the §PR-17 report — so every case below is
+    testable without a transport and without a webhook.
 
-    The rules, and what each one is protecting:
+    The rules, and which DATE each one rests on:
 
-    * an incomplete or untrusted set is UNKNOWN. A timeout, a page that did not
-      come back, pagination that does not add up, a card whose uuid resolves to
-      somebody else: none of them is "this person has no bookings". Turning an
-      API failure into an empty list is the single most dangerous mistake
-      available here, and it is the reason ``complete`` exists;
-    * an active booking in the future excludes. They already have an
-      appointment; a voucher reminder is at best noise;
-    * any booking at all after the original attempt excludes, cancelled
-      included. §46.5 asks for exactly that, and the cancelled case matters most
-      — somebody who booked and changed their mind has engaged with us since,
-      and a reminder would be the wrong message;
-    * a visit BEFORE the attempt excludes nothing by itself. That is the visit
-      that earned the voucher, and §46.5 is explicit that it must not read as a
-      reason to stay silent.
+    * an incomplete or untrusted LIVE set is UNKNOWN. A timeout, a page that did
+      not come back, pagination that does not add up, a card whose uuid resolves
+      to somebody else: none of them is "this person has no bookings". Turning
+      an API failure into an empty list is the most dangerous mistake available
+      here, and it is why ``complete`` exists;
+    * an active booking whose APPOINTMENT is still ahead excludes, whenever it
+      was made. They already have a slot booked;
+    * a booking this person CREATED after the original attempt excludes,
+      cancelled ones included and whatever the appointment time is. A booking
+      made the day after the mailing to record a visit that already happened is
+      exactly the engagement the rule is about;
+    * a booking whose appointment falls after the attempt but whose CREATION
+      cannot be proven is UNKNOWN. Whether it was made before or after the
+      attempt decides the answer, so neither verdict is available;
+    * everything else is proven clear. A visit that happened BEFORE the attempt
+      excludes nothing by itself — that is the visit which earned the voucher,
+      and §46.5 is explicit that it must not read as a reason to stay silent.
 
-    Branch scope comes from the read, which is keyed on the customer uuid and is
-    therefore workspace-wide: a booking at any configured branch of the same
-    workspace is visible here, which is what §46.5 asks of the booking question
-    even though the send audience stays with the original batch's branch.
-
-    The one approximation, stated plainly: EasyWeek's booking rows carry no
-    creation time, so "booked after the attempt" is read off the APPOINTMENT
-    time. A booking created before the attempt for a date after it is therefore
-    treated as new. That can only ever exclude somebody a stricter reading would
-    have kept, never the other way round.
+    Branch scope comes from the two reads: the live one is keyed on the customer
+    uuid and is therefore workspace-wide, and the capture covers every
+    configured branch of the same workspace.
     """
     if not bookings.complete:
+        # This phase's OWN code, with the reader's reason kept beside it. A
+        # stored snapshot and an operator's screen speak the follow-up's safe
+        # vocabulary; the live proof's internal codes belong to another phase
+        # and would arrive on the page with nothing to say them in words.
         return BookingVerdict(
             False,
-            bookings.reason or HISTORY_UNPROVEN,
+            HISTORY_UNPROVEN,
             unknown=True,
+            detail=bookings.reason,
             pages_read=bookings.pages_read,
         )
     anchor = _aware(attempted_at)
     moment = _aware(now)
     assert anchor is not None and moment is not None
+
+    # The appointment-time rule first: it needs no creation evidence at all, so
+    # a person who plainly has a slot booked ahead is excluded for that reason
+    # rather than reported as unknown because a webhook was never captured.
     for row in bookings.bookings:
         start = _aware(row.start_time)
         if start is None:  # pragma: no cover - the reader proves tz-aware starts
             return BookingVerdict(False, HISTORY_UNPROVEN, unknown=True, pages_read=bookings.pages_read)
         if not row.is_canceled and start > moment:
             return BookingVerdict(False, FUTURE_BOOKING_ACTIVE, pages_read=bookings.pages_read)
-        if start > anchor:
-            return BookingVerdict(False, NEW_BOOKING_AFTER_ATTEMPT, pages_read=bookings.pages_read)
+
+    # Then the creation rule, which does.
+    if not creations.proven:
+        return BookingVerdict(
+            False,
+            creations.reason or BOOKING_CAPTURE_UNPROVEN,
+            unknown=True,
+            pages_read=bookings.pages_read,
+        )
+    if creations.created_after(anchor):
+        return BookingVerdict(False, NEW_BOOKING_AFTER_ATTEMPT, pages_read=bookings.pages_read)
+
+    # A booking the live read can see, appointed after the attempt, whose own
+    # creation nothing proves. It may be the booking that earned nothing and was
+    # made yesterday, or one made months ago; the rule cannot be applied to it.
+    for row in bookings.bookings:
+        start = _aware(row.start_time)
+        if start is None or start <= anchor:
+            continue
+        if creations.creation_of(row.booking_uuid) is None:
+            return BookingVerdict(
+                False,
+                BOOKING_CREATION_UNPROVEN,
+                unknown=True,
+                pages_read=bookings.pages_read,
+            )
+
     return BookingVerdict(
         True,
         None,
@@ -618,6 +697,9 @@ class RowFacts:
     group: GroupVerdict
     entitlement_digest: str = ""
     recipient_digest: str | None = None
+    # The local half of the booking question, resolved before the external read
+    # and carried across it: which bookings this person created, and when.
+    creations: SlotCreations = field(default_factory=lambda: SlotCreations(False, BOOKING_CAPTURE_UNPROVEN))
     decision: str = FOLLOWUP_ROW_UNKNOWN
     reason: str | None = None
     notes: dict[str, Any] = field(default_factory=dict)

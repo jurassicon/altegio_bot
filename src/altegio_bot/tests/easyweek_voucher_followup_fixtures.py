@@ -15,6 +15,7 @@ testing the runner, not the audience rules.
 
 from __future__ import annotations
 
+import json
 import uuid as uuid_module
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -25,6 +26,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.dispatch import SENDER_CO
 from altegio_bot.easyweek_voucher_identity import KARLSRUHE_LOCATION_UUID
 from altegio_bot.easyweek_voucher_production_contract import production_contract
 from altegio_bot.models.models import (
+    INBOUND_AUTHENTICITY_SIGNED,
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
@@ -40,6 +42,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
+    EasyWeekVoucherProductionDeliveryReceipt,
     MessageTemplate,
     Record,
     WhatsAppSender,
@@ -67,19 +70,148 @@ ACCOUNT_UUID = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
 TEMPLATE_UUID = "0ffb0346-57b8-475e-9c22-152dd23e25ca"
 
 
-def person(index: int) -> dict[str, str]:
-    """One obviously fake person: a uuid, a number and a booking."""
+def person(index: int) -> dict[str, Any]:
+    """One obviously fake person: a uuid, a number, a booking and a numeric id.
+
+    The numeric id is the bridge EasyWeek's own booking webhooks use — they name
+    a customer by number, never by uuid — so a fixture without one cannot
+    exercise the booking CREATION capture at all.
+    """
     return {
         "customer_uuid": f"{index:08d}-1111-4111-8111-111111111111",
         "phone": f"+4915100{index:05d}",
         "booking_uuid": f"{index:08d}-2222-4222-8222-222222222222",
+        "numeric_id": 7700000 + index,
     }
+
+
+def order_uuid_for(batch_id: int, slot: int) -> str:
+    """The synthetic order uuid of one slot. Unique across batches, as in production."""
+    return f"{int(batch_id):04d}{int(slot):04d}-3333-4333-8333-333333333333"
+
+
+def voucher_code_for(index: int) -> str:
+    """One obviously fabricated code, whose whole job is to be searched for."""
+    return f"FOLLOWUP-TEST-CODE-{index:04d}"
+
+
+def stored_mac(
+    *,
+    batch_id: int,
+    slot: int,
+    schema_version: str,
+    frozen_digest: str,
+    recipient_basis: str,
+    source_proof_digest: str | None,
+    customer_uuid: str,
+    target_order_uuid: str,
+    code: str,
+) -> tuple[str, str]:
+    """``(key_id, mac)`` for one slot, bound the way a real claim binds it.
+
+    Computed through the production phase's own material and domain, so a test
+    that seeds this and a preview that verifies it cannot disagree about what
+    the binding covers.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_delivery.binding import voucher_code_mac
+    from altegio_bot.campaigns.easyweek_voucher_production.identity import binding_material
+    from altegio_bot.campaigns.easyweek_voucher_production.ledger import VOUCHER_PRODUCTION_DOMAIN
+
+    contract = production_contract(schema_version)
+    material = binding_material(
+        batch_id=int(batch_id),
+        slot=int(slot),
+        schema_version=schema_version,
+        product_contract_version=contract.version,
+        message_contract_code=contract.message_code,
+        frozen_digest=frozen_digest,
+        recipient_basis=recipient_basis,
+        manual_policy=None,
+        source_proof_digest=source_proof_digest,
+        customer_uuid=customer_uuid,
+    )
+    return voucher_code_mac(
+        voucher_code=code,
+        ledger_uuid=material,
+        target_order_uuid=target_order_uuid,
+        voucher_template_uuid=contract.template_uuid,
+        domain=VOUCHER_PRODUCTION_DOMAIN,
+    )
+
+
+def voucher_order(
+    *,
+    order_uuid: str,
+    marker: str,
+    customer_uuid: str,
+    code: str,
+    schema_version: str = SCHEMA_VERSION,
+    status: str = "paid",
+    vouchers: list[dict[str, Any]] | None = None,
+    **changes: Any,
+) -> dict[str, Any]:
+    """One EasyWeek order as a read-back describes it, in safe synthetic form.
+
+    The voucher line uses the singleton shape production actually returns —
+    ``voucher_template_uuid``, ``value``, ``price`` and no quantity — because
+    the §35 proof the artifact check reuses is written against that shape, and
+    a fixture with a different one would be testing the fixture.
+    """
+    contract = production_contract(schema_version)
+    order: dict[str, Any] = {
+        "uuid": order_uuid,
+        "comment": marker,
+        "customer": {"uuid": customer_uuid},
+        "status": status,
+        "is_paid": status in ("paid", "refunded"),
+        "is_reverted": status == "refunded",
+        "total": contract.issue_price_minor,
+        "subtotal": contract.issue_price_minor,
+        "services": [],
+        "goods": [],
+        "vouchers": (
+            [
+                {
+                    "code": code,
+                    "voucher_template_uuid": contract.template_uuid,
+                    "value": contract.face_value_minor,
+                    "price": contract.issue_price_minor,
+                }
+            ]
+            if vouchers is None
+            else vouchers
+        ),
+        "created_at": FROZEN_AT.isoformat(),
+    }
+    order.update(changes)
+    return order
 
 
 def _digest_of(phone: str) -> str:
     value = recipient_route_digest(phone)
     assert value is not None
     return value
+
+
+def location_map(*, booking_link: str = "https://example.test/ka") -> str:
+    """The configured branch registry, as the settings string the loader reads.
+
+    Needed by the booking CREATION capture (§46.5): a creation delivery is
+    accepted only for a configured branch of this workspace, so a test with no
+    registry would see every creation rejected as foreign — which is the honest
+    answer for an unconfigured deployment and the wrong starting point for a
+    test about creation times.
+    """
+    return json.dumps(
+        {
+            "karlsruhe": {
+                "location_id": COMPANY_ID,
+                "location_uuid": KARLSRUHE_LOCATION_UUID,
+                "meta_template_prefix": "ka",
+                "booking_page_url": booking_link,
+            }
+        }
+    )
 
 
 async def seed_sender_and_template(
@@ -156,7 +288,7 @@ async def seed_source_batch(
     *,
     slots: list[dict[str, Any]],
     company_id: int = COMPANY_ID,
-    recipient_basis: str = RECIPIENT_BASIS_EARNED,
+    recipient_basis: str | None = None,
     schema_version: str = SCHEMA_VERSION,
     status: str = VOUCHER_PRODUCTION_COMPLETED,
     frozen_digest: str = "f" * 64,
@@ -179,6 +311,12 @@ async def seed_source_batch(
     Returns the batch id and the campaign recipient ids in slot order.
     """
     count = len(slots)
+    # Each slot may name its own basis; the header carries the one they share,
+    # or ``mixed`` when they do not — exactly what the §42 composition read
+    # writes. A caller may still pin the header explicitly, which is how a test
+    # seeds a header that disagrees with its slots.
+    slot_bases = [str(spec.get("basis", RECIPIENT_BASIS_EARNED)) for spec in slots]
+    header_basis = recipient_basis or (slot_bases[0] if len(set(slot_bases)) == 1 else "mixed")
     async with session_maker() as session:
         async with session.begin():
             run = CampaignRun(
@@ -203,7 +341,7 @@ async def seed_source_batch(
                 baseline_version=contract.baseline_version,
                 company_id=company_id,
                 campaign_code=CAMPAIGN_CODE,
-                recipient_basis=recipient_basis,
+                recipient_basis=header_basis,
                 campaign_run_id=int(run.id),
                 campaign_period_start=PERIOD_START,
                 campaign_period_end=PERIOD_END,
@@ -227,6 +365,7 @@ async def seed_source_batch(
 
             recipient_ids: list[int] = []
             for position, spec in enumerate(slots, start=1):
+                basis = str(spec.get("basis", RECIPIENT_BASIS_EARNED))
                 who = person(spec.get("index", position))
                 phone = spec.get("phone", who["phone"])
                 card_phone = spec.get("card_phone", phone)
@@ -240,6 +379,7 @@ async def seed_source_batch(
                     provider=PROVIDER_EASYWEEK,
                     company_id=company_id,
                     easyweek_customer_uuid=customer_uuid,
+                    altegio_client_id=spec.get("numeric_id", who["numeric_id"]),
                     display_name=f"Person {position}",
                     phone_e164=card_phone,
                     raw={},
@@ -249,7 +389,10 @@ async def seed_source_batch(
                 await session.flush()
                 record = Record(
                     company_id=company_id,
-                    altegio_record_id=900000 + position,
+                    # Unique across batches: the marker, the order uuid and
+                    # this id are all table-wide unique in production, so a
+                    # test that seeds two batches must not reuse them.
+                    altegio_record_id=900000 + int(batch.id) * 100 + position,
                     client_id=int(card.id),
                     is_deleted=False,
                     raw={},
@@ -264,17 +407,17 @@ async def seed_source_batch(
                     client_id=int(card.id),
                     phone_e164=phone,
                     status="candidate",
-                    recipient_basis=recipient_basis,
+                    recipient_basis=basis,
                     total_records_in_period=1,
                     arrived_records_in_period=1,
                     is_opted_out=bool(spec.get("recipient_opted_out", False)),
                     meta={},
-                    easyweek_customer_uuid=(customer_uuid if recipient_basis == RECIPIENT_BASIS_MANUAL else None),
-                    source_easyweek_event_id=(int(event.id) if recipient_basis == RECIPIENT_BASIS_EARNED else None),
-                    source_record_id=(int(record.id) if recipient_basis == RECIPIENT_BASIS_EARNED else None),
-                    source_booking_uuid=(booking_uuid if recipient_basis == RECIPIENT_BASIS_EARNED else None),
-                    source_visits_total=(1 if recipient_basis == RECIPIENT_BASIS_EARNED else None),
-                    source_visits_total_updated_at=(FROZEN_AT if recipient_basis == RECIPIENT_BASIS_EARNED else None),
+                    easyweek_customer_uuid=(customer_uuid if basis == RECIPIENT_BASIS_MANUAL else None),
+                    source_easyweek_event_id=(int(event.id) if basis == RECIPIENT_BASIS_EARNED else None),
+                    source_record_id=(int(record.id) if basis == RECIPIENT_BASIS_EARNED else None),
+                    source_booking_uuid=(booking_uuid if basis == RECIPIENT_BASIS_EARNED else None),
+                    source_visits_total=(1 if basis == RECIPIENT_BASIS_EARNED else None),
+                    source_visits_total_updated_at=(FROZEN_AT if basis == RECIPIENT_BASIS_EARNED else None),
                 )
                 session.add(recipient)
                 await session.flush()
@@ -282,6 +425,24 @@ async def seed_source_batch(
 
                 state = spec.get("state", "delivered")
                 attempted = bool(spec.get("attempted", True))
+                marker = f"marker-{batch.id}-{position}"
+                order_uuid = order_uuid_for(int(batch.id), position)
+                code = voucher_code_for(position)
+                computed_key_id, computed_mac = stored_mac(
+                    batch_id=int(batch.id),
+                    slot=position,
+                    schema_version=schema_version,
+                    frozen_digest=frozen_digest,
+                    recipient_basis=basis,
+                    source_proof_digest=("d" * 64 if basis == RECIPIENT_BASIS_EARNED else None),
+                    customer_uuid=str(customer_uuid),
+                    target_order_uuid=order_uuid,
+                    code=code,
+                )
+                # The key id a caller pinned wins, which is how a test seeds a
+                # MAC written under a key this deployment no longer holds.
+                slot_key_id = spec.get("hmac_key_id", hmac_key_id or computed_key_id)
+                slot_mac = spec.get("voucher_code_hmac", computed_mac)
                 item_status = spec.get(
                     "status",
                     {
@@ -291,7 +452,9 @@ async def seed_source_batch(
                     }.get(state, VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED),
                 )
                 attempted_at = spec.get("attempted_at", ATTEMPTED_AT) if attempted else None
-                message_id = spec.get("provider_message_id", f"wamid.slot{position}") if attempted else None
+                message_id = (
+                    spec.get("provider_message_id", f"wamid.b{int(batch.id)}s{position}") if attempted else None
+                )
                 item = EasyWeekVoucherProductionBatchItem(
                     batch_id=int(batch.id),
                     batch_recipient_count=count,
@@ -299,11 +462,9 @@ async def seed_source_batch(
                     provider=PROVIDER_EASYWEEK,
                     company_id=company_id,
                     campaign_code=CAMPAIGN_CODE,
-                    recipient_basis=recipient_basis,
-                    source_booking_uuid=(
-                        uuid_module.UUID(booking_uuid) if recipient_basis == RECIPIENT_BASIS_EARNED else None
-                    ),
-                    source_proof_digest=("d" * 64 if recipient_basis == RECIPIENT_BASIS_EARNED else None),
+                    recipient_basis=basis,
+                    source_booking_uuid=(uuid_module.UUID(booking_uuid) if basis == RECIPIENT_BASIS_EARNED else None),
+                    source_proof_digest=("d" * 64 if basis == RECIPIENT_BASIS_EARNED else None),
                     campaign_run_id=int(run.id),
                     campaign_recipient_id=int(recipient.id),
                     easyweek_customer_uuid=customer_uuid,
@@ -311,12 +472,14 @@ async def seed_source_batch(
                     campaign_period_end=PERIOD_END,
                     voucher_value_minor=contract.face_value_minor,
                     voucher_quantity=1,
-                    reconciliation_marker=f"marker-{batch.id}-{position}",
-                    target_order_uuid=uuid_module.UUID(f"{position:08d}-3333-4333-8333-333333333333"),
-                    outbound_intent_uuid=uuid_module.UUID(f"{position:08d}-4444-4444-8444-444444444444"),
+                    reconciliation_marker=marker,
+                    target_order_uuid=uuid_module.UUID(order_uuid),
+                    outbound_intent_uuid=uuid_module.UUID(
+                        f"{int(batch.id):04d}{position:04d}-4444-4444-8444-444444444444"
+                    ),
                     provider_message_id=message_id,
-                    voucher_code_hmac=spec.get("voucher_code_hmac", "a" * 64),
-                    hmac_key_id=spec.get("hmac_key_id", hmac_key_id),
+                    voucher_code_hmac=slot_mac,
+                    hmac_key_id=slot_key_id,
                     status=item_status,
                     # The real CREATE/PAY stage order the §45 CHECKs require: a
                     # slot cannot be sent before the voucher it carries is
@@ -349,6 +512,30 @@ async def seed_source_batch(
                 session.add(item)
                 await session.flush()
 
+                # §46.3's proof behind a positive status, as the live status
+                # path now writes it. ``receipt_proven=False`` seeds the
+                # historical case instead: a slot whose status is the mailing's
+                # record and whose proof was never recorded.
+                if attempted and state in {"delivered", "read"} and spec.get("receipt_proven", True):
+                    kinds = ["delivered"] if state == "delivered" else ["delivered", "read"]
+                    for receipt_kind in kinds:
+                        session.add(
+                            EasyWeekVoucherProductionDeliveryReceipt(
+                                fact_key=f"receipt-{batch.id}-{position}-{receipt_kind}",
+                                kind=receipt_kind,
+                                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                                item_id=int(item.id),
+                                batch_id=int(batch.id),
+                                slot=position,
+                                provider_message_id=str(message_id),
+                                observed_sender_digest=spec.get("sender_digest", SENDER_DIGEST),
+                                observed_recipient_digest=_digest_of(phone),
+                                route_proven=True,
+                                observed_at=attempted_at + timedelta(minutes=1),
+                                event_at=attempted_at + timedelta(minutes=1),
+                                evidence={},
+                            )
+                        )
                 if attempted:
                     session.add(
                         EasyWeekVoucherProductionBatchAttempt(
@@ -371,3 +558,71 @@ async def seed_source_batch(
                     )
             await session.flush()
             return int(batch.id), recipient_ids
+
+
+async def seed_booking_created(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_uuid: str,
+    numeric_customer_id: int,
+    created_at: datetime,
+    company_id: int = COMPANY_ID,
+    received_at: datetime | None = None,
+    location_uuid: str = KARLSRUHE_LOCATION_UUID,
+) -> int:
+    """One captured ``booking-created`` delivery, as the ingress stored it.
+
+    ``created_at`` is the provider's OWN statement of when the booking was
+    made, and ``received_at`` is when this deployment happened to hear about it.
+    They are deliberately separate arguments: the whole point of §46.5's
+    creation rule is that the second is not the first.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                event_hint="booking-created",
+                query={},
+                headers={},
+                payload={
+                    "uid": booking_uuid,
+                    "location_id": company_id,
+                    "location_uuid": location_uuid,
+                    "customer_id": int(numeric_customer_id),
+                    "booking_created_at": created_at.isoformat(),
+                },
+                received_at=received_at or created_at,
+                status="processed",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+async def seed_booking_cancelled(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_uuid: str,
+    numeric_customer_id: int,
+    company_id: int = COMPANY_ID,
+    received_at: datetime | None = None,
+    location_uuid: str = KARLSRUHE_LOCATION_UUID,
+) -> int:
+    """One captured ``booking-canceled`` delivery of the same booking."""
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                event_hint="booking-canceled",
+                query={},
+                headers={},
+                payload={
+                    "uid": booking_uuid,
+                    "location_id": company_id,
+                    "location_uuid": location_uuid,
+                    "customer_id": int(numeric_customer_id),
+                },
+                received_at=received_at or NOW,
+                status="processed",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)

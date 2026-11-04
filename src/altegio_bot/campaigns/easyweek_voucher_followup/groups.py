@@ -27,6 +27,20 @@ side, so that one path's bug cannot quietly promote somebody into the failure
 group. A person whose device showed the voucher is not somebody whose voucher
 failed to arrive.
 
+What a status timestamp is, and is not
+--------------------------------------
+``delivered_at`` and ``read_at`` on the slot are the MAILING's own record. They
+are applied by a transition matched on the exact message id, deliberately
+outside the §42 fence, because dropping a status about a message already sent
+would corrupt the history of a mailing that really happened.
+
+They are not proof for a NEW send. §46.3 asks a status for a verified inbound
+context with an exact sender and message id, and the transition records neither
+the signature nor the route — the ingress strips Meta's signature header out of
+the stored copy, so no later reader can recover it. PR-22.2 therefore writes
+that proof down beside the transition, and a slot with a status but no proof is
+``unproven`` here: a historical row, or a callback whose route did not match.
+
 Identity, never proximity
 -------------------------
 A group is only ever read off facts tied to this slot by exact identity: its own
@@ -50,6 +64,7 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     FOLLOWUP_GROUP_READ,
     SENDER_UNPROVEN,
     SOURCE_ATTEMPT_UNPROVEN,
+    STATUS_EVIDENCE_UNPROVEN,
 )
 
 __all__ = ["GroupVerdict", "SourceEvidence", "resolve_group"]
@@ -85,6 +100,15 @@ class SourceEvidence:
     # policy has to see all of them, because one inadmissible reason among
     # several is a veto rather than something to average away.
     confirmed_failures: tuple[FailureFact, ...] = field(default_factory=tuple)
+
+    # Whether §46.3's proof exists for each positive status: a callback whose
+    # signature the ingress verified, naming this slot's exact message id, on
+    # the route the attempt froze. The slot's own ``delivered_at`` / ``read_at``
+    # are the MAILING's record and are not that proof — they are written by a
+    # transition that records neither the signature nor the route, and the
+    # signature is unrecoverable afterwards.
+    delivered_receipt_proven: bool = False
+    read_receipt_proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,13 +164,22 @@ def resolve_group(evidence: SourceEvidence, *, expected_sender_digest: str | Non
     if expected_sender_digest is not None and evidence.attempt_sender_digest != expected_sender_digest:
         return GroupVerdict(None, SENDER_UNPROVEN)
 
-    # Read first, and unconditionally. A read receipt names this slot's own
-    # message id, and nothing that arrives afterwards can unsay it.
+    # Read first, and unconditionally — but only on §46.3's proof. A read is
+    # the strongest evidence there is and nothing arriving later can unsay it;
+    # what makes it evidence is the verified signature and the matching route,
+    # not the timestamp the transition left behind.
     if evidence.read_at is not None:
-        return GroupVerdict(FOLLOWUP_GROUP_READ)
+        if evidence.read_receipt_proven:
+            return GroupVerdict(FOLLOWUP_GROUP_READ)
+        # The mailing's record says read and this phase cannot prove it. Never
+        # demoted to "delivered, not read": that would state something weaker
+        # than what the record says and stronger than what is proven.
+        return GroupVerdict(None, STATUS_EVIDENCE_UNPROVEN)
 
     if evidence.delivered_at is not None:
-        return GroupVerdict(FOLLOWUP_GROUP_DELIVERED)
+        if evidence.delivered_receipt_proven:
+            return GroupVerdict(FOLLOWUP_GROUP_DELIVERED)
+        return GroupVerdict(None, STATUS_EVIDENCE_UNPROVEN)
 
     if evidence.confirmed_failures:
         # The group, not yet the eligibility: whether the FAILURE REASON admits
