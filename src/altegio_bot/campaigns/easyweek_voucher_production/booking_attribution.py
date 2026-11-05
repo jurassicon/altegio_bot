@@ -77,7 +77,7 @@ from __future__ import annotations
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Final
+from typing import Any, Collection, Final
 
 from sqlalchemy import func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -357,6 +357,19 @@ class _BookingDraft:
     completed_signals: set[str] = field(default_factory=set)
     # Every customer id any delivery of this booking named, creation included.
     customer_ids: set[int] = field(default_factory=set)
+    # And the same evidence as PAIRS. ``customer_ids`` stays, because the
+    # report's own questions are asked per branch already; these answer "did
+    # the deliveries about this booking name one customer record or two",
+    # which bare numbers cannot.
+    customer_pairs: set[tuple[int, int]] = field(default_factory=set)
+    creation_pairs: set[tuple[int, int]] = field(default_factory=set)
+    # Was anything beyond the branch and the booking identity ever proven about
+    # this booking? A creation delivery that named no customer proves that this
+    # booking exists in this branch and nothing else — no owner to credit, no
+    # instant to believe, and nothing for anybody to dispute. Such a delivery
+    # must date the booking it names without becoming evidence of its own, so a
+    # draft that has only ever seen those leaves the scan entirely.
+    proved_more_than_identity: bool = False
 
     def resolved_state(self) -> tuple[str, str | None]:
         """The current state, or ``unknown`` with the reason there is none.
@@ -417,6 +430,12 @@ class DisputedBooking:
     # Every creation instant any creation delivery of it stated. Empty when no
     # creation was observed at all, and empty for an undated one.
     created_at: tuple[datetime, ...] = ()
+    # The (branch, customer id) pairs the deliveries really named: the creation
+    # ones, and every one. A caller that has to decide whose dispute this is
+    # must read these rather than combine the branches and the numbers below,
+    # because a product of the two invents customer records nothing observed.
+    creation_pairs: frozenset[tuple[int, int]] = frozenset()
+    customer_pairs: frozenset[tuple[int, int]] = frozenset()
     # Every branch a creation delivery of it named. One entry is what makes the
     # numeric ids above readable at all, because such an id means one person in
     # one branch and somebody else in the next; two entries are a contradiction
@@ -679,11 +698,16 @@ async def resolve_identities(
 
     # The reverse direction. A number that another card binds to a different
     # UUID is not this person's number, whatever the first direction suggested.
-    numeric_bindings: dict[int, set[uuid_module.UUID]] = {}
+    #
+    # Read per (branch, number), because that is what a numeric customer id
+    # identifies: the same digits are one person in Karlsruhe and somebody else
+    # in Ettlingen. How the claims are then COMBINED depends on the question
+    # being asked, and the two callers ask different ones — see below.
+    numeric_bindings: dict[tuple[int, int], set[uuid_module.UUID]] = {}
     if candidate_numbers:
-        for numeric, bound_uuid in (
+        for company_id, numeric, bound_uuid in (
             await session.execute(
-                select(Client.altegio_client_id, Client.easyweek_customer_uuid).where(
+                select(Client.company_id, Client.altegio_client_id, Client.easyweek_customer_uuid).where(
                     Client.provider == PROVIDER_EASYWEEK,
                     Client.company_id.in_(branch_scope) if branch_scope is not None else true(),
                     Client.altegio_client_id.in_(candidate_numbers),
@@ -691,7 +715,33 @@ async def resolve_identities(
                 )
             )
         ).all():
-            numeric_bindings.setdefault(int(numeric), set()).add(bound_uuid)
+            numeric_bindings.setdefault((int(company_id), int(numeric)), set()).add(bound_uuid)
+
+    def _claims_on(number: int, *, branches: Collection[int]) -> set[uuid_module.UUID]:
+        """Who else binds *number*, in the branches the question is about.
+
+        A branch-scoped caller — §46.5's follow-up, which judges deliveries
+        from configured branches — asks only about the branches this person's
+        own card proves the number in. Another branch's card carrying the same
+        digits is a different customer record and contradicts nothing: it used
+        to read as «two people claim this number» and refuse the whole booking
+        question with a completely empty history.
+
+        The §PR-17 report passes no scope and keeps the workspace-wide reading
+        it was written with, where any card binding those digits to somebody
+        else is a reason to credit nobody.
+        """
+        if branch_scope is None:
+            return {
+                owner
+                for (_company_id, numeric), owners in numeric_bindings.items()
+                if numeric == int(number)
+                for owner in owners
+            }
+        claims: set[uuid_module.UUID] = set()
+        for company_id in branches:
+            claims |= numeric_bindings.get((int(company_id), int(number)), set())
+        return claims
 
     resolved: dict[int, RecipientIdentity] = {}
     for item in items:
@@ -728,7 +778,7 @@ async def resolve_identities(
             continue
 
         chosen = next(iter(numbers))
-        bound = numeric_bindings.get(chosen, set())
+        bound = _claims_on(chosen, branches=number_branches.get(chosen, set()))
         if proven_uuid is not None and any(value != proven_uuid for value in bound):
             resolved[slot] = RecipientIdentity(IDENTITY_CONFLICT, card_company_ids=tuple(sorted(branches)))
             continue
@@ -797,7 +847,17 @@ def _validate_delivery(
 
     if event_hint == CREATED_HINT:
         if facts["customer_id"] is None:
-            return None, REJECT_CUSTOMER_ID
+            # The branch and the booking identity are proven and the OWNER is
+            # not. Returning nothing at all threw those two away with the
+            # missing one, so the scan never learned that this booking existed
+            # when the delivery was stored — and a later creation of the same
+            # booking claiming a much newer instant then looked like a new
+            # booking rather than a contradiction.
+            #
+            # So the proven half comes back WITH the rejection, which is still
+            # counted. It names nobody, so it credits nobody and is no
+            # conversion; it dates nothing, so no instant is read from it.
+            return facts, REJECT_CUSTOMER_ID
         try:
             created_at = parse_iso_utc(payload.get("booking_created_at"), required=True)
         except NormalizationError:
@@ -909,17 +969,26 @@ async def scan_capture(
         # lower bound on its existence and never a creation date.
         if received_at is not None and (draft.first_observed_at is None or received_at < draft.first_observed_at):
             draft.first_observed_at = received_at
+        if event_hint == CREATED_HINT and facts["customer_id"] is None:
+            # A creation delivery that named no customer. It has dated the
+            # booking's existence above and that is all it can do: it names no
+            # owner, so it is not evidence about any person, and treating it as
+            # a creation with a gap would hold a whole batch open on a row
+            # whose owner nobody ever claimed.
+            continue
+        draft.proved_more_than_identity = True
         # Every delivery of this booking contributes whatever customer it named,
         # whether it arrived before or after the creation. The earlier version
         # compared against the creation's customer at read time and therefore
         # lost the evidence entirely whenever the lifecycle delivery came first.
         if facts["customer_id"] is not None:
             draft.customer_ids.add(int(facts["customer_id"]))
+            draft.customer_pairs.add((int(facts["company_id"]), int(facts["customer_id"])))
 
         if event_hint == CREATED_HINT:
             created_at = facts.get("booking_created_at")
-            if facts["customer_id"] is not None:
-                draft.creation_customer_ids.add(int(facts["customer_id"]))
+            draft.creation_customer_ids.add(int(facts["customer_id"]))
+            draft.creation_pairs.add((int(facts["company_id"]), int(facts["customer_id"])))
             if created_at is not None:
                 draft.creation_times.add(created_at)
             # WHO created a booking is a fact its creation delivery states even
@@ -996,6 +1065,15 @@ async def scan_capture(
     bookings: list[ObservedBooking] = []
     disputed: list[DisputedBooking] = []
     for draft in drafts.values():
+        if not draft.proved_more_than_identity:
+            # Every delivery about this booking proved its branch and its
+            # identity and nothing more. There is no owner in doubt and no
+            # instant to disbelieve, so this is neither a booking the report
+            # can speak about nor a dispute a caller could refuse on. It
+            # leaves the scan exactly as it did before its early sighting was
+            # kept — and it has dated the booking for a caller holding the
+            # same uuid, which is the whole point of keeping it.
+            continue
         # A booking with no proven creation is not a booking this report can
         # speak about, however many lifecycle deliveries it has. It is RECORDED
         # as disputed rather than forgotten, so a caller asking about a person
@@ -1020,6 +1098,8 @@ async def scan_capture(
                     creation_customer_ids=frozenset(draft.creation_customer_ids),
                     created_at=tuple(sorted(draft.creation_times)),
                     creation_company_ids=frozenset(draft.creation_company_ids),
+                    creation_pairs=frozenset(draft.creation_pairs),
+                    customer_pairs=frozenset(draft.customer_pairs),
                     first_observed_at=draft.first_observed_at,
                 )
             )
@@ -1034,9 +1114,14 @@ async def scan_capture(
                 booking_created_at=draft.booking_created_at,
                 state=state,
                 state_reason=state_reason,
-                # Any delivery of this booking naming a customer other than
-                # the one its creation named.
-                customer_reassigned=bool(draft.customer_ids - {draft.customer_id}),
+                # Any delivery of this booking naming a customer RECORD other
+                # than the one its creation named — the pair, because the same
+                # digits in another branch are somebody else. Comparing
+                # bare numbers reported no reassignment at all for a booking
+                # that had moved between two branches, and a caller whose only
+                # view of a person is their current list then had nothing
+                # saying a booking might have left it.
+                customer_reassigned=bool(draft.customer_pairs - {(int(draft.company_id or 0), int(draft.customer_id))}),
                 first_observed_at=draft.first_observed_at,
             )
         )

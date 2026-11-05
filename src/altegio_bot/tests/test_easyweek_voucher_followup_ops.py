@@ -703,3 +703,46 @@ async def test_a_direct_api_call_does_not_bypass_the_historical_backlog(
     assert response.json()["included"] == 0
     page = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
     assert "отписк" in page.lower()
+
+
+async def test_a_wide_capture_still_answers_over_the_real_endpoint(
+    session_maker, ops_client, no_network, seams, binding_key, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 7, finding 7: the answer must not depend on history's size.
+
+    The reverse owner lookup asks about every (branch, number) pair the capture
+    named. One branch with a long history names enough of them to cross the
+    wire protocol's limit on bound parameters in a single statement, and the
+    operator was told the database was unavailable.
+
+    The same request is made twice over the real HTTP path — once with the
+    statement budget as deployed, once with a budget so small that the lookup
+    has to be split into many statements — and the two answers must be the
+    same one. A split that lost a batch, or an error swallowed into an empty
+    selection, would show up here as a different count.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import booking_evidence
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import ATTEMPTED_AT, seed_booking_created
+
+    batch_id = await _batch(session_maker)
+    who = person(1)
+    for offset in range(12):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=f"{200 + offset:08d}-7777-4777-8777-777777777777",
+            numeric_customer_id=who["numeric_id"] + offset,
+            created_at=ATTEMPTED_AT + timedelta(days=2),
+        )
+
+    whole = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    assert whole.status_code == 200, whole.text
+
+    monkeypatch.setattr(booking_evidence, "MAX_STATEMENT_PARAMETERS", 4, raising=False)
+    chunked = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    assert chunked.status_code == 200, chunked.text
+
+    def counts(response: Any) -> tuple[int, int, int]:
+        body = response.json()
+        return body["included"], body["excluded"], body["unknown"]
+
+    assert counts(chunked) == counts(whole)

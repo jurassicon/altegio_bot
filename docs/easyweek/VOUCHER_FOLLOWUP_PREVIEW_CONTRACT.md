@@ -386,6 +386,18 @@ later delivery handing the booking on. When the creator really cannot be
 established and the booking could be theirs, the row stays `unknown`, and an
 active booking ahead still excludes on its own.
 
+Two creation deliveries naming two branches are a contradiction about the
+booking and not automatically one about its owner. The owner is resolved from
+the pairs the deliveries really named — never from a product of the branches
+and the numbers, which would ask cards about customer records nothing observed
+— and when every one of those pairs reads back to the same person, or to
+different strangers, the booking is somebody else's and an unrelated
+recipient's complete empty history stays provable. Anything less is unknown,
+deliberately: a pair that bridges to nobody leaves it open, and a pair that
+reads back to the recipient themselves is precisely the case where the dispute
+may be about their own booking. And the same booking INSIDE their list is their
+problem whoever made it.
+
 Without the numeric bridge the live set is the whole account of this person's
 bookings, and the one thing it cannot show is a booking that LEFT it. So a
 reassignment observed after this slot's own send anchor, of a booking that is not
@@ -396,6 +408,25 @@ somebody else's, the reassignment is an event in that person's history and the
 recipient being judged stays provable. An absent or ambiguous link proves
 nothing and the slot stays `unknown`. A window with no reassignments hides
 nothing, and the recipient is provable.
+
+What a delivery really named: the pair
+--------------------------------------
+Every statement the capture makes about a customer is a `(branch, number)`
+pair, because that pair is the smallest thing that names a customer RECORD. The
+capture used to keep the bare numbers, so a booking created in one configured
+branch under a number and then named by a lifecycle delivery of another branch
+under the same digits looked like one customer twice — no reassignment at all,
+for a booking that had in fact moved between two different records. For a
+recipient whose only account of themselves is their current list, that was the
+one thing the list cannot show, reported as nothing to see.
+
+So the pairs are what the follow-up reads, in both directions: a booking has
+moved when any delivery of it names a pair other than the one its creation
+named, and a dispute's owner is resolved from the pairs its creation deliveries
+really named. A branch of its own proves no change of person — two pairs bound
+by cards of this workspace to ONE proven uuid are one person with a record in
+each branch, and a booking moving between them is that person's business — and
+matching digits prove no sameness either.
 
 Whose numeric id it is — the branch is half of the answer
 ---------------------------------------------------------
@@ -432,6 +463,29 @@ interchangeable:
   proven, a creation from a branch their card does not cover is simply
   unresolved; being permissive there is what credited them with a stranger's
   booking.
+
+A numeric bridge is therefore not a complete view of a person, and the
+question "could a booking have left this list unseen?" is asked of every slot
+rather than only of the bridge-less ones. A bridge proven in one branch reads
+that person's bookings there and nothing at all in the others: a booking
+created in another configured branch and handed on inside the window used to
+pass unnoticed — with the same digits, which are a different customer record
+there, and with different ones, which say nothing about who that person is
+there. It is out of the way on the same single condition as before: a creator
+proven to be somebody else, in the branch that delivered the creation. Their
+own booking, proven under the number their own card covers in the branch that
+card is in, still excludes them.
+
+The identity check reads the other direction per branch for the same reason. A
+different customer's card in another configured branch carrying this
+recipient's digits against a different proven uuid is not a competing claim
+about anybody: it used to read as «two people claim this number» and refuse the
+whole booking question as an identity conflict, with a completely empty
+history. The refusals that are real are untouched — the frozen card now naming
+a different person, and two different numbers claiming one proven uuid, which
+is what the schema permits and the genuine ambiguity about which number the
+capture's deliveries are about. The §PR-17 report passes no branch scope and
+keeps the workspace-wide reading its own question needs.
 
 A card in a branch that is **not** configured takes no part in any of this. It
 is another workspace's row, or one from the Altegio era, and it may neither
@@ -485,18 +539,37 @@ about the owner, a bridge-less card follows the same older rule in both cases.
 
 A chronology of its own
 -----------------------
-The sighting is also read back against the creation. A booking some valid
-delivery named BEFORE the attempt, whose single creation states an instant
-AFTER it, is making two claims that cannot both be true — and the half this
-phase acted on was the harsher one: the person was excluded for a new booking
-the capture's own earlier row says was already there. Such a booking is not a
-proven creation and the row is `followup_booking_capture_unproven`.
+The sighting is also read back against the creation. A booking whose creation
+claims an instant LATER than the first delivery this deployment stored about it
+is making two claims that cannot both be true — and the half this phase acted
+on was the harsher one: the person was excluded for a new booking the capture's
+own earlier row says was already there. Such a booking is not a proven creation
+and the row is `followup_booking_capture_unproven`.
 
-Anchored on the attempt rather than on the two instants themselves, because an
-ordinary late delivery is allowed: this provider may deliver a creation after
-the cancellation it precedes, carrying a truthful earlier date, and that order
-is normal and has its own regression. A second booking whose own facts agree,
-provably created after the attempt, still excludes on its own.
+The attempt's own date does not decide this. An earlier revision compared the
+two instants against the send anchor, so a cancellation stored the day AFTER
+the mailing bounded nothing and the same contradiction excluded somebody; the
+comparison is now between the two instants the capture holds about that
+booking, and the attempt is where the exclusion question is asked, not where
+this one is. The same rule at the other end catches a creation dated after the
+moment the preview is computed at, which nothing can have been created after.
+
+Nothing is invented by it: an ordinary late delivery is still allowed — this
+provider may deliver a creation after the cancellation it precedes, carrying a
+truthful earlier instant, which contradicts nothing and has its own regression
+— a creation delivered at the instant it states is the ordinary prompt webhook
+and still excludes, `received_at` is never substituted for a creation date, and
+a second booking whose own facts agree, provably created after the attempt,
+still excludes on its own.
+
+The first sighting is taken from every delivery whose branch and booking
+identity are proven, including a `booking-created` that named no customer. Such
+a delivery states that this booking exists and nothing about whose it is: it
+credits nobody, is no conversion, and is not a dispute of its own — a partial
+row may not hold a whole batch open — and it used to be dropped whole, so a
+later complete creation claiming an instant days afterwards looked like a new
+booking. A delivery from an unconfigured branch, one whose booking identity is
+unreadable, and one whose payload proves nothing at all date nothing.
 
 A repeat of a creation is not a disagreement
 --------------------------------------------
@@ -515,6 +588,26 @@ Three shapes are distinguished for one booking uuid:
   whichever creation happened to carry a date — in either delivery order, and
   with an empty current history reading as "nothing has happened since the
   mailing". Both orders are covered by regression tests.
+
+One pass, in statements that fit
+--------------------------------
+The reverse owner lookup asks about every `(branch, number)` pair the capture
+named, and one branch with a long history names tens of thousands of them. A
+single statement carrying one bound parameter per number crosses the PostgreSQL
+wire protocol's own 16-bit limit at 32 766 ids, and the driver's refusal
+reached the operator as «the database is unavailable» — an infrastructure
+answer to an ordinary amount of history. The numbers are now asked for in
+order, in slices that fit, and the answer is the one the single statement gave
+while it fitted: every number is asked about, including the last slice, and no
+error is turned into an empty selection. No protective bound is lowered —
+`MAX_SCANNED_EVENTS` and the truncation report are unchanged — and nothing is
+read that was not read before.
+
+A scan that already truncated asks this lookup nothing at all. It has no answer
+about anybody by definition, so the owner question has nothing left to inform;
+with a capture large enough to truncate it was also the query that failed
+first, which turned the planned incomplete result — every slot
+`followup_booking_capture_unproven` — into that same 503.
 
 ### Proven `delivered` / `read`
 
@@ -1024,6 +1117,52 @@ The sixth round's four findings, all failing before the fix:
    booking the capture's own earlier row says was already there. Controls: a
    late creation delivery carrying a truthful earlier date is ordinary, and a
    second booking whose own facts agree still excludes.
+
+The seventh round's seven findings, each failing before its fix:
+
+1. a recipient whose numeric id is proven only in branch A, and a booking that
+   appeared in configured branch B after the attempt, was handed on, and is not
+   in their current history: `included`, because having a bridge switched the
+   slot to rules that assume the bridge sees everything. Checked dated and
+   undated, with the same digits in A and B and with different ones. Controls:
+   a proven foreign creator in B settles it, and their own proven new booking
+   still excludes them;
+2. one booking created in A under a number and cancelled in B under the SAME
+   number, gone from a manual recipient's list with no creator established
+   anywhere: `included`, because the capture compared bare numbers and saw no
+   reassignment. Both delivery orders, dated and undated. Controls: the same
+   pair twice in one branch is no handover, two pairs proven to be one person
+   move nothing, and in the §PR-17 report that booking is still one booking and
+   one conversion with the disagreement shown;
+3. the attempt, a cancellation stored the day after it, and the booking's one
+   creation claiming the day after that: `excluded` as a new booking. Also with
+   an instant later than the preview itself. Controls: a late delivery with a
+   truthful old date is ordinary, a creation dated at its own first sighting
+   still excludes, and another proven new booking or a booking ahead excludes
+   for its own reason;
+4. an early `booking-created` with a proven branch and booking identity and no
+   customer, dropped whole, so a later complete creation of the same booking
+   claiming an instant after the attempt read as a new booking and `excluded`
+   somebody. Controls: an unconfigured branch, an unreadable booking identity
+   and an arbitrary payload date nothing, and such a delivery alone blocks
+   nobody and is no conversion;
+5. a different customer's card in another configured branch carrying this
+   recipient's digits against a different proven uuid: an identity conflict
+   (`followup_identity_conflict`) with a completely empty history. Controls: a frozen card now
+   naming somebody else still refuses, two numbers claiming one proven uuid
+   still refuse, and the §PR-17 report's own resolver call is unchanged;
+6. two creations of one booking naming two branches, both pairs proven by cards
+   to one stranger, outside a manual recipient's list: `unknown`, because two
+   branches meant no owner could be named at all. Checked with two different
+   strangers too. Controls: a pair bridging to nobody, a pair that reads back
+   to the recipient, and the same booking inside their own list all stay
+   `unknown`;
+7. through the real Ops POST: 32 766 ids in the owner lookup returned 503
+   `voucher_production_database_unavailable`, and a capture past
+   `MAX_SCANNED_EVENTS` failed there before the truncated pass could answer.
+   Controls: the proven card sits at the top of the range asked about, and the
+   same request over the real endpoint gives the same counts with a statement
+   budget small enough to force many slices.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

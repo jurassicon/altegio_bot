@@ -115,8 +115,27 @@ What this module refuses to do
   the historical fact, and a later reassignment does not undo somebody's visit
   to the booking page. For the new owner that booking's creation is not theirs
   and is reported unknown rather than credited to them.
+* It never reads a numeric bridge as a complete view of a person. The bridge is
+  proven in the branches that person's own card covers and says nothing in the
+  others, so a booking created in another configured branch and handed on is
+  asked about for a bridged slot exactly as it is for a bridge-less one — with
+  the same single way out, a creator proven to be somebody else in the branch
+  that delivered the creation.
+* It never reads matching digits as the same customer. Every statement about a
+  customer is a (branch, number) PAIR, because that pair is what names a
+  customer record: a booking created in one branch under a number and then
+  named by another branch's delivery under the same digits has moved between
+  two records, and comparing bare numbers reported it as a booking nothing had
+  moved. The pairs a dispute's creations really named are also what its owner
+  is resolved from, never a product of its branches and its numbers.
+* It never reads a creation instant that its own capture contradicts. A booking
+  whose creation claims a moment later than the first delivery stored about it,
+  or later than the moment the preview is being computed at, is not a proven
+  creation — and the attempt's own date decides neither comparison.
 * It invents no numeric id, bridges no identity by phone, and asks the provider
-  for nothing: the whole module is a local read.
+  for nothing: the whole module is a local read, in statements whose bound
+  parameters are bounded by the protocol's own limit rather than by the size of
+  the capture.
 """
 
 from __future__ import annotations
@@ -269,6 +288,16 @@ class CreationOwners:
         return (int(company_id), int(numeric_id)) in self.conflicting
 
 
+# How many bound parameters one statement may carry. The PostgreSQL wire
+# protocol counts them in a 16-bit field, so the driver refuses a statement
+# with more — and this lookup asks about one number per (branch, customer id)
+# the capture named, which a single branch with a long history exceeds. The
+# limit is a property of the protocol and not a safety bound of this phase:
+# nothing here reads less than it did, the work is simply split across
+# statements.
+MAX_STATEMENT_PARAMETERS: Final = 32_767
+
+
 async def _creation_owner_uuids(
     session: AsyncSession,
     *,
@@ -292,24 +321,31 @@ async def _creation_owner_uuids(
     pairs = {(int(company_id), int(numeric)) for company_id, numeric in wanted}
     if not pairs or not registry.ready:
         return CreationOwners()
-    branches = {company_id for company_id, _numeric in pairs} & set(registry.locations)
-    numbers = {numeric for _company_id, numeric in pairs}
+    branches = sorted({company_id for company_id, _numeric in pairs} & set(registry.locations))
+    numbers = sorted({numeric for _company_id, numeric in pairs})
     if not branches:
         return CreationOwners()
-    rows = (
-        await session.execute(
-            select(Client.company_id, Client.altegio_client_id, Client.easyweek_customer_uuid)
-            .where(Client.provider == PROVIDER_EASYWEEK)
-            .where(Client.company_id.in_(sorted(branches)))
-            .where(Client.altegio_client_id.in_(sorted(numbers)))
-            .where(Client.easyweek_customer_uuid.is_not(None))
-        )
-    ).all()
+    # One parameter for the provider, one per branch and one per number. The
+    # numbers are asked for in order and in slices that fit, so the answer is
+    # the same answer the single statement gave while it fitted — every number
+    # is asked about, including the last slice, and a failure is never turned
+    # into an empty selection.
+    budget = max(1, MAX_STATEMENT_PARAMETERS - 1 - len(branches))
     claims: dict[tuple[int, int], set[uuid_module.UUID]] = {}
-    for company_id, numeric, customer_uuid in rows:
-        key = (int(company_id), int(numeric))
-        if key in pairs:
-            claims.setdefault(key, set()).add(customer_uuid)
+    for start in range(0, len(numbers), budget):
+        rows = (
+            await session.execute(
+                select(Client.company_id, Client.altegio_client_id, Client.easyweek_customer_uuid)
+                .where(Client.provider == PROVIDER_EASYWEEK)
+                .where(Client.company_id.in_(branches))
+                .where(Client.altegio_client_id.in_(numbers[start : start + budget]))
+                .where(Client.easyweek_customer_uuid.is_not(None))
+            )
+        ).all()
+        for company_id, numeric, customer_uuid in rows:
+            key = (int(company_id), int(numeric))
+            if key in pairs:
+                claims.setdefault(key, set()).add(customer_uuid)
     return CreationOwners(
         in_branch={key: next(iter(owners)) for key, owners in claims.items() if len(owners) == 1},
         conflicting=frozenset(key for key, owners in claims.items() if len(owners) > 1),
@@ -420,22 +456,38 @@ def _dispute_owner(
     owner and an unproven date — so it is that person's problem and nobody
     else's, and it has no business holding a stranger's empty history open.
 
-    ``None`` whenever the capture names no single creator in a single branch:
-    no creation was observed, or two of them disagree. Then nothing about whose
-    it is has been established, which is not the same as its being anybody's.
+    Asked of the pairs the creation deliveries REALLY named — (that branch,
+    that number) — and never of a product of the branches and the numbers,
+    which invents customer records nothing observed. Two creations naming two
+    branches are a contradiction about the booking; they are not a
+    contradiction about its owner when both pairs are read back, through cards
+    of this workspace, to one and the same person.
+
+    ``None`` whenever that reading leaves anything open: no creation was
+    observed, a pair bridges to nobody, or the pairs disagree about whose it
+    is — including the case where one of them may be this very recipient.
+    Then nothing about whose it is has been established, which is not the same
+    as its being anybody's.
     """
-    if len(dispute.creation_customer_ids) != 1 or len(dispute.creation_company_ids) != 1:
+    if not dispute.creation_pairs:
         return None
-    (customer_id,) = dispute.creation_customer_ids
-    (company_id,) = dispute.creation_company_ids
-    verdict = _owner_verdict(
-        company_id=int(company_id),
-        customer_id=int(customer_id),
-        numeric_id=numeric_id,
-        numeric_branches=numeric_branches,
-        slot_uuid=slot_uuid,
-        owners=owners,
-    )
+    verdicts = {
+        _owner_verdict(
+            company_id=int(company_id),
+            customer_id=int(customer_id),
+            numeric_id=numeric_id,
+            numeric_branches=numeric_branches,
+            slot_uuid=slot_uuid,
+            owners=owners,
+        )
+        for company_id, customer_id in dispute.creation_pairs
+    }
+    if len(verdicts) > 1:
+        # The pairs do not agree about whose booking this is, so nothing is
+        # established. Fail-closed, deliberately: one of them resolving to the
+        # recipient is exactly the case where the dispute may be theirs.
+        return None
+    (verdict,) = verdicts
     if verdict is not None:
         return verdict
     if numeric_id is not None:
@@ -446,28 +498,40 @@ def _dispute_owner(
     # a row admissible that would read unknown with it, and it must not make
     # one unknown that would read fine with it either — the instant is not
     # evidence about whose booking it is, in either direction.
-    return None if dispute.customer_ids - dispute.creation_customer_ids else ATTRIBUTION_THEIRS
+    #
+    # "Nothing moved it" is read from the pairs: a lifecycle delivery naming
+    # the same digits in ANOTHER branch names a different customer record, so
+    # the deliveries do disagree about whose booking it is.
+    return None if dispute.customer_pairs - dispute.creation_pairs else ATTRIBUTION_THEIRS
 
 
-def _chronology_contradicted(booking: ObservedBooking, *, anchor: datetime | None) -> bool:
+def _chronology_contradicted(booking: ObservedBooking, *, now: datetime) -> bool:
     """Does its own creation instant contradict when it was first heard of?
 
     A delivery about a booking proves the booking existed when that delivery
-    was made. So a booking some valid delivery named BEFORE the attempt, whose
-    single creation says it appeared AFTER it, is making two claims that cannot
-    both be true — and the one this phase acts on is the harsher: it excluded
-    somebody for engagement that the capture's own earlier row says had already
-    happened.
+    was made. So a booking whose creation claims an instant LATER than the
+    first delivery this deployment stored about it is making two claims that
+    cannot both be true — and the one this phase acts on is the harsher: it
+    excluded somebody for engagement the capture's own earlier row says had
+    already happened. The attempt's own date is not what decides this: a
+    cancellation stored the day after the mailing bounds the creation just as
+    firmly as one stored weeks before it.
 
-    Deliberately anchored on the attempt rather than on the two instants
-    themselves. An ordinary late delivery is allowed to arrive after a
-    cancellation and to carry a truthful EARLIER creation date; that order is
-    normal for this provider, it is covered by its own regression, and nothing
-    here substitutes ``received_at`` for a creation date.
+    The same rule at the other end catches a creation dated after the moment
+    the preview is being computed at, which nothing can have been created
+    after.
+
+    Both comparisons are between instants the capture already holds, and
+    neither invents a date: an ordinary late delivery is still allowed to
+    arrive after the cancellation it precedes and to carry a truthful EARLIER
+    creation instant, which contradicts nothing, and ``received_at`` is still
+    never substituted for a creation date.
     """
-    if anchor is None or booking.first_observed_at is None:
+    if booking.booking_created_at > now:
+        return True
+    if booking.first_observed_at is None:
         return False
-    return booking.booking_created_at > anchor and booking.first_observed_at <= anchor
+    return booking.booking_created_at > booking.first_observed_at
 
 
 def _dispute_predates(dispute: DisputedBooking, *, anchor: datetime | None) -> bool:
@@ -556,7 +620,19 @@ def _dispute_touches(
         # one made since, whoever made it and with no creation date guessed.
         return False
     if numeric_id is not None:
-        return int(numeric_id) in dispute.customer_ids
+        # Their number is proven in the branches their own card covers, and it
+        # answers nothing anywhere else: a delivery of this booking from
+        # another configured branch may be about a customer record of theirs
+        # this deployment cannot see, so matching digits are not the question
+        # there — the absence of an answer is. A dispute naming no customer at
+        # all is in the same position.
+        branches = {int(value) for value in numeric_branches}
+        if not dispute.customer_pairs:
+            return True
+        return any(
+            int(customer_id) == int(numeric_id) if int(company_id) in branches else True
+            for company_id, customer_id in dispute.customer_pairs
+        )
     return True
 
 
@@ -602,15 +678,31 @@ async def load_creation_evidence(
             by_slot={int(item.slot): SlotCreations(False, unproven_reason) for item in items},
         )
 
+    # No lower bound: the question is when a booking the live read can see was
+    # MADE, which may be long before the mailing. Bounded newest-first by the
+    # report's own row cap, which reports truncation.
+    scan = await scan_capture(session, anchors=list(anchors), now=now, registry=locations, lookback=None)
+    if scan.truncated:
+        # A partial pass is not an answer about anybody, so nothing below has
+        # anything left to decide — and with a capture large enough to
+        # truncate, the per-pair owner lookup was also the query that failed
+        # first, turning this planned incomplete result into "the database is
+        # unavailable" on the operator's screen. The answer is the incomplete
+        # one this phase has always promised for a truncated scan.
+        return CapturedCreations(
+            complete=False,
+            scanned_events=int(scan.scanned_events),
+            truncated=True,
+            registry_ready=bool(locations.ready),
+            disputed=len(scan.disputed),
+            by_slot={int(item.slot): SlotCreations(False, unproven_reason) for item in items},
+        )
+
     # Scoped to the configured branches: a card of a branch nobody configured
     # is another workspace's row or an Altegio-era one, and it may neither
     # supply this recipient's numeric bridge nor contradict it. The §PR-17
     # report keeps its own workspace-wide scope, which this does not touch.
     identities = await resolve_identities(session, items=items, registry=locations)
-    # No lower bound: the question is when a booking the live read can see was
-    # MADE, which may be long before the mailing. Bounded newest-first by the
-    # report's own row cap, which reports truncation.
-    scan = await scan_capture(session, anchors=list(anchors), now=now, registry=locations, lookback=None)
     grouped = scan.by_customer()
     by_uuid = scan.by_booking_uuid()
     live_strays = [booking for booking in scan.bookings if booking.customer_reassigned]
@@ -645,29 +737,31 @@ async def load_creation_evidence(
     # still needs the reverse link to read a creation delivered by another, and
     # the pair is what makes that reading about a person rather than a number.
     needed_owners: set[tuple[int, int]] = set()
-    for item in items:
-        slot = int(item.slot)
-        if slot in refused:
-            continue
-        for booking_uuid in slot_bookings.get(slot, ()) if slot_bookings is not None else ():
+    judged = [item for item in items if int(item.slot) not in refused]
+    for item in judged:
+        for booking_uuid in slot_bookings.get(int(item.slot), ()) if slot_bookings is not None else ():
             booking = by_uuid.get(booking_uuid)
             if booking is not None:
                 needed_owners.add((int(booking.company_id), int(booking.customer_id)))
-        # And the bookings OUTSIDE this person's list that a reassignment
-        # touched. They are the reason a bridge-less slot is refused at all, so
-        # they are precisely where a proven creator is worth asking about: a
-        # booking somebody else provably made and then handed on is not a
-        # booking that could have left THIS person's list unseen.
+    if judged:
+        # And the bookings OUTSIDE anybody's list that a reassignment touched.
+        # They are the reason a slot whose own list cannot show them is refused
+        # at all, so they are precisely where a proven creator is worth asking
+        # about: a booking somebody else provably made and then handed on is
+        # not a booking that could have left THIS person's list unseen.
         for booking in live_strays:
             needed_owners.add((int(booking.company_id), int(booking.customer_id)))
         # And the disputes, for the same reason in the other direction: a
         # booking whose creations agree on the creator and disagree on the date
         # is that creator's problem, so knowing whose it is keeps the gap away
-        # from everybody else.
+        # from everybody else. The pairs the deliveries really named, never a
+        # product of the branches and the numbers — that product would ask
+        # about customer records nothing observed, and a card answering one of
+        # them would speak about a booking it has nothing to do with.
         for dispute in scan.disputed:
-            for company_id in dispute.creation_company_ids:
-                for customer_id in dispute.creation_customer_ids:
-                    needed_owners.add((int(company_id), int(customer_id)))
+            needed_owners.update(
+                (int(company_id), int(customer_id)) for company_id, customer_id in dispute.creation_pairs
+            )
     owners = await _creation_owner_uuids(session, wanted=needed_owners, registry=locations)
 
     by_slot: dict[int, SlotCreations] = {}
@@ -694,7 +788,7 @@ async def load_creation_evidence(
         contradicted: set[uuid_module.UUID] = set()
 
         def _credit(booking: ObservedBooking) -> None:
-            if _chronology_contradicted(booking, anchor=anchor):
+            if _chronology_contradicted(booking, now=now):
                 contradicted.add(booking.booking_uuid)
                 return
             created[booking.booking_uuid] = booking.booking_created_at
@@ -773,36 +867,41 @@ async def load_creation_evidence(
         ):
             proven = False
             reason = unproven_reason
-        elif numeric_id is None:
-            # No bridge: the live set is the whole account of this person's
-            # bookings, and a booking that LEFT it is what it cannot show. A
-            # reassignment after this slot's own anchor, of a booking not in
-            # their list, is exactly that case.
-            if any(
-                booking.booking_uuid not in live
-                and anchor is not None
-                and booking.booking_created_at > anchor
-                # Unless its creator is PROVEN to be somebody else. The whole
-                # worry is a booking of THIS person's that left their list
-                # unseen, and a creation resolved through a card of this
-                # workspace to another proven uuid is demonstrably not one. An
-                # absent or conflicting link proves nothing, and those stay
-                # unknown.
-                and _attribution(
-                    booking,
-                    numeric_id=None,
-                    slot_uuid=item.easyweek_customer_uuid,
-                    owners=owners,
-                )
-                != ATTRIBUTION_ANOTHERS
-                # A creator proven in the branch that made the booking. A card
-                # matching the number only in ANOTHER configured branch proves
-                # nothing here and leaves the slot unknown, as it did before
-                # any card existed.
-                for booking in live_strays
-            ):
-                proven = False
-                reason = unproven_reason
+        elif any(
+            # A booking that LEFT somebody's list is the one thing their list
+            # cannot show, and a reassignment after this slot's own anchor, of
+            # a booking not in their list, is exactly that case.
+            #
+            # Asked of every slot and not only of the bridge-less ones. A
+            # numeric bridge is proven in the branches that person's own card
+            # covers, so it reads their bookings in those branches and nothing
+            # at all in the others; treating a bridge as a complete view used
+            # to skip this question entirely, and a booking created in another
+            # configured branch and handed on then passed unnoticed — with the
+            # same digits, which are a different customer record there, and
+            # with different ones, which say nothing about who they are there.
+            booking.booking_uuid not in live
+            and anchor is not None
+            and booking.booking_created_at > anchor
+            # Unless its creator is PROVEN to be somebody else, in the branch
+            # that delivered the creation. The whole worry is a booking of THIS
+            # person's that left their list unseen, and a creation resolved to
+            # another proven uuid — or to a number their own card proves in
+            # that branch and does not match — is demonstrably not one. An
+            # absent or conflicting link proves nothing, and those stay
+            # unknown, as they did before any card existed.
+            and _attribution(
+                booking,
+                numeric_id=numeric_id,
+                numeric_branches=numeric_branches,
+                slot_uuid=item.easyweek_customer_uuid,
+                owners=owners,
+            )
+            != ATTRIBUTION_ANOTHERS
+            for booking in live_strays
+        ):
+            proven = False
+            reason = unproven_reason
         by_slot[slot] = SlotCreations(
             proven,
             reason,

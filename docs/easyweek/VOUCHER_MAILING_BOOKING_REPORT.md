@@ -99,6 +99,15 @@ Rules:
 * two different numeric ids for one proven UUID, or a numeric id that another
   card binds to a different UUID, is a **conflict**: the row is reported as
   unknown and nobody is credited;
+* a numeric customer id is unique **per branch**, not per workspace, so the
+  reverse check above reads the cards per `(branch, number)` pair. How those
+  claims are combined depends on the question: this report asks which cards
+  speak for one recipient, which is not branch-limited, so any card binding
+  those digits to another UUID is still a conflict here. A caller that passes
+  the branch registry — §46.5's follow-up, which judges deliveries from
+  configured branches — asks only about the branches that person's own card
+  proves the number in, because another branch's card with the same digits is a
+  different customer record and contradicts nothing;
 * one customer UUID may hold cards in several branches. That is one recipient,
   not several conversions. The report lists the branches and merges nothing;
 * opening or refreshing the report fills no `Client` UUID, merges no cards and
@@ -152,7 +161,12 @@ Rules:
 * A booking some delivery assigns to another customer keeps the creation
   attributed to the customer its own creation delivery named, flags
   `customer_reassigned` in the details, and credits the other customer with
-  nothing.
+  nothing. The comparison is between `(branch, customer id)` **pairs** and not
+  between bare numbers: the same digits in two branches are two different
+  customer records, so a booking created in one branch and then named by a
+  delivery from another has been moved, and reporting it as unmoved hid that
+  from a caller whose only view of a person is their current list. It is still
+  one booking, one conversion and one creation.
 
 ## 6. Data completeness
 
@@ -173,6 +187,15 @@ Four answers are distinguished and never collapsed:
   captured payload, and ignores the inbox worker's status.
 * Incomplete, truncated and conflicting payloads never become positive facts.
   They are counted by reason in the coverage block, with no personal data.
+* A `booking-created` delivery whose branch and booking identity are proven and
+  whose **customer is missing** is counted as `customer_identity_unusable`, as
+  before: it credits nobody, is no conversion, moves no per-branch observation,
+  and — since nothing about it is in dispute either — produces no disputed
+  record for a caller to refuse on. What it does prove is kept: the booking
+  with that identity existed in that branch when the delivery was stored, which
+  is a lower bound on its existence for a caller holding the same booking uuid,
+  and never a creation date. A delivery that proves no branch or no booking
+  identity proves nothing and is counted as before.
 * The coverage block reports, per configured branch, how many new bookings were
   observed in the scanned range. A zero means "nothing observed here", not a
   proven absence of bookings.

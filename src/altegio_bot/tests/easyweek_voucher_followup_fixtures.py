@@ -664,6 +664,49 @@ async def seed_booking_created_without_a_date(
             return int(event.id)
 
 
+async def seed_booking_created_without_a_customer(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_uuid: str,
+    received_at: datetime,
+    created_at: datetime | None = None,
+    company_id: int = COMPANY_ID,
+    location_uuid: str = KARLSRUHE_LOCATION_UUID,
+) -> int:
+    """A creation delivery that proves the branch and the booking and no owner.
+
+    The customer is missing, so nothing about WHOSE booking it is can be read
+    from it and it is no conversion. What it does prove is that a booking with
+    this identity existed in this branch when the delivery was stored — which
+    is a lower bound on its existence, and the fact a later creation claiming a
+    much newer instant has to be consistent with.
+
+    ``created_at`` is still written into the payload by default-free choice of
+    the caller: a real delivery may well carry one, and the point is that an
+    instant stated beside no owner credits nobody.
+    """
+    payload: dict[str, Any] = {
+        "uid": booking_uuid,
+        "location_id": company_id,
+        "location_uuid": location_uuid,
+    }
+    if created_at is not None:
+        payload["booking_created_at"] = created_at.isoformat()
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                event_hint="booking-created",
+                query={},
+                headers={},
+                payload=payload,
+                received_at=received_at,
+                status="processed",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
 async def seed_booking_cancelled(
     session_maker: async_sessionmaker[AsyncSession],
     *,
