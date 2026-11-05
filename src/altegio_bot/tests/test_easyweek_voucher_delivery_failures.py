@@ -2291,3 +2291,122 @@ async def test_an_unproven_success_never_withdraws_a_confirmed_failure(
     assert "withdrawn_delivery_failure_reason" not in item.evidence
     assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
     assert await _receipts(session_maker) == []
+
+
+# ---------------------------------------------------------------------------
+# The slot's rank and one callback's proof (round 5, fix 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flawed_middle", ["unsigned", "foreign_recipient"])
+async def test_a_signed_delivered_still_proves_itself_behind_an_unproven_read(
+    session_maker, production_configuration, binding_key, flawed_middle: str
+) -> None:
+    """Review round 5, finding 5: the rank and the proof are two questions.
+
+    Three callbacks about one message, in the order that used to lose the third.
+    A proven `failed` is confirmed and stamps the slot. An unproven `read` then
+    arrives: the ledger applies it, because the slot's status is the record of a
+    mailing that really happened and is kept whatever can be proven about it —
+    and it leaves no §46.3 proof, which is correct, so §46.3's precedence does
+    not run and the confirmation stands.
+
+    Then the signed `delivered` arrives on the route this slot's own attempt
+    froze. It cannot move the rank, and that refusal used to discard the whole
+    callback: the proof of a delivery Meta had signed for was thrown away with
+    the transition it could not make, and the slot went on asserting a delivery
+    failure about it.
+
+    The two are asked separately now. The rank stays where the `read` left it —
+    monotonicity is untouched — the receipt is recorded, and the proven success
+    withdraws the confirmed failure exactly as it does when it arrives first.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = f"wamid.RANK-{flawed_middle}"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is True
+
+    if flawed_middle == "unsigned":
+        await _deliver_status(
+            session_maker,
+            _status_payload(wamid=wamid, status="read", recipient=recipient),
+            signature_verified=False,
+        )
+    else:
+        await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient="4915100000888"))
+    middle = await _item(session_maker, batch_id)
+    assert middle.status == VOUCHER_PRODUCTION_ITEM_READ
+    # An unproven callback proves nothing, so the confirmation is still standing.
+    assert middle.evidence.get("confirmed_delivery_failure") is True
+    assert await _receipts(session_maker) == []
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="delivered", recipient=recipient))
+
+    item = await _item(session_maker, batch_id)
+    # The slot does not walk backwards: the rank the `read` reached is kept.
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert "confirmed_delivery_failure" not in item.evidence
+    assert item.evidence.get("withdrawn_delivery_failure_reason") == DELIVERY_FAILURE_REASON_CALLBACK_FAILED
+    assert item.evidence.get("withdrawn_delivery_failure_by") == "delivered"
+    receipts = await _receipts(session_maker)
+    assert len(receipts) == 1
+    assert receipts[0].kind == DELIVERY_RECEIPT_KIND_DELIVERED
+    assert receipts[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+    assert receipts[0].route_proven is True
+    fact = (await _facts(session_maker))[0]
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert fact.evidence.get("conflict") == CONFLICT_AFTER_SUCCESS
+    assert fact.evidence.get("superseded_by_status") == "delivered"
+    assert fact.reason_code == DELIVERY_FAILURE_REASON_CALLBACK_FAILED
+
+
+async def test_a_delivered_behind_a_proven_read_adds_its_own_receipt_once(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Idempotent and additive: two proven statuses, two receipts, one each.
+
+    The `read` is proven here, so it leaves its own receipt and the `delivered`
+    that follows leaves another — they are facts about two different callbacks,
+    not two attempts at one. Repeating the `delivered` adds nothing.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.RANK-BOTH-PROVEN"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient))
+    late = _status_payload(wamid=wamid, status="delivered", recipient=recipient)
+    for _ in range(3):
+        await _deliver_status(session_maker, late)
+
+    assert (await _item(session_maker, batch_id)).status == VOUCHER_PRODUCTION_ITEM_READ
+    kinds = sorted(receipt.kind for receipt in await _receipts(session_maker))
+    assert kinds == [DELIVERY_RECEIPT_KIND_DELIVERED, DELIVERY_RECEIPT_KIND_READ]
+
+
+async def test_a_lower_status_for_a_foreign_message_id_is_still_nobodys_business(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The control: a callback no slot owns leaves this phase alone.
+
+    Asking for the proof on every callback whose transition was refused must not
+    turn «not ours» into «ours». The message id belongs to no slot of this
+    phase, so nothing is located, nothing is written, and the slot that does
+    exist is untouched.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    assert (await _accept(session_maker, batch_id, "wamid.RANK-OURS")).applied
+    await _deliver_status(session_maker, _status_payload(wamid="wamid.RANK-OURS", status="read", recipient=recipient))
+
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid="wamid.SOMEBODY-ELSES-ENTIRELY", status="delivered", recipient=recipient),
+    )
+
+    assert (await _item(session_maker, batch_id)).status == VOUCHER_PRODUCTION_ITEM_READ
+    receipts = await _receipts(session_maker)
+    assert len(receipts) == 1
+    assert receipts[0].kind == DELIVERY_RECEIPT_KIND_READ

@@ -2247,30 +2247,42 @@ async def _apply_voucher_production_status(
         provider_message_id=provider_message_id,
         status=kind,
     )
-    if result.applied:
-        logger.info("status_webhook: voucher production mailing advanced to %s", kind)
-        # §46.3: the slot's status is the mailing's own record and is applied
-        # above whatever else is true. What a LATER send may rest on is the
-        # proof beside it — the verified signature and the frozen route — and
-        # that is recorded here, or not at all when it cannot be proven.
-        if status is not None:
-            receipt = await delivery_evidence.record_status_receipt(
-                session,
-                status=status,
-                kind=kind,
-                whatsapp_event_id=int(event.id) if event is not None else None,
-                signature_verified=_event_authenticity_verified(event),
-            )
-            if not receipt.stored:
-                logger.info(
-                    "status_webhook: voucher production %s status left no §46.3 proof (%s)",
-                    kind,
-                    receipt.reason,
-                )
-        return True
     # A refused write is either "not ours" — fall through — or "ours, and
     # already at or past this status", which is handled and done.
-    return result.reason != voucher_production_ledger.RECORD_MISSING_ROW
+    ours = result.applied or result.reason != voucher_production_ledger.RECORD_MISSING_ROW
+    if result.applied:
+        logger.info("status_webhook: voucher production mailing advanced to %s", kind)
+    # §46.3: the slot's status is the mailing's own record and is applied above
+    # whatever else is true, and it only ever moves forward. What a LATER send
+    # may rest on is the proof beside it — the verified signature and the frozen
+    # route — and that is a fact about THIS callback, not about the rank the
+    # slot happens to sit at.
+    #
+    # So the two are asked separately, for every callback whose exact message id
+    # belongs to this slot. Asking for the proof only when the status moved tied
+    # them together: a signed `delivered`, on the frozen route, arriving after an
+    # unproven `read` had already walked the slot to the higher rank, was refused
+    # by the monotonicity rule and discarded WITH its proof — so §46.3's
+    # precedence never ran and the slot kept asserting a delivery failure about a
+    # message Meta had signed for. The rank still does not move backwards, and an
+    # unproven callback still proves nothing: a `read` that cannot be verified
+    # does not become a proven one by being recorded here, because
+    # ``record_status_receipt`` refuses it on its own terms.
+    if ours and status is not None:
+        receipt = await delivery_evidence.record_status_receipt(
+            session,
+            status=status,
+            kind=kind,
+            whatsapp_event_id=int(event.id) if event is not None else None,
+            signature_verified=_event_authenticity_verified(event),
+        )
+        if not receipt.stored:
+            logger.info(
+                "status_webhook: voucher production %s status left no §46.3 proof (%s)",
+                kind,
+                receipt.reason,
+            )
+    return ours
 
 
 def _event_authenticity_verified(event: WhatsAppEvent | None) -> bool:

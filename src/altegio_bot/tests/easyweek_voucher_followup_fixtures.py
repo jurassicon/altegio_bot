@@ -193,7 +193,19 @@ def _digest_of(phone: str) -> str:
     return value
 
 
-def location_map(*, booking_link: str = "https://example.test/ka") -> str:
+# A SECOND configured branch of the same workspace, deliberately fabricated:
+# these ids are not production ids and never were. One numeric customer id is
+# unique per branch rather than per workspace, so two cards claiming the same
+# number against two different proven uuids need two branches to exist at all.
+SECOND_COMPANY_ID = 322581
+SECOND_LOCATION_UUID = "8395fab6-7ee8-4702-88d9-fd78f92539c3"
+
+# And a branch NOBODY configured: another workspace, or one left out of the
+# registry. Nothing it holds may speak about this mailing's bookings.
+UNCONFIGURED_COMPANY_ID = 999777
+
+
+def location_map(*, booking_link: str = "https://example.test/ka", second_branch: bool = False) -> str:
     """The configured branch registry, as the settings string the loader reads.
 
     Needed by the booking CREATION capture (§46.5): a creation delivery is
@@ -201,17 +213,28 @@ def location_map(*, booking_link: str = "https://example.test/ka") -> str:
     registry would see every creation rejected as foreign — which is the honest
     answer for an unconfigured deployment and the wrong starting point for a
     test about creation times.
+
+    ``second_branch`` widens it to two branches of the SAME workspace, leaving
+    the mailing's own branch exactly as it was. Needed by the tests about the
+    reverse numeric-id lookup: the uniqueness that makes an ambiguous bridge
+    possible is per branch.
     """
-    return json.dumps(
-        {
-            "karlsruhe": {
-                "location_id": COMPANY_ID,
-                "location_uuid": KARLSRUHE_LOCATION_UUID,
-                "meta_template_prefix": "ka",
-                "booking_page_url": booking_link,
-            }
+    branches = {
+        "karlsruhe": {
+            "location_id": COMPANY_ID,
+            "location_uuid": KARLSRUHE_LOCATION_UUID,
+            "meta_template_prefix": "ka",
+            "booking_page_url": booking_link,
         }
-    )
+    }
+    if second_branch:
+        branches["ettlingen"] = {
+            "location_id": SECOND_COMPANY_ID,
+            "location_uuid": SECOND_LOCATION_UUID,
+            "meta_template_prefix": "et",
+            "booking_page_url": "https://example.test/et",
+        }
+    return json.dumps(branches)
 
 
 async def seed_sender_and_template(

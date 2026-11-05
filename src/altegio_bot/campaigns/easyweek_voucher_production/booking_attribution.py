@@ -324,6 +324,10 @@ class _BookingDraft:
     # A creation delivery whose branch, booking and customer were proven and
     # whose instant was not. It names an owner and dates nothing.
     undated_creation: bool = False
+    # Two creation deliveries of this booking named DIFFERENT customers. Read
+    # from the set of owners above rather than from a comparison against
+    # whichever of them happened to carry a date, and counted once per booking.
+    owner_conflict: bool = False
     # The earliest moment any delivery of this booking was received. A lower
     # bound on when the booking existed; never its creation date.
     first_observed_at: datetime | None = None
@@ -402,6 +406,24 @@ class DisputedBooking:
     # lower bound on its existence — and never a creation date: §46.5's rule is
     # about when a booking was MADE, and a late delivery says nothing about it.
     first_observed_at: datetime | None = None
+
+    @property
+    def contradictory(self) -> bool:
+        """Do this booking's own creation deliveries disagree with each other?
+
+        A dispute that is merely INCOMPLETE — no creation was captured, or the
+        one that was states no usable instant — can still be settled by other
+        evidence about the same booking. One that is self-contradictory cannot:
+        two creations naming two owners, or two different instants, are claims
+        that cannot both be true, and no amount of surrounding proof decides
+        which of them to believe. So an early sighting answers the first kind
+        and is never allowed to paper over the second.
+        """
+        return (
+            self.reason == DISPUTE_CONFLICTING_CREATION
+            or len(self.creation_customer_ids) > 1
+            or len(self.created_at) > 1
+        )
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -847,14 +869,28 @@ async def scan_capture(
             draft.customer_ids.add(int(facts["customer_id"]))
 
         if event_hint == CREATED_HINT:
+            created_at = facts.get("booking_created_at")
             if facts["customer_id"] is not None:
                 draft.creation_customer_ids.add(int(facts["customer_id"]))
-            if facts.get("booking_created_at") is not None:
-                draft.creation_times.add(facts["booking_created_at"])
-            else:
+            if created_at is not None:
+                draft.creation_times.add(created_at)
+            # WHO created a booking is a fact its creation delivery states even
+            # when it could not state WHEN, so the owners' disagreement is read
+            # from the SET of customers the creations named. The undated
+            # delivery used to leave this block before any comparison was made,
+            # and the booking then came out cleanly attributed to whichever
+            # creation happened to carry a date — in either delivery order. A
+            # missing instant on one of two creations is a second gap, not a
+            # resolution of the first.
+            if len(draft.creation_customer_ids) > 1 and not draft.owner_conflict:
+                draft.owner_conflict = True
+                draft.conflicting = True
+                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            if created_at is None:
                 # Proven owner, unproven instant. It contributes the owner and
-                # does NOT count as a usable creation, so neither this report's
-                # conversions nor its per-branch observations move.
+                # the conflict above, and does NOT count as a usable creation,
+                # so neither this report's conversions nor its per-branch
+                # observations move.
                 draft.undated_creation = True
                 continue
             if not draft.seen_creation:
@@ -862,16 +898,16 @@ async def scan_capture(
                 draft.company_id = facts["company_id"]
                 draft.branch_name = facts["branch_name"]
                 draft.customer_id = facts["customer_id"]
-                draft.booking_created_at = facts["booking_created_at"]
+                draft.booking_created_at = created_at
                 branch_observed[facts["company_id"]] = branch_observed.get(facts["company_id"], 0) + 1
-            elif (
-                draft.customer_id != facts["customer_id"]
-                or draft.booking_created_at != facts["booking_created_at"]
-                or draft.company_id != facts["company_id"]
-            ):
-                # Two creations of one booking that do not agree. A repeated
-                # delivery of the SAME creation is the ordinary case and lands
-                # in neither branch of this check.
+            elif draft.booking_created_at != created_at or draft.company_id != facts["company_id"]:
+                # Two DATED creations of one booking that do not agree about
+                # when or where it was made. The owners' disagreement is
+                # counted above and not again here, so one conflicting pair is
+                # still one counted conflict. A repeated delivery of the SAME
+                # creation — including one that merely adds the instant an
+                # earlier delivery omitted — is the ordinary case and lands in
+                # neither branch.
                 draft.conflicting = True
                 rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
             # A creation states WHAT WAS CREATED. It is never also a statement

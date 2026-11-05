@@ -133,7 +133,9 @@ from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     COMPANY_ID,
     NOW,
     PHONE_NUMBER_ID,
+    SECOND_COMPANY_ID,
     SENDER_DIGEST,
+    UNCONFIGURED_COMPANY_ID,
     TemplateReader,
     location_map,
     order_uuid_for,
@@ -4484,19 +4486,31 @@ async def test_a_scan_that_was_asked_less_than_the_veto_needs_is_unknown(
 # ---------------------------------------------------------------------------
 
 
-async def _proven_other_card(session_maker, *, numeric_id: int, customer_uuid: str, phone: str) -> None:
+async def _proven_other_card(
+    session_maker,
+    *,
+    numeric_id: int,
+    customer_uuid: str,
+    phone: str,
+    company_id: int = COMPANY_ID,
+) -> None:
     """A card of this workspace carrying BOTH a numeric id and a proven uuid.
 
     The link a creation delivery's numeric id is resolved back through. UUID
     first and no phone involved: the number is only there because the column
     exists.
+
+    ``company_id`` is which branch holds the card, because that is what the
+    reverse lookup's scope is about: one numeric id is unique per branch, so a
+    second card claiming it lives in another branch — configured, and then the
+    claim competes, or not, and then it says nothing here at all.
     """
     async with session_maker() as session:
         async with session.begin():
             session.add(
                 Client(
                     provider=PROVIDER_EASYWEEK,
-                    company_id=COMPANY_ID,
+                    company_id=int(company_id),
                     easyweek_customer_uuid=uuid_module.UUID(customer_uuid),
                     altegio_client_id=int(numeric_id),
                     display_name="Other proven customer",
@@ -4769,3 +4783,522 @@ async def test_a_dispute_without_a_proven_booking_of_their_own_stays_unknown(
     )
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
     assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+# ---------------------------------------------------------------------------
+# Whose booking it is, and how old (round 5, fixes 1–4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dated_first", [True, False])
+async def test_an_undated_second_creation_does_not_settle_the_owner_conflict(
+    session_maker, binding_key, no_network, dated_first: bool
+) -> None:
+    """Review round 5, finding 1: a missing date is a second gap, not an answer.
+
+    Two creation deliveries of one booking name two different customers, and
+    one of them states no usable instant. WHO created a booking is a fact its
+    creation delivery states even when it could not state WHEN, so the two are
+    in conflict about the owner — but the undated delivery used to leave the
+    aggregation before any comparison was made, and the booking came out
+    cleanly attributed to whichever creation happened to carry a date.
+
+    Checked in both delivery orders, because neither of them is the business
+    order and the answer may not depend on which arrived first. With this
+    person's current history empty, the wrong answer is the dangerous one:
+    «nothing has happened since the mailing» about a booking one of those two
+    deliveries says is theirs.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    contested = booking(index=50, customer_uuid=person(7)["customer_uuid"], start=NOW + timedelta(days=5))
+    made = ATTEMPTED_AT - timedelta(days=11)
+
+    async def dated() -> None:
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=contested["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=made,
+        )
+
+    async def undated() -> None:
+        await seed_booking_created_without_a_date(
+            session_maker,
+            booking_uuid=contested["uuid"],
+            numeric_customer_id=who["numeric_id"] + 61,
+            received_at=made + timedelta(minutes=5),
+        )
+
+    for seed in (dated, undated) if dated_first else (undated, dated):
+        await seed()
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+@pytest.mark.parametrize("dated_first", [True, False])
+async def test_a_repeated_creation_that_only_adds_the_instant_is_still_usable(
+    session_maker, binding_key, no_network, dated_first: bool
+) -> None:
+    """The control the owner check must not break.
+
+    The same booking, the same owner, twice — once without the instant and once
+    with it. That is a repeat of one creation with the date filled in, not a
+    disagreement, so it stays usable evidence and the recipient is provable.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(
+        index=51,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    made = ATTEMPTED_AT - timedelta(days=12)
+
+    async def dated() -> None:
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=theirs["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=made,
+        )
+
+    async def undated() -> None:
+        await seed_booking_created_without_a_date(
+            session_maker,
+            booking_uuid=theirs["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            received_at=made + timedelta(minutes=5),
+        )
+
+    for seed in (dated, undated) if dated_first else (undated, dated):
+        await seed()
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_an_early_sighting_does_not_hide_a_creator_conflict(session_maker, binding_key, no_network) -> None:
+    """Review round 5, finding 1: the louder problem is not settled by the quieter one.
+
+    A cancellation of this booking was stored before the mailing went out, so
+    the booking provably existed by then. Its creation deliveries then claim a
+    LATER instant and name two different owners — a record that contradicts
+    itself, and an early sighting answers an incomplete record, never a
+    self-contradictory one. The conflict stands and the recipient stays unknown.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    contested = booking(index=52, customer_uuid=person(7)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=contested["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT - timedelta(days=18),
+    )
+    for owner, day in ((who["numeric_id"], 3), (who["numeric_id"] + 62, 4)):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=contested["uuid"],
+            numeric_customer_id=owner,
+            created_at=ATTEMPTED_AT + timedelta(days=day),
+        )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+@pytest.mark.parametrize("made_after_the_attempt", [False, True])
+async def test_a_numeric_id_two_workspace_cards_claim_is_not_an_absent_link(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch, made_after_the_attempt: bool
+) -> None:
+    """Review round 5, finding 2: ambiguous is not absent.
+
+    The recipient's card is a manual one — a proven uuid and no numeric id, the
+    ordinary shape — so the creation's own numeric id has to be read back to an
+    owner. Two cards of this workspace claim that number against two different
+    proven uuids, which is a POSITIVE claim that the creation may be somebody
+    else's. Dropping such an id from the lookup made it indistinguishable from
+    a number nobody bridges at all, and the rule that follows an absent link is
+    the permissive one: the booking was credited to whoever holds it now.
+
+    Checked for a creation before and after the attempt, because the permissive
+    rule was wrong in both directions — it invented an old booking for one and
+    somebody else's engagement for the other. With no other proven ground,
+    both are unknown.
+
+    The companion control, a creation resolving UNAMBIGUOUSLY to another
+    person, is covered by the round-4 test above.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    claimed = person(8)["numeric_id"]
+    await _proven_other_card(
+        session_maker,
+        numeric_id=claimed,
+        customer_uuid=person(8)["customer_uuid"],
+        phone="+4915100444333",
+    )
+    await _proven_other_card(
+        session_maker,
+        numeric_id=claimed,
+        customer_uuid=person(9)["customer_uuid"],
+        phone="+4915100444334",
+        company_id=SECOND_COMPANY_ID,
+    )
+    theirs_now = booking(
+        index=53,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs_now["uuid"],
+        numeric_customer_id=claimed,
+        created_at=ATTEMPTED_AT + (timedelta(days=2) if made_after_the_attempt else -timedelta(days=9)),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs_now]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_a_card_outside_the_configured_branches_makes_no_conflict(session_maker, binding_key, no_network) -> None:
+    """And a card nobody configured competes with nothing.
+
+    The same number, claimed by a second card in a branch that is not in the
+    registry. The lookup is scoped to the configured branches, so the link
+    inside this workspace stays unambiguous and the creation is still proven to
+    be another person's — which is what keeps an unrelated tenant's numbering
+    from making this mailing's bookings unanswerable.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    maker = person(8)
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=maker["customer_uuid"],
+        phone="+4915100444335",
+    )
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=person(9)["customer_uuid"],
+        phone="+4915100444336",
+        company_id=UNCONFIGURED_COMPANY_ID,
+    )
+    await _handed_on_booking(session_maker, index=54, maker_numeric_id=maker["numeric_id"])
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def _handed_on_booking(session_maker, *, index: int, maker_numeric_id: int) -> dict[str, Any]:
+    """A booking somebody made after the attempt and then handed to a third person.
+
+    The shape that used to leave every bridge-less recipient unknown: a
+    reassignment the live read cannot show, of a booking created inside the
+    window. Who MADE it is stated by its own creation delivery.
+    """
+    handed_on = booking(index=index, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=8))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=handed_on["uuid"],
+        numeric_customer_id=maker_numeric_id,
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=handed_on["uuid"],
+        numeric_customer_id=maker_numeric_id + 70,
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+    )
+    return handed_on
+
+
+async def test_a_handover_of_somebody_elses_proven_booking_blocks_nobody(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 5, finding 3: a proven creator settles a reassignment too.
+
+    The recipient's card is manual, so the live set is the whole account of
+    their bookings and a booking that LEFT it is the one thing it cannot show —
+    which is why a reassignment inside the window used to leave them unknown.
+    But this booking's own creation delivery names a customer whose number
+    resolves, through a card of this workspace, to a different proven uuid. It
+    is an event in somebody else's history, and the recipient stays provable.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    maker = person(8)
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=maker["customer_uuid"],
+        phone="+4915100444337",
+    )
+    await _handed_on_booking(session_maker, index=55, maker_numeric_id=maker["numeric_id"])
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_handover_with_no_resolvable_creator_still_leaves_it_unknown(
+    session_maker, binding_key, no_network
+) -> None:
+    """The window that really is open stays closed: no card, no answer."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    await _handed_on_booking(session_maker, index=56, maker_numeric_id=person(8)["numeric_id"])
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_handover_elsewhere_does_not_stop_their_own_booking_excluding_them(
+    session_maker, binding_key, no_network
+) -> None:
+    """And the exclusion the live read can see on its own still holds."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    maker = person(8)
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=maker["customer_uuid"],
+        phone="+4915100444338",
+    )
+    await _handed_on_booking(session_maker, index=57, maker_numeric_id=maker["numeric_id"])
+    ahead = booking(index=58, customer_uuid=who["customer_uuid"], start=NOW + timedelta(days=4))
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [ahead]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == FUTURE_BOOKING_ACTIVE
+
+
+async def test_their_own_undated_booking_heard_of_before_the_attempt_is_not_new(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 5, finding 4: the existence proof reaches a VISIBLE booking.
+
+    Their own cancelled booking, still in their complete current history. Its
+    creation delivery proves the branch, the booking identity and the owner and
+    states no usable instant — so the capture cannot date it, and the rule that
+    every visible booking needs a proven creation held the recipient for ever.
+
+    The delivery was stored before the mailing went out, which proves the
+    booking existed by then. That is a lower bound on its existence and not a
+    creation date, and it is exactly the fact the rule needs: nothing new is
+    hiding here. No date is invented to reach it.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(
+        index=59,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=3),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created_without_a_date(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT - timedelta(days=15),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_an_undated_booking_first_heard_of_after_the_attempt_is_still_unknown(
+    session_maker, binding_key, no_network
+) -> None:
+    """The first control: a sighting after the send proves nothing about before it."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(
+        index=60,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=3),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created_without_a_date(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_an_old_appointment_without_an_early_delivery_proves_nothing(
+    session_maker, binding_key, no_network
+) -> None:
+    """The second control: the appointment time is not an existence proof.
+
+    A booking in their history whose appointment was months ago and about which
+    the capture holds nothing at all. A backdated booking recording a visit that
+    already happened has exactly this shape, and it is engagement since the
+    mailing — so the old date settles nothing and the answer stays unknown.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    stale = booking(
+        index=61,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=90),
+        canceled=False,
+        completed=True,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [stale]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_a_visible_booking_whose_creators_disagree_stays_unknown(session_maker, binding_key, no_network) -> None:
+    """The third control: an early sighting does not settle a contradiction.
+
+    Same booking, same early delivery, and now two creation deliveries naming
+    two owners. The record does not merely lack a fact; it asserts two that
+    cannot both hold, and that is not something an earlier sighting answers.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(
+        index=62,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=3),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created_without_a_date(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT - timedelta(days=15),
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"] + 63,
+        created_at=ATTEMPTED_AT - timedelta(days=14),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_an_active_future_booking_still_excludes_despite_the_early_sighting(
+    session_maker, binding_key, no_network
+) -> None:
+    """The fourth control: a slot booked ahead is a reason of its own."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    ahead = booking(index=63, customer_uuid=who["customer_uuid"], start=NOW + timedelta(days=6))
+    await seed_booking_created_without_a_date(
+        session_maker,
+        booking_uuid=ahead["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT - timedelta(days=15),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [ahead]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == FUTURE_BOOKING_ACTIVE

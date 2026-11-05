@@ -193,6 +193,19 @@ Four answers are distinguished and never collapsed:
   of it is no longer thrown away with the unproven half: the owner it named
   reaches the disputed set below. `received_at` is never substituted for the
   creation instant, here or anywhere.
+* **An undated creation can also be half of a creators' conflict.** WHO created
+  a booking is a fact a creation delivery states even when it could not state
+  WHEN, so two creation deliveries of one booking naming different customers
+  disagree about its owner however many of them carry a usable instant. Such a
+  booking is `conflicting_creation_events` and no conversion, in either delivery
+  order; before, the undated delivery left the aggregation before the comparison
+  was made and the booking was attributed to whichever creation was dated. One
+  conflicting pair is still exactly ONE counted conflict: the owners'
+  disagreement is counted where it is detected and not a second time by the
+  instant comparison. A repeated delivery of the same creation — including one
+  that merely adds the instant an earlier one omitted — is still the ordinary
+  case and counts nothing. The window, the conversion rules and the per-branch
+  observations are unchanged.
 * **Disputed bookings are reported, not claimed.** `scan_capture` now also
   returns the bookings it saw and cannot attribute — two creation deliveries of
   one booking naming different owners, and a booking with lifecycle deliveries

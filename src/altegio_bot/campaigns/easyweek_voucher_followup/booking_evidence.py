@@ -85,8 +85,20 @@ What this module refuses to do
 * It never reads a booking it had ALREADY HEARD OF before the attempt as a
   booking made since. A delivery about a booking proves the booking existed when
   that delivery was made, which is a lower bound on its existence and never a
-  creation date — so an unattributable booking whose first sighting predates the
-  mailing stops blocking a recipient it provably cannot be about.
+  creation date — so a booking whose first sighting predates the mailing stops
+  blocking a recipient, including one of their own sitting undated in their
+  current history. A booking whose creation deliveries CONTRADICT each other is
+  not settled this way: an early sighting answers an incomplete record, never a
+  self-contradictory one.
+* It never reads an ambiguous reverse link as an absent one. A numeric id two
+  cards of this workspace claim against two different proven uuids is a positive
+  claim that the creation may be somebody else's, and the rule that follows a
+  genuinely absent link is the permissive one — so collapsing the two credited
+  an unrelated person's booking to a manual recipient.
+* It never reads a booking somebody else provably made as one that could have
+  left THIS person's list unseen. A reassignment of a booking whose creator
+  resolves to another proven uuid is an event in that person's history, and the
+  recipient being judged stays provable.
 * It never credits a creation to somebody the creation delivery did not name.
   When the recipient's numeric id is proven the two are simply compared, so a
   booking sitting in their current history whose creation named a different
@@ -112,7 +124,7 @@ from __future__ import annotations
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Collection, Mapping
+from typing import Any, Collection, Final, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -157,9 +169,26 @@ class SlotCreations:
     # Reported rather than used: a creation is never credited to the customer a
     # booking was later moved to.
     reassigned: frozenset[uuid_module.UUID] = frozenset()
+    # Bookings in this person's CURRENT history whose creation instant the
+    # capture could not establish and which it had provably already heard of
+    # before the attempt. They carry no creation date — none is invented — and
+    # they answer the only question §46.5's creation rule asks of them: no,
+    # this cannot be a booking made since the mailing.
+    existed_before_attempt: frozenset[uuid_module.UUID] = frozenset()
 
     def creation_of(self, booking_uuid: uuid_module.UUID) -> datetime | None:
         return self.created_at.get(booking_uuid)
+
+    def existed_at_attempt(self, booking_uuid: uuid_module.UUID) -> bool:
+        """Was this booking proven to exist already when the attempt was made?
+
+        A weaker fact than a creation date and a sufficient one for the rule
+        that asks whether anything is NEW. Kept apart from
+        :attr:`created_at` precisely so the two are never confused: a lower
+        bound on when a booking existed is not a statement about when it was
+        made, and only the latter can exclude anybody.
+        """
+        return booking_uuid in self.existed_before_attempt
 
     def created_after(self, boundary: datetime) -> bool:
         """Did this person create any booking after *boundary*?
@@ -200,28 +229,59 @@ class CapturedCreations:
         }
 
 
+@dataclass(frozen=True)
+class CreationOwners:
+    """numeric customer id → whose it is, in the three states it can be in.
+
+    The reverse of the bridge ``resolve_identities`` walks, and the three
+    states are not interchangeable:
+
+    * **one proven uuid.** The link is positive and decides, in either
+      direction — the creation is this person's or demonstrably somebody
+      else's;
+    * **conflicting.** Two cards of this workspace carry the same numeric id
+      against two different proven uuids. That is not an absent link: the
+      capture holds a POSITIVE claim that this creation may belong to somebody
+      else, and reading it as "nothing known" is how an unrelated person's
+      visit to the booking page used to become this recipient's engagement;
+    * **absent.** No card of this workspace bridges that id at all, and
+      nothing has been established either way.
+
+    Collapsing the middle state into the last one is exactly the bug: both
+    looked like "no link", and the rule that follows an absent link is the
+    permissive one.
+    """
+
+    single: Mapping[int, uuid_module.UUID] = field(default_factory=dict)
+    conflicting: frozenset[int] = frozenset()
+
+    def owner_of(self, numeric_id: int) -> uuid_module.UUID | None:
+        return self.single.get(int(numeric_id))
+
+    def is_conflicting(self, numeric_id: int) -> bool:
+        return int(numeric_id) in self.conflicting
+
+
 async def _creation_owner_uuids(
     session: AsyncSession,
     *,
     customer_ids: Collection[int],
     registry: EasyWeekLocationRegistry,
-) -> dict[int, uuid_module.UUID]:
-    """numeric customer id → the ONE proven EasyWeek uuid it belongs to.
+) -> CreationOwners:
+    """Read the numeric ids a creation delivery named back to their owners.
 
-    The reverse of the bridge ``resolve_identities`` walks, and UUID-first in
-    the same sense: the link is a card of this workspace that carries BOTH a
-    numeric id and a proven customer uuid, so reading it backwards names the
-    person a creation delivery was about. No phone is involved and no id is
-    invented.
+    UUID-first in the same sense as the forward bridge: the link is a card of
+    this workspace that carries BOTH a numeric id and a proven customer uuid,
+    so reading it backwards names the person a creation delivery was about. No
+    phone is involved and no id is invented.
 
     Scoped to the configured branches, so a card of another workspace cannot
-    speak about this mailing's bookings. An id two different uuids claim is
-    left out entirely: an ambiguous link is not a positive one, and this map is
-    only ever read to find out that a creation belongs to somebody ELSE.
+    speak about this mailing's bookings — and cannot manufacture a conflict
+    either, which is what keeps an unrelated tenant's numbering out of this.
     """
     wanted = {int(value) for value in customer_ids}
     if not wanted or not registry.ready:
-        return {}
+        return CreationOwners()
     rows = (
         await session.execute(
             select(Client.altegio_client_id, Client.easyweek_customer_uuid)
@@ -234,17 +294,30 @@ async def _creation_owner_uuids(
     claims: dict[int, set[uuid_module.UUID]] = {}
     for numeric, customer_uuid in rows:
         claims.setdefault(int(numeric), set()).add(customer_uuid)
-    return {numeric: next(iter(owners)) for numeric, owners in claims.items() if len(owners) == 1}
+    return CreationOwners(
+        single={numeric: next(iter(owners)) for numeric, owners in claims.items() if len(owners) == 1},
+        conflicting=frozenset(numeric for numeric, owners in claims.items() if len(owners) > 1),
+    )
 
 
-def _attributable(
+# Whose creation a booking's own creation delivery named, as far as the
+# capture can establish it. Three answers rather than two, because "proven
+# somebody else's" and "nobody knows" license entirely different conclusions:
+# the first takes the booking out of this person's account of themselves, and
+# the second refuses to answer about them at all.
+ATTRIBUTION_THEIRS: Final = "theirs"
+ATTRIBUTION_ANOTHERS: Final = "anothers"
+ATTRIBUTION_UNRESOLVED: Final = "unresolved"
+
+
+def _attribution(
     booking: ObservedBooking,
     *,
     numeric_id: int | None,
     slot_uuid: uuid_module.UUID | None = None,
-    owner_of: Mapping[int, uuid_module.UUID] | None = None,
-) -> bool:
-    """May this booking's creation be credited to the person being judged?
+    owners: CreationOwners | None = None,
+) -> str:
+    """Whose creation is this, as far as the capture can prove?
 
     The creation delivery NAMES a customer. When this person's numeric id is
     proven, that comparison is available and it decides — and it needs no
@@ -255,23 +328,50 @@ def _attributable(
     visit to the booking page.
 
     With no numeric bridge on the card the comparison is made the other way
-    round: the creation's own numeric id is resolved back to the proven uuid it
-    belongs to in this workspace. When that uuid is somebody ELSE's, the absence
-    of a numeric id on this card is no reason to credit them with the creation —
-    which is exactly what used to happen to a manual recipient, whose card
-    carries a proven uuid and no numeric id by design.
+    round, through :class:`CreationOwners`. A single proven uuid settles it in
+    either direction. An id two cards of this workspace claim against two
+    different uuids settles nothing and must not fall through to the permissive
+    rule below: a positive claim that this creation may be somebody else's is
+    not the same as never having heard of the id.
 
-    When the reverse link is unavailable or ambiguous nothing positive has been
-    established either way, and the older rule stands: a booking nothing moved
-    belongs to whoever created it, and one whose deliveries disagree is not
-    attributable.
+    Only a genuinely absent link reaches the older rule: a booking nothing
+    moved belongs to whoever created it, and one whose deliveries disagree
+    about its owner is nobody's as far as this module is concerned.
     """
     if numeric_id is not None:
-        return int(booking.customer_id) == int(numeric_id)
-    owner = (owner_of or {}).get(int(booking.customer_id))
-    if owner is not None and slot_uuid is not None and owner != slot_uuid:
+        return ATTRIBUTION_THEIRS if int(booking.customer_id) == int(numeric_id) else ATTRIBUTION_ANOTHERS
+    links = owners if owners is not None else CreationOwners()
+    if links.is_conflicting(booking.customer_id):
+        return ATTRIBUTION_UNRESOLVED
+    owner = links.owner_of(booking.customer_id)
+    if owner is not None and slot_uuid is not None:
+        return ATTRIBUTION_THEIRS if owner == slot_uuid else ATTRIBUTION_ANOTHERS
+    return ATTRIBUTION_THEIRS if not booking.customer_reassigned else ATTRIBUTION_UNRESOLVED
+
+
+def _dispute_predates(dispute: DisputedBooking, *, anchor: datetime | None) -> bool:
+    """Was this booking proven to exist ALREADY when the attempt was made?
+
+    A delivery about a booking proves the booking existed when that delivery
+    was made. That is a lower bound on its existence and never a creation date,
+    and it is exactly the fact §46.5's creation rule needs about a booking it
+    is asked to treat as possibly new: a booking this deployment had already
+    heard of before the mailing is not one made since.
+
+    Self-contradictory disputes are excluded, and that exclusion is the whole
+    care this rule needs. An early sighting settles an INCOMPLETE record — no
+    creation captured, or one that stated no usable instant. It settles nothing
+    about a booking whose own creation deliveries name two owners or two
+    instants: there the record does not merely lack a fact, it asserts two that
+    cannot both hold, and letting the earliest delivery of such a booking clear
+    it would hide the louder problem behind the quieter one.
+    """
+    if anchor is None or dispute.contradictory:
         return False
-    return not booking.customer_reassigned
+    if dispute.first_observed_at is not None and dispute.first_observed_at <= anchor:
+        return True
+    # Or its creation deliveries all state an instant at or before the attempt.
+    return bool(dispute.created_at) and all(moment <= anchor for moment in dispute.created_at)
 
 
 def _dispute_touches(
@@ -293,30 +393,28 @@ def _dispute_touches(
       disagree about — and with no usable creation time, or one after the
       attempt, neither verdict is available.
 
-    Two things take a dispute out of the way, and neither invents a creation
-    date:
-
-    * every creation instant it states is at or before the attempt, and it is
-      not in their list. Then it cannot be a booking made since the mailing;
-    * it was ALREADY OBSERVED before the attempt. A delivery about a booking
-      proves the booking existed when that delivery was made, so a dispute this
-      deployment had already heard of by then is not a booking made since —
-      whatever its creation date turns out to be, and without this module
-      guessing one. The ordinary case is a cancellation stored weeks before the
-      mailing: it blocked a recipient as a possible new booking, which it
-      provably is not.
+    What takes a dispute out of the way is :func:`_dispute_predates`, and it
+    invents no creation date. It is asked before either test above, because a
+    booking proven to have existed when the mailing went out cannot be a
+    booking made since it — and that is true of the person's own visible
+    bookings exactly as it is of a stranger's.
 
     With no numeric bridge the ownership test cannot be made, so a dispute
     first seen AFTER the attempt and outside their list stays unknown: that is
     the window in which it really could be theirs.
     """
+    if _dispute_predates(dispute, anchor=anchor):
+        # Asked FIRST, and so applying to a booking the live read can see as
+        # well. The question this rule exists to answer is whether anything
+        # could have appeared since the mailing, and a booking already observed
+        # by then provably could not have — whether or not it is still in
+        # somebody's list, and with no creation date guessed for it. Asking it
+        # second meant the person's own cancelled booking, visible in their
+        # history and heard of weeks before the send, held them as a possible
+        # new one for ever.
+        return False
     if dispute.booking_uuid in live:
         return True
-    if anchor is not None:
-        if dispute.created_at and all(moment <= anchor for moment in dispute.created_at):
-            return False
-        if dispute.first_observed_at is not None and dispute.first_observed_at <= anchor:
-            return False
     if numeric_id is not None:
         return int(numeric_id) in dispute.customer_ids
     return True
@@ -401,7 +499,14 @@ async def load_creation_evidence(
             booking = by_uuid.get(booking_uuid)
             if booking is not None:
                 needed_owners.add(int(booking.customer_id))
-    owner_of = await _creation_owner_uuids(session, customer_ids=needed_owners, registry=locations)
+        # And the bookings OUTSIDE this person's list that a reassignment
+        # touched. They are the reason a bridge-less slot is refused at all, so
+        # they are precisely where a proven creator is worth asking about: a
+        # booking somebody else provably made and then handed on is not a
+        # booking that could have left THIS person's list unseen.
+        for booking in live_strays:
+            needed_owners.add(int(booking.customer_id))
+    owners = await _creation_owner_uuids(session, customer_ids=needed_owners, registry=locations)
 
     by_slot: dict[int, SlotCreations] = {}
     for item in items:
@@ -416,6 +521,7 @@ async def load_creation_evidence(
         live = frozenset(slot_bookings.get(slot, ()) if slot_bookings is not None else ())
         numeric_id = bridges.get(slot)
         bridge = "frozen_card_numeric_id" if numeric_id is not None else None
+        anchor = item.send_attempted_at
 
         created: dict[uuid_module.UUID, datetime] = {}
         reassigned: set[uuid_module.UUID] = set()
@@ -432,17 +538,28 @@ async def load_creation_evidence(
                 continue
             if booking.customer_reassigned:
                 reassigned.add(booking_uuid)
-            if _attributable(
-                booking,
-                numeric_id=numeric_id,
-                slot_uuid=item.easyweek_customer_uuid,
-                owner_of=owner_of,
+            if (
+                _attribution(
+                    booking,
+                    numeric_id=numeric_id,
+                    slot_uuid=item.easyweek_customer_uuid,
+                    owners=owners,
+                )
+                == ATTRIBUTION_THEIRS
             ):
                 created[booking_uuid] = booking.booking_created_at
 
+        # Bookings of theirs the capture cannot date and had provably already
+        # heard of when the attempt was made. No creation date is taken from
+        # the sighting; all it answers is that nothing NEW is hiding here.
+        existed_before = frozenset(
+            dispute.booking_uuid
+            for dispute in scan.disputed
+            if dispute.booking_uuid in live and _dispute_predates(dispute, anchor=anchor)
+        )
+
         proven = True
         reason: str | None = None
-        anchor = item.send_attempted_at
         # A booking the capture could not attribute at all, which could be
         # theirs. Reported rather than dropped, because an empty live history
         # plus a forgotten dispute reads as "nothing happened since the
@@ -456,7 +573,22 @@ async def load_creation_evidence(
             # reassignment after this slot's own anchor, of a booking not in
             # their list, is exactly that case.
             if any(
-                booking.booking_uuid not in live and anchor is not None and booking.booking_created_at > anchor
+                booking.booking_uuid not in live
+                and anchor is not None
+                and booking.booking_created_at > anchor
+                # Unless its creator is PROVEN to be somebody else. The whole
+                # worry is a booking of THIS person's that left their list
+                # unseen, and a creation resolved through a card of this
+                # workspace to another proven uuid is demonstrably not one. An
+                # absent or conflicting link proves nothing, and those stay
+                # unknown.
+                and _attribution(
+                    booking,
+                    numeric_id=None,
+                    slot_uuid=item.easyweek_customer_uuid,
+                    owners=owners,
+                )
+                != ATTRIBUTION_ANOTHERS
                 for booking in live_strays
             ):
                 proven = False
@@ -467,6 +599,7 @@ async def load_creation_evidence(
             created_at=created,
             bridge=bridge,
             reassigned=frozenset(reassigned),
+            existed_before_attempt=existed_before,
         )
 
     return CapturedCreations(

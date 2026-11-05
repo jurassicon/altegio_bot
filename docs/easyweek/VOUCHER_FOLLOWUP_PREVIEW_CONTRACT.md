@@ -372,8 +372,84 @@ that creation is not theirs and the row is
 Without the numeric bridge the live set is the whole account of this person's
 bookings, and the one thing it cannot show is a booking that LEFT it. So a
 reassignment observed after this slot's own send anchor, of a booking that is not
-in their list, leaves the slot `unknown`. A window with no reassignments hides
+in their list, leaves the slot `unknown` — **unless that booking's own creator is
+proven**. The creation delivery names a numeric customer id; when that id
+resolves, through a card of this workspace, to a single proven uuid that is
+somebody else's, the reassignment is an event in that person's history and the
+recipient being judged stays provable. An absent or ambiguous link proves
+nothing and the slot stays `unknown`. A window with no reassignments hides
 nothing, and the recipient is provable.
+
+Whose numeric id it is — three answers, not two
+-----------------------------------------------
+The reverse lookup is scoped to the configured branches, and its result is one
+of three things:
+
+* **one proven uuid.** The link is positive and decides in either direction: the
+  creation is this person's, or demonstrably somebody else's;
+* **conflicting** — two cards of this workspace carry the same numeric id
+  against two different proven uuids. One numeric id is unique per branch rather
+  than per workspace, so this shape is reachable. It is **not** an absent link:
+  the capture holds a positive claim that the creation may belong to somebody
+  else, and the rule that follows an absent link is the permissive one. Treating
+  the two alike credited an unrelated person's booking to a manual recipient —
+  `included` when its creation predated the mailing and `excluded` when it did
+  not, and both were invented. Such a booking is now
+  `followup_booking_creation_unproven`;
+* **absent** — no card of this workspace bridges that id at all. Nothing is
+  established either way, and the older rule stands.
+
+A card in a branch that is **not** configured competes with nothing: it neither
+bridges an id nor makes one ambiguous, so another workspace's numbering cannot
+make this mailing's bookings unanswerable.
+
+An exact creation date, and a proof of existence
+------------------------------------------------
+Two different facts, and only the first can exclude anybody:
+
+* **the creation instant**, as the provider stated it in `booking_created_at`.
+  This is what "созданная после исходной попытки" is read from, and nothing
+  else ever stands in for it;
+* **a proof that the booking existed already** when the attempt was made. A
+  delivery ABOUT a booking proves the booking existed when that delivery was
+  made. That is a lower bound on its existence and never a creation date, and it
+  answers exactly one question: no, this cannot be a booking made since the
+  mailing.
+
+The second is why a creation delivery that proves the branch, the booking
+identity and the owner but states no usable instant no longer holds its own
+recipient for ever. Their cancelled booking sits in their complete current
+history, the capture cannot date it, and the delivery that named it was stored
+weeks before the send — so nothing new is hiding there, and no date is invented
+to say so. `received_at` is still never written as a creation date, and such a
+booking still excludes nobody: only `booking_created_at` can do that.
+
+The proof settles an INCOMPLETE record and never a self-contradictory one. A
+booking whose own creation deliveries name two owners, or two instants, asserts
+two things that cannot both hold, and an earlier sighting of it does not decide
+which to believe. A cancellation stored before the mailing therefore does not
+clear a creator conflict: the row stays `followup_booking_capture_unproven`.
+Controls: a first sighting after the attempt, an old appointment with no early
+delivery at all, and an active booking ahead — which excludes for its own
+reason, as always.
+
+A repeat of a creation is not a disagreement
+--------------------------------------------
+Three shapes are distinguished for one booking uuid:
+
+* **a repeat** — the same owner again, including a second delivery that merely
+  adds the instant an earlier one omitted. Ordinary, and the booking stays
+  usable evidence;
+* **a reassignment** — a LIFECYCLE delivery naming a customer other than the one
+  the creation named. Reported, and it never moves the creation;
+* **a creators' conflict** — two CREATION deliveries naming different customers.
+  WHO created a booking is a fact a creation delivery states even when it could
+  not state WHEN, so a missing instant on one of the two is a second gap and not
+  a resolution of the first. The undated delivery used to leave the aggregation
+  before any comparison was made, and the booking came out cleanly attributed to
+  whichever creation happened to carry a date — in either delivery order, and
+  with an empty current history reading as "nothing has happened since the
+  mailing". Both orders are covered by regression tests.
 
 ### Proven `delivered` / `read`
 
@@ -453,6 +529,28 @@ each leave the status without the proof the receipt table requires, and none of
 them may clear a confirmation that was proven. A lone failure keeps its
 confirmation. The failed group's admissibility policy and the mailing's attempt
 count are untouched.
+
+#### The slot's rank and one callback's proof
+
+Two questions, asked separately. The slot's status is the record of a mailing
+that really happened and only ever moves forward; the receipt is a fact about
+ONE callback — that its signature was verified and that it named the route this
+slot's single attempt froze.
+
+Asking for the proof only when the status moved tied them together. A signed
+`delivered`, on the frozen route, arriving after an unproven `read` had already
+walked the slot to the higher rank was refused by the monotonicity rule and
+discarded WITH its proof: §46.3's precedence never ran, and the slot went on
+asserting a delivery failure about a message Meta had signed for. The proof is
+now recorded for every callback whose exact message id belongs to the slot,
+whether or not the rank moved.
+
+Nothing else changes. The rank still never walks backwards, so the slot stays at
+`read`. An unproven callback still proves nothing — a `read` that cannot be
+verified does not become a proven one by being recorded, because the receipt is
+refused on its own terms. A message id no slot of this phase owns is still
+nobody's business and falls through untouched. Two proven statuses of one
+message leave one receipt each, and a repeat of either adds none.
 
 ## 6. The message
 
@@ -796,6 +894,41 @@ of them as deterministic races driven on independent PostgreSQL connections:
    exact message id and route, both after the acceptance and with the failure
    overtaking it. Plus a repeated success, a success with no stated time, a lone
    failure, and the three unproven successes that may not clear a confirmation.
+
+The fifth round's five findings, all failing before the fix:
+
+1. two creation deliveries of one booking naming different owners with one of
+   them undated, in BOTH delivery orders, and an empty current history: the
+   booking came out cleanly attributed to whoever's creation carried the date,
+   and the recipient `included`. Plus a separate one: a cancellation of that
+   booking stored before the mailing, with the creations claiming a later
+   instant and two owners, where the early sighting must not hide the
+   contradiction. Control: a repeat with the same owner that merely adds the
+   instant stays usable evidence;
+2. one numeric customer id claimed by two cards of this workspace against two
+   different proven uuids, for a manual recipient holding that booking in their
+   current history — `included` for a creation before the attempt and `excluded`
+   for one after it, both invented from an ambiguous link read as an absent one.
+   Controls: an unambiguously foreign creator, an ordinary manual card with a
+   complete empty history, and a card in a branch nobody configured, which
+   competes with nothing;
+3. a booking somebody else provably created and then handed on, outside this
+   person's list and inside the window, which left every bridge-less recipient
+   `unknown`. Controls: the same handover with no card bridging its creator
+   stays `unknown`, and this person's own active booking ahead still excludes
+   them;
+4. their OWN cancelled booking, still in their complete current history, whose
+   creation delivery proves branch, booking and owner and states no usable
+   instant, stored weeks before the mailing. Controls: a first sighting after
+   the attempt, an old appointment with no early delivery at all, a creators'
+   conflict, and an active booking ahead;
+5. through the real worker: a confirmed `failed`, then an unproven `read` that
+   walked the slot to the higher rank, then a signed `delivered` on the frozen
+   route — refused by monotonicity and discarded with its proof, so the slot
+   kept asserting the failure. Checked with both unproven middles, an unsigned
+   callback and a foreign recipient. Controls: two proven statuses leave one
+   receipt each and repeats add none, and a foreign message id is still
+   nobody's business.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

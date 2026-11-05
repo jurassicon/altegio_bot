@@ -1817,6 +1817,18 @@ Five things, none of them done by this stage:
    withdraw anything, a failure with no success beside it keeps its
    confirmation, and neither the failed group's policy nor the mailing's attempt
    count is affected.
+
+   That withdrawal now also reaches the pair the slot's RANK hid. The slot's
+   status only ever moves forward, and the proof of a callback is a separate
+   fact about that callback. Asking for the proof only when the status moved
+   tied them together: a signed `delivered` on the frozen route, arriving after
+   an unproven `read` had already walked the slot to the higher rank, was
+   refused by the monotonicity rule and discarded with its proof — and the slot
+   went on asserting a delivery failure about a message Meta had signed for. The
+   proof is now recorded for every callback whose exact message id belongs to
+   the slot, whether or not the rank moved. The rank still never walks
+   backwards, an unproven callback still proves nothing, and a message id this
+   phase does not own is still untouched.
 5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
    claim, the terminal tombstones, the executor and the follow-up callbacks all
    belong to that stage. The source and dedupe contract it will claim against is

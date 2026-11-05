@@ -605,7 +605,8 @@ def booking_verdict(
       exactly the engagement the rule is about. This is asked BEFORE the
       unknowns, because a proven fact about one booking is not weakened by a gap
       about another;
-    * a booking the live read can see whose CREATION cannot be proven is
+    * a booking the live read can see whose CREATION cannot be proven, and
+      which was not proven to EXIST already when the attempt was made, is
       UNKNOWN, whenever its appointment is. Whether it was made before or after
       the attempt decides the answer, so neither verdict is available — and an
       appointment in the past does not settle it: a booking made the day after
@@ -678,13 +679,23 @@ def booking_verdict(
     # because a creation is never credited to the customer a booking was later
     # moved to.
     for row in bookings.bookings:
-        if creations.creation_of(row.booking_uuid) is None:
-            return BookingVerdict(
-                False,
-                BOOKING_CREATION_UNPROVEN,
-                unknown=True,
-                pages_read=bookings.pages_read,
-            )
+        if creations.creation_of(row.booking_uuid) is not None:
+            continue
+        # Or proven to have existed ALREADY when the attempt was made. That is
+        # a weaker fact than a creation date and the exact one this rule needs:
+        # the question is whether anything is new since the mailing, and a
+        # booking this deployment had already heard of by then is not. It
+        # excludes nobody — only ``created_at`` can do that — and it stops a
+        # creation delivery that named the owner but not the instant from
+        # reading as "we know nothing about this booking at all".
+        if creations.existed_at_attempt(row.booking_uuid):
+            continue
+        return BookingVerdict(
+            False,
+            BOOKING_CREATION_UNPROVEN,
+            unknown=True,
+            pages_read=bookings.pages_read,
+        )
 
     return BookingVerdict(
         True,
