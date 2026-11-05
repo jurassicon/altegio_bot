@@ -196,6 +196,10 @@ _REASON_LABELS: Final[dict[str, str]] = {
         "Исходный заказ прочитать не удалось: таймаут, нечитаемый ответ или другой заказ. "
         "Это не означает, что ваучер действителен."
     ),
+    "followup_entitlement_settlement_unproven": (
+        "Исходный заказ прочитан, но его оплата не доказана: он не в оплаченном состоянии либо его суммы "
+        "противоречат финансовому контракту своей схемы. Наличие кода и совпавший отпечаток этого не заменяют."
+    ),
     "followup_group_moved_out_of_selection": (
         "Пока выполнялись внешние проверки, этот адресат перешёл в группу, которая не была выбрана. "
         "В состав он не включается, и его место никем не занимается."
@@ -478,9 +482,11 @@ def _stored_block(
             "текущий текст относится не к этому составу.</div>"
         )
     )
+    standing_state = "current" if currency.current else "historical"
     return f"""
-<div class="alert {css}">
-  <div><b>Результат проверки, версия {int(stored.version)}.</b> {_esc(standing)}</div>
+<div class="alert {css}" id="followup-stored" data-followup-standing="{standing_state}">
+  <div><b>Результат проверки, версия {int(stored.version)}.</b>
+    <span id="followup-standing">{_esc(standing)}</span></div>
   <div class="small mt-1">
     Группы: {_esc(groups)}.<br>
     Минимальный интервал после исходной попытки: {days:.0f} дн.<br>
@@ -506,11 +512,11 @@ def _stored_block(
   </div></div></div>
 </div>
 <div class="small text-muted mb-2">
-  Это числа на момент проверки. {
+  Это числа на момент проверки. <span id="followup-confirmation">{
         "Они подтверждены и сейчас."
         if currency.current
         else "Они НЕ подтверждены заново: это историческая запись проверки, а не текущая готовность."
-    }
+    }</span>
 </div>
 {_rows_table(stored.rows)}
 """
@@ -649,6 +655,30 @@ async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
 <script>
 const CSRF = {_json_literal(csrf)};
 const HEADER = {_json_literal(CSRF_HEADER)};
+// A refresh that did not produce a new result must not leave the previous one
+// standing as current. The page was rendered when the saved snapshot still held;
+// the click just proved that nothing can be asserted about NOW — a 409, a
+// network failure, or an answer that could not be read. So the displayed
+// standing drops to historical immediately, without a reload, and without
+// touching the immutable snapshot: the counts, the dates and the rows stay
+// readable as the history they are.
+function followupDemoteStoredResult() {{
+  const block = document.getElementById('followup-stored');
+  if (block === null) {{ return; }}
+  block.classList.remove('alert-success', 'alert-danger');
+  block.classList.add('alert-warning');
+  block.dataset.followupStanding = 'historical';
+  const standing = document.getElementById('followup-standing');
+  if (standing !== null) {{
+    standing.textContent = 'Проверка состава не выполнена, поэтому актуальность этих проверок '
+      + 'сейчас не подтверждена. Ниже — исторический результат; состав нужно пересчитать.';
+  }}
+  const confirmation = document.getElementById('followup-confirmation');
+  if (confirmation !== null) {{
+    confirmation.textContent = 'Они НЕ подтверждены заново: это историческая запись проверки, '
+      + 'а не текущая готовность.';
+  }}
+}}
 document.getElementById('followup-check')?.addEventListener('click', async (event) => {{
   const button = event.currentTarget;
   const out = document.getElementById('followup-result');
@@ -672,16 +702,31 @@ document.getElementById('followup-check')?.addEventListener('click', async (even
       headers: {{'Content-Type': 'application/json', [HEADER]: CSRF}},
       body: JSON.stringify({{groups: groups, min_interval_days: days}}),
     }});
-    const data = await response.json();
-    if (data.accepted) {{
+    let data = null;
+    try {{
+      data = await response.json();
+    }} catch (parseError) {{
+      // An answer we cannot read is not an answer. Same consequence as a
+      // refusal: nothing is asserted about now.
+      data = null;
+    }}
+    if (data !== null && data.accepted) {{
       out.textContent = 'Готово. Обновляем страницу…';
       window.location.reload();
       return;
     }}
-    out.textContent = 'Проверка не выполнена, предыдущий результат не изменился. '
-      + (data.detail || '') + ' ' + (data.reasons || []).join(', ');
+    followupDemoteStoredResult();
+    if (data === null) {{
+      out.textContent = 'Проверка не выполнена: ответ сервера не удалось прочитать. '
+        + 'Предыдущий результат не изменился, но он больше не считается актуальным.';
+    }} else {{
+      out.textContent = 'Проверка не выполнена, предыдущий результат не изменился и больше '
+        + 'не считается актуальным. ' + (data.detail || '') + ' ' + (data.reasons || []).join(', ');
+    }}
   }} catch (error) {{
-    out.textContent = 'Проверка не выполнена, предыдущий результат не изменился.';
+    followupDemoteStoredResult();
+    out.textContent = 'Проверка не выполнена, предыдущий результат не изменился и больше '
+      + 'не считается актуальным.';
   }} finally {{
     button.disabled = false;
   }}

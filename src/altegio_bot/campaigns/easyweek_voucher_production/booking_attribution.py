@@ -79,7 +79,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_locations import EasyWeekLocationRegistry, configured_easyweek_locations
@@ -370,6 +370,16 @@ class CaptureScan:
         for booking in self.bookings:
             grouped.setdefault(booking.customer_id, []).append(booking)
         return grouped
+
+    def by_booking_uuid(self) -> dict[uuid_module.UUID, ObservedBooking]:
+        """The same bookings keyed by their own identity.
+
+        For a caller that already knows WHICH bookings it is asking about — a
+        live read keyed on a proven customer uuid returns their booking ids —
+        and therefore needs no numeric customer id to find their creations.
+        Dedupe is by booking uuid, so this is one row per booking.
+        """
+        return {booking.booking_uuid: booking for booking in self.bookings}
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +678,7 @@ async def scan_capture(
     anchors: list[datetime],
     now: datetime,
     registry: EasyWeekLocationRegistry,
+    lookback: timedelta | None = LATE_CAPTURE_SLACK,
 ) -> CaptureScan:
     """Every booking of this workspace that could matter, once.
 
@@ -679,11 +690,25 @@ async def scan_capture(
     Deduplication is by booking identity, which is what makes a retried
     webhook, a Resend and a rescheduled appointment one booking rather than
     three conversions.
+
+    ``lookback`` is how far before the earliest anchor the scan reaches, and the
+    attribution report keeps the one-day slack it was written with: a conversion
+    is a booking CREATED after the send, so a creation delivered more than a day
+    before it cannot be one, and reading further back would only cost rows.
+
+    ``lookback=None`` removes the lower bound for a caller that needs creations
+    older than the anchor — §46.5's follow-up asks when a booking the live read
+    can see was MADE, and that may be long before the mailing. It is still
+    bounded in both rows and work: the newest :data:`MAX_SCANNED_EVENTS`
+    lifecycle deliveries are read, newest-first through the primary key, and are
+    then applied in their own order. More stored than that reports ``truncated``
+    rather than a short answer, so nothing here becomes an unbounded full scan
+    and no caller can mistake a partial pass for a complete one.
     """
     if not anchors or not registry.ready:
         return CaptureScan(branch_observed={location_id: 0 for location_id in registry.locations})
 
-    floor = min(anchors) - LATE_CAPTURE_SLACK
+    floor = min(anchors) - lookback if lookback is not None else None
     rows = (
         await session.execute(
             select(
@@ -698,15 +723,21 @@ async def scan_capture(
                 EasyWeekEvent.payload_hash,
             )
             .where(EasyWeekEvent.event_hint.in_(LIFECYCLE_HINTS))
-            .where(EasyWeekEvent.received_at >= floor)
+            .where(EasyWeekEvent.received_at >= floor if floor is not None else true())
             .where(EasyWeekEvent.received_at <= now)
-            .order_by(EasyWeekEvent.id.asc())
+            # Newest-first only when there is no floor, so the cap keeps the
+            # deliveries nearest the question instead of the oldest ones in the
+            # table. The rows are put back into primary-key order below, which
+            # is what makes a later delivery apply after an earlier one.
+            .order_by(EasyWeekEvent.id.asc() if floor is not None else EasyWeekEvent.id.desc())
             .limit(MAX_SCANNED_EVENTS + 1)
         )
     ).all()
 
     truncated = len(rows) > MAX_SCANNED_EVENTS
     rows = rows[:MAX_SCANNED_EVENTS]
+    if floor is None:
+        rows = list(reversed(rows))
 
     rejected: dict[str, int] = {}
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}

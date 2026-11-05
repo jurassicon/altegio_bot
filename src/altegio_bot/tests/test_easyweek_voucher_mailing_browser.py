@@ -3540,3 +3540,127 @@ async def test_followup_stored_result_standing_in_a_real_browser(page, monkeypat
     )
     assert overflow <= 1, overflow
     assert_no_page_errors(opened)
+
+
+async def test_followup_failed_refresh_demotes_the_open_page(page, monkeypatch, session_maker):
+    """Review round 2, finding 6, in Chromium and without a reload.
+
+    The operator is looking at a green saved result. The Meta template is paused
+    behind their back. They press «Проверить состав», the POST comes back 409 —
+    and the old block used to stay green, still claiming «Эти проверки
+    актуальны» and «Они подтверждены и сейчас», because the script only replaced
+    one line of status text. The click had just proved the opposite.
+
+    Three outcomes are checked on the one open page: a refusal, a network
+    failure, and a successful recalculation that really does produce a new
+    result. Then the same page at phone width, and no PII anywhere.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        approved_meta_templates,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False
+    )
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('Результат проверки')", timeout=15_000)
+    assert "Эти проверки актуальны" in await opened.inner_text("body")
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+
+    # Paused in Meta while this page stays open. No reload.
+    paused = approved_meta_templates()
+    paused[0]["status"] = "PAUSED"
+    templates.templates = paused
+
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    body = await opened.inner_text("body")
+    assert "Эти проверки актуальны" not in body
+    assert "Они подтверждены и сейчас." not in body
+    assert "НЕ подтверждены заново" in body
+    assert "не подтверждена" in body
+    # The snapshot itself is still readable as the history it is.
+    assert "исключены" in body
+    assert "не удалось установить" in body
+    classes = await opened.get_attribute("#followup-stored", "class")
+    assert "alert-success" not in classes
+    assert "alert-warning" in classes
+
+    # A network failure says the same thing. Reload first so the block starts
+    # green again, then take the connection away.
+    templates.templates = approved_meta_templates()
+    await opened.reload()
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+    await opened.evaluate("() => { window.fetch = () => Promise.reject(new Error('offline')); }")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    assert "Эти проверки актуальны" not in await opened.inner_text("body")
+
+    # And a refresh that really does recalculate still produces a new version.
+    await opened.reload()
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.body.innerText.includes('версия 2')",
+        timeout=15_000,
+    )
+    fresh = await opened.inner_text("body")
+    assert "Эти проверки актуальны" in fresh
+
+    await opened.set_viewport_size({"width": 390, "height": 844})
+    await opened.reload()
+    await opened.evaluate("() => { window.fetch = () => Promise.reject(new Error('offline')); }")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    narrow = await opened.inner_text("body")
+    assert "НЕ подтверждены заново" in narrow
+    for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
+        assert forbidden not in narrow, forbidden
+    overflow = await opened.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 1, overflow
+    assert_no_page_errors(opened)

@@ -494,6 +494,40 @@ async def _start_identifier_conflict(
     return bool(found)
 
 
+def stop_superseded_by_opt_in(
+    *,
+    stop_event_at: datetime | None,
+    state: str | None,
+    decision_command: str | None,
+    decided_event_at: datetime | None,
+) -> bool:
+    """Is this STOP a replay of something a PROVEN newer opt-in already answered?
+
+    THE single definition of the STOP/START order, so the writer that applies a
+    refusal and every reader that asks whether an old refusal still stands
+    cannot drift apart. Lifted out of :func:`apply_consent_decision`, which is
+    its original home and now its first caller.
+
+    Only a provable order refuses a STOP. The bar is the PROVEN event time of
+    the opt-in actually IN FORCE, and both sides must be known: an equal time,
+    an unknown time on either side, an opt-in that is not the decision in force,
+    and anything that is not a proven opt-in at all all leave the refusal
+    standing. That asymmetry is deliberate — a tie and an unproven order both
+    fall to the refusal — and it is the same rule in both directions, because
+    only a decision this ledger honoured can be read as an opt-in here. An
+    unsigned, older or refused START never became one.
+
+    About ONE address. A START proven for one number says nothing about another,
+    which is why the caller passes the row of the address the refusal was sent
+    from and never an aggregate.
+    """
+    if state != CONSENT_STATE_OPTED_IN or decision_command != CONSENT_COMMAND_START:
+        return False
+    if stop_event_at is None or decided_event_at is None:
+        return False
+    return stop_event_at < decided_event_at
+
+
 async def apply_consent_decision(
     session: AsyncSession,
     *,
@@ -568,8 +602,12 @@ async def apply_consent_decision(
             # 10:45 was discarded as a replay of something that never happened.
             # An audit trail of rejected attempts must not be able to license
             # ignoring a refusal.
-            opt_in_event_at = row.decided_event_at if row.decision_command == CONSENT_COMMAND_START else None
-            if event_at is not None and opt_in_event_at is not None and event_at < opt_in_event_at:
+            if stop_superseded_by_opt_in(
+                stop_event_at=event_at,
+                state=row.state,
+                decision_command=row.decision_command,
+                decided_event_at=row.decided_event_at,
+            ):
                 if row.last_stop_observed_at is None or observed_at > row.last_stop_observed_at:
                     row.last_stop_observed_at = observed_at
                 merged = dict(row.evidence or {})
@@ -1522,10 +1560,26 @@ class LedgerState:
     # against — our own clock on both sides, never a timestamp invented for the
     # snapshot.
     decided_observed_at: datetime | None = None
+    # WHICH decision is in force, and the PROVEN event time it was made at.
+    # Carried so a reader asking whether an old refusal still stands can apply
+    # :func:`stop_superseded_by_opt_in` — the writer's own order — instead of
+    # comparing arrival times, which prove nothing about what the customer sent
+    # first.
+    decision_command: str | None = None
+    decided_event_at: datetime | None = None
 
     @property
     def refuses(self) -> bool:
         return self.state == CONSENT_STATE_OPTED_OUT
+
+    def supersedes_stop(self, stop_event_at: datetime | None) -> bool:
+        """Has a proven newer opt-in on THIS address already answered that STOP?"""
+        return stop_superseded_by_opt_in(
+            stop_event_at=stop_event_at,
+            state=self.state,
+            decision_command=self.decision_command,
+            decided_event_at=self.decided_event_at,
+        )
 
     @property
     def permits(self) -> bool:
@@ -1557,18 +1611,22 @@ async def ledger_state(session: AsyncSession, *, phone: object) -> LedgerState:
                 WhatsAppConsentSuppression.consent_version,
                 WhatsAppConsentSuppression.evidence,
                 WhatsAppConsentSuppression.decided_observed_at,
+                WhatsAppConsentSuppression.decision_command,
+                WhatsAppConsentSuppression.decided_event_at,
             ).where(WhatsAppConsentSuppression.wa_address == address)
         )
     ).first()
     if row is None:
         return LedgerState(None)
-    state, version, evidence, decided_observed_at = row
+    state, version, evidence, decided_observed_at, decision_command, decided_event_at = row
     reason = (evidence or {}).get("last_refused_start_reason")
     return LedgerState(
         str(state),
         int(version),
         str(reason) if isinstance(reason, str) else None,
         decided_observed_at,
+        str(decision_command) if decision_command is not None else None,
+        decided_event_at,
     )
 
 
@@ -1937,4 +1995,5 @@ __all__ = [
     "recipient_route_digest",
     "record_inbound_receipts",
     "sender_route_digest",
+    "stop_superseded_by_opt_in",
 ]

@@ -129,6 +129,7 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
     DELIVERY_RECEIPT_KIND_DELIVERED,
     DELIVERY_RECEIPT_KIND_READ,
+    DELIVERY_RECEIPT_MATCH_CONFIRMED,
     FOLLOWUP_GROUP_UNPROVEN,
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -647,16 +648,24 @@ async def _confirmed_failures(session: AsyncSession, *, batch_id: int) -> dict[i
 async def _proven_receipts(session: AsyncSession, *, batch_id: int) -> dict[int, set[str]]:
     """Which positive statuses of this batch carry §46.3's proof, by item id.
 
-    A stored receipt IS the proof — the database requires the verified
-    signature and both halves of a matching route — so reading the rows is
-    enough and no verdict is recomputed here.
+    A CONFIRMED receipt IS the proof — the database requires the verified
+    signature, the slot and both halves of a matching route — so reading those
+    rows is enough and no verdict is recomputed here.
+
+    The other two states are deliberately excluded. An ``unmatched`` row is a
+    signed callback whose message id nothing owned yet, kept so the commit that
+    records the identifier can bind it; it names no slot and is evidence for
+    nobody. A ``conflicting`` one was bound and turned out to name a foreign or
+    unverifiable route, and is kept for audit only.
     """
     rows = (
         await session.execute(
             select(
                 EasyWeekVoucherProductionDeliveryReceipt.item_id,
                 EasyWeekVoucherProductionDeliveryReceipt.kind,
-            ).where(EasyWeekVoucherProductionDeliveryReceipt.batch_id == int(batch_id))
+            )
+            .where(EasyWeekVoucherProductionDeliveryReceipt.batch_id == int(batch_id))
+            .where(EasyWeekVoucherProductionDeliveryReceipt.match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED)
         )
     ).all()
     proven: dict[int, set[str]] = {}
@@ -754,7 +763,6 @@ async def _local_phase(
     now: datetime,
     configured_key_id: str | None,
     historical: HistoricalConsentScan,
-    creations: CapturedCreations,
 ) -> list[RowFacts]:
     """Decide everything that can be decided without a network request.
 
@@ -891,7 +899,12 @@ async def _local_phase(
             facts.unknown(HISTORICAL_CONSENT_UNPROVEN, historical_consent=list(historical.gaps))
             decided.append(facts)
             continue
-        if historical.blocks(identity.address):
+        # Asked about the whole aggregate the live veto itself matched, not
+        # about the number this slot would write to: §46.4.2–3 keep a refusal a
+        # fact about the PERSON, and a stored STOP sent from another card of
+        # this uuid — another branch's, or a number the card has since dropped —
+        # is this person's refusal. The widening bans and proves nothing.
+        if historical.blocks_any((identity.address, *consent.addresses)):
             facts.exclude(HISTORICAL_STOP_UNACCOUNTED)
             decided.append(facts)
             continue
@@ -920,10 +933,6 @@ async def _local_phase(
         facts.notes["schema_version"] = gate.schema_version
         facts.notes["target_order_uuid"] = str(item.target_order_uuid) if item.target_order_uuid else None
         facts.notes["reconciliation_marker"] = str(item.reconciliation_marker or "")
-        # The local half of the booking question, resolved now and carried: the
-        # creation capture is a database read and must not be taken while the
-        # external read is in flight.
-        facts.creations = creations.for_slot(int(item.slot), reason=BOOKING_CAPTURE_UNPROVEN)
         decided.append(facts)
 
     return decided
@@ -937,6 +946,7 @@ async def _local_phase(
 async def _external_phase(
     candidates: Sequence[RowFacts],
     *,
+    batch_id: int,
     reader: CustomerHistoryReader | None,
     order_reader: Any | None,
     session_maker: async_sessionmaker[AsyncSession],
@@ -944,15 +954,23 @@ async def _external_phase(
     read_bookings: Callable[..., Any] = _read_customer_bookings,
     prove_artifact: Callable[..., Any] = _prove_source_artifact,
 ) -> tuple[int, bool]:
-    """The two external proofs, for every row that is still a candidate.
+    """The external proofs, then the local pass that depends on their answers.
 
-    The artifact first (§46.6) and the bookings second (§46.5), because a slot
-    whose original voucher is gone needs no booking read at all.
+    Three steps, in this order. The artifact first (§46.6), because a slot whose
+    original voucher is gone needs no booking read at all; then the live booking
+    read (§46.5), which states this person's bookings and their appointment
+    times; then one bounded LOCAL pass over the stored booking deliveries, which
+    states when each of those bookings was MADE.
 
-    No transaction and no lock is held across either request. The MAC check
-    inside the artifact proof opens its own short read session once the order
-    has already come back, which is why ``session_maker`` is passed rather than
-    a session.
+    The third step is here rather than in the local phase because it depends on
+    the second one's answer: a person's creations are found by booking identity
+    as well as by numeric customer id, and the booking identities come from the
+    live read. It opens its own session once every request has finished.
+
+    No transaction and no lock is held across any request. The MAC check inside
+    the artifact proof opens its own short read session once the order has
+    already come back, which is why ``session_maker`` is passed rather than a
+    session.
 
     A missing reader is never an empty answer. Without a configured EasyWeek
     read every candidate becomes ``unknown``, which is what §46.5 and §46.6
@@ -961,6 +979,13 @@ async def _external_phase(
     """
     reads = 0
     retryable = False
+    # Slot → the live booking set, kept between the two sub-phases. The live
+    # read answers "which bookings does this person have, and when are the
+    # appointments"; the creation pass below answers "and when was each of them
+    # made". The second one is a database read, so it may not happen while a
+    # request is in flight — and it needs the first one's answer, which is why
+    # it is a second sub-phase rather than part of the local phase.
+    live: dict[int, CustomerBookingSet] = {}
     for facts in candidates:
         if not facts.notes.get("pending_booking_proof"):
             continue
@@ -999,6 +1024,34 @@ async def _external_phase(
             customer_uuid=facts.easyweek_customer_uuid,
         )
         reads += 1
+        live[int(facts.slot)] = bookings
+
+    # Sub-phase 2b: one bounded local pass over the stored booking deliveries,
+    # in a session of its own with nothing external in flight. It is given the
+    # booking identities the live reads proved, because a person's creations are
+    # found by booking identity as well as by numeric customer id — which is
+    # what makes a manual card carrying no numeric id provable at all.
+    creations = CapturedCreations(complete=False, by_slot={})
+    pending = [facts for facts in candidates if int(facts.slot) in live]
+    if pending:
+        async with session_maker() as session:
+            creations = await load_creation_evidence(
+                session,
+                items=await _batch_items(session, batch_id=int(batch_id)),
+                now=now,
+                unproven_reason=BOOKING_CAPTURE_UNPROVEN,
+                conflict_reason=IDENTITY_CONFLICT,
+                slot_bookings={
+                    int(slot): tuple(row.booking_uuid for row in result.bookings)
+                    for slot, result in live.items()
+                    if result.complete
+                },
+            )
+
+    for facts in pending:
+        bookings = live[int(facts.slot)]
+        assert facts.source_attempted_at is not None
+        facts.creations = creations.for_slot(int(facts.slot), reason=BOOKING_CAPTURE_UNPROVEN)
         verdict: BookingVerdict = booking_verdict(
             bookings,
             creations=facts.creations,
@@ -1018,7 +1071,7 @@ async def _external_phase(
             facts.unknown(verdict.reason, booking_reason=verdict.detail or verdict.reason)
         else:
             facts.exclude(verdict.reason)
-    return reads, retryable
+    return reads, retryable, creations
 
 
 # ---------------------------------------------------------------------------
@@ -1283,16 +1336,6 @@ async def create_preview(
             limit=int(historical_event_limit),
             now=moment,
         )
-        # The booking CREATION capture (§46.5), also local and also once for
-        # the whole batch. Separate from the live read on purpose: creation
-        # times come from stored deliveries, appointment times from the live
-        # history, and collapsing the two is the defect this closes.
-        creations = await load_creation_evidence(
-            session,
-            items=await _batch_items(session, batch_id=int(spec.batch_id)),
-            now=moment,
-            unproven_reason=BOOKING_CAPTURE_UNPROVEN,
-        )
         decided = await _local_phase(
             session,
             gate=gate,
@@ -1301,7 +1344,6 @@ async def create_preview(
             now=moment,
             configured_key_id=configured_key_id,
             historical=historical,
-            creations=creations,
         )
 
     # An unproven message contract blocks the whole preview. §46.4 forbids
@@ -1319,8 +1361,9 @@ async def create_preview(
         return PreviewOutcome(False, TEMPLATE_UNPROVEN, template=template)
 
     # Phase 2: the only network step, with no session open.
-    reads, retryable = await _external_phase(
+    reads, retryable, creations = await _external_phase(
         decided,
+        batch_id=int(spec.batch_id),
         reader=booking_reader,
         order_reader=order_reader if order_reader is not None else booking_reader,
         session_maker=session_maker,

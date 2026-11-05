@@ -56,6 +56,7 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     CONTRACT_VERSION,
     CUSTOMER_REPLIED,
     ENTITLEMENT_INVALID,
+    ENTITLEMENT_SETTLEMENT_UNPROVEN,
     ENTITLEMENT_UNPROVEN,
     ENTITLEMENT_UNREADABLE,
     EVIDENCE_UNPROVEN,
@@ -85,8 +86,10 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as production_ledger
 from altegio_bot.models.models import (
     CONSENT_COMMAND_NONE,
+    CONSENT_COMMAND_START,
     CONSENT_COMMAND_STOP,
     CONSENT_SOURCE_INBOUND,
+    CONSENT_STATE_OPTED_IN,
     CONSENT_STATE_OPTED_OUT,
     DELIVERY_FAILURE_CLASS_PERMANENT,
     DELIVERY_FAILURE_CLASS_TRANSIENT,
@@ -99,9 +102,13 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
     DELIVERY_FAILURE_SOURCE_META_API,
+    DELIVERY_RECEIPT_KIND_READ,
+    DELIVERY_RECEIPT_MATCH_CONFIRMED,
+    DELIVERY_RECEIPT_MATCH_UNMATCHED,
     FOLLOWUP_GROUP_UNPROVEN,
     INBOUND_AUTHENTICITY_SIGNED,
     INBOUND_AUTHENTICITY_UNVERIFIED,
+    PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     VOUCHER_PRODUCTION_ITEM_AMBIGUOUS,
@@ -1289,8 +1296,16 @@ async def test_a_booking_after_the_attempt_with_no_creation_evidence_is_unknown(
     assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
 
 
-async def test_a_reassigned_booking_has_no_attributable_creation(session_maker, binding_key, no_network) -> None:
-    """Two deliveries disagree about whose booking it is, so it proves nothing."""
+async def test_a_reassigned_booking_keeps_its_creation_with_whoever_made_it(
+    session_maker, binding_key, no_network
+) -> None:
+    """A later reassignment does not undo the fact that this person booked.
+
+    Review round 2, finding 2B. The creation delivery names a customer; that is
+    the historical fact. Dropping it because a LATER delivery of the same
+    booking names somebody else credited nobody with the booking and let the
+    person who made it back into the audience.
+    """
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
     who = person(1)
@@ -1315,23 +1330,223 @@ async def test_a_reassigned_booking_has_no_attributable_creation(session_maker, 
     )
     reader = FakeHistoryReader(bookings={who["customer_uuid"]: [moved]})
     outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    # Created BEFORE the attempt and cancelled, so nothing excludes: the
+    # creation is attributed, it is simply not new.
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_booking_created_after_the_attempt_then_moved_away_still_excludes(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 2, finding 2B, the reproduction exactly as it was reported.
+
+    The person booked after the mailing; the booking was then reassigned, so
+    their live history is empty. The capture still attributes the creation to
+    them, and that is engagement since the mailing.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    moved = booking(index=7, customer_uuid=person(2)["customer_uuid"], start=ATTEMPTED_AT + timedelta(days=9))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"] + 1,
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: []})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_booking_moved_in_is_not_the_new_holders_creation(session_maker, binding_key, no_network) -> None:
+    """The other direction: a creation is never credited to the new owner."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    moved = booking(
+        index=7,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    # Created by somebody else, then moved to this person.
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"] + 5,
+        created_at=ATTEMPTED_AT - timedelta(days=4),
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"],
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [moved]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
     assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
 
 
-async def test_a_person_with_no_numeric_id_has_no_creation_evidence(session_maker, binding_key, no_network) -> None:
-    """EasyWeek's booking webhooks name a number; without one, nothing bridges."""
+async def test_a_manual_card_without_a_numeric_id_is_provable(session_maker, binding_key, no_network) -> None:
+    """Review round 2, finding 5: the production shape of a manual card.
+
+    ``ensure_local_identity`` creates a manual recipient's card with the proven
+    uuid and ``altegio_client_id=None``. That is ordinary data, not damage, and
+    demanding a numeric bridge from it refused somebody for the way their card
+    was made. With a complete empty live history by the proven uuid there is
+    nothing to date and nothing that could have left their list.
+    """
     await seed_sender_and_template(session_maker, with_followup_template=True)
-    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
     async with session_maker() as session:
-        async with session.begin():
-            card = (
-                await session.execute(select(Client).where(Client.easyweek_customer_uuid.is_not(None)).limit(1))
-            ).scalar_one()
-            card.altegio_client_id = None
-    outcome = await build(session_maker, batch_id=batch_id)
+        card = (
+            await session.execute(select(Client).where(Client.easyweek_customer_uuid.is_not(None)).limit(1))
+        ).scalar_one()
+        assert card.altegio_client_id is None
+    reader = FakeHistoryReader(bookings={person(1)["customer_uuid"]: []})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_manual_card_without_a_numeric_id_still_sees_its_own_bookings(
+    session_maker, binding_key, no_network
+) -> None:
+    """The history check is not weakened: a real new booking still excludes."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    fresh = booking(
+        index=4,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=fresh["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [fresh]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_manual_card_without_a_numeric_id_is_unknown_while_a_booking_moved(
+    session_maker, binding_key, no_network
+) -> None:
+    """And it stays honest: a reassignment is what an empty list cannot show."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    stray = booking(index=8, customer_uuid=person(3)["customer_uuid"], start=ATTEMPTED_AT + timedelta(days=5))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=stray["uuid"],
+        numeric_customer_id=4242,
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_cancelled(session_maker, booking_uuid=stray["uuid"], numeric_customer_id=4343)
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: []})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
     assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_an_old_appointment_with_no_creation_evidence_is_unknown(session_maker, binding_key, no_network) -> None:
+    """Review round 2, finding 2A: an old appointment is not an old booking.
+
+    A booking appointed before the attempt used to skip the creation check
+    altogether, so a booking entered after the mailing to record a visit that
+    already happened — exactly the engagement §46.5 is about — came out
+    included whenever its creation webhook was missing or invalid.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    backdated = booking(index=5, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=2))
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [backdated]})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_an_old_appointment_created_after_the_attempt_excludes(session_maker, binding_key, no_network) -> None:
+    """And with the creation proven, the backdated booking excludes."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    backdated = booking(index=5, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=2))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=backdated["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=3),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [backdated]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_creation_older_than_the_report_window_is_still_read(session_maker, binding_key, no_network) -> None:
+    """Review round 2, finding 2C: the evidence was in the database, unread.
+
+    The attribution report scans from one day before the earliest send, because
+    a conversion is a booking created AFTER it. The follow-up asks a second
+    question about the same bookings — when was this one made — and the answer
+    may be long before the mailing. With the report's floor the creation sat
+    unread and an ordinary cancelled booking made ten days earlier turned the
+    recipient unknown.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    old = booking(
+        index=6,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=3),
+        canceled=True,
+        completed=False,
+    )
+    made = ATTEMPTED_AT - timedelta(days=10)
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=old["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=made,
+        # The delivery arrived when the booking was made, which is what put it
+        # outside the report's own window. Not faked late.
+        received_at=made,
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [old]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
 
 
 async def test_an_unconfigured_branch_registry_has_no_creation_evidence(session_maker, monkeypatch, no_network) -> None:
@@ -1371,13 +1586,17 @@ async def test_the_earning_visit_alone_does_not_exclude(session_maker, binding_k
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
     who = person(1)
-    reader = FakeHistoryReader(
-        bookings={
-            who["customer_uuid"]: [
-                booking(index=1, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=10))
-            ]
-        }
+    earned = booking(index=1, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=10))
+    # Its creation is proven and older than the attempt. Without that the row is
+    # honestly unknown, because an old APPOINTMENT does not establish an old
+    # booking — which is the whole point of keeping the two dates apart.
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=earned["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=12),
     )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: [earned]})
     outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
 
@@ -1392,14 +1611,18 @@ async def test_a_second_completed_visit_does_not_fail_the_proof(session_maker, b
     await seed_sender_and_template(session_maker, with_followup_template=True)
     batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
     who = person(1)
-    reader = FakeHistoryReader(
-        bookings={
-            who["customer_uuid"]: [
-                booking(index=1, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=30)),
-                booking(index=2, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=10)),
-            ]
-        }
-    )
+    visits = [
+        booking(index=1, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=30)),
+        booking(index=2, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=10)),
+    ]
+    for visit, made in zip(visits, (timedelta(days=40), timedelta(days=12))):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=visit["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=ATTEMPTED_AT - made,
+        )
+    reader = FakeHistoryReader(bookings={who["customer_uuid"]: visits})
     outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
 
@@ -2294,6 +2517,280 @@ async def test_a_historical_start_is_not_read_as_permission(session_maker, bindi
     assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
 
 
+async def _other_branch_card(session_maker, *, customer_uuid: str, phone: str, company_id: int = 777) -> None:
+    """A second EasyWeek card of the SAME person, at another configured branch.
+
+    The ordinary shape of a workspace with more than one salon, and the data the
+    §46.4.2–3 veto is written for: one person, two cards, two numbers.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    provider=PROVIDER_EASYWEEK,
+                    company_id=company_id,
+                    easyweek_customer_uuid=uuid_module.UUID(customer_uuid),
+                    altegio_client_id=None,
+                    display_name="Same person, other branch",
+                    phone_e164=phone,
+                    raw={},
+                )
+            )
+
+
+async def _proven_opt_in(session_maker, *, address: str, stop_at: datetime, start_at: datetime) -> tuple[str, str]:
+    """A refusal, then the proven newer opt-in the EXISTING contract honours.
+
+    Written through ``apply_consent_decision`` rather than by hand, so these
+    tests rest on the real START rules — signed, strictly newer, orderable —
+    instead of a row a test invented.
+    """
+    from altegio_bot.whatsapp_consent import apply_consent_decision, lock_consent_address
+
+    outcomes: list[str] = []
+    for command, moment in ((CONSENT_COMMAND_STOP, stop_at), (CONSENT_COMMAND_START, start_at)):
+        async with session_maker() as session:
+            async with session.begin():
+                await lock_consent_address(session, address)
+                decision = await apply_consent_decision(
+                    session,
+                    wa_address=address,
+                    command=command,
+                    authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    source=CONSENT_SOURCE_INBOUND,
+                    observed_at=moment,
+                    event_at=moment,
+                )
+                outcomes.append(str(decision.state))
+    return outcomes[0], outcomes[1]
+
+
+async def test_a_stored_stop_from_another_card_of_the_same_person_blocks(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 2, finding 1A: the veto follows the PERSON, not the number.
+
+    The mailing went to number A. Another card of the same proven uuid, at
+    another branch, carries number B, and the backlog holds a refusal sent from
+    B. The scan found it — B is one of the numbers the batch's recipients are
+    known by — and the preview then asked about A alone and included them.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    other_number = "+4915100654321"
+    await _other_branch_card(session_maker, customer_uuid=who["customer_uuid"], phone=other_number)
+    await _stored_event(session_maker, dedupe_key="legacy-uuid-1", address=other_number, text="стоп")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_a_stored_stop_from_a_stranger_does_not_block(session_maker, binding_key, no_network) -> None:
+    """Another number belonging to another uuid is another person."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    stranger = "+4915100654399"
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Client(
+                    provider=PROVIDER_EASYWEEK,
+                    company_id=778,
+                    easyweek_customer_uuid=uuid_module.UUID(person(5)["customer_uuid"]),
+                    altegio_client_id=None,
+                    display_name="Somebody else",
+                    phone_e164=stranger,
+                    raw={},
+                )
+            )
+    await _stored_event(session_maker, dedupe_key="legacy-uuid-2", address=stranger, text="стоп")
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_proven_newer_start_lifts_a_stored_stop(session_maker, binding_key, no_network) -> None:
+    """Review round 2, finding 1B: an answered refusal is not an unaccounted one.
+
+    The customer said stop, then resubscribed under the existing START contract
+    and the ledger honoured it. Both events happened before the mailing. The
+    backlog scan re-imposed the old refusal on every preview because the ledger
+    no longer reads ``opted_out``.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    stop_at = ATTEMPTED_AT - timedelta(days=20)
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-order-1",
+        address=who["phone"],
+        text="стоп",
+        received=stop_at,
+    )
+    _, after_start = await _proven_opt_in(
+        session_maker,
+        address=who["phone"],
+        stop_at=stop_at,
+        start_at=ATTEMPTED_AT - timedelta(days=10),
+    )
+    assert after_start == CONSENT_STATE_OPTED_IN
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_stop_newer_than_the_opt_in_still_blocks(session_maker, binding_key, no_network) -> None:
+    """The order is the writer's own, and a later refusal wins."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    await _proven_opt_in(
+        session_maker,
+        address=who["phone"],
+        stop_at=ATTEMPTED_AT - timedelta(days=20),
+        start_at=ATTEMPTED_AT - timedelta(days=15),
+    )
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-order-2",
+        address=who["phone"],
+        text="стоп",
+        received=ATTEMPTED_AT - timedelta(days=5),
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_a_stop_at_the_same_moment_as_the_opt_in_still_blocks(session_maker, binding_key, no_network) -> None:
+    """A tie is not an order, and an unordered pair falls to the refusal."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    opt_in_at = ATTEMPTED_AT - timedelta(days=15)
+    await _proven_opt_in(
+        session_maker,
+        address=who["phone"],
+        stop_at=ATTEMPTED_AT - timedelta(days=20),
+        start_at=opt_in_at,
+    )
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-order-3",
+        address=who["phone"],
+        text="стоп",
+        received=opt_in_at,
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_a_stop_with_no_stated_time_cannot_be_superseded(session_maker, binding_key, no_network) -> None:
+    """Unknown on one side means the order has no answer, so the refusal stands."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    await _proven_opt_in(
+        session_maker,
+        address=who["phone"],
+        stop_at=ATTEMPTED_AT - timedelta(days=20),
+        start_at=ATTEMPTED_AT - timedelta(days=10),
+    )
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-order-4",
+        address=who["phone"],
+        text="стоп",
+        payload={
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "metadata": {"phone_number_id": PHONE_NUMBER_ID},
+                                "messages": [
+                                    {
+                                        "from": who["phone"].lstrip("+"),
+                                        "id": "wamid.no-time",
+                                        "type": "text",
+                                        "text": {"body": "стоп"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_an_unsigned_start_never_lifts_a_stored_stop(session_maker, binding_key, no_network) -> None:
+    """The existing START contract decides, and it refuses an unverified one."""
+    from altegio_bot.whatsapp_consent import apply_consent_decision, lock_consent_address
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    stop_at = ATTEMPTED_AT - timedelta(days=20)
+    await _stored_event(
+        session_maker,
+        dedupe_key="legacy-order-5",
+        address=who["phone"],
+        text="стоп",
+        received=stop_at,
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, who["phone"])
+            await apply_consent_decision(
+                session,
+                wa_address=who["phone"],
+                command=CONSENT_COMMAND_STOP,
+                authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                source=CONSENT_SOURCE_INBOUND,
+                observed_at=stop_at,
+                event_at=stop_at,
+            )
+    async with session_maker() as session:
+        async with session.begin():
+            await lock_consent_address(session, who["phone"])
+            refused = await apply_consent_decision(
+                session,
+                wa_address=who["phone"],
+                command=CONSENT_COMMAND_START,
+                authenticity=INBOUND_AUTHENTICITY_UNVERIFIED,
+                source=CONSENT_SOURCE_INBOUND,
+                observed_at=ATTEMPTED_AT - timedelta(days=10),
+                event_at=ATTEMPTED_AT - timedelta(days=10),
+            )
+    assert refused.applied is False
+    # The ledger still refuses, so the aggregate excludes before the backlog
+    # scan is even consulted.
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == CONSENT_REFUSED
+
+
+async def test_a_start_on_another_number_does_not_lift_this_one(session_maker, binding_key, no_network) -> None:
+    """A START proven for one number is not a subscription on another."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    other_number = "+4915100654322"
+    await _other_branch_card(session_maker, customer_uuid=who["customer_uuid"], phone=other_number)
+    await _stored_event(session_maker, dedupe_key="legacy-order-6", address=other_number, text="стоп")
+    # The opt-in belongs to the OTHER number of the same person.
+    await _proven_opt_in(
+        session_maker,
+        address=who["phone"],
+        stop_at=ATTEMPTED_AT - timedelta(days=20),
+        start_at=ATTEMPTED_AT - timedelta(days=10),
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
 async def test_the_backlog_scan_writes_nothing_at_all(session_maker, binding_key, no_network) -> None:
     """§46.4.4 keeps the projection a separate explicit operation."""
     await seed_sender_and_template(session_maker, with_followup_template=True)
@@ -2561,6 +3058,128 @@ async def test_an_explicitly_expired_artifact_excludes(
     reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order})
     outcome = await build(session_maker, batch_id=batch_id, reader=reader)
     assert reason_for(outcome, 1) == ENTITLEMENT_INVALID
+
+
+@pytest.mark.parametrize("schema", ["3", "4"])
+async def test_an_open_unpaid_order_is_not_settled(session_maker, binding_key, no_network, schema: str) -> None:
+    """Review round 2, finding 4: a code that exists is not a settled order.
+
+    Everything else about the body is right — the source bindings, the voucher
+    line, the real MAC — and the order was never paid for. The check read the
+    state and refused only ``refunded``/``cancelled``/``unknown``, so an
+    ``open``, ``is_paid: false`` order went through and the recipient was
+    included.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version=schema)
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+        schema_version=schema,
+        status="open",
+    )
+    order["is_paid"] = False
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order}, schema_version=schema)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == ENTITLEMENT_SETTLEMENT_UNPROVEN
+
+
+@pytest.mark.parametrize("schema", ["3", "4"])
+async def test_a_correctly_settled_order_of_either_schema_proves_out(
+    session_maker, binding_key, no_network, schema: str
+) -> None:
+    """Each schema keeps its own price, and a correct one still proves out."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version=schema)
+    reader = FakeHistoryReader(schema_version=schema)
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+    async with session_maker() as session:
+        row = (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+    assert row.evidence["artifact"]["settlement_proven"] is True
+
+
+async def test_a_paid_order_whose_totals_contradict_the_contract_is_not_settled(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 2, finding 4, second half: the amounts are proven too."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version="3")
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+        schema_version="3",
+    )
+    # Paid, and for a different amount than this schema's contract names.
+    order["total"] = 9999
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order}, schema_version="3")
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_SETTLEMENT_UNPROVEN
+
+
+async def test_a_paid_order_publishing_no_total_at_all_is_not_settled(session_maker, binding_key, no_network) -> None:
+    """A missing amount is not an amount that agrees."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}], schema_version="3")
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+        schema_version="3",
+    )
+    order.pop("total")
+    order.pop("subtotal")
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order}, schema_version="3")
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_SETTLEMENT_UNPROVEN
+
+
+async def test_a_free_issue_funded_from_an_account_is_not_a_free_issue(session_maker, binding_key, no_network) -> None:
+    """Schema 4's zero totals are necessary and never sufficient."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+    )
+    order["account_paid_amount"] = 1000
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_SETTLEMENT_UNPROVEN
+
+
+async def test_a_zero_order_that_is_merely_open_is_not_a_gift_already_given(
+    session_maker, binding_key, no_network
+) -> None:
+    """The case zero amounts cannot distinguish: a draft and a settled gift."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    order = voucher_order(
+        order_uuid=order_uuid_for(batch_id, 1),
+        marker=f"marker-{batch_id}-1",
+        customer_uuid=who["customer_uuid"],
+        code=voucher_code_for(1),
+        status="open",
+    )
+    order["is_paid"] = False
+    order["amount_due"] = 0
+    order["amount_paid"] = 0
+    reader = FakeHistoryReader(orders={order_uuid_for(batch_id, 1): order})
+    outcome = await build(session_maker, batch_id=batch_id, reader=reader)
+    assert reason_for(outcome, 1) == ENTITLEMENT_SETTLEMENT_UNPROVEN
 
 
 async def test_an_artifact_with_no_individual_dates_still_proves_out(session_maker, binding_key, no_network) -> None:
@@ -2978,3 +3597,234 @@ async def test_the_rechecks_of_stop_consent_and_reply_still_hold(session_maker, 
         reader=_DuringRead(session_maker, reply_during, people={1: 2}),
     )
     assert reason_for(second, 1) == CUSTOMER_REPLIED
+
+
+async def test_the_database_itself_requires_each_part_of_a_receipt(session_maker, binding_key, no_network) -> None:
+    """A stored CONFIRMED receipt IS the proof, enforced by Postgres.
+
+    Three shapes the database refuses outright, so no writer can produce a
+    receipt that is not evidence: a confirmed row with no slot, an unmatched row
+    that names one, and a row whose signature was never verified.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "read"}])
+    async with session_maker() as session:
+        item = (
+            await session.execute(
+                select(EasyWeekVoucherProductionBatchItem).where(
+                    EasyWeekVoucherProductionBatchItem.batch_id == batch_id
+                )
+            )
+        ).scalar_one()
+        item_id = int(item.id)
+
+    def receipt(**changes: Any) -> EasyWeekVoucherProductionDeliveryReceipt:
+        base: dict[str, Any] = {
+            "fact_key": f"check-{uuid_module.uuid4().hex}"[:64],
+            "kind": DELIVERY_RECEIPT_KIND_READ,
+            "authenticity": INBOUND_AUTHENTICITY_SIGNED,
+            "match_state": DELIVERY_RECEIPT_MATCH_CONFIRMED,
+            "item_id": item_id,
+            "batch_id": batch_id,
+            "slot": 1,
+            "provider_message_id": f"wamid.check-{uuid_module.uuid4().hex[:8]}",
+            "observed_sender_digest": "a" * 64,
+            "observed_recipient_digest": "b" * 64,
+            "route_proven": True,
+            "observed_at": NOW,
+            "evidence": {},
+        }
+        base.update(changes)
+        return EasyWeekVoucherProductionDeliveryReceipt(**base)
+
+    refused = [
+        # Confirmed, with no slot named.
+        {"item_id": None, "batch_id": None, "slot": None},
+        # Confirmed, with no route proven.
+        {"route_proven": False},
+        # Unmatched, yet naming a slot.
+        {"match_state": DELIVERY_RECEIPT_MATCH_UNMATCHED, "route_proven": False},
+        # Never signed.
+        {"authenticity": INBOUND_AUTHENTICITY_UNVERIFIED},
+    ]
+    for changes in refused:
+        async with session_maker() as session:
+            with pytest.raises(IntegrityError):
+                async with session.begin():
+                    session.add(receipt(**changes))
+    # And the honest unmatched shape is accepted.
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                receipt(
+                    match_state=DELIVERY_RECEIPT_MATCH_UNMATCHED,
+                    item_id=None,
+                    batch_id=None,
+                    slot=None,
+                    route_proven=False,
+                )
+            )
+
+
+async def test_an_unmatched_receipt_is_evidence_for_nobody(session_maker, binding_key, no_network) -> None:
+    """It names no slot, so no audience may rest on it."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "read", "receipt_proven": False}])
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                EasyWeekVoucherProductionDeliveryReceipt(
+                    fact_key="unmatched-not-evidence",
+                    kind=DELIVERY_RECEIPT_KIND_READ,
+                    authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    match_state=DELIVERY_RECEIPT_MATCH_UNMATCHED,
+                    provider_message_id=f"wamid.b{batch_id}s1",
+                    observed_sender_digest="a" * 64,
+                    observed_recipient_digest="b" * 64,
+                    route_proven=False,
+                    observed_at=NOW,
+                    evidence={},
+                )
+            )
+    outcome = await build(session_maker, batch_id=batch_id, groups=(FOLLOWUP_GROUP_READ,))
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == STATUS_EVIDENCE_UNPROVEN
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "expected"),
+    [(-1, FOLLOWUP_ROW_INCLUDED), (0, FOLLOWUP_ROW_INCLUDED), (1, FOLLOWUP_ROW_EXCLUDED)],
+)
+async def test_the_creation_boundary_is_strictly_after_the_attempt(
+    session_maker, binding_key, no_network, offset_seconds: int, expected: str
+) -> None:
+    """«После исходной попытки» means strictly after, to the second.
+
+    A booking created at the very instant of the attempt is not engagement since
+    the attempt; one created a second later is.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    row = booking(
+        index=9,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=row["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(seconds=offset_seconds),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [row]}),
+    )
+    assert decision_for(outcome, 1) == expected
+
+
+async def test_a_repeated_creation_delivery_is_one_booking(session_maker, binding_key, no_network) -> None:
+    """A Resend of the same creation is the same booking, not a second one."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    row = booking(index=10, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=2))
+    made = ATTEMPTED_AT - timedelta(days=3)
+    for _ in range(3):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=row["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=made,
+        )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [row]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_cancellation_delivered_before_its_creation_still_attributes_it(
+    session_maker, binding_key, no_network
+) -> None:
+    """Delivery order is not business order, and the creation still stands.
+
+    The cancellation arrives first, the creation afterwards, and both name the
+    same customer. The booking was created after the attempt, so the person is
+    excluded — §46.5 counts a booking that was later cancelled.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    row = booking(
+        index=11,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT + timedelta(days=4),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=row["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=row["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(hours=6),
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [row]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_truncated_creation_scan_is_unknown_for_everybody(
+    session_maker, binding_key, no_network, monkeypatch
+) -> None:
+    """A partial pass over the stored deliveries is not an answer about anybody."""
+    from altegio_bot.campaigns.easyweek_voucher_production import booking_attribution
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    row = booking(index=12, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=2))
+    for index, made in enumerate((3, 4, 5)):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=booking(index=20 + index, customer_uuid=who["customer_uuid"], start=NOW)["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=ATTEMPTED_AT - timedelta(days=made),
+        )
+    monkeypatch.setattr(booking_attribution, "MAX_SCANNED_EVENTS", 1, raising=False)
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [row]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+    async with session_maker() as session:
+        stored = (
+            (
+                await session.execute(
+                    select(EasyWeekVoucherFollowupPreview).order_by(EasyWeekVoucherFollowupPreview.id.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+    assert stored.evidence["booking_creation_capture"]["truncated"] is True

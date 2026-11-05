@@ -44,6 +44,7 @@ __all__ = [
     "CUSTOMER_REPLIED",
     "DUPLICATE_SOURCE",
     "ENTITLEMENT_INVALID",
+    "ENTITLEMENT_SETTLEMENT_UNPROVEN",
     "ENTITLEMENT_UNPROVEN",
     "ENTITLEMENT_UNREADABLE",
     "EVIDENCE_UNPROVEN",
@@ -161,6 +162,12 @@ ENTITLEMENT_UNPROVEN: Final = "followup_entitlement_unproven"
 # described a different order than the one the slot names. An artifact nobody
 # could read is not a valid artifact (§46.6).
 ENTITLEMENT_UNREADABLE: Final = "followup_entitlement_unreadable"
+# The original order was read, but its settlement is not proven: it is not in a
+# paid state, or its published amounts contradict the financial contract of its
+# own schema. A code that exists and a MAC that verifies say nothing about
+# whether the order behind them was ever settled, and §46.6 forbids referring to
+# an entitlement whose contract is not proven. Never "probably fine": unknown.
+ENTITLEMENT_SETTLEMENT_UNPROVEN: Final = "followup_entitlement_settlement_unproven"
 # Another slot of this same version already represents this person or this
 # entitlement. Reported rather than silently dropped.
 DUPLICATE_SOURCE: Final = "followup_duplicate_source"

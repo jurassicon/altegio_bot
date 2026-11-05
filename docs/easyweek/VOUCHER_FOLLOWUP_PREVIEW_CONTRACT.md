@@ -170,14 +170,39 @@ In order, cheap and local first, the one external step last:
    therefore scans the stored events that have **no receipts at all**, with the
    same extractor the live ingress uses, asked only about the numbers this
    batch's recipients are known by (the campaign row's and the uuid's card).
-   A refusal it finds that the ledger does not already hold is
+   A refusal it finds that nothing has accounted for is
    `followup_historical_stop_unaccounted`; a truncated pass is
    `followup_historical_consent_unproven` for **everybody**, because a partial
    answer about a backlog is not an answer. The scan writes nothing, runs no
    reconciliation and acknowledges nothing: §46.4.4 keeps the projection a
    separate explicit operation, and a Chatwoot mirror, an `ignored` route and a
    historical START are all excluded for the reasons that operation excludes
-   them. An empty suppression table is therefore not read as consent;
+   them. An empty suppression table is therefore not read as consent.
+
+   Two things decide whether a stored refusal is **accounted for**, and both
+   were wrong in the first round:
+
+   * **whose refusal it is.** §46.4.2–3 keep the veto a fact about the PERSON,
+     so it is taken against the whole aggregate the live veto itself matched —
+     the outbound number, and every number a card of this proven uuid holds,
+     another branch's or an Altegio one. The first round asked only about the
+     number this slot would write to, so a refusal sent from the person's other
+     card was found by the scan and then ignored by the preview. The widening
+     bans and nothing more: a matching number never proves a positive identity
+     or a branch membership;
+   * **whether it was already answered.** A refusal can have been accounted for
+     and then LIFTED, by the one thing §46.4.7 allows: a proven, strictly newer
+     explicit opt-in under the existing START contract. "The ledger does not
+     refuse this number" is therefore not the same as "nothing accounted for
+     this", and the first round re-imposed a withdrawn refusal on every preview.
+     The question asked of each found STOP is now the writer's own —
+     `whatsapp_consent.stop_superseded_by_opt_in`, the predicate
+     `apply_consent_decision` applies when a STOP arrives against a row that is
+     already opted in. One rule, one place, and no comparison of arrival times:
+     a delivery can arrive days after the message it carries. An unproven order,
+     an equal time, an unknown time on either side, a START that never became
+     the decision in force, and a START on a DIFFERENT number all leave the
+     refusal standing;
 7. **replies** — a proven reply from the addressee after the original attempt
    excludes (`followup_customer_replied`). The reply need not mention the first
    message. The receipt's signature must have been verified by the ingress and
@@ -215,6 +240,18 @@ preconditions rather than reimplementing them:
   `expired` status, an `expires_at` or `valid_until` already past — exclude. The
   **absence** of individual dates blocks nothing: it is the ordinary shape of a
   correct voucher under this contract;
+* **settlement and the amounts**, through the same `paid_order_amounts_proven`
+  the primary delivery gate applies to this schema: a documented paid status AND
+  every published total, at both the order and the invoice level, equal to what
+  the ORIGINAL schema's contract names, with `amount_due` zero. An order that is
+  merely `open` was never settled, and the first round let one through — a code
+  in the response and a MAC that verifies prove a binding was made, not that the
+  order behind it was paid. For a free schema-4 issue the zero totals are
+  necessary and never sufficient, because an untouched draft publishes the same
+  ones, so its documented zero-amount adjustments are required as well. A
+  contradictory, missing or account-funded amount is refused rather than
+  trusted. The row is `followup_entitlement_settlement_unproven`, which is
+  `unknown`;
 * the real MAC check. The code is read out of the order through the same proof
   the payment gate uses and compared with the slot's stored binding by
   `ledger.binding_matches`, which also pins the batch, the slot, the template
@@ -285,12 +322,58 @@ The webhook's ARRIVAL time is never read as the creation time. A capture whose
 `booking_created_at` cannot be parsed is rejected by the report's own validator
 rather than falling back to `received_at`.
 
-Absence of a captured creation is never absence of a booking. When a booking the
-live read can see has an appointment after the attempt and no proven creation,
-the row is `followup_booking_creation_unproven`; when the person's numeric
-EasyWeek id cannot be bridged to their proven uuid, when the branch registry is
-not configured, or when the bounded capture scan truncated, the row is
-`followup_booking_capture_unproven`. Both are `unknown`, never `included`.
+Absence of a captured creation is never absence of a booking. **Every** booking
+the live read can see needs a proven creation before "nothing new since the
+attempt" may be asserted, whenever its appointment is: an appointment in the
+past does not establish an old booking, and a review-round-2 reproduction showed
+a backdated booking with a missing creation webhook coming out `included`. Such a
+row is `followup_booking_creation_unproven`; when the branch registry is not
+configured, when the bounded capture scan truncated, or when two numeric ids
+claim one person, the row is `followup_booking_capture_unproven`. Both are
+`unknown`, never `included`.
+
+How far back the capture reads
+------------------------------
+Further than the §PR-17 report itself, and that report's own contract is
+unchanged. The report asks "was a booking created after the send?", so one day of
+slack below the earliest send is all it can need, and it still scans exactly
+that. The follow-up asks a second question about the same bookings — when was
+this one made — whose answer may be months earlier, and with the report's floor
+that evidence sat in the database unread: an ordinary cancelled booking made ten
+days before the mailing turned the recipient `unknown`.
+
+So the follow-up passes `lookback=None` to the same scan, which then reads the
+most recent `MAX_SCANNED_EVENTS` lifecycle deliveries newest-first through the
+primary key and applies them in their own order. Bounded in rows and in work,
+with `truncated` reported rather than a short answer — never an unbounded full
+scan, and never a silently widened report.
+
+Which bookings belong to whom
+-----------------------------
+A person's creations are found two ways, and both are UUID-first:
+
+* **by booking identity.** The live read is keyed on the proven customer uuid
+  and returns that person's booking ids, so their creations are looked up
+  without any numeric id. This is what makes a genuine manual recipient
+  provable: `ensure_local_identity` creates their card with the proven uuid and
+  `altegio_client_id = None`, which is the ordinary shape of that data rather
+  than damage, and demanding a numeric bridge from it refused somebody for the
+  way their card was made;
+* **by numeric customer id**, when the frozen card carries one. This finds the
+  creations the live set cannot show — a booking of theirs that has since been
+  moved to somebody else and so left their list.
+
+A reassignment never moves a creation. The creation stays with the customer its
+own creation delivery named, because that is the historical fact and a later move
+does not undo somebody's visit to the booking page; for the booking's new holder
+that creation is not theirs and the row is
+`followup_booking_creation_unproven` rather than an exclusion credited to them.
+
+Without the numeric bridge the live set is the whole account of this person's
+bookings, and the one thing it cannot show is a booking that LEFT it. So a
+reassignment observed after this slot's own send anchor, of a booking that is not
+in their list, leaves the slot `unknown`. A window with no reassignments hides
+nothing, and the recipient is provable.
 
 ### Proven `delivered` / `read`
 
@@ -315,6 +398,36 @@ A slot with a status and no proof is `followup_status_evidence_unproven` —
 including every historical slot, which is the honest answer. It is never demoted
 to the weaker group instead: that would state something weaker than the
 mailing's record and stronger than what is proven.
+
+#### An early callback, kept and bound
+
+Meta can deliver a `read` for a message id while the transaction that records
+that id is still in flight: the slot is `send_claimed`, the POST has returned,
+and the acceptance has not committed. "No slot owns this id" is then an ordinary
+momentary state rather than evidence that the callback is foreign, and a repeat
+callback is not guaranteed — a review-round-2 reproduction through the real
+worker left the slot at `provider_accepted` with an empty `read_at`, no receipt
+and therefore an `unknown` audience for somebody who had demonstrably read the
+message.
+
+So a signed positive callback that nothing owns yet is stored `unmatched`: it
+names no slot, carries the route it observed with nothing to compare it against,
+and is kept only while some slot of this phase could still claim a NEW message
+id — a decision about whether to KEEP the callback, never about which slot it
+belongs to. `record_item_outcome` then binds it on the exact identifier, inside
+the transaction that records that identifier and under the same locks, re-judges
+it from scratch against the frozen route, and advances the slot through the same
+transition rule the live callback path uses. A foreign or unverifiable route
+makes the row `conflicting`, kept for audit and evidence for nobody.
+
+An UNSIGNED callback is not kept at all. Authenticity cannot be established after
+the fact, so there is nothing a later binding could promote.
+
+The message-identity lock is taken FIRST on both sides, in the one global order
+(message → header → item) PR-22.1 proved, so the gap between "nothing owns this
+id" and keeping the callback is unreachable rather than merely narrow. Read still
+outranks delivered, a late `failed` still cannot undo a success, and the
+contradiction is still kept for audit.
 
 ## 6. The message
 
@@ -398,6 +511,18 @@ decision and a safe reason code.
   historical result that needs recomputing, with the reason named. So a paused
   template, a stop since, an expired window or a refused refresh cannot leave a
   stale block looking fresh.
+- **And the page it is already on stays honest too.** A standing the server
+  rendered describes the moment the page loaded. When the operator then presses
+  «Проверить состав» and no new result comes back — a 409, a transport failure,
+  or an answer that cannot be read — that click has just proved the opposite, so
+  the displayed block drops to the historical state immediately and without a
+  reload: the success colour goes, the standing sentence says the checks are not
+  confirmed now, and the claim that the counts are confirmed is replaced. The
+  first round changed only one line of status text underneath, leaving the green
+  block asserting «Эти проверки актуальны» and «Они подтверждены и сейчас». The
+  snapshot stays fully readable as the history it is, and nothing about it is
+  rewritten: this is display state, carried on the block as
+  `data-followup-standing`.
 - The stored snapshot keeps the body's **digest** and not the body. When the
   digest no longer matches, the page says the old text cannot be shown and that
   the current text belongs to a different composition; it never substitutes
@@ -414,7 +539,7 @@ decision and a safe reason code.
 - Nothing fabricates a successful check status of a previous follow-up attempt.
   The preview model and the future execution ledger are separate.
 
-### Migration
+### The migration's receipt table
 
 `b7d41f9c0a52`, one Alembic head over `a1c4e7b25d80`. Additive and narrow:
 three new tables — the two preview tables and
@@ -426,6 +551,14 @@ exists: a receipt is evidence about a message that really was delivered and its
 proof cannot be recovered once dropped, which is §46.9's rule. Upgrade from
 scratch, `downgrade -1` and re-upgrade were verified on a disposable
 PostgreSQL 16.
+
+The receipt table carries a `match_state` of `confirmed`, `unmatched` or
+`conflicting`, and its CHECK constraints are what make a stored row either proof
+or honestly not: `confirmed` requires the slot, the batch, the slot number and a
+proven route; `unmatched` requires all four to be absent; `conflicting` names the
+slot it was tested against. The verified signature is required of **every** row,
+whatever its state, because authenticity is the one part that cannot be
+established after the fact. Only `confirmed` rows are read as a slot's evidence.
 
 The preview header deliberately carries **no** `provider` column, for the same
 reason `easyweek_voucher_production_stop_requests` has none: the row names a
@@ -492,8 +625,16 @@ src/altegio_bot/tests/test_easyweek_voucher_followup_preview.py
 src/altegio_bot/tests/test_easyweek_voucher_followup_ops.py
 ```
 
-plus one browser acceptance test in
-`src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py`, which drives
+The §46.3 proof behind a positive status is exercised where the rest of the
+production mailing's delivery evidence is, through the real worker and the real
+acceptance write:
+
+```
+src/altegio_bot/tests/test_easyweek_voucher_delivery_failures.py
+```
+
+plus browser acceptance tests in
+`src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py`, which drive
 the operator path in Chromium: the link from the mailing page, the empty
 selection being refused, the groups ticked, the interval typed, the button
 clicked, the composition read off the repainted page — and then the server
@@ -524,6 +665,42 @@ is in flight with only `delivered_unread` selected; a manual and a mixed
 schema-3/4 production batch; and a paused template, a changed body digest, a
 stop since and an expired window each leaving a saved result shown as
 historical rather than current.
+
+The second round's six findings have theirs too, and all six failed before the
+fix:
+
+1. a stored refusal sent from the person's OTHER card, at another branch, with
+   the mailing having gone to the first number; and a withdrawn refusal — a
+   proven newer START on the same number, both events before the mailing — being
+   re-imposed on every preview. Plus the cases that must NOT lift it: a STOP
+   newer than the opt-in, one at the same instant, one whose own time the
+   payload never stated, an unsigned START, and a START on another number of the
+   same person;
+2. a booking appointed before the attempt with no creation webhook coming out
+   `included`; a booking created after the attempt and then reassigned away,
+   leaving its creator's live history empty; and an ordinary cancelled booking
+   made ten days before the mailing whose creation sat outside the report's own
+   window. Plus the other direction: a booking moved IN is not the new holder's
+   creation;
+3. through the real worker and `record_item_outcome`: a signed `read` arriving
+   while the slot was `send_claimed` with no message id, the acceptance then
+   storing the POST result, and the slot left at `provider_accepted` with an
+   empty `read_at` and no receipt. Plus `delivered`, read-before-delivered,
+   duplicates, a restart between keeping and binding, an unsigned callback, a
+   foreign sender, a foreign recipient, a foreign message id, a late `failed`
+   after a bound `read`, and the two halves run concurrently;
+4. an `open`, `is_paid: false` order of schema 3 and of schema 4 being included;
+   a paid order whose totals contradict its schema's contract; one publishing no
+   total at all; a free schema-4 issue funded from an account balance; and a
+   zero order that is merely open;
+5. a manual card in its production shape — proven uuid, `altegio_client_id`
+   `None` — being refused for the way it was created, with a complete empty live
+   history. Plus the cases that must stay strict: a real new booking still
+   excludes, and a reassignment in the window still leaves it `unknown`;
+6. in Chromium, on an already-open page and with no reload: the saved result
+   staying green and claiming to be confirmed now after a 409 and after a
+   network failure, checked at desktop and phone width, with a successful
+   recalculation still producing a new version and no PII anywhere on the block.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

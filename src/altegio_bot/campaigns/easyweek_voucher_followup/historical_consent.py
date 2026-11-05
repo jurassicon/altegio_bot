@@ -36,13 +36,42 @@ already a hold in the consent aggregate. If the bound is reached the scan
 reports itself incomplete and every candidate becomes ``unknown``: a partial
 answer about a backlog is not an answer.
 
+When a stored STOP is already answered
+--------------------------------------
+"The ledger does not refuse this number" is not the same as "this refusal was
+never accounted for". A refusal can have been accounted for and then LIFTED, by
+exactly the one thing §46.4.7 allows to lift it: a proven, strictly newer
+explicit opt-in under the existing START contract. Treating that as an
+unaccounted gap would make the backlog scan re-impose, on every preview, a
+refusal the customer themself withdrew.
+
+So the question asked of each found STOP is the writer's own:
+:func:`...whatsapp_consent.stop_superseded_by_opt_in`, the predicate
+:func:`...whatsapp_consent.apply_consent_decision` applies when a STOP arrives
+against a row that is already opted in. One rule, one place, no second order
+invented here and no comparison of arrival times — a delivery can arrive days
+after the message it carries, so ``received_at`` proves nothing about what the
+customer sent first. An unproven order, an equal time, an unknown time on
+either side and a START that never became the decision in force all leave the
+refusal standing, and the opt-in has to be on the SAME address: a START from
+one number is not a subscription on another.
+
 Why the addresses are passed in
 -------------------------------
 Narrowness is the point. §46.4.4 allows either a proven completed
 reconciliation or a narrow completeness proof for the affected recipients, and
-this is the second: the scan is interested only in the numbers this preview
-would write to, so one bounded pass serves the whole preview and nobody else's
-backlog is examined.
+this is the second: the scan is interested only in the numbers this preview's
+recipients are KNOWN BY, so one bounded pass serves the whole preview and
+nobody else's backlog is examined.
+
+Known by, not written to. §46.4.2–3 keep the refusal veto global and bound to
+the person: a stored STOP sent from another card of the same proven EasyWeek
+uuid — another branch's, or one whose number the card has since dropped — is
+this person's refusal, and the live aggregate already spans exactly that set.
+:meth:`HistoricalConsentScan.blocks_any` is therefore asked about the whole
+aggregate rather than the outbound number alone. The expansion runs in one
+direction only: a matching number can widen a ban and can never prove a
+positive identity or a branch membership.
 """
 
 from __future__ import annotations
@@ -102,6 +131,18 @@ class HistoricalConsentScan:
         if normalised is None:
             return False
         return any(variant in self.unaccounted for variant in address_variants(normalised))
+
+    def blocks_any(self, addresses: Collection[object]) -> bool:
+        """Does it hold one for ANY number this person is known by?
+
+        The question the preview asks. §46.4.2–3 make a refusal a fact about the
+        person rather than about the number it was sent from, so the veto is
+        taken against the whole proven aggregate — the outbound number, the
+        numbers this uuid's other cards hold, another branch's card, an Altegio
+        one. A match widens the ban and nothing else: it never reads back as
+        proof that an address belongs to this customer.
+        """
+        return any(self.blocks(address) for address in addresses)
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -181,7 +222,10 @@ async def scan_historical_refusals(
     if truncated:
         gaps.append(f"stored_events_truncated_at_{int(limit)}")
 
-    found: set[str] = set()
+    # address → the PROVEN event times of the stored refusals sent from it.
+    # ``None`` is a refusal whose own time the payload did not state, which no
+    # opt-in can be ordered against and which therefore always stands.
+    found: dict[str, list[datetime | None]] = {}
     for event_id, dedupe_key, payload, received_at, status in rows:
         if not isinstance(payload, dict) or not payload:
             gaps.append("stored_event_payload_not_object")
@@ -197,21 +241,35 @@ async def scan_historical_refusals(
                 continue
             if draft.wa_address not in wanted:
                 continue
-            found.add(draft.wa_address)
+            # The event's OWN stated time, never its arrival time: a delivery
+            # can arrive days after the message it carries.
+            found.setdefault(draft.wa_address, []).append(draft.event_at)
             logger.info(
-                "followup_historical_consent: unaccounted stop found in stored event %s",
+                "followup_historical_consent: stored stop found in event %s",
                 int(event_id),
             )
 
-    # A stored STOP the ledger already refuses is accounted for: the refusal is
-    # in force, the consent aggregate will exclude that person on its own, and
-    # this module has nothing to add. Only a refusal the ledger does NOT hold
-    # is the §46.4.4 gap.
+    # A stored STOP is accounted for in exactly two ways, and only the second
+    # one is new here:
+    #
+    # * the ledger REFUSES this address. The refusal is in force, the consent
+    #   aggregate excludes that person on its own, and this module has nothing
+    #   to add;
+    # * the ledger holds a PROVEN, strictly newer opt-in on this same address
+    #   that already answered this refusal. §46.4.7 lets exactly that lift a
+    #   refusal, and the test is the writer's own predicate rather than a
+    #   second order invented here.
+    #
+    # Anything else — no row at all, a row that is not a proven opt-in, an
+    # opt-in that cannot be ordered against the refusal — is the §46.4.4 gap.
     unaccounted: set[str] = set()
     for address in sorted(found):
         state = await ledger_state(session, phone=address)
-        if not state.refuses:
-            unaccounted.update(address_variants(address))
+        if state.refuses:
+            continue
+        if all(state.supersedes_stop(moment) for moment in found[address]):
+            continue
+        unaccounted.update(address_variants(address))
 
     return HistoricalConsentScan(
         complete=not truncated,

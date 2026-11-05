@@ -150,6 +150,16 @@ reported. Only a provable order refuses it: an equal time, an unknown time on
 either side, or a newer STOP all apply, so a tie and an unproven order both fall
 to the refusal.
 
+That exception now has exactly one definition in the code,
+`stop_superseded_by_opt_in`, and `apply_consent_decision` is its first caller.
+It was lifted out because a second reader appeared: PR-22.2's §46.4.4 backlog
+scan asks the very same question of a STOP it finds in a stored event — "has a
+proven newer opt-in on this same address already answered this?" — and a scan
+with its own private answer would have drifted from the writer's. It had: the
+first round of that scan treated any STOP as unaccounted whenever the ledger did
+not currently read `opted_out`, which re-imposed a withdrawn refusal on every
+preview. One predicate, one rule, read by both.
+
 The bar that exception is measured against is **`decided_event_at` of the
 decision in force**, and nothing else. `last_start_observed_at` and
 `last_start_event_at` are audit: they move only for a START this ledger actually
@@ -665,6 +675,19 @@ guess. A Meta error title, message or detail can quote the request it refused,
 which for this phase means a voucher code, a rendered body or a customer's name,
 so none of it is stored, logged or classified from. `observed_at` (when we saw
 it) and `event_at` (proven, NULL when unprovable) are kept apart.
+
+### The positive half, added by PR-22.2
+
+§46.3 asks the same of a `delivered`/`read` that it asks of a `failed`, and
+PR-22.1 recorded no proof behind a positive status: the slot's timestamps are
+the mailing's own record and keep neither the signature nor the route. PR-22.2
+adds `easyweek_voucher_production_delivery_receipts` beside this table, with the
+same vocabulary and the same early-callback protocol — `unmatched` kept on the
+identifier alone, bound by the acceptance that records it, re-judged against the
+frozen route — and the full contract lives in
+`VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md`. Nothing in this section's table, its
+match states or its slot marking changed, and the positive transition still
+applies whether or not a proof could be stored.
 
 ### A fact is not a permission
 

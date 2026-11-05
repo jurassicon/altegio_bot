@@ -48,8 +48,10 @@ from altegio_bot.models.models import (
 from altegio_bot.ops.auth import SESSION_COOKIE
 from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+    PHONE_NUMBER_ID,
     TemplateReader,
     location_map,
+    person,
     seed_sender_and_template,
     seed_source_batch,
 )
@@ -604,3 +606,72 @@ async def test_neither_the_page_nor_the_check_applies_a_reconciliation(
         ).scalar_one()
         receipts = (await session.execute(select(func.count()).select_from(WhatsAppInboundReceipt))).scalar_one()
     assert (suppressions, receipts) == (0, 0)
+
+
+async def test_the_page_can_demote_its_own_saved_result(
+    session_maker, ops_client, no_network, seams, binding_key
+) -> None:
+    """Review round 2, finding 6: the hooks the open page needs to stay honest.
+
+    The server renders the standing it can prove at load time. A click that
+    fails afterwards has to drop that standing on the page itself, so the block
+    carries a state attribute, a named standing element and a named
+    confirmation element, and the script carries the one function that changes
+    all three.
+    """
+    batch_id = await _batch(session_maker)
+    assert (await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)).status_code == 200
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert 'id="followup-stored"' in body
+    assert 'data-followup-standing="current"' in body
+    assert 'id="followup-standing"' in body
+    assert 'id="followup-confirmation"' in body
+    assert "followupDemoteStoredResult" in body
+    # Called on every outcome that is not a new result: a refusal, an
+    # unreadable answer and a transport failure.
+    assert body.count("followupDemoteStoredResult()") >= 3
+
+
+async def test_a_direct_api_call_does_not_bypass_the_historical_backlog(
+    session_maker, ops_client, no_network, seams, binding_key
+) -> None:
+    """§46.4.4 holds on the HTTP path too, not only inside the orchestrator."""
+    from altegio_bot.models.models import WhatsAppEvent
+
+    batch_id = await _batch(session_maker)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppEvent(
+                    dedupe_key="ops-legacy-stop",
+                    status="processed",
+                    query={},
+                    headers={},
+                    payload={
+                        "entry": [
+                            {
+                                "changes": [
+                                    {
+                                        "value": {
+                                            "metadata": {"phone_number_id": PHONE_NUMBER_ID},
+                                            "messages": [
+                                                {
+                                                    "from": person(1)["phone"].lstrip("+"),
+                                                    "id": "wamid.ops-legacy",
+                                                    "type": "text",
+                                                    "text": {"body": "СТОП"},
+                                                }
+                                            ],
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            )
+    response = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+    assert response.status_code == 200, response.text
+    assert response.json()["included"] == 0
+    page = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert "отписк" in page.lower()

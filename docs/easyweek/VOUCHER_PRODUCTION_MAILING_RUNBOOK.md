@@ -1726,12 +1726,17 @@ carries; the delivered or read status they are selected by carries recorded
 proof of a verified callback on that frozen route; the chosen minimum interval
 has passed, measured from the proven original attempt; the original order is
 read back and its voucher proven, including a real check of the stored MAC
-against the code the order carries; the §46.4 consent aggregate allows it, and
-no refusal of theirs is sitting unaccounted in the stored-event backlog; the
-person has not replied since; and the bookings say nothing against it — no
+against the code the order carries **and** a proven settlement — a paid state
+with every published amount equal to what that order's own schema contracts,
+because a code that exists is not an order that was paid for; the §46.4 consent
+aggregate allows it, and no refusal of theirs — sent from any number they are
+known by, at any branch — is sitting unaccounted in the stored-event backlog;
+the person has not replied since; and the bookings say nothing against it — no
 booking **created** after the attempt (from the captured creation deliveries,
-cancelled ones included) and no active booking ahead (from the live, fully
-paginated history), across every configured branch of the workspace.
+cancelled ones included, and every booking the live read can see needs a proven
+creation before "nothing new" may be asserted) and no active booking ahead
+(from the live, fully paginated history), across every configured branch of the
+workspace.
 
 Everything unestablished is reported as «не установлено» with its own reason,
 never as eligible. A saved result is shown as current only while it is young
@@ -1750,7 +1755,9 @@ spends nor reserves a send attempt. The original mailing's ledger, its one-attem
 limit, its stop rules and its booking report are untouched.
 
 Reading a preview changes nothing. A check that fails leaves the previous
-snapshot visibly stale rather than looking current.
+snapshot visibly stale rather than looking current — on the open page too, the
+moment the refusal or the transport failure comes back, without waiting for a
+reload.
 
 ### Before this is used on a production audience
 
@@ -1787,6 +1794,12 @@ Five things, none of them done by this stage:
    status and no proof, so a preview reports them as «не установлено». That is
    the honest answer; the owner decides whether to wait for proven callbacks or
    to confine the first follow-up to a mailing sent after this deploy.
+
+   From now on a positive callback is also not lost when it overtakes the write
+   that records the message id: a signed `delivered`/`read` whose identifier
+   nothing owns yet is kept and then bound by the very commit that records that
+   identifier, which also advances the slot. An unsigned one is still not kept,
+   and a foreign route still proves nothing.
 5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
    claim, the terminal tombstones, the executor and the follow-up callbacks all
    belong to that stage. The source and dedupe contract it will claim against is
@@ -1796,7 +1809,9 @@ Five things, none of them done by this stage:
 
 ### Migration
 
-One additive revision, `b7d41f9c0a52`, over `a1c4e7b25d80`. Two new tables and
-nothing else: no existing column altered, no consent row, delivery fact, attempt
-counter, HMAC byte or financial value touched. Its downgrade refuses, before any
-DDL, while any preview is stored.
+One additive revision, `b7d41f9c0a52`, over `a1c4e7b25d80`. Three new tables and
+nothing else — the two preview tables and
+`easyweek_voucher_production_delivery_receipts`: no existing column altered, no
+consent row, delivery fact, attempt counter, HMAC byte or financial value
+touched. Its downgrade refuses, before any DDL, while any preview or any
+delivery receipt is stored.

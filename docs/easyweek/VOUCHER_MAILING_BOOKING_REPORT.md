@@ -185,6 +185,17 @@ Four answers are distinguished and never collapsed:
 * The capture scan is bounded: below by the earliest proven send minus one day
   of late-capture margin, above by the moment of reading, with a hard row cap.
   If the cap bites, the report says the coverage was truncated.
+* **This report's own bounds are unchanged.** `scan_capture` now takes an
+  explicit `lookback`, and the report keeps passing the one day it was written
+  with — a conversion is a booking CREATED after the send, so a creation
+  delivered more than a day before it cannot be one. PR-22.2's follow-up
+  preview reuses the same scan with `lookback=None` for a different question:
+  when was a booking the live read can see actually made, which may be long
+  before the mailing. That variant reads the most recent capped number of
+  lifecycle deliveries newest-first through the primary key, applies them in
+  their own order, and reports truncation rather than a short answer — so it is
+  bounded in rows and in work, it is not a full-history scan, and it changes
+  nothing about what this report reads or claims.
 * With no proven send there is no window, so nothing is scanned at all.
 * Late events and a later proven identity binding are picked up by the next
   refresh, because each refresh re-reads.

@@ -421,6 +421,12 @@ class ConsentSnapshot:
     sources: tuple[str, ...] = ()
     gaps: tuple[str, ...] = ()
     pending_inbound: int = 0
+    # Every address the aggregate matched this person by: the outbound number
+    # and every number a card of their proven uuid holds. Carried because the
+    # §46.4.4 backlog veto has to cover exactly this set — a refusal sent from
+    # another card of the same person is still their refusal — and because
+    # recomputing it anywhere else would invite the two to drift apart.
+    addresses: tuple[str, ...] = ()
 
 
 async def consent_snapshot(
@@ -470,6 +476,7 @@ async def consent_snapshot(
             tuple(decision.sources),
             tuple(decision.gaps),
             int(decision.pending_inbound or 0),
+            tuple(decision.matched_addresses),
         )
     if int(decision.pending_inbound or 0) > 0:
         return ConsentSnapshot(
@@ -479,6 +486,7 @@ async def consent_snapshot(
             tuple(decision.sources),
             tuple(decision.gaps),
             int(decision.pending_inbound or 0),
+            tuple(decision.matched_addresses),
         )
     if decision.gaps:
         return ConsentSnapshot(
@@ -488,8 +496,9 @@ async def consent_snapshot(
             tuple(decision.sources),
             tuple(decision.gaps),
             0,
+            tuple(decision.matched_addresses),
         )
-    return ConsentSnapshot(True, None, decision.fingerprint, (), (), 0)
+    return ConsentSnapshot(True, None, decision.fingerprint, (), (), 0, tuple(decision.matched_addresses))
 
 
 # ---------------------------------------------------------------------------
@@ -594,9 +603,14 @@ def booking_verdict(
       cancelled ones included and whatever the appointment time is. A booking
       made the day after the mailing to record a visit that already happened is
       exactly the engagement the rule is about;
-    * a booking whose appointment falls after the attempt but whose CREATION
-      cannot be proven is UNKNOWN. Whether it was made before or after the
-      attempt decides the answer, so neither verdict is available;
+    * a booking the live read can see whose CREATION cannot be proven is
+      UNKNOWN, whenever its appointment is. Whether it was made before or after
+      the attempt decides the answer, so neither verdict is available — and an
+      appointment in the past does not settle it: a booking made the day after
+      the mailing to record a visit that already happened is precisely the
+      engagement this rule is about, so reading an old appointment as an old
+      booking would turn a missing creation webhook into proof that nobody has
+      booked since;
     * everything else is proven clear. A visit that happened BEFORE the attempt
       excludes nothing by itself — that is the visit which earned the voucher,
       and §46.5 is explicit that it must not read as a reason to stay silent.
@@ -642,13 +656,15 @@ def booking_verdict(
     if creations.created_after(anchor):
         return BookingVerdict(False, NEW_BOOKING_AFTER_ATTEMPT, pages_read=bookings.pages_read)
 
-    # A booking the live read can see, appointed after the attempt, whose own
-    # creation nothing proves. It may be the booking that earned nothing and was
-    # made yesterday, or one made months ago; the rule cannot be applied to it.
+    # A booking the live read can see whose own creation nothing proves. It may
+    # have been made yesterday or months ago, and the appointment time does not
+    # decide which: a backdated booking for a visit that already happened has an
+    # appointment in the past and a creation after the attempt. So EVERY visible
+    # booking needs a proven creation before "nothing new since the attempt" can
+    # be asserted — including one whose original attribution is ambiguous,
+    # because a creation is never credited to the customer a booking was later
+    # moved to.
     for row in bookings.bookings:
-        start = _aware(row.start_time)
-        if start is None or start <= anchor:
-            continue
         if creations.creation_of(row.booking_uuid) is None:
             return BookingVerdict(
                 False,

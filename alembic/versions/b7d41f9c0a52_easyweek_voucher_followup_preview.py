@@ -52,6 +52,7 @@ _DECISIONS = "'included', 'excluded', 'unknown'"
 # shared with the inbound receipts of PR-22.1.
 _RECEIPT_KINDS_SQL = "kind IN ('delivered', 'read')"
 _RECEIPT_AUTHENTICITY_SQL = "authenticity IN ('signature_verified', 'unverified')"
+_RECEIPT_MATCH_SQL = "match_state IN ('confirmed', 'unmatched', 'conflicting')"
 
 
 def upgrade() -> None:
@@ -155,17 +156,19 @@ def upgrade() -> None:
         sa.Column("fact_key", sa.String(64), nullable=False),
         sa.Column("kind", sa.String(16), nullable=False),
         sa.Column("authenticity", sa.String(24), nullable=False),
-        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("match_state", sa.String(16), nullable=False, server_default=sa.text("'confirmed'")),
+        sa.Column("item_id", sa.BigInteger(), nullable=True),
         sa.Column("attempt_id", sa.BigInteger(), nullable=True),
-        sa.Column("batch_id", sa.BigInteger(), nullable=False),
-        sa.Column("slot", sa.Integer(), nullable=False),
+        sa.Column("batch_id", sa.BigInteger(), nullable=True),
+        sa.Column("slot", sa.Integer(), nullable=True),
         sa.Column("provider_message_id", sa.String(128), nullable=False),
-        sa.Column("observed_sender_digest", sa.String(64), nullable=False),
-        sa.Column("observed_recipient_digest", sa.String(64), nullable=False),
-        sa.Column("route_proven", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("observed_sender_digest", sa.String(64), nullable=True),
+        sa.Column("observed_recipient_digest", sa.String(64), nullable=True),
+        sa.Column("route_proven", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("whatsapp_event_id", sa.BigInteger(), nullable=True),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("event_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("evidence", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.UniqueConstraint("fact_key", name="uq_ew_voucher_receipt_fact"),
@@ -189,14 +192,39 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(_RECEIPT_KINDS_SQL, name="ck_ew_voucher_receipt_kind"),
         sa.CheckConstraint(_RECEIPT_AUTHENTICITY_SQL, name="ck_ew_voucher_receipt_authenticity"),
-        # A stored row IS the proof, so the database requires all three parts.
+        sa.CheckConstraint(_RECEIPT_MATCH_SQL, name="ck_ew_voucher_receipt_match"),
+        # A stored row IS the proof, so the database requires each part. The
+        # signature is required of every row — it cannot be established later —
+        # while the slot and the route are required of a CONFIRMED one.
         sa.CheckConstraint("authenticity = 'signature_verified'", name="ck_ew_voucher_receipt_signed"),
         sa.CheckConstraint(
-            "route_proven AND observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL",
+            "match_state <> 'confirmed' OR ("
+            "item_id IS NOT NULL AND batch_id IS NOT NULL AND slot IS NOT NULL AND route_proven"
+            ")",
+            name="ck_ew_voucher_receipt_confirmed_proof",
+        ),
+        sa.CheckConstraint(
+            "match_state <> 'unmatched' OR ("
+            "item_id IS NULL AND batch_id IS NULL AND slot IS NULL AND NOT route_proven"
+            ")",
+            name="ck_ew_voucher_receipt_unmatched_has_no_item",
+        ),
+        sa.CheckConstraint(
+            "match_state <> 'conflicting' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_receipt_conflicting_has_item",
+        ),
+        sa.CheckConstraint(
+            "NOT route_proven OR (observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL)",
             name="ck_ew_voucher_receipt_route_proven",
         ),
     )
     op.create_index("ix_ew_voucher_receipt_item_kind", RECEIPTS, ["item_id", "kind"])
+    op.create_index(
+        "ix_ew_voucher_receipt_unmatched",
+        RECEIPTS,
+        ["provider_message_id"],
+        postgresql_where=sa.text("match_state = 'unmatched'"),
+    )
 
 
 def downgrade() -> None:
@@ -232,6 +260,7 @@ def downgrade() -> None:
             "cannot be recovered once dropped."
         )
 
+    op.drop_index("ix_ew_voucher_receipt_unmatched", table_name=RECEIPTS)
     op.drop_index("ix_ew_voucher_receipt_item_kind", table_name=RECEIPTS)
     op.drop_table(RECEIPTS)
     op.drop_index("ix_ew_followup_preview_row_preview", table_name=ROWS)

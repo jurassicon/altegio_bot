@@ -25,10 +25,46 @@ booking webhooks carry ``booking_created_at`` — the provider's own statement o
 when the booking was made — and the §PR-17 booking report already validates it
 narrowly, deduplicates by booking identity, keeps creation evidence apart from
 lifecycle evidence, and bounds its scan. This module reuses that whole proof
-(:func:`...booking_attribution.scan_capture`) rather than writing a second one,
-and it reuses that report's identity bridge
-(:func:`...booking_attribution.resolve_identities`) to get from a slot's proven
-customer uuid to the numeric id the webhooks name.
+(:func:`...booking_attribution.scan_capture`) rather than writing a second one.
+
+How far back the scan reaches
+-----------------------------
+Further than the report's own window, and deliberately. The report asks "was a
+booking created after the send?", so a day of slack below the earliest send is
+all it can ever need. The follow-up asks a second question about the SAME
+bookings — "when was this one, which the live read can see, actually made?" —
+and the answer may be months before the mailing. With the report's floor that
+evidence sits in the database unread and every such recipient comes out
+``unknown``, which is safe and wrong.
+
+So this module passes ``lookback=None`` and takes the bounded newest-first pass
+that :func:`...booking_attribution.scan_capture` documents: the most recent
+:data:`...booking_attribution.MAX_SCANNED_EVENTS` lifecycle deliveries, read
+through the primary key and applied in their own order, with ``truncated``
+reported rather than a short answer. Bounded in rows and in work, and no change
+to what the report itself scans.
+
+Two ways to find one person's creations
+---------------------------------------
+By booking identity, and by numeric customer id:
+
+* **by booking uuid.** A live read keyed on a proven customer uuid returns the
+  ids of that person's bookings, so their creations can be looked up without
+  knowing any numeric id at all. This is what makes a genuine manual recipient
+  provable: ``ensure_local_identity`` creates their card with the proven uuid
+  and ``altegio_client_id=None``, which is the ordinary shape of that data and
+  not damage, and demanding a numeric bridge from it would refuse somebody for
+  the way their card was created;
+* **by numeric id**, when the frozen card carries one. This finds the creations
+  the live set cannot show — a booking of theirs that has since been moved to
+  somebody else, and so left their list.
+
+Without the numeric bridge the live set is the only account of this person's
+bookings, and the one thing it cannot show is a booking that left it. So a
+reassignment observed after this slot's own send anchor, for a booking that is
+not in their list, leaves this slot ``unknown``: that is exactly the case where
+the missing bridge could hide a real creation. A quiet window with no
+reassignments hides nothing, and the recipient is provable.
 
 What this module refuses to do
 ------------------------------
@@ -40,8 +76,13 @@ What this module refuses to do
   capture is a bounded scan of deliveries this deployment happened to store;
   §46.5 forbids turning that into proof. An absent creation for a booking the
   live read can see is ``unknown``, with its own reason.
-* It invents no semantics for undocumented fields, and asks the provider for
-  nothing: the whole module is a local read.
+* It never moves a creation to the customer a booking was LATER moved to. The
+  creation stays with the customer its own creation delivery named — that is
+  the historical fact, and a later reassignment does not undo somebody's visit
+  to the booking page. For the new owner that booking's creation is not theirs
+  and is reported unknown rather than credited to them.
+* It invents no numeric id, bridges no identity by phone, and asks the provider
+  for nothing: the whole module is a local read.
 """
 
 from __future__ import annotations
@@ -49,13 +90,15 @@ from __future__ import annotations
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Collection, Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.easyweek_voucher_production.booking_attribution import (
     BOOKING_CANCELLED,
+    IDENTITY_NUMERIC_MISSING,
     IDENTITY_PROVEN,
+    ObservedBooking,
     resolve_identities,
     scan_capture,
 )
@@ -70,23 +113,28 @@ class SlotCreations:
     """What the capture proves about ONE slot's person.
 
     ``proven`` is the only licence to conclude anything negative. While it is
-    ``False`` this person's creations are simply not established — their numeric
-    id could not be bridged, or the scan was truncated — and every booking of
-    theirs whose creation matters becomes ``unknown``.
+    ``False`` this person's creations are simply not established — the scan was
+    truncated, two numeric ids claim them, or a booking may have left their list
+    unseen — and every booking of theirs whose creation matters becomes
+    ``unknown``.
     """
 
     proven: bool
     reason: str | None = None
-    # booking uuid → the provider's own creation instant. Only bookings whose
-    # creation delivery was captured and validated appear here.
+    # booking uuid → the provider's own creation instant, for the creations this
+    # person is proven to have made. Only bookings whose creation delivery was
+    # captured, validated and attributed to THEM appear here.
     created_at: dict[uuid_module.UUID, datetime] = field(default_factory=dict)
+    # How the numeric customer id was established, when it was. Shape fact for
+    # the stored snapshot; ``None`` means the slot was proven from booking
+    # identities alone.
+    bridge: str | None = None
     # Bookings whose deliveries disagree about which customer they belong to.
-    # Their creation is not attributable, so it is reported rather than used.
+    # Reported rather than used: a creation is never credited to the customer a
+    # booking was later moved to.
     reassigned: frozenset[uuid_module.UUID] = frozenset()
 
     def creation_of(self, booking_uuid: uuid_module.UUID) -> datetime | None:
-        if booking_uuid in self.reassigned:
-            return None
         return self.created_at.get(booking_uuid)
 
     def created_after(self, boundary: datetime) -> bool:
@@ -123,20 +171,50 @@ class CapturedCreations:
         }
 
 
+def _attributable(booking: ObservedBooking, *, numeric_id: int | None) -> bool:
+    """May this booking's creation be credited to the person being judged?
+
+    A booking nothing moved belongs to whoever created it, and the caller only
+    ever asks about bookings the live read proved are this person's or that the
+    numeric grouping already attributed to them.
+
+    A booking whose deliveries DISAGREE about the customer is different: the
+    live read shows it under whoever holds it now, and crediting its creation to
+    them would hand somebody else's visit to the new owner. So a reassigned
+    booking counts only when the numeric bridge shows that this person is the
+    one its own creation delivery named.
+    """
+    if not booking.customer_reassigned:
+        return True
+    return numeric_id is not None and int(booking.customer_id) == int(numeric_id)
+
+
 async def load_creation_evidence(
     session: AsyncSession,
     *,
     items: list[EasyWeekVoucherProductionBatchItem],
     now: datetime,
     unproven_reason: str,
+    conflict_reason: str | None = None,
+    slot_bookings: Mapping[int, Collection[uuid_module.UUID]] | None = None,
     registry: EasyWeekLocationRegistry | None = None,
 ) -> CapturedCreations:
     """One bounded local pass: which bookings each slot's person created, when.
 
-    Reads nothing external and writes nothing. The scan is bounded below by the
-    earliest attempt among *items* — creations before that cannot matter to a
-    "since the attempt" question — and above by the report's own row cap, which
-    reports truncation rather than silently returning a short answer.
+    Reads nothing external and writes nothing, and takes no lock. Called AFTER
+    the live booking reads have finished, in a session of its own, because the
+    booking identities the live read returns are half of how a person's
+    creations are found — and because no database handle may be open while a
+    request is in flight.
+
+    ``slot_bookings`` is each slot's live booking identities, for the slots
+    whose live read came back complete. A slot missing from it gets no evidence:
+    its live set is already unknown and the booking rules refuse it on that.
+
+    ``conflict_reason`` is what a slot whose IDENTITY does not line up is
+    reported as — two numeric ids claiming one person, or a frozen card that now
+    names a different uuid. That is an identity problem rather than a missing
+    bridge, and saying so is what lets the operator read the right sentence.
 
     The branch scope comes from the configured location registry, so a creation
     at any configured branch of the same workspace counts, which is what §46.5
@@ -154,31 +232,76 @@ async def load_creation_evidence(
         )
 
     identities = await resolve_identities(session, items=items)
-    scan = await scan_capture(session, anchors=list(anchors), now=now, registry=locations)
+    # No lower bound: the question is when a booking the live read can see was
+    # MADE, which may be long before the mailing. Bounded newest-first by the
+    # report's own row cap, which reports truncation.
+    scan = await scan_capture(session, anchors=list(anchors), now=now, registry=locations, lookback=None)
     grouped = scan.by_customer()
+    by_uuid = scan.by_booking_uuid()
+    live_strays = [booking for booking in scan.bookings if booking.customer_reassigned]
 
     by_slot: dict[int, SlotCreations] = {}
     for item in items:
         slot = int(item.slot)
-        identity = identities.get(slot)
-        if identity is None or identity.state != IDENTITY_PROVEN or identity.customer_id is None:
-            # The webhooks name a numeric id and this person's could not be
-            # bridged to their proven uuid, or two ids claim them. Either way
-            # their creations are not established.
-            by_slot[slot] = SlotCreations(False, unproven_reason)
-            continue
         if scan.truncated:
+            # A partial pass is not an answer about anybody.
             by_slot[slot] = SlotCreations(False, unproven_reason)
             continue
-        observed = grouped.get(int(identity.customer_id), [])
+        live = frozenset(slot_bookings.get(slot, ()) if slot_bookings is not None else ())
+        identity = identities.get(slot)
+        numeric_id: int | None = None
+        bridge: str | None = None
+        if identity is not None and identity.state == IDENTITY_PROVEN and identity.customer_id is not None:
+            numeric_id = int(identity.customer_id)
+            bridge = "frozen_card_numeric_id"
+        elif identity is None or identity.state != IDENTITY_PROVEN:
+            # Two numeric ids claiming one person, or a frozen card that now
+            # names a different uuid, is an identity problem and not a missing
+            # bridge. A card that simply carries no numeric id is neither, and
+            # falls through to the booking-identity path below.
+            if identity is None or identity.state != IDENTITY_NUMERIC_MISSING:
+                by_slot[slot] = SlotCreations(False, conflict_reason or unproven_reason)
+                continue
+
         created: dict[uuid_module.UUID, datetime] = {}
         reassigned: set[uuid_module.UUID] = set()
-        for booking in observed:
-            if booking.customer_reassigned:
-                reassigned.add(booking.booking_uuid)
+        if numeric_id is not None:
+            for booking in grouped.get(numeric_id, []):
+                if booking.customer_reassigned:
+                    reassigned.add(booking.booking_uuid)
+                # Grouped by the customer its own CREATION named, so a booking
+                # that has since moved away is still this person's creation.
+                created[booking.booking_uuid] = booking.booking_created_at
+        for booking_uuid in live:
+            booking = by_uuid.get(booking_uuid)
+            if booking is None:
                 continue
-            created[booking.booking_uuid] = booking.booking_created_at
-        by_slot[slot] = SlotCreations(True, None, created_at=created, reassigned=frozenset(reassigned))
+            if booking.customer_reassigned:
+                reassigned.add(booking_uuid)
+            if _attributable(booking, numeric_id=numeric_id):
+                created[booking_uuid] = booking.booking_created_at
+
+        proven = True
+        reason: str | None = None
+        if numeric_id is None:
+            # No bridge: the live set is the whole account of this person's
+            # bookings, and a booking that LEFT it is what it cannot show. A
+            # reassignment after this slot's own anchor, of a booking not in
+            # their list, is exactly that case.
+            anchor = item.send_attempted_at
+            if any(
+                booking.booking_uuid not in live and anchor is not None and booking.booking_created_at > anchor
+                for booking in live_strays
+            ):
+                proven = False
+                reason = unproven_reason
+        by_slot[slot] = SlotCreations(
+            proven,
+            reason,
+            created_at=created,
+            bridge=bridge,
+            reassigned=frozenset(reassigned),
+        )
 
     return CapturedCreations(
         complete=not scan.truncated,

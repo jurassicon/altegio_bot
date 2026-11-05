@@ -2227,8 +2227,21 @@ async def _apply_voucher_production_status(
     caller's session and transaction; a callback for any other message returns
     ``False`` immediately and falls through to the ordinary path.
     """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
     from altegio_bot.campaigns.easyweek_voucher_production import ledger as voucher_production_ledger
 
+    # §46.3's binding protocol, and the lock comes FIRST — ahead of the lookup,
+    # in the one global order (message → header → item) that
+    # ``record_item_outcome`` also takes. The gap this closes is between "no slot
+    # owns this identifier" and keeping the callback for later: an acceptance
+    # committing in that gap would bind nothing and the callback would stay
+    # unbindable for ever. Held for the rest of this unit of work, which is why
+    # the keeper below needs no lock of its own.
+    #
+    # Taken for every delivered/read callback, including one that turns out to
+    # belong to an ordinary campaign message. It is an advisory lock on that one
+    # identifier, so two different messages never wait for each other.
+    await delivery_evidence.lock_message_identity(session, provider_message_id)
     result = await voucher_production_ledger.apply_webhook_transition(
         session,
         provider_message_id=provider_message_id,
@@ -2241,8 +2254,6 @@ async def _apply_voucher_production_status(
         # proof beside it — the verified signature and the frozen route — and
         # that is recorded here, or not at all when it cannot be proven.
         if status is not None:
-            from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
-
             receipt = await delivery_evidence.record_status_receipt(
                 session,
                 status=status,
@@ -2345,6 +2356,37 @@ async def _keep_unmatched_voucher_failure(
     )
     if outcome.stored:
         logger.info("status_webhook: unmatched failed callback kept for later binding")
+
+
+async def _keep_unmatched_voucher_status(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+    kind: str,
+) -> None:
+    """Keep a signed ``delivered``/``read`` that nothing in this database owns yet.
+
+    Reached only after BOTH the production lookup and the ``OutboxMessage``
+    lookup came back empty, which is an ordinary momentary state: Meta can
+    deliver a status while the transaction that records the message id is still
+    in flight. §46.3 requires such an early callback to remain matchable rather
+    than be dropped, and the binding happens later on the exact identifier —
+    never by phone similarity or timestamp proximity.
+
+    An unsigned callback is not kept: authenticity cannot be established after
+    the fact, and no later binding may promote one.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import delivery_evidence
+
+    outcome = await delivery_evidence.record_unmatched_status_receipt(
+        session,
+        status=status,
+        kind=kind,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.stored:
+        logger.info("status_webhook: unmatched %s callback kept for later binding", kind)
 
 
 # The salt for the status-webhook diagnostic handle below. Domain-separated so
@@ -2469,6 +2511,13 @@ async def _handle_delivery_statuses(
                 # callback to stay matchable until the commit that records its
                 # message id can claim it.
                 await _keep_unmatched_voucher_failure(session, event, status)
+            elif kind in {"delivered", "read"}:
+                # The same contract for a POSITIVE status, and for the same
+                # reason. A `read` can overtake the commit that records the
+                # message id, and a repeat callback is not guaranteed: dropping
+                # it leaves the slot's audience unprovable for ever. The hook
+                # above already holds this identifier's lock.
+                await _keep_unmatched_voucher_status(session, event, status, kind)
             continue
 
         chain_resolution = None

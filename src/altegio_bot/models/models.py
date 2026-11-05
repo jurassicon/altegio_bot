@@ -5801,17 +5801,50 @@ DELIVERY_RECEIPT_KIND_READ = "read"
 
 DELIVERY_RECEIPT_KINDS = (DELIVERY_RECEIPT_KIND_DELIVERED, DELIVERY_RECEIPT_KIND_READ)
 
+# How far a stored positive callback has got towards being one slot's evidence.
+# Only ``confirmed`` is evidence; the other two exist so that a callback is
+# never silently dropped.
+#
+# ``unmatched`` is the §46.3 early-callback case: Meta can deliver a `read` for
+# a message id while the transaction that records that id is still in flight, so
+# "no slot owns this id" is an ordinary momentary state rather than proof the
+# callback is foreign. The row names no slot — that is what makes it unmatched —
+# and is bound by the very commit that records the identifier.
+#
+# ``conflicting`` is a bound callback whose route turned out not to be the one
+# the slot's attempt froze. Kept for audit, never read as proof.
+DELIVERY_RECEIPT_MATCH_CONFIRMED = "confirmed"
+DELIVERY_RECEIPT_MATCH_UNMATCHED = "unmatched"
+DELIVERY_RECEIPT_MATCH_CONFLICTING = "conflicting"
+
+DELIVERY_RECEIPT_MATCH_STATES = (
+    DELIVERY_RECEIPT_MATCH_CONFIRMED,
+    DELIVERY_RECEIPT_MATCH_UNMATCHED,
+    DELIVERY_RECEIPT_MATCH_CONFLICTING,
+)
+
+_DELIVERY_RECEIPT_MATCH_SQL = ", ".join(f"'{value}'" for value in DELIVERY_RECEIPT_MATCH_STATES)
+
 _DELIVERY_RECEIPT_KIND_SQL = ", ".join(f"'{value}'" for value in DELIVERY_RECEIPT_KINDS)
 
 
 class EasyWeekVoucherProductionDeliveryReceipt(Base):
     """One PROVEN positive status about one original production voucher send.
 
-    What makes a row here, and nothing less: a ``delivered`` or ``read`` status
-    whose delivery signature the ingress verified, naming the exact message id
-    of this slot, on a route equal to the one that slot's single attempt froze.
-    A callback missing any of the three is not written — it is not evidence —
-    while the slot's own transition is applied exactly as before.
+    What makes a CONFIRMED row, and nothing less: a ``delivered`` or ``read``
+    status whose delivery signature the ingress verified, naming the exact
+    message id of this slot, on a route equal to the one that slot's single
+    attempt froze. A callback missing any of the three is not confirmed — it is
+    not evidence — while the slot's own transition is applied exactly as before.
+
+    An unsigned callback is not written at all. The signature is the one part
+    that cannot be established later, so there is nothing to keep.
+
+    A signed callback whose message id nothing owns YET is written ``unmatched``:
+    it names no slot, and the commit that records that identifier binds it and
+    re-judges it from scratch against the frozen route. That is §46.3's early
+    callback, and it is matched on the exact identifier — never on phone
+    similarity and never on timestamp proximity.
 
     It carries no authority of its own. Nothing here re-opens a slot, changes a
     counter, or claims a send: it records that a status was proven, and whether
@@ -5851,18 +5884,46 @@ class EasyWeekVoucherProductionDeliveryReceipt(Base):
             f"authenticity IN ({_INBOUND_AUTHENTICITY_SQL})",
             name="ck_ew_voucher_receipt_authenticity",
         ),
-        # A stored row IS the proof, so the three parts §46.3 asks for are
-        # required by the database rather than by whoever writes it: the
-        # verified signature, and both halves of a route that matched.
+        CheckConstraint(f"match_state IN ({_DELIVERY_RECEIPT_MATCH_SQL})", name="ck_ew_voucher_receipt_match"),
+        # A stored row IS the proof, so the parts §46.3 asks for are required by
+        # the database rather than by whoever writes it. The signature is
+        # required of EVERY row, matched or not: it is the one part that cannot
+        # be established after the fact, so a callback without it is not kept.
         CheckConstraint(
             f"authenticity = '{INBOUND_AUTHENTICITY_SIGNED}'",
             name="ck_ew_voucher_receipt_signed",
         ),
+        # A confirmed row names its slot and carries both halves of a route that
+        # matched. An unmatched one names no slot — that is what makes it
+        # unmatched — and has no frozen route to be compared with yet.
         CheckConstraint(
-            "route_proven AND observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL",
+            f"match_state <> '{DELIVERY_RECEIPT_MATCH_CONFIRMED}' OR ("
+            "item_id IS NOT NULL AND batch_id IS NOT NULL AND slot IS NOT NULL AND route_proven"
+            ")",
+            name="ck_ew_voucher_receipt_confirmed_proof",
+        ),
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_RECEIPT_MATCH_UNMATCHED}' OR ("
+            "item_id IS NULL AND batch_id IS NULL AND slot IS NULL AND NOT route_proven"
+            ")",
+            name="ck_ew_voucher_receipt_unmatched_has_no_item",
+        ),
+        # A conflicting row knows which slot it was tested against — that is the
+        # difference between it and an unmatched one.
+        CheckConstraint(
+            f"match_state <> '{DELIVERY_RECEIPT_MATCH_CONFLICTING}' OR item_id IS NOT NULL",
+            name="ck_ew_voucher_receipt_conflicting_has_item",
+        ),
+        CheckConstraint(
+            "NOT route_proven OR (observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL)",
             name="ck_ew_voucher_receipt_route_proven",
         ),
         Index("ix_ew_voucher_receipt_item_kind", "item_id", "kind"),
+        Index(
+            "ix_ew_voucher_receipt_unmatched",
+            "provider_message_id",
+            postgresql_where=text(f"match_state = '{DELIVERY_RECEIPT_MATCH_UNMATCHED}'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -5870,19 +5931,29 @@ class EasyWeekVoucherProductionDeliveryReceipt(Base):
     fact_key: Mapped[str] = mapped_column(String(64), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+    match_state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=text(f"'{DELIVERY_RECEIPT_MATCH_CONFIRMED}'"),
+    )
 
-    item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL while the row is unmatched: nothing owns this message id yet, and
+    # guessing which slot it is about is exactly what §46.3 forbids.
+    item_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    slot: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     provider_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
-    # The route the CALLBACK named, as one-way digests, proven equal to the one
-    # the attempt froze. Never the values: this table holds no phone number and
+    # The route the CALLBACK named, as one-way digests. For a confirmed row both
+    # are present and proven equal to the one the attempt froze; for an
+    # unmatched one they are what the callback stated, with nothing to compare
+    # them against yet. Never the values: this table holds no phone number and
     # no sender secret.
-    observed_sender_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    observed_recipient_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    route_proven: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    observed_sender_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    observed_recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_proven: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     whatsapp_event_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

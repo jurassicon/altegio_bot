@@ -47,6 +47,11 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
     DELIVERY_FAILURE_SOURCE_META_API,
+    DELIVERY_RECEIPT_KIND_DELIVERED,
+    DELIVERY_RECEIPT_KIND_READ,
+    DELIVERY_RECEIPT_MATCH_CONFIRMED,
+    DELIVERY_RECEIPT_MATCH_CONFLICTING,
+    DELIVERY_RECEIPT_MATCH_UNMATCHED,
     INBOUND_AUTHENTICITY_SIGNED,
     INBOUND_AUTHENTICITY_UNVERIFIED,
     VOUCHER_PRODUCTION_ITEM_DELIVERED,
@@ -58,6 +63,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
+    EasyWeekVoucherProductionDeliveryReceipt,
     MessageJob,
     OutboxMessage,
     WhatsAppConsentSuppression,
@@ -1725,3 +1731,240 @@ async def test_a_statuses_only_payload_still_records_everything(
     item = await _item(session_maker, batch_id, 1)
     assert item.delivered_at is not None
     assert item.status in {VOUCHER_PRODUCTION_ITEM_DELIVERED, VOUCHER_PRODUCTION_ITEM_READ}
+
+
+# ---------------------------------------------------------------------------
+# §46.3 — an EARLY delivered/read, kept and bound (review round 2, finding 3)
+# ---------------------------------------------------------------------------
+
+
+async def _receipts(session_maker) -> list[EasyWeekVoucherProductionDeliveryReceipt]:
+    async with session_maker() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(EasyWeekVoucherProductionDeliveryReceipt).order_by(
+                        EasyWeekVoucherProductionDeliveryReceipt.id
+                    )
+                )
+            ).all()
+        )
+
+
+async def test_an_early_read_is_kept_and_bound_when_the_id_lands(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The reproduction exactly as review round 2 reported it.
+
+    A correctly signed ``read`` naming the slot's own sender and recipient
+    arrived while the slot was ``send_claimed``. The worker finished the event
+    as processed, the acceptance then stored the POST result, and the slot was
+    left at ``provider_accepted`` with an empty ``read_at`` and no receipt —
+    so the follow-up audience read ``unknown`` for somebody who had demonstrably
+    read the message. A repeat callback is not guaranteed and a general replay
+    of the handler is not a fix.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-READ"
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient))
+
+    early = await _receipts(session_maker)
+    assert len(early) == 1
+    assert early[0].match_state == DELIVERY_RECEIPT_MATCH_UNMATCHED
+    assert early[0].item_id is None
+    assert early[0].batch_id is None
+    assert early[0].route_proven is False
+    assert early[0].authenticity == INBOUND_AUTHENTICITY_SIGNED
+    assert early[0].evidence.get("awaiting_binding") is True
+    # Nothing was guessed about the slot while the identifier was unowned.
+    assert (await _item(session_maker, batch_id)).read_at is None
+
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    bound = await _receipts(session_maker)
+    assert len(bound) == 1
+    item = await _item(session_maker, batch_id)
+    assert bound[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+    assert bound[0].item_id == int(item.id)
+    assert bound[0].slot == 1
+    assert bound[0].route_proven is True
+    assert bound[0].kind == DELIVERY_RECEIPT_KIND_READ
+    # And the slot's own record agrees with the proof beside it.
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert item.read_at is not None
+    assert item.delivered_at is not None
+
+
+async def test_an_early_delivered_binds_and_advances_to_delivered(
+    session_maker, production_configuration, binding_key
+) -> None:
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-DELIVERED"
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="delivered", recipient=recipient))
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_DELIVERED
+    assert item.read_at is None
+    assert (await _receipts(session_maker))[0].kind == DELIVERY_RECEIPT_KIND_DELIVERED
+
+
+async def test_two_early_callbacks_bind_with_read_winning(session_maker, production_configuration, binding_key) -> None:
+    """Read arriving BEFORE delivered still leaves the slot at read."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-BOTH"
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient))
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="delivered", recipient=recipient))
+    assert len(await _receipts(session_maker)) == 2
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert item.read_at is not None
+    assert {row.match_state for row in await _receipts(session_maker)} == {DELIVERY_RECEIPT_MATCH_CONFIRMED}
+
+
+async def test_a_duplicate_early_callback_is_one_receipt(session_maker, production_configuration, binding_key) -> None:
+    """Idempotent on the proven contents, so a Resend adds nothing."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-DUP"
+    payload = _status_payload(wamid=wamid, status="read", recipient=recipient)
+    await _deliver_status(session_maker, payload)
+    await _deliver_status(session_maker, payload)
+    assert len(await _receipts(session_maker)) == 1
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    # And the SAME callback arriving once more, now that the slot owns the id,
+    # lands on the same key through the matched path.
+    await _deliver_status(session_maker, payload)
+    rows = await _receipts(session_maker)
+    assert len(rows) == 1
+    assert rows[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+
+
+async def test_an_early_callback_outlives_a_restart_before_binding(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The kept proof is durable, so a process death between the two halves is safe."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-RESTART"
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient))
+    # Whatever else the deployment does in between must not consume it.
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid="wamid.SOMEBODY-ELSE", status="delivered", recipient="4915100000999"),
+    )
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    ours = [row for row in await _receipts(session_maker) if row.provider_message_id == wamid]
+    assert [row.match_state for row in ours] == [DELIVERY_RECEIPT_MATCH_CONFIRMED]
+
+
+async def test_an_unsigned_early_callback_is_not_kept_at_all(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Authenticity cannot be established later, so there is nothing to keep."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-UNSIGNED"
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, status="read", recipient=recipient),
+        signature_verified=False,
+    )
+    assert await _receipts(session_maker) == []
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    assert await _receipts(session_maker) == []
+    assert (await _item(session_maker, batch_id)).status == VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED
+
+
+async def test_an_early_callback_on_a_foreign_sender_binds_as_conflicting(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """A route that is not the frozen one is not this slot's evidence."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-FOREIGN-SENDER"
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, status="read", recipient=recipient, phone_number_id="PNID_SOMEBODY_ELSE"),
+    )
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    row = (await _receipts(session_maker))[0]
+    assert row.match_state == DELIVERY_RECEIPT_MATCH_CONFLICTING
+    assert row.evidence.get("conflict") == CONFLICT_FOREIGN_ROUTE
+    assert (await _item(session_maker, batch_id)).status == VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED
+
+
+async def test_an_early_callback_on_a_foreign_recipient_binds_as_conflicting(
+    session_maker, production_configuration, binding_key
+) -> None:
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.EARLY-FOREIGN-RECIPIENT"
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid=wamid, status="read", recipient="4915100000999"),
+    )
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    assert (await _receipts(session_maker))[0].match_state == DELIVERY_RECEIPT_MATCH_CONFLICTING
+    assert (await _item(session_maker, batch_id)).read_at is None
+
+
+async def test_an_early_callback_for_another_message_id_is_never_bound(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Matched on the exact identifier, never on time or phone similarity."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    await _deliver_status(
+        session_maker,
+        _status_payload(wamid="wamid.NOT-THIS-ONE", status="read", recipient=recipient),
+    )
+    assert (await _accept(session_maker, batch_id, "wamid.THE-REAL-ONE")).applied
+    row = (await _receipts(session_maker))[0]
+    assert row.match_state == DELIVERY_RECEIPT_MATCH_UNMATCHED
+    assert row.item_id is None
+    assert (await _item(session_maker, batch_id)).read_at is None
+
+
+async def test_a_late_failed_does_not_undo_a_bound_read(session_maker, production_configuration, binding_key) -> None:
+    """§46.3: success is not rolled back, and the contradiction is kept."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-THEN-FAILED"
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient))
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert item.read_at is not None
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert (await _receipts(session_maker))[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+
+
+async def test_a_concurrent_early_callback_and_acceptance_agree(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Either order leaves the same answer, and neither loses the status.
+
+    The two halves take the message-identity lock first, in the one global
+    order, so they serialise on this identifier rather than racing: whichever
+    commits first, the slot ends at ``read`` with one confirmed receipt.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.EARLY-RACE-2"
+    await asyncio.gather(
+        _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient=recipient)),
+        _accept(session_maker, batch_id, wamid),
+    )
+    item = await _item(session_maker, batch_id)
+    rows = await _receipts(session_maker)
+    assert len(rows) == 1
+    assert rows[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert item.read_at is not None

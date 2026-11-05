@@ -32,6 +32,15 @@ an order is the one a slot names, and the same proofs are used here:
   ``expired`` status, or an ``expires_at``/``valid_until`` already past. The
   ABSENCE of individual dates is the ordinary shape of a correct voucher under
   this contract and blocks nothing;
+* SETTLEMENT and the amounts, through the same ``paid_order_amounts_proven``
+  the primary delivery gate applies to this schema. A documented paid status
+  AND every published total at both levels equal to what the ORIGINAL schema's
+  contract says, with ``amount_due`` zero. An order that is merely ``open`` is
+  refused: a voucher line in the response and a MAC that verifies prove a
+  binding was made, not that the order behind it was ever settled. For a free
+  schema-4 issue the zero totals are not themselves the proof — an unsettled
+  draft has the same ones — so its documented zero-amount adjustments are
+  required as well;
 * the real MAC check. The code is read out of the order through the same proof
   the payment gate uses and compared against the slot's stored binding by
   :func:`...ledger.binding_matches`, which also pins the batch, the slot and the
@@ -65,6 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     ENTITLEMENT_INVALID,
+    ENTITLEMENT_SETTLEMENT_UNPROVEN,
     ENTITLEMENT_UNPROVEN,
     ENTITLEMENT_UNREADABLE,
 )
@@ -76,10 +86,12 @@ from altegio_bot.easyweek_voucher_canary.artifact import observe_artifact
 from altegio_bot.easyweek_voucher_canary.orders import (
     ORDER_CANCELLED,
     ORDER_MALFORMED,
+    ORDER_PAID,
     ORDER_REFUNDED,
     ORDER_UNKNOWN,
     classify_order,
     order_object,
+    paid_order_amounts_proven,
     prove_voucher_line,
 )
 from altegio_bot.easyweek_voucher_production_contract import ProductionVoucherContract, production_contract
@@ -106,7 +118,11 @@ class ArtifactVerdict:
     @property
     def unknown(self) -> bool:
         """Is this "we could not tell" rather than "this voucher is gone"?"""
-        return not self.proven and self.reason in {ENTITLEMENT_UNPROVEN, ENTITLEMENT_UNREADABLE}
+        return not self.proven and self.reason in {
+            ENTITLEMENT_UNPROVEN,
+            ENTITLEMENT_UNREADABLE,
+            ENTITLEMENT_SETTLEMENT_UNPROVEN,
+        }
 
 
 def _canonical(value: object) -> str | None:
@@ -183,6 +199,23 @@ async def prove_source_artifact(
 
     if not observation.order_customer_binding_proven or not observation.voucher_line_proven:
         return ArtifactVerdict(False, ENTITLEMENT_UNPROVEN, facts)
+
+    # SETTLEMENT, with the proof the primary delivery already applies to this
+    # same schema. An order that is merely OPEN was never settled: the voucher
+    # may exist in the response and its MAC may verify, and neither says the
+    # order behind it was paid. The amounts are proven in the same step and at
+    # both published levels, so a paid status beside a total that contradicts the
+    # contract is refused rather than trusted — and a free schema-4 issue needs
+    # its documented zero-amount adjustments, because zero totals alone are also
+    # what an unsettled draft looks like. The historical schema's own price and
+    # conditions decide, never a newer mailing's.
+    facts["order_paid"] = state == ORDER_PAID
+    settled = state == ORDER_PAID and paid_order_amounts_proven(
+        payload, expected_price_minor=contract.issue_price_minor
+    )
+    facts["settlement_proven"] = bool(settled)
+    if not settled:
+        return ArtifactVerdict(False, ENTITLEMENT_SETTLEMENT_UNPROVEN, facts)
 
     code = _issued_code(order, contract=contract)
     if code is None:
