@@ -185,6 +185,15 @@ Four answers are distinguished and never collapsed:
 * The capture scan is bounded: below by the earliest proven send minus one day
   of late-capture margin, above by the moment of reading, with a hard row cap.
   If the cap bites, the report says the coverage was truncated.
+* **Disputed bookings are reported, not claimed.** `scan_capture` now also
+  returns the bookings it saw and cannot attribute — two creation deliveries of
+  one booking naming different owners, and a booking with lifecycle deliveries
+  and no creation — with every customer any delivery named and every creation
+  instant stated. This report still reads `bookings` and `rejected` exactly as
+  before and still counts those shapes among its rejections: a conversion needs
+  a proven creation, and nothing here claims one. The field exists for PR-22.2's
+  follow-up, which asks about a PERSON and for which a dropped dispute would
+  read as "nothing happened".
 * **This report's own bounds are unchanged.** `scan_capture` now takes an
   explicit `lookback`, and the report keeps passing the one day it was written
   with — a conversion is a booking CREATED after the send, so a creation

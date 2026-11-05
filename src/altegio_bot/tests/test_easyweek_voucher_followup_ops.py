@@ -463,11 +463,39 @@ async def _store_one(ops_client: Any, batch_id: int) -> dict[str, Any]:
 async def test_a_saved_result_reads_as_current_right_after_the_check(
     session_maker, ops_client, no_network, seams
 ) -> None:
+    """Review round 3, finding 5: the green state says what the GET re-proved.
+
+    A GET re-proves the batch, the snapshot's validity window and the message
+    contract. It reads nobody's consent, replies, artifact or bookings — that is
+    an external recalculation and §46.6 makes it an explicit operator action —
+    so the page must not claim the recipients or their number are confirmed now.
+    """
     batch_id = await _batch(session_maker)
     await _store_one(ops_client, batch_id)
     body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
-    assert "Эти проверки актуальны" in body
-    assert "подтверждены и сейчас" in body
+    assert 'data-followup-standing="current"' in body
+    # What was re-checked, named.
+    assert "сама партия, срок действия снимка и контракт текста" in body
+    assert "Состав при этом не пересчитывался" in body
+    # And what was not.
+    assert "Согласие, ответы и записи каждого получателя заново не проверялись" in body
+    assert "текущее количество получателей этим не подтверждается" in body
+    # The old claims are gone.
+    assert "Эти проверки актуальны" not in body
+    assert "подтверждены и сейчас" not in body
+
+
+async def test_every_stored_number_is_printed_with_its_check_time(session_maker, ops_client, no_network, seams) -> None:
+    """A stored figure never appears without the moment it was computed."""
+    batch_id = await _batch(session_maker)
+    await _store_one(ops_client, batch_id)
+    async with session_maker() as session:
+        stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
+    stamp = stored.checked_at.strftime("%d.%m.%Y %H:%M UTC")
+    body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
+    assert body.count(stamp) >= 4, stamp
+    for caption in ("подходили для повторного сообщения", "исключены", "не удалось установить"):
+        assert caption in body
 
 
 async def test_a_paused_template_stops_the_result_reading_as_current(

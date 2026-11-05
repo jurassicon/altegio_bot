@@ -1394,6 +1394,35 @@ async def _resolve_identity(
     )
 
 
+async def matched_addresses(
+    session: AsyncSession,
+    *,
+    phone: object,
+    easyweek_customer_uuid: uuid_module.UUID | str | None = None,
+) -> tuple[str, ...]:
+    """Every address :func:`consent_decision` would match this person by.
+
+    The aggregate's own answer, exposed so that a caller which has to ask a
+    QUESTION about those addresses — rather than read the decision — cannot
+    assemble a narrower set of its own and then miss what the decision would
+    have found.
+
+    PR-22.2's §46.4.4 backlog scan is that caller. It is given the numbers a
+    preview's recipients are known by and reports the refusals sitting
+    unaccounted among them, and the preview then takes the veto against this
+    same set. Assembling the question from the cards alone left out exactly the
+    numbers §46.4.2 cares about most: a number the card has since dropped, which
+    is reachable only from the links this database wrote down for the ban to
+    travel. The scan never saw the event, so the later veto had nothing to find.
+
+    Ban extension only, as everywhere else: a number in this set is a number a
+    refusal for this person could be recorded against, and never a proof that it
+    belongs to this customer or to their branch.
+    """
+    identity = await _resolve_identity(session, phone=phone, easyweek_customer_uuid=easyweek_customer_uuid)
+    return identity.addresses
+
+
 async def consent_decision(
     session: AsyncSession,
     *,
@@ -1450,7 +1479,13 @@ async def consent_decision(
     sources: list[str] = []
     gaps: list[str] = list(identity.gaps)
     suppressed = False
-    newest_opt_in: datetime | None = None
+    # The newest proven opt-in PER ADDRESS. Not one figure for the person: a
+    # START is a decision about the number it arrived from, and §46.4.7 lets one
+    # lift only the refusal on that number. Collapsing them into a single
+    # high-water mark let an opt-in proven on B answer the historical refusal
+    # recorded against A — the same person, the same uuid, and a number they
+    # never resubscribed on.
+    opt_in_at: dict[str, datetime] = {}
     for row in rows:
         if row.state == CONSENT_STATE_OPTED_OUT:
             suppressed = True
@@ -1460,8 +1495,11 @@ async def consent_decision(
                 or (row.wa_address not in ordered_addresses and row.banned_easyweek_customer_uuid is not None)
                 else SOURCE_SUPPRESSION
             )
-        elif row.decided_observed_at is not None and (newest_opt_in is None or row.decided_observed_at > newest_opt_in):
-            newest_opt_in = row.decided_observed_at
+        elif row.decided_observed_at is not None:
+            for variant in address_variants(row.wa_address):
+                known = opt_in_at.get(variant)
+                if known is None or row.decided_observed_at > known:
+                    opt_in_at[variant] = row.decided_observed_at
         if row.banned_easyweek_customer_uuid is None and (row.evidence or {}).get("uuid_binding") == "ambiguous":
             gaps.append(GAP_UUID_BINDING_AMBIGUOUS)
 
@@ -1477,20 +1515,44 @@ async def consent_decision(
         suppressed = True
         sources.append(SOURCE_CLIENT_FLAG)
 
-    recipient_rows = (
-        await session.scalars(
-            select(CampaignRecipient.created_at)
+    # One row per matched ADDRESS, and no row limit. The earlier query took the
+    # newest fifty snapshots across every matched number ordered by time, which
+    # a single busy number's answered history can fill on its own while a live
+    # refusal on another number sits past the cut and is never read. Grouping
+    # removes both the ordering and the limit: the result is bounded by the
+    # number of addresses the aggregate matched, which is bounded already.
+    snapshots = (
+        await session.execute(
+            select(
+                CampaignRecipient.phone_e164,
+                func.max(CampaignRecipient.created_at),
+                # How many of this number's snapshots carry no time of their own.
+                func.count(CampaignRecipient.id) - func.count(CampaignRecipient.created_at),
+            )
             .where(CampaignRecipient.is_opted_out.is_(True))
             .where(CampaignRecipient.phone_e164.in_(ordered_addresses))
-            .order_by(CampaignRecipient.created_at.desc().nullslast())
-            .limit(50)
+            .group_by(CampaignRecipient.phone_e164)
         )
     ).all()
-    for created_at in recipient_rows:
-        # A snapshot taken BEFORE a proven, verified opt-in has been answered by
-        # that opt-in and is not a live refusal. One taken after it, or one whose
-        # own time is unknown, still refuses — an unproven order never grants.
-        if newest_opt_in is not None and created_at is not None and created_at < newest_opt_in:
+    for phone, newest_snapshot, undated in snapshots:
+        # A snapshot taken BEFORE a proven, verified opt-in ON ITS OWN NUMBER has
+        # been answered by that opt-in and is not a live refusal. One taken
+        # after it, one whose own time is unknown, and one on a number that was
+        # never resubscribed all still refuse — an unproven order never grants,
+        # and neither does somebody's opt-in on a different line.
+        answered_at: datetime | None = None
+        normalised = normalize_wa_address(phone)
+        if normalised is not None:
+            for variant in address_variants(normalised):
+                found = opt_in_at.get(variant)
+                if found is not None and (answered_at is None or found > answered_at):
+                    answered_at = found
+        if (
+            int(undated or 0) == 0
+            and answered_at is not None
+            and newest_snapshot is not None
+            and newest_snapshot < answered_at
+        ):
             continue
         suppressed = True
         sources.append(SOURCE_RECIPIENT_FLAG)
@@ -1983,6 +2045,7 @@ __all__ = [
     "extract_inbound_receipts",
     "final_send_guard",
     "is_suppressed",
+    "matched_addresses",
     "is_chatwoot_sourced",
     "iter_payload_consent_commands",
     "ledger_matches_clause",

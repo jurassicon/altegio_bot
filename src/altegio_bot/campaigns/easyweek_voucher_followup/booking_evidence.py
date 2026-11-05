@@ -76,6 +76,17 @@ What this module refuses to do
   capture is a bounded scan of deliveries this deployment happened to store;
   §46.5 forbids turning that into proof. An absent creation for a booking the
   live read can see is ``unknown``, with its own reason.
+* It never credits a creation to somebody the creation delivery did not name.
+  When the recipient's numeric id is proven the two are simply compared, so a
+  booking sitting in their current history whose creation named a different
+  customer is not their engagement — no separate move delivery is needed for
+  the disagreement to exist.
+* It never reads a booking the capture could not attribute as a booking that
+  did not happen. Two creations of one booking naming different owners, and a
+  booking with lifecycle deliveries from two customers and no proven creation,
+  are reported by the capture as DISPUTED; a dispute that could belong to this
+  person leaves the slot ``unknown`` instead of letting an empty live history
+  read as "nothing since the mailing".
 * It never moves a creation to the customer a booking was LATER moved to. The
   creation stays with the customer its own creation delivery named — that is
   the historical fact, and a later reassignment does not undo somebody's visit
@@ -98,6 +109,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.booking_attribution impor
     BOOKING_CANCELLED,
     IDENTITY_NUMERIC_MISSING,
     IDENTITY_PROVEN,
+    DisputedBooking,
     ObservedBooking,
     resolve_identities,
     scan_capture,
@@ -154,6 +166,10 @@ class CapturedCreations:
     scanned_events: int = 0
     truncated: bool = False
     registry_ready: bool = True
+    # How many bookings the capture saw and could not attribute. A shape fact
+    # for the stored snapshot and the operator's screen; which of them matter to
+    # which slot is decided per slot.
+    disputed: int = 0
     by_slot: dict[int, SlotCreations] = field(default_factory=dict)
 
     def for_slot(self, slot: int, *, reason: str) -> SlotCreations:
@@ -168,25 +184,66 @@ class CapturedCreations:
             "scanned_events": int(self.scanned_events),
             "truncated": bool(self.truncated),
             "registry_ready": bool(self.registry_ready),
+            "disputed_bookings": int(self.disputed),
         }
 
 
 def _attributable(booking: ObservedBooking, *, numeric_id: int | None) -> bool:
     """May this booking's creation be credited to the person being judged?
 
-    A booking nothing moved belongs to whoever created it, and the caller only
-    ever asks about bookings the live read proved are this person's or that the
-    numeric grouping already attributed to them.
+    The creation delivery NAMES a customer. When this person's numeric id is
+    proven, that comparison is available and it decides — and it needs no
+    separate move delivery to disagree. The earlier rule only distrusted a
+    booking whose deliveries contradicted each other, so a booking sitting in
+    somebody's current history whose single creation named a DIFFERENT customer
+    was credited to them: their own engagement, invented from somebody else's
+    visit to the booking page.
 
-    A booking whose deliveries DISAGREE about the customer is different: the
-    live read shows it under whoever holds it now, and crediting its creation to
-    them would hand somebody else's visit to the new owner. So a reassigned
-    booking counts only when the numeric bridge shows that this person is the
-    one its own creation delivery named.
+    With no numeric bridge the comparison cannot be made at all. The live read,
+    keyed on the proven uuid, has established that the booking is theirs NOW,
+    and the older rule stands: a booking nothing moved belongs to whoever
+    created it, and one whose deliveries disagree is not attributable.
     """
-    if not booking.customer_reassigned:
+    if numeric_id is not None:
+        return int(booking.customer_id) == int(numeric_id)
+    return not booking.customer_reassigned
+
+
+def _dispute_touches(
+    dispute: DisputedBooking,
+    *,
+    numeric_id: int | None,
+    live: frozenset[uuid_module.UUID],
+    anchor: datetime | None,
+) -> bool:
+    """Could this unattributable booking be the person being judged's?
+
+    Two ways, and either one is enough to refuse an answer about them:
+
+    * it is in their CURRENT history. Whoever made it, its creation is in
+      dispute, so "nothing new since the attempt" cannot be asserted about a
+      list that contains it;
+    * a delivery of it named their proven numeric id. Then it may be their
+      booking that left the list, or one whose ownership two deliveries
+      disagree about — and with no usable creation time, or one after the
+      attempt, neither verdict is available.
+
+    A dispute whose every stated creation time is at or before the attempt, and
+    which is not in their list, cannot be a booking made since the mailing and
+    is left alone. With no numeric bridge the second test cannot be made, so an
+    undatable dispute outside their list is treated like a booking that left
+    somebody's list: unknown.
+    """
+    if dispute.booking_uuid in live:
         return True
-    return numeric_id is not None and int(booking.customer_id) == int(numeric_id)
+    datable_before_anchor = (
+        bool(dispute.created_at) and anchor is not None and all(moment <= anchor for moment in dispute.created_at)
+    )
+    if datable_before_anchor:
+        return False
+    if numeric_id is not None:
+        return int(numeric_id) in dispute.customer_ids
+    return True
 
 
 async def load_creation_evidence(
@@ -283,12 +340,19 @@ async def load_creation_evidence(
 
         proven = True
         reason: str | None = None
-        if numeric_id is None:
+        anchor = item.send_attempted_at
+        # A booking the capture could not attribute at all, which could be
+        # theirs. Reported rather than dropped, because an empty live history
+        # plus a forgotten dispute reads as "nothing happened since the
+        # mailing" — and that is exactly what it is not.
+        if any(_dispute_touches(dispute, numeric_id=numeric_id, live=live, anchor=anchor) for dispute in scan.disputed):
+            proven = False
+            reason = unproven_reason
+        elif numeric_id is None:
             # No bridge: the live set is the whole account of this person's
             # bookings, and a booking that LEFT it is what it cannot show. A
             # reassignment after this slot's own anchor, of a booking not in
             # their list, is exactly that case.
-            anchor = item.send_attempted_at
             if any(
                 booking.booking_uuid not in live and anchor is not None and booking.booking_created_at > anchor
                 for booking in live_strays
@@ -308,6 +372,7 @@ async def load_creation_evidence(
         scanned_events=int(scan.scanned_events),
         truncated=bool(scan.truncated),
         registry_ready=bool(locations.ready),
+        disputed=len(scan.disputed),
         by_slot=by_slot,
     )
 

@@ -135,7 +135,6 @@ from altegio_bot.models.models import (
     RECIPIENT_BASIS_EARNED,
     RECIPIENT_BASIS_MANUAL,
     CampaignRecipient,
-    Client,
     EasyWeekVoucherFollowupPreview,
     EasyWeekVoucherFollowupPreviewRow,
     EasyWeekVoucherProductionBatch,
@@ -145,7 +144,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherProductionDeliveryReceipt,
 )
 from altegio_bot.utils import utcnow
-from altegio_bot.whatsapp_consent import normalize_wa_address
+from altegio_bot.whatsapp_consent import matched_addresses
 
 logger = logging.getLogger("easyweek_voucher_followup_preview")
 
@@ -711,13 +710,24 @@ async def _batch_items(session: AsyncSession, *, batch_id: int) -> list[EasyWeek
 async def _candidate_addresses(session: AsyncSession, *, batch_id: int) -> set[str]:
     """Every number this batch's recipients are known by, normalised.
 
-    Both sides of the identity, because the §46.4.4 backlog is about PEOPLE and
-    a number can have moved since the mailing: the campaign row's number, and
-    the number on the EasyWeek card of each slot's proven uuid. A refusal sent
-    from either is this person's refusal.
+    The question the bounded stored-event scan is given, and it has to be the
+    SAME set the live veto will take itself against. So it is not assembled
+    here: :func:`...whatsapp_consent.matched_addresses` is asked once per slot,
+    which is the aggregate's own resolver and therefore cannot drift from the
+    decision the local phase reads a moment later.
 
-    One query pair for the whole batch. The result is the question the bounded
-    stored-event scan is given, which is what keeps that scan narrow.
+    Assembling it from the cards was the defect. §46.4.2 keeps a refusal a fact
+    about the person, and the number it matters most for is the one the card has
+    since DROPPED — reachable only from the links this database wrote down so
+    the ban could travel (a suppression bound to the uuid, an accepted inbound
+    message stamped with it). The scan was never asked about that number, so the
+    stored «стоп» on it was never found, and the veto afterwards had nothing to
+    act on however correctly it asked.
+
+    One resolver call per slot, which is the cost profile the local phase
+    already has: it reads the whole aggregate for every candidate row anyway.
+    Ban extension only — a number in this set is never read back as proof that
+    it belongs to this customer.
     """
     rows = list(
         (
@@ -732,25 +742,8 @@ async def _candidate_addresses(session: AsyncSession, *, batch_id: int) -> set[s
         ).all()
     )
     addresses: set[str] = set()
-    uuids: set[uuid_module.UUID] = set()
     for phone, customer_uuid in rows:
-        normalised = normalize_wa_address(phone)
-        if normalised is not None:
-            addresses.add(normalised)
-        if customer_uuid is not None:
-            uuids.add(customer_uuid)
-    if uuids:
-        cards = (
-            await session.execute(
-                select(Client.phone_e164)
-                .where(Client.provider == PROVIDER_EASYWEEK)
-                .where(Client.easyweek_customer_uuid.in_(sorted(uuids)))
-            )
-        ).scalars()
-        for phone in cards:
-            normalised = normalize_wa_address(phone)
-            if normalised is not None:
-                addresses.add(normalised)
+        addresses.update(await matched_addresses(session, phone=phone, easyweek_customer_uuid=customer_uuid))
     return addresses
 
 

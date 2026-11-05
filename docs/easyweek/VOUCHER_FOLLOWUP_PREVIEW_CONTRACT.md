@@ -507,10 +507,20 @@ decision and a safe reason code.
   preview contract version, the source batch's frozen digest and its stop
   generation — and asks whether anything blocks a follow-up right now (a
   terminal stop, a missing sender, a template that is no longer proven). Only
-  the conjunction reads as "these checks hold"; everything else is shown as a
-  historical result that needs recomputing, with the reason named. So a paused
-  template, a stop since, an expired window or a refused refresh cannot leave a
-  stale block looking fresh.
+  the conjunction reads as "nothing forbids a follow-up"; everything else is
+  shown as a historical result that needs recomputing, with the reason named. So
+  a paused template, a stop since, an expired window or a refused refresh cannot
+  leave a stale block looking fresh.
+- **And that conjunction is all the page claims.** A GET re-proves those three
+  things and nothing else: it reads nobody's consent, replies, artifact or
+  bookings, because that is an external recalculation and §46.6 makes it an
+  explicit operator action rather than a side effect of opening a page. So the
+  green state names the three things it re-checked and says, in the same breath,
+  that the composition was not recomputed; every stored figure is printed with
+  the moment it was computed; and nothing says the recipients or their number
+  are confirmed now. Claiming otherwise was wrong in the most expensive
+  direction available here — an operator reading «эти проверки актуальны»
+  beside a count of one, for somebody who had since sent a STOP.
 - **And the page it is already on stays honest too.** A standing the server
   rendered describes the moment the page loaded. When the operator then presses
   «Проверить состав» and no new result comes back — a 409, a transport failure,
@@ -518,8 +528,8 @@ decision and a safe reason code.
   the displayed block drops to the historical state immediately and without a
   reload: the success colour goes, the standing sentence says the checks are not
   confirmed now, and the claim that the counts are confirmed is replaced. The
-  first round changed only one line of status text underneath, leaving the green
-  block asserting «Эти проверки актуальны» and «Они подтверждены и сейчас». The
+  second round changed only one line of status text underneath, leaving the
+  green block asserting that its counts were confirmed now. The
   snapshot stays fully readable as the history it is, and nothing about it is
   rewritten: this is display state, carried on the block as
   `data-followup-standing`.
@@ -701,6 +711,37 @@ fix:
    staying green and claiming to be confirmed now after a 409 and after a
    network failure, checked at desktop and phone width, with a successful
    recalculation still producing a new version and no PII anywhere on the block.
+
+The third round's five findings, same rule, all failing before the fix:
+
+1. the mailing went to the person's current number while a raw «стоп» with no
+   stated time sat on a number no card carries any more, reachable only through
+   the uuid the ban was bound to. The veto would have asked about it; the scan
+   was handed a narrower set and never saw it. Positive control: the same shape
+   with the order provable and a newer proven START on that number, which lifts
+   it. Plus the bound: a truncated pass is still unknown for everybody;
+2. a historical campaign refusal on A with a proven opt-in on B of the same
+   person, through `consent_decision` and through a real preview. Controls: the
+   opt-in on A's own number does answer A's snapshot, an older one does not, and
+   a tie does not. Plus sixty answered snapshots on B and one refusing snapshot
+   on A, which the earlier time-ordered row limit hid completely;
+3. a booking in this person's current history whose single creation delivery
+   named another customer, before and after the attempt; two creations of one
+   booking naming different owners with an empty live history; and lifecycle
+   deliveries from two customers with no creation at all. Controls: a stranger's
+   ordinary booking changes nothing, the proven creator is still excluded, an
+   active booking ahead still excludes whatever the creation says, and an
+   ordinary manual card with a uuid and no numeric id is unaffected;
+4. a signed `delivered`/`failed` and a signed `read`/`failed` pair for one exact
+   message id and route, in both arrival orders, both entirely before the
+   acceptance write and entirely after it. All four leave the success standing,
+   the failure a conflict and no `confirmed_delivery_failure` on the slot. Plus
+   a lone failure, a repeated pair, a foreign route and an unsigned pair;
+5. through the real Ops route and in Chromium: a composition saved with one
+   eligible recipient, that person's STOP recorded, the page reopened — the block
+   is still green, because the batch, the window and the template are all
+   unchanged, and it no longer claims the count is confirmed now. The stored
+   figures carry their check time, and the recalculation afterwards stores zero.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

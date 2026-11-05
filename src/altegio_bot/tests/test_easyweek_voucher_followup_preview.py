@@ -144,6 +144,7 @@ from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     voucher_code_for,
     voucher_order,
 )
+from altegio_bot.utils import utcnow
 
 THIRTY_DAYS = 30 * 24 * 60 * 60
 FOURTEEN_DAYS = 14 * 24 * 60 * 60
@@ -2791,6 +2792,230 @@ async def test_a_start_on_another_number_does_not_lift_this_one(session_maker, b
     assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
 
 
+async def _uuid_bound_opt_in(
+    session_maker,
+    *,
+    address: str,
+    customer_uuid: str,
+    stop_at: datetime,
+    start_at: datetime,
+) -> None:
+    """A refusal once recorded against *address* and bound to the uuid, then lifted.
+
+    The shape that keeps a dropped number reachable: the card has moved on, no
+    card carries this number any more, and the ban travelled through
+    ``banned_easyweek_customer_uuid`` when it was applied. The row now reads
+    ``opted_in`` — a proven newer START answered it — so nothing refuses, and the
+    link it carries is still the only thing that connects the old number to this
+    person.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppConsentSuppression(
+                    wa_address=address,
+                    state=CONSENT_STATE_OPTED_IN,
+                    consent_version=2,
+                    decision_command=CONSENT_COMMAND_START,
+                    decision_source=CONSENT_SOURCE_INBOUND,
+                    decision_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    decided_observed_at=start_at,
+                    decided_event_at=start_at,
+                    # No ``opted_out_at``: the ban is not in force any more, and
+                    # the schema pairs that column with the ``opted_out`` state.
+                    last_stop_observed_at=stop_at,
+                    last_stop_event_at=stop_at,
+                    last_start_observed_at=start_at,
+                    last_start_event_at=start_at,
+                    banned_easyweek_customer_uuid=uuid_module.UUID(customer_uuid),
+                    banned_uuid_recorded_at=stop_at,
+                )
+            )
+
+
+async def test_a_stored_stop_on_a_number_the_card_dropped_still_blocks(session_maker, binding_key, no_network) -> None:
+    """Review round 3, finding 1: the scan must be asked what the veto will ask.
+
+    The mailing went to the person's current number. Their old number is carried
+    by no card at all — it survives only in the consent ledger, through the uuid
+    the ban was bound to when it was applied there. A raw «стоп» with no stated
+    time of its own is sitting on that old number with no receipt, so nothing has
+    accounted for it, and no opt-in can be ordered against it.
+
+    The veto asked about the whole aggregate and would have found it. The SCAN
+    was handed a set assembled from the cards, never saw the event, and so had
+    nothing to report.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    who = person(1)
+    dropped = "+4915100111222"
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _uuid_bound_opt_in(
+        session_maker,
+        address=dropped,
+        customer_uuid=who["customer_uuid"],
+        stop_at=ATTEMPTED_AT - timedelta(days=40),
+        start_at=ATTEMPTED_AT - timedelta(days=30),
+    )
+    await _stored_event(
+        session_maker,
+        dedupe_key="dropped-number-stop",
+        address=dropped,
+        text="стоп",
+        payload={
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "metadata": {"phone_number_id": PHONE_NUMBER_ID},
+                                "messages": [
+                                    {
+                                        "from": dropped.lstrip("+"),
+                                        "id": "wamid.dropped-number",
+                                        "type": "text",
+                                        "text": {"body": "стоп"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    # The scan is now asked about the dropped number, because the aggregate is.
+    async with session_maker() as session:
+        scan = await scan_historical_refusals(
+            session,
+            addresses=await preview_module._candidate_addresses(session, batch_id=batch_id),
+        )
+    assert scan.complete is True
+    assert scan.blocks(dropped) is True
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == HISTORICAL_STOP_UNACCOUNTED
+
+
+async def test_a_proven_newer_start_on_the_dropped_number_lifts_it(session_maker, binding_key, no_network) -> None:
+    """The positive control: the same shape, with the order provable.
+
+    The refusal on the dropped number states its own time, and the opt-in in
+    force on that same number is strictly newer. §46.4.7 lets exactly that lift
+    it, so the person is sendable — and the widening that found the number is
+    still only a ban extension.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    who = person(1)
+    dropped = "+4915100111333"
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    stop_at = ATTEMPTED_AT - timedelta(days=40)
+    await _uuid_bound_opt_in(
+        session_maker,
+        address=dropped,
+        customer_uuid=who["customer_uuid"],
+        stop_at=stop_at,
+        start_at=ATTEMPTED_AT - timedelta(days=30),
+    )
+    await _stored_event(
+        session_maker,
+        dedupe_key="dropped-number-stop-dated",
+        address=dropped,
+        text="стоп",
+        received=stop_at,
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_the_dropped_number_scan_stays_bounded_and_fails_closed(session_maker, binding_key, no_network) -> None:
+    """The widened question does not widen the scan's licence to conclude."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    who = person(1)
+    dropped = "+4915100111444"
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    await _uuid_bound_opt_in(
+        session_maker,
+        address=dropped,
+        customer_uuid=who["customer_uuid"],
+        stop_at=ATTEMPTED_AT - timedelta(days=40),
+        start_at=ATTEMPTED_AT - timedelta(days=30),
+    )
+    await _stored_event(session_maker, dedupe_key="noise-a", address="+4915100777771", text="guten Tag")
+    await _stored_event(session_maker, dedupe_key="noise-b", address="+4915100777772", text="guten Tag")
+    async with session_maker() as session:
+        scan = await scan_historical_refusals(session, addresses=[dropped], limit=1)
+    assert (scan.complete, scan.truncated, scan.scanned_events) == (False, True, 1)
+    outcome = await preview_module.create_preview(
+        session_maker,
+        spec=preview_module.PreviewSpec(
+            batch_id=batch_id,
+            groups=(FOLLOWUP_GROUP_DELIVERED,),
+            min_interval_seconds=FOURTEEN_DAYS,
+            operator_principal="operator@example.test:fp",
+        ),
+        booking_reader=FakeHistoryReader(),
+        template_reader=TemplateReader(),
+        now=NOW,
+        historical_event_limit=1,
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == HISTORICAL_CONSENT_UNPROVEN
+
+
+async def test_a_historical_refusal_is_not_answered_by_an_opt_in_elsewhere(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 3, finding 2, through a real preview.
+
+    The campaign snapshot refuses the number this slot writes to. A proven
+    opt-in exists for the same person on ANOTHER number of theirs. §46.4.7 lets
+    an opt-in lift the refusal on the number it arrived from; collapsing the
+    opt-ins into one high-water mark for the person let B's resubscribe answer
+    A's refusal and put A back in the audience.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    who = person(1)
+    other = "+4915100222555"
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "recipient_opted_out": True}],
+    )
+    # Newer than the snapshot by the database's own clock, which is what
+    # stamps ``CampaignRecipient.created_at``.
+    await _uuid_bound_opt_in(
+        session_maker,
+        address=other,
+        customer_uuid=who["customer_uuid"],
+        stop_at=ATTEMPTED_AT - timedelta(days=40),
+        start_at=utcnow() + timedelta(hours=1),
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == CONSENT_REFUSED
+
+
+async def test_a_proven_opt_in_on_the_same_number_does_answer_its_snapshot(
+    session_maker, binding_key, no_network
+) -> None:
+    """The control: on its own number, a newer proven opt-in still answers it."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    who = person(1)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "recipient_opted_out": True}],
+    )
+    await _uuid_bound_opt_in(
+        session_maker,
+        address=who["phone"],
+        customer_uuid=who["customer_uuid"],
+        stop_at=ATTEMPTED_AT - timedelta(days=40),
+        start_at=utcnow() + timedelta(hours=1),
+    )
+    outcome = await build(session_maker, batch_id=batch_id)
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
 async def test_the_backlog_scan_writes_nothing_at_all(session_maker, binding_key, no_network) -> None:
     """§46.4.4 keeps the projection a separate explicit operation."""
     await seed_sender_and_template(session_maker, with_followup_template=True)
@@ -3828,3 +4053,209 @@ async def test_a_truncated_creation_scan_is_unknown_for_everybody(
             .first()
         )
     assert stored.evidence["booking_creation_capture"]["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Who created the booking (§46.5, review round 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("made_after_the_attempt", [False, True])
+async def test_a_booking_in_their_history_created_by_somebody_else_is_unknown(
+    session_maker, binding_key, no_network, made_after_the_attempt: bool
+) -> None:
+    """Review round 3, finding 3: the creation names an owner, so compare it.
+
+    The booking sits in this person's CURRENT history and its one creation
+    delivery named a different customer. Nothing moved it as far as the capture
+    can see, so the old rule — distrust only a booking whose deliveries
+    contradict each other — credited the creation to whoever holds it now. Their
+    own engagement, invented from somebody else's visit to the booking page.
+
+    Checked for a foreign creation both before and after the attempt: neither
+    may be attributed, and with no independent reason to exclude the answer is
+    unknown rather than either verdict.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs_now = booking(
+        index=30,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs_now["uuid"],
+        numeric_customer_id=who["numeric_id"] + 77,
+        created_at=ATTEMPTED_AT + (timedelta(days=2) if made_after_the_attempt else -timedelta(days=9)),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs_now]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CREATION_UNPROVEN
+
+
+async def test_two_creations_of_one_booking_do_not_vanish_into_an_empty_history(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 3, finding 3: a disputed booking is not a booking that did not happen.
+
+    Two creation deliveries of one booking uuid name two different owners, so
+    the capture can attribute neither. It used to drop the booking entirely —
+    correct for a conversion report, and here it turned an empty live history
+    into «nothing has happened since the mailing» for somebody one of those
+    deliveries says did book.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    disputed = booking(index=31, customer_uuid=person(4)["customer_uuid"], start=NOW + timedelta(days=6))
+    for owner, made in ((who["numeric_id"], timedelta(days=1)), (who["numeric_id"] + 5, timedelta(days=2))):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=disputed["uuid"],
+            numeric_customer_id=owner,
+            created_at=ATTEMPTED_AT + made,
+        )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+    async with session_maker() as session:
+        stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
+    assert stored.evidence["booking_creation_capture"]["disputed_bookings"] == 1
+
+
+async def test_an_owner_change_with_no_proven_creation_is_unknown(session_maker, binding_key, no_network) -> None:
+    """Lifecycle deliveries from two customers and no creation at all.
+
+    The capture can say that something happened to a booking and that two
+    customers were named on it, and nothing about who made it or when. That is
+    a dispute, not an absence.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    moved = booking(index=32, customer_uuid=person(4)["customer_uuid"], start=NOW + timedelta(days=4))
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_cancelled(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=who["numeric_id"] + 9,
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_strangers_booking_says_nothing_about_this_recipient(session_maker, binding_key, no_network) -> None:
+    """The control: somebody else's perfectly ordinary booking changes nothing."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    stranger = booking(index=33, customer_uuid=person(6)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=stranger["uuid"],
+        numeric_customer_id=who["numeric_id"] + 404,
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_the_proven_creator_of_that_booking_is_still_excluded(session_maker, binding_key, no_network) -> None:
+    """The other control: an undisputed creation of theirs still excludes them."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(index=34, customer_uuid=person(6)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_an_active_future_booking_excludes_even_with_a_disputed_creation(
+    session_maker, binding_key, no_network
+) -> None:
+    """The appointment rule needs no creation evidence, so it still decides."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    ahead = booking(index=35, customer_uuid=who["customer_uuid"], start=NOW + timedelta(days=3), completed=False)
+    for owner in (who["numeric_id"], who["numeric_id"] + 3):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=ahead["uuid"],
+            numeric_customer_id=owner,
+            created_at=ATTEMPTED_AT + timedelta(days=1),
+        )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [ahead]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == FUTURE_BOOKING_ACTIVE
+
+
+async def test_a_manual_card_is_unaffected_by_the_owner_comparison(session_maker, binding_key, no_network) -> None:
+    """The ordinary manual card keeps working: there is no id to compare with."""
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    theirs = booking(
+        index=36,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=4711,
+        created_at=ATTEMPTED_AT - timedelta(days=4),
+    )
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED

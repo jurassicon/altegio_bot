@@ -2063,10 +2063,12 @@ async def record_item_outcome(
     * ``provider_message_id`` claims any callback fact that arrived BEFORE this
       commit — a ``failed`` one, and a signed ``delivered``/``read`` one. Any of
       them can overtake the write that records the identifier, and binding them
-      here means the very commit that makes them bindable also binds them. A
-      confirmed positive receipt then advances this slot through the same
-      transition rule the live callback path uses, so the slot's own record
-      cannot disagree with the proof stored beside it;
+      here means the very commit that makes them bindable also binds them. The
+      positive ones bind FIRST and advance this slot through the same transition
+      rule the live callback path uses; the failures bind after, so each is
+      judged against a slot that already carries whatever success was proven,
+      and a `failed` that overtook the commit alongside a `read` is recorded as
+      the conflict it is rather than as a confirmed failure;
     * ``proven_api_rejection`` records that META refused the request. Only the
       caller's proven-rejection branch may pass it. ``send_rejected`` alone is
       not that proof: this phase writes the same state for its own parameter
@@ -2176,18 +2178,12 @@ async def record_item_outcome(
                     attempt.completed_at = now
             if provider_message_id is not None:
                 await session.flush()
-                await delivery_evidence.bind_unmatched_failures(
-                    session,
-                    item=row,
-                    provider_message_id=provider_message_id,
-                    observed_at=now,
-                )
-                # §46.3's positive half. A signed ``delivered``/``read`` can
-                # overtake this very commit, and it was kept unmatched because
-                # nothing owned the identifier yet. Binding it here means the
+                # §46.3's positive half FIRST, and the order is the contract
+                # rather than a convenience. A signed ``delivered``/``read`` can
+                # overtake this very commit and was kept unmatched because
+                # nothing owned the identifier yet; binding it here means the
                 # commit that makes it bindable also applies it, so a status
-                # that may never be re-sent is not lost — and the slot's own
-                # record stops disagreeing with the proof beside it.
+                # that may never be re-sent is not lost.
                 #
                 # Applied in rank order, through the same transition rule the
                 # live callback path uses: ``read`` outranks ``delivered``, and
@@ -2201,6 +2197,26 @@ async def record_item_outcome(
                 for receipt_kind, item_status in delivery_evidence.RECEIPT_KIND_STATUS:
                     if receipt_kind in confirmed:
                         _advance_delivery_status(row, status=item_status, now=now)
+                await session.flush()
+                # And the failures AFTER, so each one is judged against a slot
+                # that already carries whatever success was proven for it.
+                #
+                # This is §46.3's precedence, not a guess about arrival order:
+                # `read` and `delivered` keep their force against a later
+                # `failed`, whichever reached the webhook first, and the two
+                # tables' row ids are not comparable evidence of anything. With
+                # the failures bound first, a `delivered`/`failed` pair that BOTH
+                # overtook this commit left the slot read-or-delivered AND
+                # carrying `confirmed_delivery_failure`, because at that moment
+                # the slot's own timestamps were still empty and the failure
+                # looked uncontradicted. The same pair arriving after the commit
+                # was always recorded as a conflict; now both orders agree.
+                await delivery_evidence.bind_unmatched_failures(
+                    session,
+                    item=row,
+                    provider_message_id=provider_message_id,
+                    observed_at=now,
+                )
             if proven_api_rejection:
                 await session.flush()
                 await delivery_evidence.record_api_rejection(

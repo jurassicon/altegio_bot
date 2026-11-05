@@ -439,6 +439,16 @@ def _stored_block(
     contract, the policy and the source batch are still the ones it was computed
     under AND nothing blocks a follow-up right now — so a failed refresh, a
     paused template or a stop since cannot leave a stale result looking fresh.
+
+    And the green state says exactly what that conjunction establishes, which is
+    LESS than it used to claim. A GET re-proves the batch, the snapshot's own
+    validity window and the message contract; it does not re-read anybody's
+    consent, replies, artifact or bookings, because that is an external
+    recalculation and §46.6 makes it an explicit operator action rather than a
+    side effect of opening a page. So nothing here says the recipients or their
+    number are confirmed now: every stored figure is printed with the moment it
+    was computed, and the sentence beside them names the three things that were
+    re-checked and the ones that were not.
     """
     if stored is None:
         return (
@@ -446,8 +456,14 @@ def _stored_block(
             "Выберите группы и интервал, затем проверьте состав.</div>"
         )
     assert currency is not None
+    checked = stored.checked_at.strftime("%d.%m.%Y %H:%M UTC")
     if currency.current:
-        css, standing = "alert-success", "Эти проверки актуальны."
+        css, standing = (
+            "alert-success",
+            "Ничто не запрещает повторное сообщение по этой рассылке: сейчас заново проверены "
+            "сама партия, срок действия снимка и контракт текста. Состав при этом не пересчитывался — "
+            f"числа и решения ниже относятся к {checked}.",
+        )
     elif not currency.fresh:
         css, standing = (
             "alert-warning",
@@ -490,7 +506,7 @@ def _stored_block(
   <div class="small mt-1">
     Группы: {_esc(groups)}.<br>
     Минимальный интервал после исходной попытки: {days:.0f} дн.<br>
-    Проверено: {_esc(stored.checked_at.strftime("%d.%m.%Y %H:%M UTC"))};
+    Проверено: {_esc(checked)};
     снимок считается актуальным до {_esc(stored.valid_until.strftime("%d.%m.%Y %H:%M UTC"))}.<br>
     Версия контракта: <code>{_esc(stored.contract_version)}</code>,
     политика причин ошибок: <code>{_esc(stored.failure_policy_version)}</code>.
@@ -500,20 +516,23 @@ def _stored_block(
 <div class="row g-2 mb-3">
   <div class="col"><div class="card"><div class="card-body py-2">
     <div class="h4 mb-0">{int(stored.included_count)}</div>
-    <div class="small text-muted">подходили для повторного сообщения</div>
+    <div class="small text-muted">подходили для повторного сообщения<br>на {_esc(checked)}</div>
   </div></div></div>
   <div class="col"><div class="card"><div class="card-body py-2">
     <div class="h4 mb-0">{int(stored.excluded_count)}</div>
-    <div class="small text-muted">исключены</div>
+    <div class="small text-muted">исключены<br>на {_esc(checked)}</div>
   </div></div></div>
   <div class="col"><div class="card"><div class="card-body py-2">
     <div class="h4 mb-0">{int(stored.unknown_count)}</div>
-    <div class="small text-muted">не удалось установить</div>
+    <div class="small text-muted">не удалось установить<br>на {_esc(checked)}</div>
   </div></div></div>
 </div>
 <div class="small text-muted mb-2">
-  Это числа на момент проверки. <span id="followup-confirmation">{
-        "Они подтверждены и сейчас."
+  Это числа на {_esc(checked)}. <span id="followup-confirmation">{
+        "Сейчас перепроверены только сама партия, срок снимка и контракт текста. "
+        "Согласие, ответы и записи каждого получателя заново не проверялись, "
+        "поэтому текущее количество получателей этим не подтверждается — "
+        "чтобы узнать его, пересчитайте состав."
         if currency.current
         else "Они НЕ подтверждены заново: это историческая запись проверки, а не текущая готовность."
     }</span>

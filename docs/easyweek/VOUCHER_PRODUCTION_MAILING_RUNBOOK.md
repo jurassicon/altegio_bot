@@ -1745,6 +1745,14 @@ it was computed under **and** nothing blocks a follow-up right now; otherwise it
 is shown as a historical result that needs recomputing, and a text that has
 changed since is not passed off as the text that composition was built with.
 
+Reading the page re-proves those three things and nothing else — opening a screen
+does not re-read anybody's consent, replies, voucher or bookings, because that is
+the explicit «Проверить состав» action. So the green state names what it checked
+and says in the same breath that the composition was not recomputed, every saved
+number is printed with the moment it was computed, and the page never claims that
+the recipients or their count are confirmed now. To learn the current count,
+recalculate.
+
 ### What this is NOT
 
 **There is no sending.** No send button, no send confirmation, no endpoint, no

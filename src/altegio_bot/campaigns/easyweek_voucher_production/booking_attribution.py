@@ -315,6 +315,12 @@ class _BookingDraft:
     booking_created_at: datetime | None = None
     seen_creation: bool = False
     conflicting: bool = False
+    # Every customer and every instant a CREATION delivery of this booking
+    # named, including the ones a disagreeing second creation named. The first
+    # creation still decides the attribution above; these exist so a disputed
+    # booking can be reported with enough detail to refuse on.
+    creation_customer_ids: set[int] = field(default_factory=set)
+    creation_times: set[datetime] = field(default_factory=set)
     # -- lifecycle facts, as a set of DISTINCT deliveries -------------------
     # Keyed by the capture's own content identity (``payload_hash``), so an
     # identical Resend of a delivery already seen adds nothing. A row whose
@@ -349,6 +355,47 @@ class _BookingDraft:
         return BOOKING_ACTIVE, None
 
 
+# Why a booking the capture saw is not a booking it can speak about. Both are
+# shapes that used to leave the scan silently, counted in ``rejected`` and
+# otherwise gone — which is correct for a conversion report, and dangerous for a
+# caller that has to decide about a PERSON: an empty answer about a disputed
+# booking reads as "nothing happened".
+DISPUTE_CONFLICTING_CREATION: Final = "conflicting_creation"
+DISPUTE_CREATION_NOT_OBSERVED: Final = "creation_not_observed"
+
+
+@dataclass(frozen=True)
+class DisputedBooking:
+    """A booking the report cannot attribute, kept so a caller can refuse.
+
+    The report itself does not use these — a conversion needs a proven creation,
+    and `rejected` already counts the shapes for diagnostics. PR-22.2's
+    follow-up does: §46.5 asks whether a PERSON booked, and a booking whose
+    owner or creation is in dispute is exactly the case where neither answer may
+    be given. Dropping it meant an empty live history came out as "nothing
+    since the mailing".
+
+    ``customer_ids`` is every customer ANY delivery of this booking named, and
+    ``creation_customer_ids`` the subset that a creation delivery named. Their
+    disagreement is the dispute, and it needs no separate move delivery.
+    """
+
+    booking_uuid: uuid_module.UUID
+    reason: str
+    customer_ids: frozenset[int] = frozenset()
+    creation_customer_ids: frozenset[int] = frozenset()
+    # Every creation instant any creation delivery of it stated. Empty when no
+    # creation was observed at all.
+    created_at: tuple[datetime, ...] = ()
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "owners_named": len(self.customer_ids),
+            "creations_observed": len(self.created_at),
+        }
+
+
 @dataclass(frozen=True)
 class CaptureScan:
     """Every booking the bounded scan could prove, plus what it could not."""
@@ -364,6 +411,9 @@ class CaptureScan:
     # is NOT the same as "this branch has no bookings", which this report has
     # no way to establish.
     branch_observed: dict[int, int] = field(default_factory=dict)
+    # Bookings this scan saw and cannot attribute. Additive: the report reads
+    # ``bookings`` and ``rejected`` exactly as before.
+    disputed: tuple[DisputedBooking, ...] = ()
 
     def by_customer(self) -> dict[int, list[ObservedBooking]]:
         grouped: dict[int, list[ObservedBooking]] = {}
@@ -765,6 +815,10 @@ async def scan_capture(
             draft.customer_ids.add(int(facts["customer_id"]))
 
         if event_hint == CREATED_HINT:
+            if facts["customer_id"] is not None:
+                draft.creation_customer_ids.add(int(facts["customer_id"]))
+            if facts.get("booking_created_at") is not None:
+                draft.creation_times.add(facts["booking_created_at"])
             if not draft.seen_creation:
                 draft.seen_creation = True
                 draft.company_id = facts["company_id"]
@@ -807,12 +861,30 @@ async def scan_capture(
         # would turn an edit into a claim about the salon's day.
 
     bookings: list[ObservedBooking] = []
+    disputed: list[DisputedBooking] = []
     for draft in drafts.values():
         # A booking with no proven creation is not a booking this report can
-        # speak about, however many lifecycle deliveries it has.
-        if not draft.seen_creation or draft.conflicting:
-            continue
-        if draft.customer_id is None or draft.booking_created_at is None:
+        # speak about, however many lifecycle deliveries it has. It is RECORDED
+        # as disputed rather than forgotten, so a caller asking about a person
+        # cannot mistake the silence for "nothing happened".
+        if (
+            not draft.seen_creation
+            or draft.conflicting
+            or draft.customer_id is None
+            or draft.booking_created_at is None
+        ):
+            disputed.append(
+                DisputedBooking(
+                    booking_uuid=draft.booking_uuid,
+                    # A validated creation always carries both its customer
+                    # and its instant, so "seen but unusable" cannot arise here
+                    # and the two real shapes are the whole vocabulary.
+                    reason=(DISPUTE_CONFLICTING_CREATION if draft.conflicting else DISPUTE_CREATION_NOT_OBSERVED),
+                    customer_ids=frozenset(draft.customer_ids),
+                    creation_customer_ids=frozenset(draft.creation_customer_ids),
+                    created_at=tuple(sorted(draft.creation_times)),
+                )
+            )
             continue
         state, state_reason = draft.resolved_state()
         bookings.append(
@@ -837,6 +909,7 @@ async def scan_capture(
         scan_to=now,
         rejected=rejected,
         branch_observed=branch_observed,
+        disputed=tuple(disputed),
     )
 
 
@@ -1241,6 +1314,9 @@ __all__ = [
     "IDENTITY_PROVEN",
     "INSUFFICIENT_DATA",
     "LIFECYCLE_HINTS",
+    "DISPUTE_CONFLICTING_CREATION",
+    "DISPUTE_CREATION_NOT_OBSERVED",
+    "DisputedBooking",
     "MAX_SCANNED_EVENTS",
     "MESSAGE_ACCEPTED",
     "MESSAGE_ATTEMPT_UNCONFIRMED",

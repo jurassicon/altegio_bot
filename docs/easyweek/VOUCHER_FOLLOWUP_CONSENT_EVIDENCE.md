@@ -115,10 +115,40 @@ The legacy sources are **read, not replaced**. One aggregate answer consults:
 2. a suppression bound to this UUID by an earlier refusal;
 3. `Client.wa_opted_out` on any matching card, any branch, any provider;
 4. the historical `CampaignRecipient.is_opted_out` snapshot, unless a proven,
-   verified opt-in landed after that snapshot was taken.
+   verified opt-in landed after that snapshot was taken **on that snapshot's own
+   number**.
+
+That last qualifier is load-bearing. §46.4.7 lets a START lift the refusal on
+the number it arrived from and no other, and the reader used to compare every
+snapshot against one newest-opt-in figure for the whole person: the same uuid,
+two numbers, a resubscribe on one of them, and the historical refusal recorded
+against the other was silently answered. The opt-in times are now kept per
+address and each snapshot is ordered against the opt-in for its own number. An
+unknown time on either side and a tie still refuse, as everywhere else.
+
+The snapshot read is also per address rather than "the newest fifty rows", for a
+reason a limit cannot fix: one busy number's answered history filled the limit
+on its own and a live refusal on another number of the same person was never
+read at all. One grouped row per matched address has no ordering and no limit,
+and the number of matched addresses is already bounded by the aggregate.
 
 **The absence of a refusal is not evidence of marketing consent.** It means only
 that this database holds no proven refusal for that address.
+
+### The address set, and who may ask for it
+
+`matched_addresses` exposes the set this aggregate matches a person by, for a
+caller that has to ask a QUESTION about those numbers rather than read the
+decision. PR-22.2's §46.4.4 backlog scan is that caller: it is given the numbers
+a preview's recipients are known by and reports the refusals sitting unaccounted
+among them. Assembling that question from the cards left out exactly the numbers
+§46.4.2 cares about most — a number the card has since dropped, reachable only
+from the links written down so the ban could travel — so the scan never saw the
+event and the veto afterwards had nothing to find.
+
+Ban extension only, as everywhere in this section: a number in that set is a
+number a refusal for this person could be recorded against, and never a proof
+that it belongs to this customer or to their branch.
 
 ### Where it is enforced
 
