@@ -146,8 +146,11 @@ FUTURE_BOOKING_ACTIVE: Final = "followup_future_booking_active"
 # available: §46.5 asks for the creation, not for the appointment.
 BOOKING_CREATION_UNPROVEN: Final = "followup_booking_creation_unproven"
 # The bounded capture of booking lifecycle deliveries could not be completed,
-# or this person's numeric EasyWeek id could not be bridged to their proven
-# uuid, so "created after the attempt" has no answer for them at all.
+# this person's numeric EasyWeek id could not be bridged to their proven uuid,
+# or the stored deliveries about one booking CONTRADICT each other — about who
+# created it, about which branch did, or about whether it existed before the
+# delivery that named it. Either way "created after the attempt" has no answer
+# for them at all.
 BOOKING_CAPTURE_UNPROVEN: Final = "followup_booking_capture_unproven"
 # The live read could not establish the booking history: a timeout, incomplete
 # pagination, an identity mismatch, a foreign workspace. Unknown, never an empty

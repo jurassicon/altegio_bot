@@ -279,6 +279,15 @@ class ObservedBooking:
     # not proof of business order, so all this says is that the deliveries
     # disagree.
     customer_reassigned: bool = False
+    # The earliest moment any delivery of this booking was received. A lower
+    # bound on when the booking EXISTED and never its creation date.
+    #
+    # Deliberately not serialised below: the report publishes what it can prove
+    # about a booking, and a capture timestamp is an internal fact for a caller
+    # that holds a send anchor to compare it against. §46.5's follow-up does —
+    # a booking some delivery named before the attempt, whose creation claims
+    # it appeared after it, is making two claims that cannot both be true.
+    first_observed_at: datetime | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -328,6 +337,13 @@ class _BookingDraft:
     # from the set of owners above rather than from a comparison against
     # whichever of them happened to carry a date, and counted once per booking.
     owner_conflict: bool = False
+    # Every branch a CREATION delivery of this booking named, and whether two
+    # of them disagreed. A numeric customer id is unique per branch rather than
+    # per workspace, so two creations of one booking in two branches naming the
+    # same number are not one person twice — they are a contradiction about
+    # where the booking was made and about whose it is.
+    creation_company_ids: set[int] = field(default_factory=set)
+    branch_conflict: bool = False
     # The earliest moment any delivery of this booking was received. A lower
     # bound on when the booking existed; never its creation date.
     first_observed_at: datetime | None = None
@@ -401,6 +417,11 @@ class DisputedBooking:
     # Every creation instant any creation delivery of it stated. Empty when no
     # creation was observed at all, and empty for an undated one.
     created_at: tuple[datetime, ...] = ()
+    # Every branch a creation delivery of it named. One entry is what makes the
+    # numeric ids above readable at all, because such an id means one person in
+    # one branch and somebody else in the next; two entries are a contradiction
+    # about where the booking was made, whatever the dates say.
+    creation_company_ids: frozenset[int] = frozenset()
     # The earliest moment any delivery of this booking was received. A delivery
     # about a booking proves the booking existed when it was made, so this is a
     # lower bound on its existence — and never a creation date: §46.5's rule is
@@ -422,6 +443,7 @@ class DisputedBooking:
         return (
             self.reason == DISPUTE_CONFLICTING_CREATION
             or len(self.creation_customer_ids) > 1
+            or len(self.creation_company_ids) > 1
             or len(self.created_at) > 1
         )
 
@@ -567,6 +589,12 @@ class RecipientIdentity:
     # Which branches hold a card for this one person. Informational: one
     # recipient with three cards is still one recipient.
     card_company_ids: tuple[int, ...] = ()
+    # Which of those branches hold a card carrying the proven NUMBER above. A
+    # numeric customer id is unique per branch rather than per workspace, so
+    # the same digits in a branch this person has no card in are a different
+    # customer record — and a caller comparing a captured creation's customer
+    # id against this one needs to know where the comparison is valid.
+    numeric_company_ids: tuple[int, ...] = ()
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -580,6 +608,7 @@ async def resolve_identities(
     session: AsyncSession,
     *,
     items: list[EasyWeekVoucherProductionBatchItem],
+    registry: EasyWeekLocationRegistry | None = None,
 ) -> dict[int, RecipientIdentity]:
     """One numeric id per slot, or a named reason there is none.
 
@@ -587,9 +616,19 @@ async def resolve_identities(
     frozen recipients, the cards that either the freeze bound or a UUID binding
     claims, and the reverse check that no candidate number belongs to anybody
     else.
+
+    ``registry`` limits every card this reads to the CONFIGURED branches, for a
+    caller whose question is about those branches. A card of a branch nobody
+    configured then neither supplies a numeric bridge nor contradicts one: it
+    is another workspace's row, or an Altegio-era one, and letting it do either
+    means an unrelated tenant's numbering decides this mailing's answers. The
+    §PR-17 report passes nothing and keeps the workspace-wide scope it was
+    written with, because its own question — which cards speak for one
+    recipient — is not branch-limited.
     """
     if not items:
         return {}
+    branch_scope = sorted(registry.locations) if registry is not None and registry.ready else None
 
     recipient_ids = {int(item.campaign_recipient_id) for item in items}
     uuids = {item.easyweek_customer_uuid for item in items if item.easyweek_customer_uuid is not None}
@@ -618,7 +657,11 @@ async def resolve_identities(
                     Client.company_id,
                     Client.altegio_client_id,
                     Client.easyweek_customer_uuid,
-                ).where(Client.provider == PROVIDER_EASYWEEK, or_(*conditions))
+                ).where(
+                    Client.provider == PROVIDER_EASYWEEK,
+                    Client.company_id.in_(branch_scope) if branch_scope is not None else true(),
+                    or_(*conditions),
+                )
             )
         ).all()
         for client_id, company_id, numeric, bound_uuid in rows:
@@ -642,6 +685,7 @@ async def resolve_identities(
             await session.execute(
                 select(Client.altegio_client_id, Client.easyweek_customer_uuid).where(
                     Client.provider == PROVIDER_EASYWEEK,
+                    Client.company_id.in_(branch_scope) if branch_scope is not None else true(),
                     Client.altegio_client_id.in_(candidate_numbers),
                     Client.easyweek_customer_uuid.is_not(None),
                 )
@@ -654,6 +698,7 @@ async def resolve_identities(
         slot = int(item.slot)
         proven_uuid = item.easyweek_customer_uuid
         numbers: dict[int, set[str]] = {}
+        number_branches: dict[int, set[int]] = {}
         branches: set[int] = set()
         conflict = False
 
@@ -667,11 +712,13 @@ async def resolve_identities(
             branches.add(company_id)
             if numeric is not None:
                 numbers.setdefault(numeric, set()).add(SOURCE_FROZEN_LOCAL_CARD)
+                number_branches.setdefault(numeric, set()).add(company_id)
 
         for company_id, numeric in uuid_cards.get(proven_uuid, []) if proven_uuid is not None else ():
             branches.add(company_id)
             if numeric is not None:
                 numbers.setdefault(numeric, set()).add(SOURCE_CLIENT_UUID_BINDING)
+                number_branches.setdefault(numeric, set()).add(company_id)
 
         if conflict or len(numbers) > 1:
             resolved[slot] = RecipientIdentity(IDENTITY_CONFLICT, card_company_ids=tuple(sorted(branches)))
@@ -690,6 +737,7 @@ async def resolve_identities(
             customer_id=chosen,
             sources=tuple(sorted(numbers[chosen])),
             card_company_ids=tuple(sorted(branches)),
+            numeric_company_ids=tuple(sorted(number_branches.get(chosen, set()))),
         )
     return resolved
 
@@ -886,6 +934,17 @@ async def scan_capture(
                 draft.owner_conflict = True
                 draft.conflicting = True
                 rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            # WHERE it was created is a fact of the same kind, and it is read
+            # from the set of branches for the same reason: a creation delivery
+            # that could not state the instant still states the branch, and a
+            # missing date must not dissolve a disagreement about it. The
+            # branches also decide what the numeric id in each delivery MEANS,
+            # since that id is unique per branch.
+            draft.creation_company_ids.add(int(facts["company_id"]))
+            if len(draft.creation_company_ids) > 1 and not draft.branch_conflict:
+                draft.branch_conflict = True
+                draft.conflicting = True
+                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
             if created_at is None:
                 # Proven owner, unproven instant. It contributes the owner and
                 # the conflict above, and does NOT count as a usable creation,
@@ -900,12 +959,12 @@ async def scan_capture(
                 draft.customer_id = facts["customer_id"]
                 draft.booking_created_at = created_at
                 branch_observed[facts["company_id"]] = branch_observed.get(facts["company_id"], 0) + 1
-            elif draft.booking_created_at != created_at or draft.company_id != facts["company_id"]:
+            elif draft.booking_created_at != created_at:
                 # Two DATED creations of one booking that do not agree about
-                # when or where it was made. The owners' disagreement is
-                # counted above and not again here, so one conflicting pair is
-                # still one counted conflict. A repeated delivery of the SAME
-                # creation — including one that merely adds the instant an
+                # when it was made. The owners' and the branches' disagreements
+                # are counted above and not again here, so one conflicting pair
+                # is still one counted conflict. A repeated delivery of the
+                # SAME creation — including one that merely adds the instant an
                 # earlier delivery omitted — is the ordinary case and lands in
                 # neither branch.
                 draft.conflicting = True
@@ -960,6 +1019,7 @@ async def scan_capture(
                     customer_ids=frozenset(draft.customer_ids),
                     creation_customer_ids=frozenset(draft.creation_customer_ids),
                     created_at=tuple(sorted(draft.creation_times)),
+                    creation_company_ids=frozenset(draft.creation_company_ids),
                     first_observed_at=draft.first_observed_at,
                 )
             )
@@ -977,6 +1037,7 @@ async def scan_capture(
                 # Any delivery of this booking naming a customer other than
                 # the one its creation named.
                 customer_reassigned=bool(draft.customer_ids - {draft.customer_id}),
+                first_observed_at=draft.first_observed_at,
             )
         )
     return CaptureScan(

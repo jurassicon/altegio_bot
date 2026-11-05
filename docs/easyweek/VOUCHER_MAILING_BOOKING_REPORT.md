@@ -206,6 +206,27 @@ Four answers are distinguished and never collapsed:
   that merely adds the instant an earlier one omitted — is still the ordinary
   case and counts nothing. The window, the conversion rules and the per-branch
   observations are unchanged.
+* **And of a BRANCH conflict, read the same way.** WHERE a booking was created
+  is stated by a creation delivery that could not state when, and two creations
+  of one booking from two different branches are a contradiction even when they
+  name the same numeric customer id — because that id is unique per branch, so
+  the same digits in two branches are two different customers. Counted once,
+  like the owners' disagreement, and no longer compared only between two dated
+  creations. A disputed booking now carries every branch its creations named
+  beside every customer they named, which is what makes those ids readable at
+  all.
+* **An observed booking carries when it was first heard of.** The earliest
+  moment any delivery of it was received, kept beside its creation instant and
+  deliberately NOT published in the report's own rows: it is a lower bound on
+  when the booking existed and never a creation date, and this report has no
+  send anchor to compare it against. PR-22.2's follow-up has one, and uses it to
+  refuse a booking whose single creation claims it appeared after an attempt
+  that the capture's own earlier delivery says it predates.
+* **The identity resolver's scope is unchanged here.** `resolve_identities`
+  gained an optional branch scope for the follow-up, which asks about the
+  configured branches only. Called without it — as this report calls it — it
+  reads the same cards it always did, because the question "which cards speak
+  for one recipient" is not branch-limited.
 * **Disputed bookings are reported, not claimed.** `scan_capture` now also
   returns the bookings it saw and cannot attribute — two creation deliveries of
   one booking naming different owners, and a booking with lifecycle deliveries
