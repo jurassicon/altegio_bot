@@ -118,6 +118,11 @@ class HistoricalConsentScan:
     complete: bool
     scanned_events: int = 0
     truncated: bool = False
+    # Exactly the addresses this pass was ASKED about. Carried so a caller can
+    # prove afterwards that the question it asked covers the person it is about
+    # to decide on: a scan that was never asked about a number has established
+    # nothing about it, however complete it calls itself.
+    asked: frozenset[str] = frozenset()
     # Normalised addresses whose stored STOP nothing has accounted for. One
     # entry means: this person really sent a refusal, and the ledger does not
     # refuse them.
@@ -131,6 +136,24 @@ class HistoricalConsentScan:
         if normalised is None:
             return False
         return any(variant in self.unaccounted for variant in address_variants(normalised))
+
+    def covers(self, addresses: Collection[object]) -> bool:
+        """Was this pass asked about every one of these numbers?
+
+        The invariant that ties the question to the verdict. The scan is given
+        the aggregate's own address set and the veto is taken against that same
+        set, so this holds by construction — and it is checked rather than
+        assumed, because the two are resolved by one function precisely so that
+        they cannot drift, and a future change that broke that should make a
+        preview say ``unknown`` rather than quietly ask a narrower question.
+        """
+        for address in addresses:
+            normalised = normalize_wa_address(address)
+            if normalised is None:
+                continue
+            if not any(variant in self.asked for variant in address_variants(normalised)):
+                return False
+        return True
 
     def blocks_any(self, addresses: Collection[object]) -> bool:
         """Does it hold one for ANY number this person is known by?
@@ -149,6 +172,7 @@ class HistoricalConsentScan:
             "complete": self.complete,
             "scanned_events": int(self.scanned_events),
             "truncated": bool(self.truncated),
+            "asked_addresses": len(self.asked),
             "unaccounted_count": len(self.unaccounted),
             "gaps": list(self.gaps),
         }
@@ -191,7 +215,7 @@ async def scan_historical_refusals(
     if not wanted:
         # Nothing to look for. Honest and complete: a pass with no question
         # has no unanswered part.
-        return HistoricalConsentScan(complete=True)
+        return HistoricalConsentScan(complete=True, asked=frozenset())
 
     moment = now or utcnow()
     accounted = exists().where(WhatsAppInboundReceipt.whatsapp_event_id == WhatsAppEvent.id)
@@ -275,6 +299,7 @@ async def scan_historical_refusals(
         complete=not truncated,
         scanned_events=len(rows),
         truncated=truncated,
+        asked=frozenset(wanted),
         unaccounted=frozenset(unaccounted),
         gaps=tuple(dict.fromkeys(gaps)),
     )

@@ -321,6 +321,12 @@ class _BookingDraft:
     # booking can be reported with enough detail to refuse on.
     creation_customer_ids: set[int] = field(default_factory=set)
     creation_times: set[datetime] = field(default_factory=set)
+    # A creation delivery whose branch, booking and customer were proven and
+    # whose instant was not. It names an owner and dates nothing.
+    undated_creation: bool = False
+    # The earliest moment any delivery of this booking was received. A lower
+    # bound on when the booking existed; never its creation date.
+    first_observed_at: datetime | None = None
     # -- lifecycle facts, as a set of DISTINCT deliveries -------------------
     # Keyed by the capture's own content identity (``payload_hash``), so an
     # identical Resend of a delivery already seen adds nothing. A row whose
@@ -362,6 +368,10 @@ class _BookingDraft:
 # booking reads as "nothing happened".
 DISPUTE_CONFLICTING_CREATION: Final = "conflicting_creation"
 DISPUTE_CREATION_NOT_OBSERVED: Final = "creation_not_observed"
+# A creation delivery whose branch, booking identity and customer were all
+# proven and whose own instant was missing or unreadable. It names an owner and
+# dates nothing, which is a different gap from never having seen a creation.
+DISPUTE_CREATION_UNDATED: Final = "creation_undated"
 
 
 @dataclass(frozen=True)
@@ -385,14 +395,20 @@ class DisputedBooking:
     customer_ids: frozenset[int] = frozenset()
     creation_customer_ids: frozenset[int] = frozenset()
     # Every creation instant any creation delivery of it stated. Empty when no
-    # creation was observed at all.
+    # creation was observed at all, and empty for an undated one.
     created_at: tuple[datetime, ...] = ()
+    # The earliest moment any delivery of this booking was received. A delivery
+    # about a booking proves the booking existed when it was made, so this is a
+    # lower bound on its existence — and never a creation date: §46.5's rule is
+    # about when a booking was MADE, and a late delivery says nothing about it.
+    first_observed_at: datetime | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
             "reason": self.reason,
             "owners_named": len(self.customer_ids),
             "creations_observed": len(self.created_at),
+            "first_observed_at": _iso(self.first_observed_at) if self.first_observed_at else None,
         }
 
 
@@ -715,9 +731,18 @@ def _validate_delivery(
         try:
             created_at = parse_iso_utc(payload.get("booking_created_at"), required=True)
         except NormalizationError:
-            return None, REJECT_CREATED_AT
+            created_at = None
         if created_at is None or created_at.tzinfo is None:
-            return None, REJECT_CREATED_AT
+            # The branch, the booking identity and the customer are all proven
+            # and only the INSTANT is missing or unreadable. Returning nothing
+            # at all threw the proven half away with the unproven one, so the
+            # scan never learned that a creation of this booking named this
+            # customer — and a caller asking about that person saw silence.
+            #
+            # So the facts come back WITH the rejection: the reason is still
+            # counted, ``booking_created_at`` stays absent, and nothing here
+            # substitutes ``received_at`` for it.
+            return facts, REJECT_CREATED_AT
         facts["booking_created_at"] = created_at
     return facts, None
 
@@ -765,6 +790,7 @@ async def scan_capture(
                 EasyWeekEvent.id,
                 EasyWeekEvent.event_hint,
                 EasyWeekEvent.payload,
+                EasyWeekEvent.received_at,
                 EasyWeekEvent.body_truncated,
                 # The capture's own content identity: the sha256 of the
                 # canonicalised JSON body. This is what makes an identical
@@ -793,20 +819,26 @@ async def scan_capture(
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
-    for event_id, event_hint, payload, body_truncated, payload_hash in rows:
+    for event_id, event_hint, payload, received_at, body_truncated, payload_hash in rows:
         facts, reason = _validate_delivery(
             event_hint=event_hint,
             payload=payload,
             body_truncated=bool(body_truncated),
             registry=registry,
         )
+        if reason is not None:
+            # Counted exactly as before, whether or not anything was proven.
+            rejected[reason] = rejected.get(reason, 0) + 1
         if facts is None:
-            code = reason or REJECT_INVALID_PAYLOAD
-            rejected[code] = rejected.get(code, 0) + 1
             continue
 
         booking_uuid = facts["booking_uuid"]
         draft = drafts.setdefault(booking_uuid, _BookingDraft(booking_uuid=booking_uuid))
+        # When this booking was first HEARD OF. A delivery about a booking
+        # proves the booking existed when that delivery was made, which is a
+        # lower bound on its existence and never a creation date.
+        if received_at is not None and (draft.first_observed_at is None or received_at < draft.first_observed_at):
+            draft.first_observed_at = received_at
         # Every delivery of this booking contributes whatever customer it named,
         # whether it arrived before or after the creation. The earlier version
         # compared against the creation's customer at read time and therefore
@@ -819,6 +851,12 @@ async def scan_capture(
                 draft.creation_customer_ids.add(int(facts["customer_id"]))
             if facts.get("booking_created_at") is not None:
                 draft.creation_times.add(facts["booking_created_at"])
+            else:
+                # Proven owner, unproven instant. It contributes the owner and
+                # does NOT count as a usable creation, so neither this report's
+                # conversions nor its per-branch observations move.
+                draft.undated_creation = True
+                continue
             if not draft.seen_creation:
                 draft.seen_creation = True
                 draft.company_id = facts["company_id"]
@@ -876,13 +914,17 @@ async def scan_capture(
             disputed.append(
                 DisputedBooking(
                     booking_uuid=draft.booking_uuid,
-                    # A validated creation always carries both its customer
-                    # and its instant, so "seen but unusable" cannot arise here
-                    # and the two real shapes are the whole vocabulary.
-                    reason=(DISPUTE_CONFLICTING_CREATION if draft.conflicting else DISPUTE_CREATION_NOT_OBSERVED),
+                    reason=(
+                        DISPUTE_CONFLICTING_CREATION
+                        if draft.conflicting
+                        else DISPUTE_CREATION_UNDATED
+                        if draft.undated_creation
+                        else DISPUTE_CREATION_NOT_OBSERVED
+                    ),
                     customer_ids=frozenset(draft.customer_ids),
                     creation_customer_ids=frozenset(draft.creation_customer_ids),
                     created_at=tuple(sorted(draft.creation_times)),
+                    first_observed_at=draft.first_observed_at,
                 )
             )
             continue
@@ -1316,6 +1358,7 @@ __all__ = [
     "LIFECYCLE_HINTS",
     "DISPUTE_CONFLICTING_CREATION",
     "DISPUTE_CREATION_NOT_OBSERVED",
+    "DISPUTE_CREATION_UNDATED",
     "DisputedBooking",
     "MAX_SCANNED_EVENTS",
     "MESSAGE_ACCEPTED",

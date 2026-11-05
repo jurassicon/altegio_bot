@@ -185,6 +185,14 @@ Four answers are distinguished and never collapsed:
 * The capture scan is bounded: below by the earliest proven send minus one day
   of late-capture margin, above by the moment of reading, with a hard row cap.
   If the cap bites, the report says the coverage was truncated.
+* **An undated creation is still a counted gap here.** A creation delivery whose
+  branch, booking identity and customer are all proven and whose own
+  `booking_created_at` is missing or unreadable is still rejected as
+  `booking_created_at_unusable`, still absent from this report's conversions and still
+  absent from its per-branch observations. What changed is that the proven half
+  of it is no longer thrown away with the unproven half: the owner it named
+  reaches the disputed set below. `received_at` is never substituted for the
+  creation instant, here or anywhere.
 * **Disputed bookings are reported, not claimed.** `scan_capture` now also
   returns the bookings it saw and cannot attribute — two creation deliveries of
   one booking naming different owners, and a booking with lifecycle deliveries
@@ -193,7 +201,9 @@ Four answers are distinguished and never collapsed:
   before and still counts those shapes among its rejections: a conversion needs
   a proven creation, and nothing here claims one. The field exists for PR-22.2's
   follow-up, which asks about a PERSON and for which a dropped dispute would
-  read as "nothing happened".
+  read as "nothing happened". Each disputed row also carries the EARLIEST moment
+  any delivery of that booking was received — a lower bound on when the booking
+  existed, never a creation date, and not read by this report at all.
 * **This report's own bounds are unchanged.** `scan_capture` now takes an
   explicit `lookback`, and the report keeps passing the one day it was written
   with — a conversion is a booking CREATED after the send, so a creation

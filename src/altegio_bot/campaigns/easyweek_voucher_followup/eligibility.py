@@ -602,7 +602,9 @@ def booking_verdict(
     * a booking this person CREATED after the original attempt excludes,
       cancelled ones included and whatever the appointment time is. A booking
       made the day after the mailing to record a visit that already happened is
-      exactly the engagement the rule is about;
+      exactly the engagement the rule is about. This is asked BEFORE the
+      unknowns, because a proven fact about one booking is not weakened by a gap
+      about another;
     * a booking the live read can see whose CREATION cannot be proven is
       UNKNOWN, whenever its appointment is. Whether it was made before or after
       the attempt decides the answer, so neither verdict is available — and an
@@ -645,7 +647,20 @@ def booking_verdict(
         if not row.is_canceled and start > moment:
             return BookingVerdict(False, FUTURE_BOOKING_ACTIVE, pages_read=bookings.pages_read)
 
-    # Then the creation rule, which does.
+    # Then the creation rule, which does — and the EXCLUSION half of it comes
+    # first, because it rests on a specific proven fact: ``created_at`` holds
+    # only creations this person was proven to have made, so one of them after
+    # the attempt is a proven reason to exclude and nothing a separate gap can
+    # take away. Asking "is everything established?" before "is this one
+    # established?" threw that away: a single unattributable booking elsewhere
+    # in the window turned a provably-booked person into unknown.
+    #
+    # The order is safe only because of what is IN that dict. A booking of
+    # somebody else's, or one whose ownership is disputed, never reaches it — so
+    # moving the check up cannot turn a foreign or conflicting booking into a
+    # reason to exclude anybody.
+    if creations.created_after(anchor):
+        return BookingVerdict(False, NEW_BOOKING_AFTER_ATTEMPT, pages_read=bookings.pages_read)
     if not creations.proven:
         return BookingVerdict(
             False,
@@ -653,8 +668,6 @@ def booking_verdict(
             unknown=True,
             pages_read=bookings.pages_read,
         )
-    if creations.created_after(anchor):
-        return BookingVerdict(False, NEW_BOOKING_AFTER_ATTEMPT, pages_read=bookings.pages_read)
 
     # A booking the live read can see whose own creation nothing proves. It may
     # have been made yesterday or months ago, and the appointment time does not

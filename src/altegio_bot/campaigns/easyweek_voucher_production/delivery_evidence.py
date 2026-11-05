@@ -393,6 +393,101 @@ def _mark_item(
     item.evidence = merged
 
 
+def _unmark_item(
+    item: EasyWeekVoucherProductionBatchItem,
+    *,
+    kind: str,
+    observed_at: datetime,
+) -> None:
+    """Withdraw a confirmed-failure mark a proven success has contradicted.
+
+    The mark says "this slot's one attempt provably failed", and a proven
+    ``delivered``/``read`` for the same message id says it provably did not —
+    §46.3 is explicit that a success keeps its force against a `failed`,
+    whichever of them this process happened to read first. So the mark goes.
+
+    What does NOT go is the evidence. The failure row keeps its reason code, its
+    class, its route and its times, re-stated as a conflict; and the withdrawal
+    itself is written down here, so the slot says that a confirmation was made
+    and then contradicted rather than quietly losing both halves.
+    """
+    merged = dict(item.evidence or {})
+    withdrawn = merged.pop("confirmed_delivery_failure_reason", None)
+    merged.pop("confirmed_delivery_failure", None)
+    merged.pop("confirmed_delivery_failure_class", None)
+    merged.pop("confirmed_delivery_failure_observed_at", None)
+    merged["withdrawn_delivery_failure_reason"] = withdrawn
+    merged["withdrawn_delivery_failure_by"] = kind
+    merged["withdrawn_delivery_failure_at"] = observed_at.isoformat()
+    item.evidence = merged
+
+
+async def demote_confirmed_failures_after_success(
+    session: AsyncSession,
+    *,
+    item: EasyWeekVoucherProductionBatchItem,
+    provider_message_id: str,
+    kind: str,
+    observed_at: datetime | None = None,
+) -> int:
+    """A PROVEN success re-states every confirmed failure of the same message.
+
+    One rule for both arrival orders, so the ledger ends in the same state
+    whichever way round this process read the pair:
+
+    * a `failed` read while the slot already carried a success was always
+      recorded as a conflict, by the route check in :func:`_store`;
+    * a `failed` read FIRST became ``confirmed`` and stamped the slot, and the
+      success that followed advanced the slot and left that stamp standing. The
+      same two facts, two different answers, and the wrong one asserted a
+      delivery failure about a message the customer had demonstrably read.
+
+    Called only where a success is PROVEN — a verified signature and a route
+    equal to the one the slot's single attempt froze — which is what keeps an
+    unsigned or foreign-route callback from clearing a real confirmation. The
+    decision is precedence, not chronology: no event time is required and the
+    row ids of two tables are never compared as clocks. Meta's own times are
+    recorded for the audit when it states them.
+
+    Runs in the CALLER's transaction, after the item lock is held, and takes no
+    lock of its own beyond the rows it re-states. Returns how many it moved.
+    """
+    now = observed_at or utcnow()
+    rows = list(
+        (
+            await session.scalars(
+                select(EasyWeekVoucherProductionDeliveryFailure)
+                .where(EasyWeekVoucherProductionDeliveryFailure.provider_message_id == provider_message_id)
+                .where(EasyWeekVoucherProductionDeliveryFailure.item_id == int(item.id))
+                .where(EasyWeekVoucherProductionDeliveryFailure.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED)
+                .order_by(EasyWeekVoucherProductionDeliveryFailure.id.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not rows:
+        return 0
+    for row in rows:
+        row.match_state = DELIVERY_FAILURE_MATCH_CONFLICTING
+        merged = dict(row.evidence or {})
+        merged["conflict"] = CONFLICT_AFTER_SUCCESS
+        merged["superseded_by_status"] = kind
+        merged["superseded_at"] = now.isoformat()
+        if row.event_at is not None:
+            merged["superseded_failure_event_at"] = row.event_at.isoformat()
+        row.evidence = merged
+        row.updated_at = now
+    _unmark_item(item, kind=kind, observed_at=now)
+    logger.info(
+        "voucher_production_failure: %s superseded %s confirmed fact(s) batch=%s slot=%s",
+        kind,
+        len(rows),
+        item.batch_id,
+        item.slot,
+    )
+    return len(rows)
+
+
 async def _locate_item(
     session: AsyncSession,
     provider_message_id: str,
@@ -886,6 +981,18 @@ async def bind_unmatched_receipts(
             row.batch_id = int(item.batch_id)
             row.slot = int(item.slot)
             confirmed.add(str(row.kind))
+            # Same rule, same transaction: a proven success withdraws any
+            # confirmed failure already bound to this message id. Ordinarily
+            # there is none at this point — the acceptance binds the positive
+            # callbacks before the failures — and saying it once here keeps the
+            # two paths on one model instead of two.
+            await demote_confirmed_failures_after_success(
+                session,
+                item=item,
+                provider_message_id=provider_message_id,
+                kind=str(row.kind),
+                observed_at=now,
+            )
         else:
             row.match_state = DELIVERY_RECEIPT_MATCH_CONFLICTING
             merged["conflict"] = conflict or UNPROVEN_ROUTE_UNKNOWN
@@ -979,6 +1086,18 @@ async def record_status_receipt(
         # All three leave the status without proof, honestly.
         return ReceiptOutcome(False, conflict or UNPROVEN_ROUTE_UNKNOWN)
     assert observed_sender is not None and observed_recipient is not None
+
+    # The success is proven here, so §46.3's precedence applies now rather than
+    # depending on which of the pair this process read first. Done before the
+    # idempotent insert and not conditionally on it, so a duplicate delivery of
+    # the same callback reaches the same conclusion.
+    await demote_confirmed_failures_after_success(
+        session,
+        item=item,
+        provider_message_id=provider_message_id,
+        kind=kind,
+        observed_at=now,
+    )
 
     event_at = status.get("event_at") if isinstance(status.get("event_at"), datetime) else None
     fact_key = _receipt_fact_key(
@@ -1169,6 +1288,7 @@ __all__ = [
     "RECEIPT_KIND_STATUS",
     "ReceiptOutcome",
     "bind_unmatched_receipts",
+    "demote_confirmed_failures_after_success",
     "record_api_rejection",
     "record_status_receipt",
     "record_callback_failure",

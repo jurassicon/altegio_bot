@@ -429,6 +429,31 @@ id" and keeping the callback is unreachable rather than merely narrow. Read stil
 outranks delivered, a late `failed` still cannot undo a success, and the
 contradiction is still kept for audit.
 
+#### A failure read first, withdrawn by the success
+
+The ordering above decides a pair bound in one transaction. A pair the process
+read in two could still disagree with it: a `failed` with nothing yet
+contradicting it becomes `confirmed` and stamps `confirmed_delivery_failure` on
+the slot, and the success that followed advanced the slot and left that stamp
+standing — a delivery failure asserted about a message the customer had
+demonstrably read.
+
+A PROVEN success now withdraws it, by one rule in one place invoked wherever a
+success is proven: the live callback, and the binding of an early one. The
+failure row is re-stated as a conflict and keeps its reason code, its class, its
+route and its times; the slot records that a confirmation was made and then
+contradicted rather than losing both halves; and the withdrawal runs in the same
+transaction and under the same locks as the success that caused it. So both
+arrival orders end in the same ledger state.
+
+The decision is precedence, never chronology: no event time is required, and the
+row ids of two different tables are not compared as clocks. Only a proven
+success does it — an unsigned callback, a foreign sender and a foreign recipient
+each leave the status without the proof the receipt table requires, and none of
+them may clear a confirmation that was proven. A lone failure keeps its
+confirmation. The failed group's admissibility policy and the mailing's attempt
+count are untouched.
+
 ## 6. The message
 
 The follow-up has its **own** contract. The original §45 message is not edited,
@@ -742,6 +767,35 @@ The third round's five findings, same rule, all failing before the fix:
    is still green, because the batch, the window and the template are all
    unchanged, and it no longer claims the count is confirmed now. The stored
    figures carry their check time, and the recalculation afterwards stores zero.
+
+The fourth round's six findings, all failing before the fix, and the first two
+of them as deterministic races driven on independent PostgreSQL connections:
+
+1. a card of this uuid appearing with an unprojected «стоп» after the addresses
+   were chosen; and a proven START applied between the scan and the local
+   decision while an undated «стоп» remained on that number. Positive control: a
+   strictly newer proven START on the same number, resolved before the preview
+   runs, which does open the row. Plus the coverage invariant, exercised by
+   handing the scan a narrower question than the veto;
+2. a creation delivery with a proven branch, booking and customer and no usable
+   instant, a later delivery of the same booking naming somebody else, and an
+   empty current history. Plus the three deliveries that prove none of it — a
+   foreign branch, an unreadable booking id, an arbitrary payload — which extend
+   nothing;
+3. a manual card with a proven uuid and no numeric id holding a booking whose
+   creation is positively linked to another customer, dated before and after the
+   attempt. Control: the ordinary manual card with a complete empty history;
+4. a cancellation of somebody else's booking stored weeks before the mailing,
+   which blocked a manual recipient as a possible new booking and provably
+   cannot be one. Control: the same shape first seen after the attempt, which
+   still reads unknown;
+5. a booking provably created by this person after the attempt beside a separate
+   unattributable one, which used to read unknown instead of excluded. Control:
+   the dispute alone is still no reason to exclude;
+6. a `failed` processed first and a proven `read`/`delivered` after it, for one
+   exact message id and route, both after the acceptance and with the failure
+   overtaking it. Plus a repeated success, a success with no stated time, a lone
+   failure, and the three unproven successes that may not clear a confirmation.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

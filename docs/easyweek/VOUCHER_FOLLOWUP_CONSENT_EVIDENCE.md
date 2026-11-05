@@ -150,6 +150,15 @@ Ban extension only, as everywhere in this section: a number in that set is a
 number a refusal for this person could be recorded against, and never a proof
 that it belongs to this customer or to their branch.
 
+That caller reads this set, the backlog it describes and the decision below in
+ONE snapshot, at REPEATABLE READ. They are three views of one state, and under
+READ COMMITTED each statement takes a fresh one: a card appearing mid-read made
+the question narrower than the fingerprint that was stored from it, and a START
+applied mid-read let a refusal the scan had just accounted for be answered by a
+ledger state that no longer existed. Nothing in this section's own writers
+changed for it — the snapshot is read-only, takes no lock, and delays no
+arriving STOP.
+
 ### Where it is enforced
 
 `campaigns/easyweek_manual_identity.local_identity` — the one shared veto point

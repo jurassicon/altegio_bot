@@ -560,6 +560,9 @@ async def seed_source_batch(
             return int(batch.id), recipient_ids
 
 
+_MISSING = object()
+
+
 async def seed_booking_created(
     session_maker: async_sessionmaker[AsyncSession],
     *,
@@ -591,6 +594,46 @@ async def seed_booking_created(
                     "booking_created_at": created_at.isoformat(),
                 },
                 received_at=received_at or created_at,
+                status="processed",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+async def seed_booking_created_without_a_date(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_uuid: str,
+    numeric_customer_id: int,
+    received_at: datetime | None = None,
+    company_id: int = COMPANY_ID,
+    location_uuid: str = KARLSRUHE_LOCATION_UUID,
+    created_at_value: Any = _MISSING,
+) -> int:
+    """A creation delivery whose branch, booking and customer are proven and
+    whose own instant is missing or unreadable.
+
+    The shape §46.5 has to keep half of: the delivery says WHICH booking and
+    WHOSE it is, and does not say when it was made. Dropping it whole threw the
+    proven half away with the unproven one.
+    """
+    payload: dict[str, Any] = {
+        "uid": booking_uuid,
+        "location_id": company_id,
+        "location_uuid": location_uuid,
+        "customer_id": int(numeric_customer_id),
+    }
+    if created_at_value is not _MISSING:
+        payload["booking_created_at"] = created_at_value
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                event_hint="booking-created",
+                query={},
+                headers={},
+                payload=payload,
+                received_at=received_at or NOW,
                 status="processed",
             )
             session.add(event)

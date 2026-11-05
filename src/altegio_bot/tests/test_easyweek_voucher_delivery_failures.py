@@ -2132,3 +2132,162 @@ async def test_an_unsigned_early_pair_keeps_only_the_unproven_failure(
     assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_UNPROVEN
     assert item.status == VOUCHER_PRODUCTION_ITEM_PROVIDER_ACCEPTED
     assert item.evidence.get("confirmed_delivery_failure") is not True
+
+
+# ---------------------------------------------------------------------------
+# A proven success withdraws a confirmed failure (§46.3, review round 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("success", ["delivered", "read"])
+async def test_a_failure_read_first_is_withdrawn_by_the_proven_success(
+    session_maker, production_configuration, binding_key, success: str
+) -> None:
+    """Review round 4, finding 6: one answer, whichever half was read first.
+
+    Both callbacks are correctly signed, name the slot's exact message id and
+    arrive on the route its attempt froze, and the slot already owns that id.
+    The `failed` is processed first, so there is nothing contradicting it yet: it
+    became ``confirmed`` and stamped ``confirmed_delivery_failure`` on the slot.
+    The success then advanced the slot and left that stamp standing — a delivery
+    failure asserted about a message the customer had demonstrably read.
+
+    §46.3 keeps a success's force against a `failed` whichever way round this
+    process read them, so the proven success now withdraws the confirmation and
+    re-states the failure as the conflict it is. The failure row itself stays,
+    with its reason, its class, its route and its times.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = f"wamid.LATE-SUCCESS-{success}"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    marked = await _item(session_maker, batch_id)
+    assert marked.evidence.get("confirmed_delivery_failure") is True
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status=success, recipient=recipient))
+
+    item = await _item(session_maker, batch_id)
+    expected = VOUCHER_PRODUCTION_ITEM_READ if success == "read" else VOUCHER_PRODUCTION_ITEM_DELIVERED
+    assert item.status == expected
+    assert item.delivered_at is not None
+    # The false confirmation is gone, and the withdrawal is written down.
+    assert "confirmed_delivery_failure" not in item.evidence
+    assert item.evidence.get("withdrawn_delivery_failure_reason") == DELIVERY_FAILURE_REASON_CALLBACK_FAILED
+    assert item.evidence.get("withdrawn_delivery_failure_by") == success
+    # The primary fact survives, re-stated as a contradiction for the audit.
+    fact = (await _facts(session_maker))[0]
+    assert fact.match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+    assert fact.evidence.get("conflict") == CONFLICT_AFTER_SUCCESS
+    assert fact.evidence.get("superseded_by_status") == success
+    assert fact.reason_code == DELIVERY_FAILURE_REASON_CALLBACK_FAILED
+    assert fact.route_proven is True
+    assert (await _receipts(session_maker))[0].match_state == DELIVERY_RECEIPT_MATCH_CONFIRMED
+
+
+@pytest.mark.parametrize("success", ["delivered", "read"])
+async def test_an_early_failure_is_withdrawn_by_a_success_after_the_commit(
+    session_maker, production_configuration, binding_key, success: str
+) -> None:
+    """The mixed order: the failure overtakes the acceptance, the success follows it."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = f"wamid.MIXED-{success}"
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is True
+
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, status=success, recipient=recipient))
+    item = await _item(session_maker, batch_id)
+    expected = VOUCHER_PRODUCTION_ITEM_READ if success == "read" else VOUCHER_PRODUCTION_ITEM_DELIVERED
+    assert item.status == expected
+    assert "confirmed_delivery_failure" not in item.evidence
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+
+
+async def test_a_repeated_success_does_not_flip_the_withdrawal_back(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """Idempotent: a Resend of the success reaches the same conclusion."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.LATE-SUCCESS-REPEAT"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    read = _status_payload(wamid=wamid, status="read", recipient=recipient)
+    for _ in range(3):
+        await _deliver_status(session_maker, read)
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert "confirmed_delivery_failure" not in item.evidence
+    assert len(await _facts(session_maker)) == 1
+    assert len(await _receipts(session_maker)) == 1
+
+
+async def test_a_success_with_no_stated_time_still_withdraws_it(
+    session_maker, production_configuration, binding_key
+) -> None:
+    """The decision is precedence, not chronology, so no event time is needed."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = "wamid.LATE-SUCCESS-NO-TIME"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    undated = _status_payload(wamid=wamid, status="read", recipient=recipient)
+    del undated["entry"][0]["changes"][0]["value"]["statuses"][0]["timestamp"]
+    await _deliver_status(session_maker, undated)
+    item = await _item(session_maker, batch_id)
+    assert item.status == VOUCHER_PRODUCTION_ITEM_READ
+    assert "confirmed_delivery_failure" not in item.evidence
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFLICTING
+
+
+async def test_a_lone_failure_keeps_its_confirmation(session_maker, production_configuration, binding_key) -> None:
+    """The control: with no success at all, the confirmation is the answer."""
+    batch_id, _claim = await _claimed_slot(session_maker)
+    wamid = "wamid.LATE-NO-SUCCESS"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=PHONES[0].lstrip("+")))
+    item = await _item(session_maker, batch_id)
+    assert item.evidence.get("confirmed_delivery_failure") is True
+    assert "withdrawn_delivery_failure_reason" not in item.evidence
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+
+
+@pytest.mark.parametrize("flaw", ["foreign_sender", "foreign_recipient", "unsigned"])
+async def test_an_unproven_success_never_withdraws_a_confirmed_failure(
+    session_maker, production_configuration, binding_key, flaw: str
+) -> None:
+    """An unproven success is not a success §46.3 lets act on anything.
+
+    A foreign sender, a foreign recipient and an unverified signature each leave
+    the status without the proof the receipt table requires, so none of them may
+    clear a confirmation that WAS proven.
+    """
+    batch_id, _claim = await _claimed_slot(session_maker)
+    recipient = PHONES[0].lstrip("+")
+    wamid = f"wamid.LATE-UNPROVEN-{flaw}"
+    assert (await _accept(session_maker, batch_id, wamid)).applied
+    await _deliver_status(session_maker, _status_payload(wamid=wamid, recipient=recipient))
+    assert (await _item(session_maker, batch_id)).evidence.get("confirmed_delivery_failure") is True
+
+    if flaw == "foreign_sender":
+        payload = _status_payload(wamid=wamid, status="read", recipient=recipient, phone_number_id="PNID_SOMEBODY_ELSE")
+        await _deliver_status(session_maker, payload)
+    elif flaw == "foreign_recipient":
+        await _deliver_status(session_maker, _status_payload(wamid=wamid, status="read", recipient="4915100000999"))
+    else:
+        await _deliver_status(
+            session_maker,
+            _status_payload(wamid=wamid, status="read", recipient=recipient),
+            signature_verified=False,
+        )
+
+    item = await _item(session_maker, batch_id)
+    assert item.evidence.get("confirmed_delivery_failure") is True
+    assert "withdrawn_delivery_failure_reason" not in item.evidence
+    assert (await _facts(session_maker))[0].match_state == DELIVERY_FAILURE_MATCH_CONFIRMED
+    assert await _receipts(session_maker) == []

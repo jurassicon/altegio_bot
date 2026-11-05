@@ -1808,6 +1808,15 @@ Five things, none of them done by this stage:
    nothing owns yet is kept and then bound by the very commit that records that
    identifier, which also advances the slot. An unsigned one is still not kept,
    and a foreign route still proves nothing.
+
+   And a slot no longer keeps a confirmed delivery failure that a proven success
+   for the same message has contradicted. Whichever of the pair this deployment
+   read first, the success stands, the failure stays in the audit as a conflict
+   with its reason and route intact, and the slot records that a confirmation
+   was made and then withdrawn. An unsigned or foreign-route callback cannot
+   withdraw anything, a failure with no success beside it keeps its
+   confirmation, and neither the failed group's policy nor the mailing's attempt
+   count is affected.
 5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
    claim, the terminal tombstones, the executor and the follow-up callbacks all
    belong to that stage. The source and dedupe contract it will claim against is

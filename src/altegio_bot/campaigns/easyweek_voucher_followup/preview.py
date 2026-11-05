@@ -892,6 +892,15 @@ async def _local_phase(
             facts.unknown(HISTORICAL_CONSENT_UNPROVEN, historical_consent=list(historical.gaps))
             decided.append(facts)
             continue
+        if not historical.covers((identity.address, *consent.addresses)):
+            # The scan was not asked about one of the numbers this person is
+            # matched by, so it has established nothing about that number. Holds
+            # by construction — both sets come from the same resolver, read in
+            # one snapshot — and is checked anyway: a narrower question must
+            # read as unknown rather than as silence.
+            facts.unknown(HISTORICAL_CONSENT_UNPROVEN, historical_consent=["scan_coverage_incomplete"])
+            decided.append(facts)
+            continue
         # Asked about the whole aggregate the live veto itself matched, not
         # about the number this slot would write to: §46.4.2–3 keep a refusal a
         # fact about the PERSON, and a stored STOP sent from another card of
@@ -1312,8 +1321,38 @@ async def create_preview(
     if blocker is not None:
         return PreviewOutcome(False, blocker)
 
-    # Phase 1: one read transaction, released before anything external.
+    # Phase 1: one read transaction, released before anything external — and
+    # one SNAPSHOT inside it.
+    #
+    # The reads of this phase are not independent questions. The addresses the
+    # §46.4.4 scan is asked about, what that scan concludes about each stored
+    # refusal, and the consent decision every row is then judged by are three
+    # views of one state, and under READ COMMITTED each statement takes a fresh
+    # one. Two interleavings turned that into a wrong inclusion:
+    #
+    # * a card of this uuid appears, carrying a number with an unprojected
+    #   «стоп», after the addresses were chosen and before the first consent
+    #   read. The scan never asked about that number, and the fingerprint the
+    #   row stored already described the world WITH it — so the re-check before
+    #   the write compared equal and found nothing to report;
+    # * the scan reads a refusal as accounted for because the ledger refuses it,
+    #   a proven START is then applied, and the consent decision a moment later
+    #   allows the send. The separate undated «стоп» on that number, which no
+    #   opt-in can be ordered against, was accounted for by a ledger state that
+    #   no longer existed.
+    #
+    # REPEATABLE READ answers both: every read of this phase sees the same
+    # instant, so the three views agree by construction and the fingerprint the
+    # row carries describes exactly the world it was judged in. A change that
+    # commits during the phase is then found by the re-check before the write,
+    # which is where it belongs.
+    #
+    # It costs nothing this phase cannot afford: a read-only snapshot takes no
+    # row lock and no advisory lock, so an arriving STOP is never delayed, and
+    # the transaction is closed before the external phase opens. Nothing here
+    # replays or projects anything.
     async with session_maker() as session:
+        await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         gate = await batch_gate(session, batch_id=int(spec.batch_id))
         if not gate.allowed:
             return PreviewOutcome(False, gate.reason)
