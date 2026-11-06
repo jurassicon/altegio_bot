@@ -26,7 +26,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator
 from datetime import timedelta
-from typing import Any
+from typing import Any, Final
 
 import pytest
 import pytest_asyncio
@@ -41,6 +41,7 @@ import altegio_bot.ops.voucher_mailing as voucher_mailing_module
 from altegio_bot.campaigns.easyweek_voucher_followup import followup_template_contract as message
 from altegio_bot.models.models import (
     EasyWeekVoucherFollowupPreview,
+    EasyWeekVoucherFollowupPreviewRow,
     EasyWeekVoucherProductionBatchItem,
     MessageJob,
     OutboxMessage,
@@ -129,14 +130,87 @@ async def ops_client(session_maker, monkeypatch, ops_credentials) -> AsyncIterat
 
 
 @pytest_asyncio.fixture
-async def anonymous_client(session_maker, monkeypatch) -> AsyncIterator[AsyncClient]:
+async def anonymous_client(session_maker, monkeypatch, ops_credentials) -> AsyncIterator[AsyncClient]:
+    """A visitor with no credentials at all, against a CONFIGURED Ops cabinet.
+
+    ``ops_credentials`` is the whole point of this fixture and used to be
+    missing from it. Two different situations were being tested as one: a
+    configured deployment refusing an anonymous visitor, and a deployment with
+    no Ops authorisation configured at all — where ``require_ops_auth`` keeps a
+    historical fallback that allows a GET. Which of the two ran depended on
+    whatever the machine happened to have in its environment or its ``.env``,
+    so the refusal was asserted on a developer's laptop and the page was served
+    in CI. The settings this fixture needs are patched onto ``settings`` and
+    restored when the test ends; no real file, secret or machine setting takes
+    part.
+
+    The client carries nothing that could authenticate it — no session cookie,
+    no ``Authorization``, no ``X-Ops-Token`` — and every request below names
+    its own ``Accept``, because that header is what decides between the two
+    documented refusals. Redirects are not followed, so the refusal itself is
+    what the assertions see.
+    """
     from altegio_bot.main import app
 
     monkeypatch.setattr(followup_ops, "SessionLocal", session_maker)
     monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE_URL) as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url=BASE_URL,
+        follow_redirects=False,
+    ) as client:
         client.headers.update({"Origin": ORIGIN})
         yield client
+
+
+# The two Accept headers §46.6's refusals are told apart by: a browser is sent
+# to the login form, anything else is told it is unauthorised.
+API_ACCEPT: Final = "application/json"
+BROWSER_ACCEPT: Final = "text/html,application/xhtml+xml"
+
+# One sentence the page cannot be read without. Asserted absent from every
+# refusal: a 401 or a 302 that nevertheless carried the page would be the
+# defect this section is about.
+PAGE_MARKER: Final = "Доступен только предпросмотр"
+
+
+def _carries_no_credentials(client: AsyncClient) -> None:
+    """The precondition, asserted rather than assumed.
+
+    A fixture that quietly grew a cookie or a token would otherwise turn every
+    refusal below into a test of nothing.
+    """
+    assert client.cookies.get(SESSION_COOKIE) is None
+    sent = {name.lower() for name in client.headers}
+    assert "authorization" not in sent
+    assert "x-ops-token" not in sent
+
+
+async def _state(session_maker) -> dict[str, Any]:
+    """Everything a refused request must leave exactly as it was.
+
+    Compared before and after as one value, which is stricter than asking
+    whether some counter is still small: a preview version, a stored row, a
+    job, an Outbox message or a moved ledger row all show up as a difference.
+    """
+    async with session_maker() as session:
+        previews = (
+            await session.execute(select(func.count()).select_from(EasyWeekVoucherFollowupPreview))
+        ).scalar_one()
+        rows = (await session.execute(select(func.count()).select_from(EasyWeekVoucherFollowupPreviewRow))).scalar_one()
+        jobs = (await session.execute(select(func.count()).select_from(MessageJob))).scalar_one()
+        outbox = (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one()
+        ledger = sorted(
+            (int(item.id), str(item.status), int(item.send_attempt_count or 0))
+            for item in (await session.execute(select(EasyWeekVoucherProductionBatchItem))).scalars()
+        )
+    return {
+        "previews": int(previews),
+        "preview_rows": int(rows),
+        "jobs": int(jobs),
+        "outbox": int(outbox),
+        "ledger": ledger,
+    }
 
 
 async def _batch(session_maker, *, with_template: bool = True) -> int:
@@ -167,17 +241,174 @@ async def _no_effects(session_maker) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_the_action_refuses_an_anonymous_caller(session_maker, anonymous_client, no_network) -> None:
+async def test_an_api_get_without_a_session_is_unauthorised(session_maker, anonymous_client, no_network) -> None:
+    """Configured cabinet, no credentials, a non-browser Accept: 401.
+
+    The exact status matters. A visitor to this page is told one of two things
+    depending on what they can render, and a test that accepted any of several
+    statuses could not tell either of them from the page being served.
+    """
     batch_id = await _batch(session_maker)
-    response = await anonymous_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
-    assert response.status_code in {401, 403}
-    await _no_effects(session_maker)
+    _carries_no_credentials(anonymous_client)
+    before = await _state(session_maker)
+
+    response = await anonymous_client.get(PAGE.format(batch_id=batch_id), headers={"Accept": API_ACCEPT})
+
+    assert response.status_code == 401
+    assert response.headers.get("WWW-Authenticate", "").startswith("Basic")
+    assert PAGE_MARKER not in response.text
+    assert await _state(session_maker) == before
 
 
-async def test_the_page_refuses_an_anonymous_caller(session_maker, anonymous_client, no_network) -> None:
+async def test_a_browser_get_without_a_session_goes_to_the_login_form(
+    session_maker, anonymous_client, no_network
+) -> None:
+    """The same request from a browser: 302 to the login form, and back here.
+
+    The redirect is checked by destination and not merely by class: a 3xx
+    pointing anywhere else would be a different behaviour entirely, and the
+    page itself must not be in the response.
+    """
     batch_id = await _batch(session_maker)
-    response = await anonymous_client.get(PAGE.format(batch_id=batch_id))
-    assert response.status_code in {401, 403, 307, 302}
+    page = PAGE.format(batch_id=batch_id)
+    _carries_no_credentials(anonymous_client)
+    before = await _state(session_maker)
+
+    response = await anonymous_client.get(page, headers={"Accept": BROWSER_ACCEPT})
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == f"/ops/login?next={page}"
+    assert PAGE_MARKER not in response.text
+    assert await _state(session_maker) == before
+
+
+async def test_the_action_without_a_session_refuses_before_it_computes_anything(
+    session_maker, anonymous_client, no_network
+) -> None:
+    """And the one POST is refused by the same configured cabinet.
+
+    Refused before the preview is computed, which is what the unchanged state
+    shows: no version, no stored rows, no job, no Outbox message, and the
+    original mailing's own ledger — statuses and attempt counts — exactly as it
+    was. ``no_network`` is armed throughout, so a refusal that nevertheless
+    reached EasyWeek or Meta would fail here rather than pass quietly.
+    """
+    batch_id = await _batch(session_maker)
+    _carries_no_credentials(anonymous_client)
+    before = await _state(session_maker)
+
+    response = await anonymous_client.post(
+        ACTION.format(batch_id=batch_id), json=GOOD_BODY, headers={"Accept": API_ACCEPT}
+    )
+
+    assert response.status_code == 401
+    assert await _state(session_maker) == before
+
+
+async def test_a_real_session_reaches_the_page_the_refusals_withhold(
+    session_maker, ops_client, no_network, seams, binding_key
+) -> None:
+    """The positive control: the same two requests, authorised.
+
+    Without this, every assertion above would also hold for an endpoint that
+    refuses everybody. A genuine signed session — minted exactly as the login
+    form mints one — reads the page and performs the action, and the preview
+    the action creates is the one new version.
+    """
+    batch_id = await _batch(session_maker)
+    before = await _state(session_maker)
+
+    page = await ops_client.get(PAGE.format(batch_id=batch_id), headers={"Accept": BROWSER_ACCEPT})
+    assert page.status_code == 200
+    assert PAGE_MARKER in page.text
+
+    accepted = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY, headers={"Accept": API_ACCEPT})
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["accepted"] is True
+
+    after = await _state(session_maker)
+    assert after["previews"] == before["previews"] + 1
+    assert after["jobs"] == before["jobs"] == 0
+    assert after["outbox"] == before["outbox"] == 0
+    assert after["ledger"] == before["ledger"]
+
+
+async def test_a_forged_session_cookie_is_refused(session_maker, ops_credentials, monkeypatch, no_network) -> None:
+    """A cookie that was not signed by this cabinet is not a session."""
+    from altegio_bot.main import app
+
+    monkeypatch.setattr(followup_ops, "SessionLocal", session_maker)
+    monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
+    batch_id = await _batch(session_maker)
+    before = await _state(session_maker)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE_URL, follow_redirects=False) as client:
+        client.cookies.set(SESSION_COOKIE, "operator:forged-not-signed")
+        client.headers.update({"Origin": ORIGIN, "Accept": API_ACCEPT})
+        response = await client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+
+    assert response.status_code == 401
+    assert await _state(session_maker) == before
+
+
+async def test_a_token_authenticated_script_still_cannot_act(
+    session_maker, ops_credentials, monkeypatch, no_network
+) -> None:
+    """The POST asks for a browser session of its own, not for any credential.
+
+    ``X-Ops-Token`` satisfies the cabinet's own dependency — that is what the
+    token is for, and read-only scripts use it — and this action still refuses
+    it: the operator behind a protected write has to be an authenticated
+    session this code can name. So the refusal here comes from the action's own
+    check and names it.
+    """
+    from altegio_bot.main import app
+
+    monkeypatch.setattr(settings, "ops_token", "synthetic-ops-token", raising=False)
+    monkeypatch.setattr(followup_ops, "SessionLocal", session_maker)
+    monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
+    batch_id = await _batch(session_maker)
+    before = await _state(session_maker)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE_URL, follow_redirects=False) as client:
+        client.headers.update({"Origin": ORIGIN, "Accept": API_ACCEPT, "X-Ops-Token": "synthetic-ops-token"})
+        response = await client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+
+    assert response.status_code == 401
+    body = response.json()
+    assert body["accepted"] is False
+    assert body["detail"] == "ops_session_invalid"
+    assert await _state(session_maker) == before
+
+
+async def test_an_unconfigured_cabinet_refuses_the_action_and_stores_nothing(
+    session_maker, monkeypatch, no_network
+) -> None:
+    """Ops not configured at all: the historical GET fallback, and its limit.
+
+    ``require_ops_auth`` allows a GET when neither a token nor a user is
+    configured, which is the shared Ops cabinet's own long-standing behaviour
+    and not this section's to change. The one POST never relies on it: it
+    resolves the operator itself, and an unconfigured cabinet has none — so the
+    action refuses with ``ops_session_unconfigured`` and computes no preview.
+    That is the boundary the two tests above are asserted inside.
+    """
+    from altegio_bot.main import app
+
+    for name in ("ops_user", "ops_pass", "ops_secret", "ops_token"):
+        monkeypatch.setattr(settings, name, "", raising=False)
+    monkeypatch.setattr(followup_ops, "SessionLocal", session_maker)
+    monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
+    batch_id = await _batch(session_maker)
+    before = await _state(session_maker)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE_URL, follow_redirects=False) as client:
+        client.headers.update({"Origin": ORIGIN, "Accept": API_ACCEPT})
+        response = await client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["accepted"] is False
+    assert body["detail"] == "ops_session_unconfigured"
+    assert body["reasons"] == ["voucher_production_ops_session_required"]
+    assert await _state(session_maker) == before
 
 
 async def test_the_action_refuses_a_missing_csrf_token(session_maker, ops_client, no_network) -> None:
