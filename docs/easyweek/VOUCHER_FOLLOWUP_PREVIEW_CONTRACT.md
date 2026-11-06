@@ -386,6 +386,15 @@ later delivery handing the booking on. When the creator really cannot be
 established and the booking could be theirs, the row stays `unknown`, and an
 active booking ahead still excludes on its own.
 
+Who HOLDS a booking is not who made it, and only a creation delivery answers
+the second question. An update or a cancellation naming somebody else is an
+event in the life of a booking this person may well have made and handed on, so
+it cannot close a question about the creator: a disputed booking with no
+creation observed at all stays open whatever its later deliveries named, and
+reading one of them as "not theirs" shut the only question that was open. What
+closes it is what always did — a creator proven to be somebody else, or a
+booking this deployment had provably already heard of before the attempt.
+
 Two creation deliveries naming two branches are a contradiction about the
 booking and not automatically one about its owner. The owner is resolved from
 the pairs the deliveries really named — never from a product of the branches
@@ -419,6 +428,16 @@ under the same digits looked like one customer twice — no reassignment at all,
 for a booking that had in fact moved between two different records. For a
 recipient whose only account of themselves is their current list, that was the
 one thing the list cannot show, reported as nothing to see.
+
+A delivery that named NO customer forms no pair, and that is not the same as a
+delivery that changed nothing. Its branch is still proven, so what it records
+is that something happened to this booking in that branch — the booking's
+custody is unproven, which is weaker than a reassignment and is kept apart from
+it: nobody is proven to have taken the booking over and nothing proves it
+stayed either. The missing field used to make the whole delivery disappear, and
+a booking that may have left a manual recipient's list then read as a booking
+that never moved; the very same delivery WITH a number had always read as a
+move, so a missing field decided the answer.
 
 So the pairs are what the follow-up reads, in both directions: a booking has
 moved when any delivery of it names a pair other than the one its creation
@@ -571,6 +590,22 @@ later complete creation claiming an instant days afterwards looked like a new
 booking. A delivery from an unconfigured branch, one whose booking identity is
 unreadable, and one whose payload proves nothing at all date nothing.
 
+An instant that cannot be expressed at all
+------------------------------------------
+`booking_created_at` may be syntactically valid ISO-8601 and still have no UTC
+representation: midnight on the first day of year one with a positive offset,
+the last second of year 9999 with a negative one. Converting either one
+overflows. That overflow used to leave the capture, cross the whole preview and
+reach the operator as HTTP 500 for the entire batch — no rows, no reasons,
+nothing to act on, and nothing saying which delivery caused it.
+
+It is an unusable creation time, exactly like an unreadable string: the
+delivery's branch, booking identity and customer stay proven, the rejection is
+counted as `booking_created_at_unusable`, no arrival time is substituted for the
+missing instant, and only the row whose own booking it is becomes `unknown`.
+Every other row of the batch gets its ordinary answer. The exception is handled
+where the instant is read, and not suppressed at the level of the Ops request.
+
 A repeat of a creation is not a disagreement
 --------------------------------------------
 Three shapes are distinguished for one booking uuid:
@@ -580,7 +615,19 @@ Three shapes are distinguished for one booking uuid:
   usable evidence;
 * **a reassignment** — a LIFECYCLE delivery naming a customer other than the one
   the creation named. Reported, and it never moves the creation;
-* **a creators' conflict** — two CREATION deliveries naming different customers.
+* **a creators' conflict** — two CREATION deliveries naming different customers,
+  different branches or different instants. Each disagreement is read from the
+  SET of what the creation deliveries named and is counted once per booking, so
+  a delivery that could not state one field still contradicts a second delivery
+  over the fields it did state: a creation naming no customer states where and,
+  when its payload carried a usable one, when. The instant used to be compared
+  only against whichever delivery was COMPLETE, so an instant stated beside a
+  missing customer disagreed with nothing and the complete delivery decided
+  alone — `included` for an instant before the mailing, `excluded` for one after
+  it, on a record that contradicts itself. Such a delivery still names nobody
+  and is still no conversion; alone, with nothing else ever delivered about that
+  booking, it holds nobody open.
+
   WHO created a booking is a fact a creation delivery states even when it could
   not state WHEN, so a missing instant on one of the two is a second gap and not
   a resolution of the first. The undated delivery used to leave the aggregation
@@ -1163,6 +1210,42 @@ The seventh round's seven findings, each failing before its fix:
    Controls: the proven card sits at the top of the range asked about, and the
    same request over the real endpoint gives the same counts with a statement
    budget small enough to force many slices.
+
+The eighth round's four findings, each failing before its fix:
+
+1. a booking created in one configured branch under a number nothing resolves,
+   with a cancellation of it from the OTHER configured branch naming no
+   customer: `included` for a manual recipient with a completely empty history,
+   because the missing field made the delivery disappear while the same
+   delivery with a number read as a move. Both delivery orders, and with their
+   list holding a proven old booking of their own. Controls: the same shape
+   with an old creation is no gap at all, a proven foreign creator settles it,
+   a cancellation from the creation's own branch moves nothing (named or not),
+   and two pairs proven to be one person still move nothing;
+2. one booking uuid with a complete creation and a second creation naming no
+   customer — two different configured branches with one instant, and one
+   branch with two instants straddling the mailing, both deliveries stored
+   later than both instants. The complete delivery decided alone, so the row
+   read `included` or `excluded` according to the date that delivery happened
+   to carry. Both delivery orders and both sides of the send date. Controls: a
+   partial delivery that agrees is an ordinary repeat and the booking still
+   excludes, an unconfigured branch, an unreadable booking identity and an
+   arbitrary payload contradict nothing, and a lone partial creation blocks
+   neither recipient of a two-slot batch;
+3. no creation observed, a cancellation naming nobody from a branch the
+   recipient has no card in, and then a `booking-updated` naming a DIFFERENT
+   customer in their own branch: `included`, because a statement about the
+   later holder was read as an answer about the creator. Also with a partial
+   creation elsewhere and a late cancellation here, and with two updates for
+   two holders. Controls: a proven foreign creator and a booking already known
+   before the attempt both release it, and their own new booking or a booking
+   ahead still excludes for its own reason;
+4. through the authorised local Ops POST: `booking_created_at` of
+   `0001-01-01T00:00:00+01:00`, and separately `9999-12-31T23:59:59-01:00` —
+   the UTC conversion overflowed and the whole batch came back as HTTP 500.
+   Controls: an ordinary unreadable string, a valid instant with an offset
+   which still excludes, and a second independent row of the batch which keeps
+   its ordinary answer.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

@@ -146,6 +146,7 @@ from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     seed_booking_created,
     seed_booking_created_without_a_customer,
     seed_booking_created_without_a_date,
+    seed_booking_lifecycle,
     seed_sender_and_template,
     seed_source_batch,
     voucher_code_for,
@@ -7011,3 +7012,814 @@ async def test_a_truncated_scan_never_asks_the_owner_lookup(
     )
     assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
     assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+# ---------------------------------------------------------------------------
+# What one delivery proves, kept apart from what it leaves open
+# (round 8, fixes 1-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cancellation_first", [False, True])
+async def test_a_nameless_cancellation_from_another_branch_can_still_be_a_move(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch, cancellation_first: bool
+) -> None:
+    """Review round 8, finding 1: the branch survives a missing customer id.
+
+    The booking was created in one configured branch under a number nothing
+    can resolve, and a cancellation of the same booking arrived from the OTHER
+    configured branch naming no customer at all. The pair cannot be formed, so
+    the capture reported no reassignment — and a manual recipient with a
+    completely empty history came out `included`, although the booking may be
+    theirs and may have left their list unseen.
+
+    The same delivery WITH a number already read as a move, which is what made
+    the gap visible: the missing field decided the answer. Both delivery
+    orders, because neither proves a business order.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    moved = booking(index=120, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=6))
+
+    async def _creation() -> None:
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=moved["uuid"],
+            numeric_customer_id=person(8)["numeric_id"],
+            created_at=ATTEMPTED_AT + timedelta(days=2),
+        )
+
+    async def _cancellation() -> None:
+        await seed_booking_lifecycle(
+            session_maker,
+            booking_uuid=moved["uuid"],
+            received_at=ATTEMPTED_AT + timedelta(days=3),
+            company_id=SECOND_COMPANY_ID,
+            location_uuid=SECOND_LOCATION_UUID,
+        )
+
+    for step in (_cancellation, _creation) if cancellation_first else (_creation, _cancellation):
+        await step()
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_nameless_cancellation_elsewhere_about_an_old_booking_is_no_gap(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control that keeps the branch from crying wolf: an old creation.
+
+    The identical shape with the creation dated BEFORE the mailing. Whatever
+    happened to that booking in the other branch, it was not made since the
+    attempt, and §46.5's creation rule has nothing to ask about it.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    old = booking(index=121, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=6))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=old["uuid"],
+        numeric_customer_id=person(8)["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=20),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=old["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+        company_id=SECOND_COMPANY_ID,
+        location_uuid=SECOND_LOCATION_UUID,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_booking_of_their_own_does_not_answer_for_the_one_that_left(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And a non-empty history does not close the gap either.
+
+    Their list holds one booking of their own, made long before the mailing
+    and provably so. The booking that may have left it is still unaccounted
+    for, so the row stays unknown rather than being answered by what remains.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    theirs = booking(
+        index=122,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=2),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=person(12)["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=30),
+    )
+    moved = booking(index=123, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=6))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=person(8)["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+        company_id=SECOND_COMPANY_ID,
+        location_uuid=SECOND_LOCATION_UUID,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_proven_creator_settles_a_nameless_cancellation_elsewhere(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: a proven foreign creator closes it, as it always has.
+
+    The creation's own number resolves, through a card of its own branch, to a
+    different proven uuid. Whatever the other branch did to that booking, it
+    was never this recipient's.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    maker = person(8)
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=maker["customer_uuid"],
+        phone="+4915100777101",
+    )
+    moved = booking(index=124, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=6))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        numeric_customer_id=maker["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=moved["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+        company_id=SECOND_COMPANY_ID,
+        location_uuid=SECOND_LOCATION_UUID,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+@pytest.mark.parametrize("named", [False, True])
+async def test_a_cancellation_from_the_creations_own_branch_moves_nothing(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch, named: bool
+) -> None:
+    """And the branch pair repeated is a repeat, named or not.
+
+    The cancellation comes from the branch the creation itself named. Nothing
+    about where the booking is has changed, so there is nothing for a
+    recipient's own list to be hiding — with the creation's own number on the
+    delivery and with no number at all.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None}],
+    )
+    who = person(1)
+    digits = person(8)["numeric_id"]
+    stayed = booking(index=125, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=6))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=stayed["uuid"],
+        numeric_customer_id=digits,
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=stayed["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+        numeric_customer_id=digits if named else None,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def _partial_and_full_creation(
+    session_maker,
+    *,
+    booking_uuid: str,
+    numeric_id: int,
+    full_at: datetime,
+    partial_at: datetime,
+    partial_company_id: int = COMPANY_ID,
+    partial_location_uuid: str = KARLSRUHE_LOCATION_UUID,
+    partial_first: bool = False,
+) -> None:
+    """One booking uuid, one complete creation and one that named no customer.
+
+    The partial delivery proves its branch and states an instant; it names
+    nobody, so it credits nobody. Those two facts are still facts about this
+    booking, and a complete creation of the same booking has to agree with
+    them.
+    """
+
+    async def _full() -> None:
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=booking_uuid,
+            numeric_customer_id=numeric_id,
+            created_at=full_at,
+            received_at=NOW - timedelta(days=2),
+        )
+
+    async def _partial() -> None:
+        await seed_booking_created_without_a_customer(
+            session_maker,
+            booking_uuid=booking_uuid,
+            received_at=NOW - timedelta(days=1),
+            created_at=partial_at,
+            company_id=partial_company_id,
+            location_uuid=partial_location_uuid,
+        )
+
+    for step in (_partial, _full) if partial_first else (_full, _partial):
+        await step()
+
+
+@pytest.mark.parametrize("partial_first", [False, True])
+@pytest.mark.parametrize("made_after_the_attempt", [False, True])
+async def test_a_partial_creation_from_another_branch_contradicts_the_full_one(
+    session_maker,
+    binding_key,
+    no_network,
+    monkeypatch: pytest.MonkeyPatch,
+    made_after_the_attempt: bool,
+    partial_first: bool,
+) -> None:
+    """Review round 8, finding 2: two creations, one of them without an owner.
+
+    Both deliveries state the same instant and name two different configured
+    branches, which cannot both be where this booking was made. The complete
+    creation used to decide alone, in both directions: the booking read as
+    this person's engagement after the mailing, or as their quiet old booking,
+    depending only on the date the complete delivery happened to carry.
+
+    The partial delivery still names nobody and counts as no conversion. What
+    it proves — a branch — is enough to know that the record contradicts
+    itself, and with no independent ground the row is unknown.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    made = ATTEMPTED_AT + timedelta(days=2) if made_after_the_attempt else ATTEMPTED_AT - timedelta(days=20)
+    contested = booking(
+        index=126,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await _partial_and_full_creation(
+        session_maker,
+        booking_uuid=contested["uuid"],
+        numeric_id=who["numeric_id"],
+        full_at=made,
+        partial_at=made,
+        partial_company_id=SECOND_COMPANY_ID,
+        partial_location_uuid=SECOND_LOCATION_UUID,
+        partial_first=partial_first,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [] if made_after_the_attempt else [contested]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+@pytest.mark.parametrize("partial_first", [False, True])
+@pytest.mark.parametrize("full_is_the_older", [False, True])
+async def test_two_creation_instants_straddling_the_send_are_a_contradiction(
+    session_maker, binding_key, no_network, full_is_the_older: bool, partial_first: bool
+) -> None:
+    """Review round 8, finding 2: and the same when only the instants differ.
+
+    One configured branch, two creation deliveries of one booking, and two
+    explicit instants — one before the mailing and one after it. Both
+    deliveries were stored later than both instants, so nothing about their
+    arrival settles anything.
+
+    Whichever instant the COMPLETE delivery carried used to be the answer: the
+    earlier one left the person `included`, the later one excluded them for a
+    booking made since the mailing. The two claims cannot both be true and
+    neither is proven, so the row is unknown.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    older, newer = ATTEMPTED_AT - timedelta(days=20), ATTEMPTED_AT + timedelta(days=2)
+    contested = booking(
+        index=127,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await _partial_and_full_creation(
+        session_maker,
+        booking_uuid=contested["uuid"],
+        numeric_id=who["numeric_id"],
+        full_at=older if full_is_the_older else newer,
+        partial_at=newer if full_is_the_older else older,
+        partial_first=partial_first,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [contested] if full_is_the_older else []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+@pytest.mark.parametrize("partial_first", [False, True])
+async def test_a_partial_creation_that_agrees_is_an_ordinary_repeat(
+    session_maker, binding_key, no_network, partial_first: bool
+) -> None:
+    """The control: agreeing with the complete delivery contradicts nothing.
+
+    The same branch and the same instant, stated twice, once without an owner.
+    That is a repeat, the booking stays usable evidence, and this person's own
+    booking made after the mailing still excludes them.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    made = ATTEMPTED_AT + timedelta(days=2)
+    theirs = booking(index=128, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=1))
+    await _partial_and_full_creation(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_id=who["numeric_id"],
+        full_at=made,
+        partial_at=made,
+        partial_first=partial_first,
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+@pytest.mark.parametrize("unusable", ["unconfigured_branch", "unreadable_uuid", "arbitrary_payload"])
+async def test_a_partial_creation_that_proves_nothing_contradicts_nothing(
+    session_maker, binding_key, no_network, unusable: str
+) -> None:
+    """The negative controls: no branch or no booking, no contradiction.
+
+    A partial creation from a branch nobody configured, one whose booking
+    identity is unreadable, and one whose payload proves nothing at all. Each
+    carries an instant that disagrees with the complete creation, and none of
+    them is about a booking of this workspace — so the complete creation is
+    still the only evidence there is, and it excludes.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(index=129, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=1))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+        received_at=NOW - timedelta(days=2),
+    )
+    if unusable == "unconfigured_branch":
+        await seed_booking_created_without_a_customer(
+            session_maker,
+            booking_uuid=theirs["uuid"],
+            received_at=NOW - timedelta(days=1),
+            created_at=ATTEMPTED_AT - timedelta(days=30),
+            company_id=UNCONFIGURED_COMPANY_ID,
+        )
+    elif unusable == "unreadable_uuid":
+        await seed_booking_created_without_a_customer(
+            session_maker,
+            booking_uuid="not-a-uuid-at-all",
+            received_at=NOW - timedelta(days=1),
+            created_at=ATTEMPTED_AT - timedelta(days=30),
+        )
+    else:
+        await _arbitrary_lifecycle_payload(session_maker, received_at=NOW - timedelta(days=1))
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == NEW_BOOKING_AFTER_ATTEMPT
+
+
+async def test_a_lone_partial_creation_blocks_neither_recipient_of_the_batch(
+    session_maker, binding_key, no_network
+) -> None:
+    """Review round 8, finding 2: and alone it is still nobody's problem.
+
+    One partial creation, outside both recipients' histories, with nothing
+    else about that booking anywhere. It names no owner and no second delivery
+    disagrees with it, so there is nothing in dispute — and a whole batch may
+    not be held open on a row whose owner nobody ever claimed.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[
+            {"state": "delivered", "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None},
+            {"state": "delivered", "index": 2, "basis": RECIPIENT_BASIS_MANUAL, "numeric_id": None},
+        ],
+    )
+    await seed_booking_created_without_a_customer(
+        session_maker,
+        booking_uuid=booking(index=130, customer_uuid=person(9)["customer_uuid"], start=NOW)["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+        created_at=ATTEMPTED_AT + timedelta(days=2),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={person(1)["customer_uuid"]: [], person(2)["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+    assert decision_for(outcome, 2) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_an_update_naming_another_holder_does_not_name_the_creator(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 8, finding 3: who holds a booking is not who made it.
+
+    No creation of this booking was ever captured, and a cancellation naming
+    no customer arrived from a branch this recipient has no card in — so
+    whether the booking was theirs is open, and the row is unknown. Adding a
+    `booking-updated` that names a DIFFERENT customer in their own branch used
+    to close it as `included`: the delivery was read as an answer about the
+    creator.
+
+    It is not one. An update names a later holder, and a booking this person
+    made and then handed on is exactly the case the gap is about.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    gone = booking(index=131, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+        company_id=SECOND_COMPANY_ID,
+        location_uuid=SECOND_LOCATION_UUID,
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        event_hint="booking-updated",
+        numeric_customer_id=person(8)["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_partial_creation_elsewhere_with_a_late_cancellation_here_is_unknown(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second shape of the same question: a creation that named nobody.
+
+    The only creation delivery of this booking came from the other configured
+    branch and named no customer, and the cancellation that followed in this
+    branch names somebody else. Nothing says who made it, this recipient's own
+    number is proven in one branch only, and their list cannot show a booking
+    that left it.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    gone = booking(index=132, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_created_without_a_customer(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        received_at=ATTEMPTED_AT + timedelta(days=2),
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+        company_id=SECOND_COMPANY_ID,
+        location_uuid=SECOND_LOCATION_UUID,
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        numeric_customer_id=person(8)["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=4),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_two_updates_for_two_holders_without_a_creation_stay_unknown(
+    session_maker, binding_key, no_network
+) -> None:
+    """And two holders in a row answer the creator question no better than one.
+
+    Two `booking-updated` deliveries naming two different customers of this
+    branch, and no creation anywhere. The booking passed through two pairs of
+    hands after the mailing and nothing says whose it was first.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    gone = booking(index=133, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    for offset, holder in ((2, person(8)), (3, person(10))):
+        await seed_booking_lifecycle(
+            session_maker,
+            booking_uuid=gone["uuid"],
+            event_hint="booking-updated",
+            numeric_customer_id=holder["numeric_id"],
+            received_at=ATTEMPTED_AT + timedelta(days=offset),
+        )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+    assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+
+
+async def test_a_proven_foreign_creator_answers_the_holder_question(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: the creator, when it is proven, still settles everything.
+
+    The booking's own creation delivery names a number that resolves, through
+    a card of its branch, to a different proven uuid. Whoever held it
+    afterwards, it was never this recipient's booking.
+    """
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(second_branch=True), raising=False)
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    maker = person(8)
+    await _proven_other_card(
+        session_maker,
+        numeric_id=maker["numeric_id"],
+        customer_uuid=maker["customer_uuid"],
+        phone="+4915100777102",
+    )
+    gone = booking(index=134, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        numeric_customer_id=maker["numeric_id"],
+        created_at=ATTEMPTED_AT + timedelta(days=1),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=gone["uuid"],
+        event_hint="booking-updated",
+        numeric_customer_id=person(10)["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+async def test_a_booking_already_known_before_the_attempt_answers_it_too(
+    session_maker, binding_key, no_network
+) -> None:
+    """The other control: a booking this deployment had already heard of.
+
+    No creation was captured and the holders disagree, but a valid delivery
+    about this booking was stored before the mailing went out — so whatever it
+    is, it is not a booking made since. Nothing contradicts that, and no
+    creation date is invented to say it.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    known = booking(index=135, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=known["uuid"],
+        received_at=ATTEMPTED_AT - timedelta(days=10),
+    )
+    await seed_booking_lifecycle(
+        session_maker,
+        booking_uuid=known["uuid"],
+        event_hint="booking-updated",
+        numeric_customer_id=person(8)["numeric_id"],
+        received_at=ATTEMPTED_AT + timedelta(days=3),
+    )
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: []}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED
+
+
+@pytest.mark.parametrize("ground", ["their_own_new_booking", "a_booking_ahead"])
+async def test_an_independent_ground_still_excludes_beside_a_holder_question(
+    session_maker, binding_key, no_network, ground: str
+) -> None:
+    """And a proven fact about them still excludes beside the open question.
+
+    The unaccounted booking with its two holders sits beside either a booking
+    this person provably made after the mailing or an appointment still ahead.
+    Each excludes for its own reason, and neither is weakened by a gap about
+    somebody else's record.
+    """
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    gone = booking(index=136, customer_uuid=person(9)["customer_uuid"], start=NOW + timedelta(days=5))
+    for offset, holder in ((2, person(8)), (3, person(10))):
+        await seed_booking_lifecycle(
+            session_maker,
+            booking_uuid=gone["uuid"],
+            event_hint="booking-updated",
+            numeric_customer_id=holder["numeric_id"],
+            received_at=ATTEMPTED_AT + timedelta(days=offset),
+        )
+    rows = []
+    if ground == "their_own_new_booking":
+        theirs = booking(index=137, customer_uuid=who["customer_uuid"], start=ATTEMPTED_AT - timedelta(days=1))
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=theirs["uuid"],
+            numeric_customer_id=who["numeric_id"],
+            created_at=ATTEMPTED_AT + timedelta(days=1),
+        )
+        rows.append(theirs)
+        expected = NEW_BOOKING_AFTER_ATTEMPT
+    else:
+        rows.append(booking(index=138, customer_uuid=who["customer_uuid"], start=NOW + timedelta(days=3)))
+        expected = FUTURE_BOOKING_ACTIVE
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: rows}),
+    )
+    assert decision_for(outcome, 1) == FOLLOWUP_ROW_EXCLUDED
+    assert reason_for(outcome, 1) == expected
+
+
+@pytest.mark.parametrize("over_the_cap", [False, True])
+async def test_the_scan_is_complete_at_its_cap_and_truncated_one_past_it(
+    session_maker, binding_key, no_network, monkeypatch: pytest.MonkeyPatch, over_the_cap: bool
+) -> None:
+    """The row cap's own boundary, asserted at the cap rather than near it.
+
+    Exactly as many stored deliveries as the cap allows is a COMPLETE pass and
+    a real answer about this person; one more is the planned incomplete result,
+    unknown for everybody. The cap itself is unchanged — it is lowered here so
+    the boundary can be crossed in an ordinary test run.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production import booking_attribution
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+    who = person(1)
+    theirs = booking(
+        index=139,
+        customer_uuid=who["customer_uuid"],
+        start=ATTEMPTED_AT - timedelta(days=1),
+        canceled=True,
+        completed=False,
+    )
+    await seed_booking_created(
+        session_maker,
+        booking_uuid=theirs["uuid"],
+        numeric_customer_id=who["numeric_id"],
+        created_at=ATTEMPTED_AT - timedelta(days=9),
+    )
+    for offset in range(2):
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=booking(index=140 + offset, customer_uuid=person(9)["customer_uuid"], start=NOW)["uuid"],
+            numeric_customer_id=person(9)["numeric_id"],
+            created_at=ATTEMPTED_AT - timedelta(days=8 - offset),
+        )
+    if over_the_cap:
+        await seed_booking_created(
+            session_maker,
+            booking_uuid=booking(index=142, customer_uuid=person(9)["customer_uuid"], start=NOW)["uuid"],
+            numeric_customer_id=person(9)["numeric_id"],
+            created_at=ATTEMPTED_AT - timedelta(days=5),
+        )
+    monkeypatch.setattr(booking_attribution, "MAX_SCANNED_EVENTS", 3, raising=False)
+
+    outcome = await build(
+        session_maker,
+        batch_id=batch_id,
+        reader=FakeHistoryReader(bookings={who["customer_uuid"]: [theirs]}),
+    )
+    async with session_maker() as session:
+        stored = (
+            (
+                await session.execute(
+                    select(EasyWeekVoucherFollowupPreview).order_by(EasyWeekVoucherFollowupPreview.id.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+    capture = stored.evidence["booking_creation_capture"]
+    if over_the_cap:
+        assert capture["truncated"] is True
+        assert capture["scanned_events"] == 3
+        assert decision_for(outcome, 1) == FOLLOWUP_ROW_UNKNOWN
+        assert reason_for(outcome, 1) == BOOKING_CAPTURE_UNPROVEN
+    else:
+        assert capture["truncated"] is False
+        assert capture["scanned_events"] == 3
+        assert decision_for(outcome, 1) == FOLLOWUP_ROW_INCLUDED

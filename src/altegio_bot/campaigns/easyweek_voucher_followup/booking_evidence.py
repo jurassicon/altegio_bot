@@ -128,6 +128,20 @@ What this module refuses to do
   two records, and comparing bare numbers reported it as a booking nothing had
   moved. The pairs a dispute's creations really named are also what its owner
   is resolved from, never a product of its branches and its numbers.
+* It never reads a missing field as a fact. A delivery that proved its branch
+  and its booking and nothing else still proves those two: a lifecycle delivery
+  from another branch that named no customer leaves the booking's custody
+  unproven, which is not a change of person and not a proof that nothing
+  changed; and a creation delivery that named no customer still states where —
+  and, when the payload carried a usable one, when — so a second creation of
+  the same booking has to agree with it. Neither names an owner, and neither is
+  evidence of its own: a booking nothing else was delivered about holds nobody
+  open.
+* It never answers a question about the CREATOR with a statement about a later
+  holder. An update or a cancellation naming somebody else says who has the
+  booking now, and a booking this person made and handed on is exactly the case
+  the gap is about, so a dispute with no creation observed stays open whatever
+  its later deliveries named.
 * It never reads a creation instant that its own capture contradicts. A booking
   whose creation claims a moment later than the first delivery stored about it,
   or later than the moment the preview is being computed at, is not a proven
@@ -620,18 +634,24 @@ def _dispute_touches(
         # one made since, whoever made it and with no creation date guessed.
         return False
     if numeric_id is not None:
-        # Their number is proven in the branches their own card covers, and it
-        # answers nothing anywhere else: a delivery of this booking from
-        # another configured branch may be about a customer record of theirs
-        # this deployment cannot see, so matching digits are not the question
-        # there — the absence of an answer is. A dispute naming no customer at
-        # all is in the same position.
+        # Only a CREATION delivery can answer the question this rule asks. Who
+        # holds a booking now is a different fact: an update or a cancellation
+        # naming somebody else is an event in the life of a booking this person
+        # may well have made and handed on, and reading it as "not theirs" shut
+        # the question that was open. So a dispute with no creation observed at
+        # all leaves it open, whatever its later deliveries named.
+        #
+        # Where creations were observed, their number is proven in the branches
+        # their own card covers and answers nothing anywhere else: a creation
+        # from another configured branch may be about a customer record of
+        # theirs this deployment cannot see, so matching digits are not the
+        # question there — the absence of an answer is.
         branches = {int(value) for value in numeric_branches}
-        if not dispute.customer_pairs:
+        if not dispute.creation_pairs:
             return True
         return any(
             int(customer_id) == int(numeric_id) if int(company_id) in branches else True
-            for company_id, customer_id in dispute.customer_pairs
+            for company_id, customer_id in dispute.creation_pairs
         )
     return True
 
@@ -705,7 +725,12 @@ async def load_creation_evidence(
     identities = await resolve_identities(session, items=items, registry=locations)
     grouped = scan.by_customer()
     by_uuid = scan.by_booking_uuid()
-    live_strays = [booking for booking in scan.bookings if booking.customer_reassigned]
+    # Bookings that may have left somebody's list. Two shapes, and the second
+    # one used to be invisible: a delivery naming a DIFFERENT customer record,
+    # and a delivery from another branch naming no customer at all. The second
+    # proves nothing about who holds the booking now, which is exactly why it
+    # cannot be read as proof that nobody else does.
+    live_strays = [booking for booking in scan.bookings if booking.customer_reassigned or booking.custody_unproven]
 
     # Which slots have a numeric bridge on their own card, decided first and
     # without touching the database, so the reverse lookup below is asked about

@@ -746,3 +746,84 @@ async def test_a_wide_capture_still_answers_over_the_real_endpoint(
         return body["included"], body["excluded"], body["unknown"]
 
     assert counts(chunked) == counts(whole)
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "0001-01-01T00:00:00+01:00",
+        "9999-12-31T23:59:59-01:00",
+        "whenever, really",
+        "2026-09-05T10:00:00+02:00",
+    ],
+)
+async def test_an_unrepresentable_creation_instant_is_one_rows_problem(
+    session_maker, ops_client, no_network, seams, binding_key, stamp: str
+) -> None:
+    """Review round 8, finding 4: one bad instant, one affected row.
+
+    The first two stamps are syntactically valid ISO-8601 and cannot be
+    expressed in UTC at all: midnight on the first day of year one east of
+    Greenwich, and the last second of year 9999 west of it. Converting either
+    one overflows, and the exception used to leave the capture, cross the whole
+    preview and reach the operator as HTTP 500 for the entire batch — no rows,
+    no reasons, nothing to act on.
+
+    Such an instant is an unusable creation time, exactly like an unreadable
+    string: the delivery's branch, booking and customer stay proven, no arrival
+    time is substituted for the missing instant, and only the row whose own
+    booking it is becomes unknown. The fourth stamp is the ordinary case with
+    an offset, which still excludes.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup.identity import BOOKING_CAPTURE_UNPROVEN
+    from altegio_bot.models.models import EasyWeekVoucherFollowupPreviewRow
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        seed_booking_created_without_a_date,
+    )
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered"}, {"state": "delivered", "index": 2}],
+    )
+    await seed_booking_created_without_a_date(
+        session_maker,
+        booking_uuid="00000150-7777-4777-8777-777777777777",
+        numeric_customer_id=person(1)["numeric_id"],
+        created_at_value=stamp,
+    )
+
+    response = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    readable = stamp.startswith("2026")
+    assert (body["included"], body["excluded"], body["unknown"]) == ((1, 1, 0) if readable else (1, 0, 1))
+    async with session_maker() as session:
+        rows = {
+            row.source_slot: (row.decision, row.reason_code)
+            for row in (await session.execute(select(EasyWeekVoucherFollowupPreviewRow))).scalars()
+        }
+    assert rows[2][0] == "included"
+    if readable:
+        assert rows[1] == ("excluded", "followup_new_booking_after_attempt")
+    else:
+        assert rows[1] == ("unknown", BOOKING_CAPTURE_UNPROVEN)
+    await _no_send_effects(session_maker)
+
+
+async def _no_send_effects(session_maker) -> None:
+    """One preview version and nothing else: no job, no Outbox row, no attempt."""
+    async with session_maker() as session:
+        jobs = (await session.execute(select(func.count()).select_from(MessageJob))).scalar_one()
+        outbox = (await session.execute(select(func.count()).select_from(OutboxMessage))).scalar_one()
+        spent = (
+            await session.execute(
+                select(func.coalesce(func.sum(EasyWeekVoucherProductionBatchItem.send_attempt_count), 0))
+            )
+        ).scalar_one()
+        previews = (
+            await session.execute(select(func.count()).select_from(EasyWeekVoucherFollowupPreview))
+        ).scalar_one()
+    assert (jobs, outbox, previews) == (0, 0, 1)
+    assert int(spent) <= 2

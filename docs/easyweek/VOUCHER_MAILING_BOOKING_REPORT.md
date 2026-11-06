@@ -132,7 +132,13 @@ Rules:
   appointment are one booking, never a second conversion.
 * Only a `booking-created` delivery can establish a creation. Two creation
   deliveries for one booking that disagree about the customer, the instant or
-  the branch are a conflict and are not a positive fact for anybody.
+  the branch are a conflict and are not a positive fact for anybody. The
+  disagreement is read from the SETS of customers, branches and instants the
+  creation deliveries named, so a delivery that could not state one of those
+  fields still contradicts a second delivery over the fields it did state: a
+  creation naming no customer still names a branch and, when its payload
+  carried a usable one, an instant. It is counted once per booking, it still
+  credits nobody, and it is still no conversion.
 * A late event about a booking created **before** the send is not counted.
 * Recipients are counted uniquely. Several bookings by one recipient are one
   recipient in the counter and several entries in the details.
@@ -158,6 +164,12 @@ Rules:
 * An identical Resend is recognised by the capture's own content identity
   (`payload_hash`) and adds no second fact, so replaying an old payload cannot
   move the answer. Nothing is replayed by this report.
+* A LIFECYCLE delivery whose branch and booking are proven and whose customer
+  is missing keeps its branch too. No `(branch, number)` pair is invented from
+  it, so it credits nobody and declares no change of person; what it records is
+  that something happened to that booking in that branch, which a caller whose
+  only view of a person is their current booking list needs (§46.5). The report
+  itself neither counts nor publishes it.
 * A booking some delivery assigns to another customer keeps the creation
   attributed to the customer its own creation delivery named, flags
   `customer_reassigned` in the details, and credits the other customer with
@@ -187,6 +199,12 @@ Four answers are distinguished and never collapsed:
   captured payload, and ignores the inbox worker's status.
 * Incomplete, truncated and conflicting payloads never become positive facts.
   They are counted by reason in the coverage block, with no personal data.
+* A `booking_created_at` that is syntactically valid and cannot be expressed in
+  UTC at all — the first day of year one east of Greenwich, the last second of
+  year 9999 west of it — is counted as `booking_created_at_unusable` like any
+  other unreadable instant. The delivery's branch, booking and customer stay
+  proven, `received_at` is not substituted for the missing instant, and the
+  overflow is one delivery's problem rather than the whole read's.
 * A `booking-created` delivery whose branch and booking identity are proven and
   whose **customer is missing** is counted as `customer_identity_unusable`, as
   before: it credits nobody, is no conversion, moves no per-branch observation,

@@ -707,6 +707,44 @@ async def seed_booking_created_without_a_customer(
             return int(event.id)
 
 
+async def seed_booking_lifecycle(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_uuid: str,
+    received_at: datetime,
+    event_hint: str = "booking-canceled",
+    numeric_customer_id: int | None = None,
+    company_id: int = COMPANY_ID,
+    location_uuid: str = KARLSRUHE_LOCATION_UUID,
+) -> int:
+    """One captured lifecycle delivery, with or without a customer.
+
+    ``numeric_customer_id=None`` leaves the field out of the payload entirely,
+    which is the shape that proves a branch and no person: something happened
+    to this booking in that branch, and who holds it now is not stated.
+    """
+    payload: dict[str, Any] = {
+        "uid": booking_uuid,
+        "location_id": company_id,
+        "location_uuid": location_uuid,
+    }
+    if numeric_customer_id is not None:
+        payload["customer_id"] = int(numeric_customer_id)
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                event_hint=event_hint,
+                query={},
+                headers={},
+                payload=payload,
+                received_at=received_at,
+                status="processed",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
 async def seed_booking_cancelled(
     session_maker: async_sessionmaker[AsyncSession],
     *,

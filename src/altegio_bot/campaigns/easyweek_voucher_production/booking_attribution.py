@@ -279,6 +279,15 @@ class ObservedBooking:
     # not proof of business order, so all this says is that the deliveries
     # disagree.
     customer_reassigned: bool = False
+    # A delivery of this booking came from a branch OTHER than the one its
+    # creation named, and named no customer at all. That is weaker than a
+    # reassignment and is not the same fact: nobody is proven to have taken
+    # the booking over, and nothing proves it stayed either. No pair is
+    # invented from it — a branch alone names no customer record — and the
+    # caller whose only view of a person is their current list needs it,
+    # because a booking that LEFT that list is the one thing the list cannot
+    # show. Not serialised: the report prints what it can prove.
+    custody_unproven: bool = False
     # The earliest moment any delivery of this booking was received. A lower
     # bound on when the booking EXISTED and never its creation date.
     #
@@ -363,6 +372,18 @@ class _BookingDraft:
     # which bare numbers cannot.
     customer_pairs: set[tuple[int, int]] = field(default_factory=set)
     creation_pairs: set[tuple[int, int]] = field(default_factory=set)
+    # Branches a delivery of this booking named while naming NO customer. The
+    # branch is proven and the pair cannot be formed, so this is kept apart
+    # from both sets above: it says something happened to this booking there,
+    # which is neither a proven change of person nor a proof that nothing
+    # changed.
+    unnamed_company_ids: set[int] = field(default_factory=set)
+    # Two creation deliveries of this booking stated two DIFFERENT instants.
+    # Read from the set of instants rather than from a comparison against
+    # whichever of them was complete, and counted once per booking — a
+    # delivery that named no customer still states when, and a creation that
+    # disagrees with it disagrees with this booking's own record.
+    date_conflict: bool = False
     # Was anything beyond the branch and the booking identity ever proven about
     # this booking? A creation delivery that named no customer proves that this
     # booking exists in this branch and nothing else — no owner to credit, no
@@ -846,34 +867,50 @@ def _validate_delivery(
     }
 
     if event_hint == CREATED_HINT:
+        # The instant is read BEFORE the owner is checked, because a creation
+        # delivery that named no customer can still state when and where — and
+        # those are facts a second creation of the same booking has to agree
+        # with. Which reason is reported does not change: a missing customer is
+        # reported as such, whatever the instant turned out to be.
+        try:
+            created_at = parse_iso_utc(payload.get("booking_created_at"), required=True)
+        except NormalizationError:
+            created_at = None
+        except OverflowError:
+            # A syntactically valid instant that cannot be expressed in UTC at
+            # all: the first day of year one east of Greenwich, the last second
+            # of year 9999 west of it. The conversion overflows, and the
+            # exception used to leave this module, cross the whole preview and
+            # reach the operator as a 500 for the entire batch — no rows, no
+            # reasons, nothing to act on. It is an unusable creation time,
+            # exactly like an unreadable one, and it is one booking's problem.
+            created_at = None
+        if created_at is not None and created_at.tzinfo is not None:
+            facts["booking_created_at"] = created_at
         if facts["customer_id"] is None:
             # The branch and the booking identity are proven and the OWNER is
-            # not. Returning nothing at all threw those two away with the
-            # missing one, so the scan never learned that this booking existed
-            # when the delivery was stored — and a later creation of the same
+            # not. Returning nothing at all threw those away with the missing
+            # one, so the scan never learned that this booking existed when
+            # the delivery was stored — and a later creation of the same
             # booking claiming a much newer instant then looked like a new
             # booking rather than a contradiction.
             #
             # So the proven half comes back WITH the rejection, which is still
             # counted. It names nobody, so it credits nobody and is no
-            # conversion; it dates nothing, so no instant is read from it.
+            # conversion.
             return facts, REJECT_CUSTOMER_ID
-        try:
-            created_at = parse_iso_utc(payload.get("booking_created_at"), required=True)
-        except NormalizationError:
-            created_at = None
-        if created_at is None or created_at.tzinfo is None:
+        if facts.get("booking_created_at") is None:
             # The branch, the booking identity and the customer are all proven
-            # and only the INSTANT is missing or unreadable. Returning nothing
-            # at all threw the proven half away with the unproven one, so the
-            # scan never learned that a creation of this booking named this
-            # customer — and a caller asking about that person saw silence.
+            # and only the INSTANT is missing, unreadable or unrepresentable.
+            # Returning nothing at all threw the proven half away with the
+            # unproven one, so the scan never learned that a creation of this
+            # booking named this customer — and a caller asking about that
+            # person saw silence.
             #
             # So the facts come back WITH the rejection: the reason is still
             # counted, ``booking_created_at`` stays absent, and nothing here
             # substitutes ``received_at`` for it.
             return facts, REJECT_CREATED_AT
-        facts["booking_created_at"] = created_at
     return facts, None
 
 
@@ -949,6 +986,33 @@ async def scan_capture(
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
+    def _note_branch_conflict(draft: _BookingDraft) -> None:
+        """Two creation deliveries of one booking naming two branches.
+
+        Counted once per booking, and read from the SET of branches: a
+        creation delivery that could not state the customer or the instant
+        still states where the booking was made, and a missing field must not
+        dissolve a disagreement about that.
+        """
+        if len(draft.creation_company_ids) > 1 and not draft.branch_conflict:
+            draft.branch_conflict = True
+            draft.conflicting = True
+            rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+
+    def _note_date_conflict(draft: _BookingDraft) -> None:
+        """Two creation deliveries of one booking naming two instants.
+
+        Also once per booking and also from the set, for the same reason: the
+        comparison used to be made against whichever delivery was COMPLETE, so
+        an instant stated beside a missing customer disagreed with nothing and
+        the complete delivery decided alone — `included` or `excluded`
+        according to the date it happened to carry.
+        """
+        if len(draft.creation_times) > 1 and not draft.date_conflict:
+            draft.date_conflict = True
+            draft.conflicting = True
+            rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+
     for event_id, event_hint, payload, received_at, body_truncated, payload_hash in rows:
         facts, reason = _validate_delivery(
             event_hint=event_hint,
@@ -970,11 +1034,22 @@ async def scan_capture(
         if received_at is not None and (draft.first_observed_at is None or received_at < draft.first_observed_at):
             draft.first_observed_at = received_at
         if event_hint == CREATED_HINT and facts["customer_id"] is None:
-            # A creation delivery that named no customer. It has dated the
-            # booking's existence above and that is all it can do: it names no
-            # owner, so it is not evidence about any person, and treating it as
-            # a creation with a gap would hold a whole batch open on a row
-            # whose owner nobody ever claimed.
+            # A creation delivery that named no customer. It credits nobody and
+            # is no conversion — but it has proven WHERE this booking was made
+            # and, when the payload carried a usable one, WHEN, and a second
+            # creation of the same booking has to agree with both. Those two
+            # facts are recorded here with no owner invented.
+            #
+            # It is still not evidence of its own: it does not set
+            # ``proved_more_than_identity``, so a booking nothing else was ever
+            # delivered about leaves the scan entirely rather than holding a
+            # whole batch open on a row whose owner nobody ever claimed.
+            draft.creation_company_ids.add(int(facts["company_id"]))
+            _note_branch_conflict(draft)
+            partial_created_at = facts.get("booking_created_at")
+            if partial_created_at is not None:
+                draft.creation_times.add(partial_created_at)
+                _note_date_conflict(draft)
             continue
         draft.proved_more_than_identity = True
         # Every delivery of this booking contributes whatever customer it named,
@@ -991,6 +1066,7 @@ async def scan_capture(
             draft.creation_pairs.add((int(facts["company_id"]), int(facts["customer_id"])))
             if created_at is not None:
                 draft.creation_times.add(created_at)
+                _note_date_conflict(draft)
             # WHO created a booking is a fact its creation delivery states even
             # when it could not state WHEN, so the owners' disagreement is read
             # from the SET of customers the creations named. The undated
@@ -1010,10 +1086,7 @@ async def scan_capture(
             # branches also decide what the numeric id in each delivery MEANS,
             # since that id is unique per branch.
             draft.creation_company_ids.add(int(facts["company_id"]))
-            if len(draft.creation_company_ids) > 1 and not draft.branch_conflict:
-                draft.branch_conflict = True
-                draft.conflicting = True
-                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            _note_branch_conflict(draft)
             if created_at is None:
                 # Proven owner, unproven instant. It contributes the owner and
                 # the conflict above, and does NOT count as a usable creation,
@@ -1028,16 +1101,12 @@ async def scan_capture(
                 draft.customer_id = facts["customer_id"]
                 draft.booking_created_at = created_at
                 branch_observed[facts["company_id"]] = branch_observed.get(facts["company_id"], 0) + 1
-            elif draft.booking_created_at != created_at:
-                # Two DATED creations of one booking that do not agree about
-                # when it was made. The owners' and the branches' disagreements
-                # are counted above and not again here, so one conflicting pair
-                # is still one counted conflict. A repeated delivery of the
-                # SAME creation — including one that merely adds the instant an
-                # earlier delivery omitted — is the ordinary case and lands in
-                # neither branch.
-                draft.conflicting = True
-                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            # A disagreement about the instant is counted above, from the set,
+            # so one conflicting pair is still one counted conflict however the
+            # two deliveries arrived. A repeated delivery of the SAME creation —
+            # including one that merely adds the instant an earlier delivery
+            # omitted — adds nothing to any set and is the ordinary case.
+            #
             # A creation states WHAT WAS CREATED. It is never also a statement
             # that the booking is live now: a cancellation of it may already
             # have been delivered, and reading the creation as "active" is
@@ -1048,6 +1117,15 @@ async def scan_capture(
         # updated appointment is the same appointment — and it contributes one
         # FACT to the set the state is derived from at the end.
         #
+        if facts["customer_id"] is None:
+            # A lifecycle delivery whose branch and booking are proven and whose
+            # customer is missing. The branch is kept: something happened to
+            # this booking in that branch. No pair is invented from it, so
+            # nobody is credited and no change of person is declared proven —
+            # and the delivery no longer disappears, which is what let a
+            # booking that may have left somebody's list read as a booking that
+            # never moved.
+            draft.unnamed_company_ids.add(int(facts["company_id"]))
         # Keyed by content identity so an identical Resend is not a second
         # fact. A delivery whose body was not JSON has no hash and is keyed by
         # its own row id, because nothing proves it identical to another.
@@ -1122,6 +1200,9 @@ async def scan_capture(
                 # view of a person is their current list then had nothing
                 # saying a booking might have left it.
                 customer_reassigned=bool(draft.customer_pairs - {(int(draft.company_id or 0), int(draft.customer_id))}),
+                # And the weaker fact, kept apart from it: a delivery about
+                # this booking came from another branch and named nobody.
+                custody_unproven=bool(draft.unnamed_company_ids - {int(draft.company_id or 0)}),
                 first_observed_at=draft.first_observed_at,
             )
         )
