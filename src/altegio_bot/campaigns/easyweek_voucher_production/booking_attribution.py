@@ -279,14 +279,14 @@ class ObservedBooking:
     # not proof of business order, so all this says is that the deliveries
     # disagree.
     customer_reassigned: bool = False
-    # A delivery of this booking came from a branch OTHER than the one its
-    # creation named, and named no customer at all. That is weaker than a
-    # reassignment and is not the same fact: nobody is proven to have taken
+    # A delivery of this booking named no customer at all. That is weaker than
+    # a reassignment and is not the same fact: nobody is proven to have taken
     # the booking over, and nothing proves it stayed either. No pair is
-    # invented from it — a branch alone names no customer record — and the
-    # caller whose only view of a person is their current list needs it,
-    # because a booking that LEFT that list is the one thing the list cannot
-    # show. Not serialised: the report prints what it can prove.
+    # invented from it — a branch alone names no customer record, because a
+    # numeric customer id is unique WITHIN a branch and a branch therefore
+    # holds many of them, so "somewhere in the branch that created it" is not
+    # "the same customer". Not serialised: the report prints what it can
+    # prove.
     custody_unproven: bool = False
     # The earliest moment any delivery of this booking was received. A lower
     # bound on when the booking EXISTED and never its creation date.
@@ -378,6 +378,11 @@ class _BookingDraft:
     # which is neither a proven change of person nor a proof that nothing
     # changed.
     unnamed_company_ids: set[int] = field(default_factory=set)
+    # A creation delivery of this booking named NO customer. Its branch and its
+    # instant are kept above, and whose creation it was is simply not
+    # established — which a second creation naming a known owner cannot answer
+    # for it.
+    ownerless_creation: bool = False
     # Two creation deliveries of this booking stated two DIFFERENT instants.
     # Read from the set of instants rather than from a comparison against
     # whichever of them was complete, and counted once per booking — a
@@ -457,6 +462,15 @@ class DisputedBooking:
     # because a product of the two invents customer records nothing observed.
     creation_pairs: frozenset[tuple[int, int]] = frozenset()
     customer_pairs: frozenset[tuple[int, int]] = frozenset()
+    # A creation delivery of this booking named no customer, so one of the
+    # claims about who made it is simply absent. A second creation naming a
+    # proven owner speaks for its own delivery and not for that one.
+    creation_without_owner: bool = False
+    # A delivery of this booking named no customer, so who holds it now is not
+    # established either — the same fact :class:`ObservedBooking` carries, and
+    # needed here for the same reason: the permissive rule for a card with no
+    # numeric bridge asks whether anything moved this booking.
+    custody_unproven: bool = False
     # Every branch a creation delivery of it named. One entry is what makes the
     # numeric ids above readable at all, because such an id means one person in
     # one branch and somebody else in the next; two entries are a contradiction
@@ -1044,6 +1058,7 @@ async def scan_capture(
             # ``proved_more_than_identity``, so a booking nothing else was ever
             # delivered about leaves the scan entirely rather than holding a
             # whole batch open on a row whose owner nobody ever claimed.
+            draft.ownerless_creation = True
             draft.creation_company_ids.add(int(facts["company_id"]))
             _note_branch_conflict(draft)
             partial_created_at = facts.get("booking_created_at")
@@ -1178,6 +1193,8 @@ async def scan_capture(
                     creation_company_ids=frozenset(draft.creation_company_ids),
                     creation_pairs=frozenset(draft.creation_pairs),
                     customer_pairs=frozenset(draft.customer_pairs),
+                    creation_without_owner=bool(draft.ownerless_creation),
+                    custody_unproven=bool(draft.unnamed_company_ids),
                     first_observed_at=draft.first_observed_at,
                 )
             )
@@ -1201,8 +1218,10 @@ async def scan_capture(
                 # saying a booking might have left it.
                 customer_reassigned=bool(draft.customer_pairs - {(int(draft.company_id or 0), int(draft.customer_id))}),
                 # And the weaker fact, kept apart from it: a delivery about
-                # this booking came from another branch and named nobody.
-                custody_unproven=bool(draft.unnamed_company_ids - {int(draft.company_id or 0)}),
+                # this booking named nobody. Its branch does not narrow that —
+                # the branch that created a booking holds every other customer
+                # of that branch too.
+                custody_unproven=bool(draft.unnamed_company_ids),
                 first_observed_at=draft.first_observed_at,
             )
         )

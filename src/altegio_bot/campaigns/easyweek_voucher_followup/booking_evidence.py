@@ -137,6 +137,17 @@ What this module refuses to do
   the same booking has to agree with it. Neither names an owner, and neither is
   evidence of its own: a booking nothing else was delivered about holds nobody
   open.
+* It never lets what one delivery proved answer for what another left open.
+  A creation delivery that named nobody leaves whose creation it was
+  unestablished, and a second creation naming a proven owner speaks for its own
+  delivery only — so a contradiction about where a booking was made is not set
+  aside because one of the two deliveries is demonstrably a stranger's.
+* It never reads a delivery that named nobody as proof that nothing moved. The
+  permissive rule for a card with no numeric bridge needs both halves: no
+  delivery naming a different customer record, and none that named no customer
+  at all. That rule reaches every decision about such a card — the bookings in
+  their list, the bookings outside it, and the disputed ones — and it used to
+  reach only the last two.
 * It never answers a question about the CREATOR with a statement about a later
   holder. An update or a cancellation naming somebody else says who has the
   booking now, and a booking this person made and handed on is exactly the case
@@ -451,7 +462,17 @@ def _attribution(
         return verdict
     if numeric_id is not None:
         return ATTRIBUTION_UNRESOLVED
-    return ATTRIBUTION_THEIRS if not booking.customer_reassigned else ATTRIBUTION_UNRESOLVED
+    # The older rule, for a card with no numeric bridge: a booking nothing
+    # moved belongs to whoever created it, and the only account of this
+    # person's bookings is the list it is in. "Nothing moved it" needs both
+    # halves — no delivery naming a different customer record, and no delivery
+    # that named NO customer. The second was missing, so a nameless delivery,
+    # which is precisely the one that cannot say the booking stayed, read as
+    # proof that it did: a booking made after the mailing excluded this person
+    # and the same booking with an older instant left them included.
+    if booking.customer_reassigned or booking.custody_unproven:
+        return ATTRIBUTION_UNRESOLVED
+    return ATTRIBUTION_THEIRS
 
 
 def _dispute_owner(
@@ -483,7 +504,14 @@ def _dispute_owner(
     Then nothing about whose it is has been established, which is not the same
     as its being anybody's.
     """
-    if not dispute.creation_pairs:
+    if not dispute.creation_pairs or dispute.creation_without_owner:
+        # A creation delivery that named nobody leaves one of the claims about
+        # who made this booking simply absent, and a second creation naming a
+        # proven owner speaks for its own delivery and not for that one. The
+        # known owner was allowed to answer for both, so a contradiction about
+        # where the booking was made was set aside as "demonstrably somebody
+        # else's" while whose the contradicting delivery was had never been
+        # established.
         return None
     verdicts = {
         _owner_verdict(
@@ -513,10 +541,14 @@ def _dispute_owner(
     # one unknown that would read fine with it either — the instant is not
     # evidence about whose booking it is, in either direction.
     #
-    # "Nothing moved it" is read from the pairs: a lifecycle delivery naming
-    # the same digits in ANOTHER branch names a different customer record, so
-    # the deliveries do disagree about whose booking it is.
-    return None if dispute.customer_pairs - dispute.creation_pairs else ATTRIBUTION_THEIRS
+    # "Nothing moved it" is read from the pairs, and from the deliveries that
+    # named no pair at all: a lifecycle delivery naming the same digits in
+    # ANOTHER branch names a different customer record, and one naming no
+    # customer says nothing about who holds the booking now — which is not the
+    # same as saying nobody else does.
+    if dispute.customer_pairs - dispute.creation_pairs or dispute.custody_unproven:
+        return None
+    return ATTRIBUTION_THEIRS
 
 
 def _chronology_contradicted(booking: ObservedBooking, *, now: datetime) -> bool:
@@ -548,7 +580,28 @@ def _chronology_contradicted(booking: ObservedBooking, *, now: datetime) -> bool
     return booking.booking_created_at > booking.first_observed_at
 
 
-def _dispute_predates(dispute: DisputedBooking, *, anchor: datetime | None) -> bool:
+def _dispute_chronology_contradicted(dispute: DisputedBooking, *, now: datetime) -> bool:
+    """Do its own claimed instants fight what was already known about it?
+
+    The same question :func:`_chronology_contradicted` asks of an attributed
+    booking, asked of a disputed one — which was the asymmetry: a booking with
+    an owner on every creation delivery had its instants checked against the
+    first delivery stored about it, and a booking whose creations left an owner
+    out did not, although such a record is weaker rather than stronger.
+
+    A claim that this booking was made after it was first heard of, or after
+    the moment the preview is being computed at, cannot be true. Nothing is
+    invented from that: the claim is simply not evidence, and neither is the
+    sighting it fights.
+    """
+    if any(moment > now for moment in dispute.created_at):
+        return True
+    if dispute.first_observed_at is None:
+        return False
+    return any(moment > dispute.first_observed_at for moment in dispute.created_at)
+
+
+def _dispute_predates(dispute: DisputedBooking, *, anchor: datetime | None, now: datetime) -> bool:
     """Was this booking proven to exist ALREADY when the attempt was made?
 
     A delivery about a booking proves the booking existed when that delivery
@@ -563,9 +616,12 @@ def _dispute_predates(dispute: DisputedBooking, *, anchor: datetime | None) -> b
     about a booking whose own creation deliveries name two owners or two
     instants: there the record does not merely lack a fact, it asserts two that
     cannot both hold, and letting the earliest delivery of such a booking clear
-    it would hide the louder problem behind the quieter one.
+    it would hide the louder problem behind the quieter one. A record whose own
+    claimed instant fights that earliest delivery
+    (:func:`_dispute_chronology_contradicted`) is in the same position, and is
+    checked BEFORE the sighting is applied rather than after.
     """
-    if anchor is None or dispute.contradictory:
+    if anchor is None or dispute.contradictory or _dispute_chronology_contradicted(dispute, now=now):
         return False
     if dispute.first_observed_at is not None and dispute.first_observed_at <= anchor:
         return True
@@ -582,6 +638,7 @@ def _dispute_touches(
     owners: CreationOwners | None = None,
     live: frozenset[uuid_module.UUID],
     anchor: datetime | None,
+    now: datetime,
 ) -> bool:
     """Could this unattributable booking be the person being judged's?
 
@@ -621,7 +678,7 @@ def _dispute_touches(
         # provably already there. That is the same bar the dated case has to
         # clear, and it has to be the same bar — a row that reads unknown with a
         # usable creation instant must not become admissible by losing it.
-        return not (owner == ATTRIBUTION_THEIRS and _dispute_predates(dispute, anchor=anchor))
+        return not (owner == ATTRIBUTION_THEIRS and _dispute_predates(dispute, anchor=anchor, now=now))
     if owner == ATTRIBUTION_ANOTHERS:
         # Provably somebody else's creation, proven in the branch that made it,
         # and not in this person's list. Whatever is disputed about it — when it
@@ -629,7 +686,7 @@ def _dispute_touches(
         # Holding an unrelated recipient's empty history open on it confuses
         # "the capture has a gap" with "this recipient may have booked".
         return False
-    if _dispute_predates(dispute, anchor=anchor):
+    if _dispute_predates(dispute, anchor=anchor, now=now):
         # A booking proven to have existed when the mailing went out cannot be
         # one made since, whoever made it and with no creation date guessed.
         return False
@@ -647,7 +704,11 @@ def _dispute_touches(
         # theirs this deployment cannot see, so matching digits are not the
         # question there — the absence of an answer is.
         branches = {int(value) for value in numeric_branches}
-        if not dispute.creation_pairs:
+        if not dispute.creation_pairs or dispute.creation_without_owner:
+            # And a creation delivery that named nobody is the same position
+            # seen from the other side: one of the claims about who made this
+            # booking is absent, so comparing their number against the claims
+            # that ARE present answers nothing.
             return True
         return any(
             int(customer_id) == int(numeric_id) if int(company_id) in branches else True
@@ -856,7 +917,7 @@ async def load_creation_evidence(
             dispute.booking_uuid
             for dispute in scan.disputed
             if dispute.booking_uuid in live
-            and _dispute_predates(dispute, anchor=anchor)
+            and _dispute_predates(dispute, anchor=anchor, now=now)
             and _dispute_owner(
                 dispute,
                 numeric_id=numeric_id,
@@ -887,6 +948,7 @@ async def load_creation_evidence(
                 owners=owners,
                 live=live,
                 anchor=anchor,
+                now=now,
             )
             for dispute in scan.disputed
         ):

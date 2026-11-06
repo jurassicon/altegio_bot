@@ -386,6 +386,19 @@ later delivery handing the booking on. When the creator really cannot be
 established and the booking could be theirs, the row stays `unknown`, and an
 active booking ahead still excludes on its own.
 
+One delivery's proven owner answers for that delivery and for no other. Two
+creation deliveries of one booking, the same instant, two different configured
+branches, and only the first naming a customer — whose card proves a stranger's
+uuid: the booking came out "demonstrably somebody else's", the contradiction
+about where it was made was set aside with it, and recipients with completely
+empty histories came out `included`, bridged and manual alike. Whose creation
+the second delivery was had never been established, and a known owner cannot
+answer for a claim nobody made. So a dispute one of whose creation deliveries
+named nobody leaves the owner question open, and the recipient stays unknown
+until something else settles it: the second delivery naming the same stranger
+or another one closes it, and a number nobody has a card for, or one that
+resolves to the recipient themselves, does not.
+
 Who HOLDS a booking is not who made it, and only a creation delivery answers
 the second question. An update or a cancellation naming somebody else is an
 event in the life of a booking this person may well have made and handed on, so
@@ -430,14 +443,31 @@ recipient whose only account of themselves is their current list, that was the
 one thing the list cannot show, reported as nothing to see.
 
 A delivery that named NO customer forms no pair, and that is not the same as a
-delivery that changed nothing. Its branch is still proven, so what it records
-is that something happened to this booking in that branch — the booking's
+delivery that changed nothing. What it records is that something happened to
+this booking and that who holds it now is not established — the booking's
 custody is unproven, which is weaker than a reassignment and is kept apart from
 it: nobody is proven to have taken the booking over and nothing proves it
 stayed either. The missing field used to make the whole delivery disappear, and
 a booking that may have left a manual recipient's list then read as a booking
 that never moved; the very same delivery WITH a number had always read as a
 move, so a missing field decided the answer.
+
+The branch such a delivery came from does not narrow it. A numeric customer id
+is unique WITHIN a branch, so one branch holds many of them, and "somewhere in
+the branch that created this booking" is not "the same customer as created it":
+an earlier revision of this document counted only a delivery from ANOTHER
+branch, which let a nameless cancellation from the creation's own branch read
+as a repeat of a pair it never named.
+
+And the doubt reaches every decision about a card with no numeric bridge, not
+only the bookings outside that person's list. The permissive rule for such a
+card — "a booking nothing moved belongs to whoever created it" — needs both
+halves: no delivery naming a different customer record, and none that named no
+customer at all. With only the first half asked, a booking the recipient can
+SEE, whose creation names a number nothing resolves and whose cancellation
+named nobody, was still credited to them: made after the mailing it excluded
+them, and made before it — or with no instant at all — it left them
+`included`. A disputed booking of the same shape was credited the same way.
 
 So the pairs are what the follow-up reads, in both directions: a booking has
 moved when any delivery of it names a pair other than the one its creation
@@ -580,6 +610,21 @@ truthful earlier instant, which contradicts nothing and has its own regression
 and still excludes, `received_at` is never substituted for a creation date, and
 a second booking whose own facts agree, provably created after the attempt,
 still excludes on its own.
+
+A DISPUTED booking has a chronology of its own, and it is checked before its
+early sighting is believed. A creation delivery naming an owner and no instant,
+stored before the mailing, proves the booking existed by then; a later creation
+of the same booking naming no customer and claiming it was made after the
+mailing — or after the moment the preview is computed at — cannot be true
+beside it. The sighting used to settle such a record anyway, so the row came out
+`included`; the identical contradiction on a booking with an owner on every
+delivery already read as unknown, because an attributed booking's instants were
+checked and a disputed one's were not, although the weaker record is the
+disputed one. Nothing is invented from the contradiction: the claim is not
+evidence and neither is the sighting it fights. A record that AGREES — a
+truthful older instant, an ordinary late delivery, or no instant at all — is
+still settled by the sighting, and `received_at` is still never read as a
+creation date.
 
 The first sighting is taken from every delivery whose branch and booking
 identity are proven, including a `booking-created` that named no customer. Such
@@ -1246,6 +1291,38 @@ The eighth round's four findings, each failing before its fix:
    Controls: an ordinary unreadable string, a valid instant with an offset
    which still excludes, and a second independent row of the batch which keeps
    its ordinary answer.
+
+The ninth round's three findings, each failing before its fix:
+
+1. a manual recipient with no numeric bridge SEEING a booking whose creation
+   names a number nothing resolves, with a cancellation of it naming no
+   customer: `excluded` for an instant after the mailing, `included` for one
+   before it and for none at all, because the permissive rule asked only
+   whether some delivery had named a different customer record. Twelve cases —
+   three shapes, both branches, both delivery orders — plus the same nameless
+   cancellation from the creation's own branch with an empty history, which
+   the round-8 revision had wrongly pinned as `included`. Controls: their own
+   proven creation still excludes them for a new booking and leaves them
+   provable for an old one; a proven foreign creator still answers; the same
+   proven pair twice is still a repeat; and outside their list a booking made
+   before the mailing, or already heard of by then, is still no gap at all;
+2. one booking uuid with two creation deliveries, one instant and two
+   configured branches, the first naming a customer whose card proves a
+   stranger's uuid and the second naming nobody: `included` for a bridged and
+   a manual recipient with empty histories, because the known owner answered
+   for both deliveries. Controls, by what the second delivery names: the same
+   stranger or another stranger closes it; a number nobody has a card for, or
+   the recipient themselves, leaves it open; and a partial repeat in the
+   creation's own branch with the same instant is still no refusal at all;
+3. an undated creation naming an owner, stored before the mailing, beside a
+   later creation naming nobody and claiming an instant after the mailing or
+   after the preview itself: `included`, because the early sighting was
+   believed without checking what the record claimed against it. Inside their
+   list and outside it, and pinned on the rule itself so the claimed instant
+   rather than the missing owner is what withdraws the sighting. Controls: an
+   agreeing older instant and no instant at all are still settled by the
+   sighting, and their own new booking or a booking ahead still excludes for
+   its own reason.
 
 ## 11. Rollout prerequisites — NOT satisfied
 

@@ -167,9 +167,17 @@ Rules:
 * A LIFECYCLE delivery whose branch and booking are proven and whose customer
   is missing keeps its branch too. No `(branch, number)` pair is invented from
   it, so it credits nobody and declares no change of person; what it records is
-  that something happened to that booking in that branch, which a caller whose
-  only view of a person is their current booking list needs (§46.5). The report
-  itself neither counts nor publishes it.
+  that something happened to that booking and that who holds it now is not
+  established, which a caller whose only view of a person is their current
+  booking list needs (§46.5). The branch it came from does not narrow that: a
+  numeric customer id is unique WITHIN a branch, so the branch that created a
+  booking holds every other customer of that branch too, and "somewhere in that
+  branch" is not "the same customer". The report itself neither counts nor
+  publishes it.
+* A booking the report cannot attribute is handed to such a caller with both
+  doubts stated: whether a creation delivery of it named NO customer, and
+  whether any delivery of it left the holder unnamed. Neither is a conversion,
+  neither credits anybody, and neither changes what this report prints.
 * A booking some delivery assigns to another customer keeps the creation
   attributed to the customer its own creation delivery named, flags
   `customer_reassigned` in the details, and credits the other customer with
