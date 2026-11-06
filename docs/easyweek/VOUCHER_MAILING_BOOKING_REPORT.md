@@ -99,6 +99,15 @@ Rules:
 * two different numeric ids for one proven UUID, or a numeric id that another
   card binds to a different UUID, is a **conflict**: the row is reported as
   unknown and nobody is credited;
+* a numeric customer id is unique **per branch**, not per workspace, so the
+  reverse check above reads the cards per `(branch, number)` pair. How those
+  claims are combined depends on the question: this report asks which cards
+  speak for one recipient, which is not branch-limited, so any card binding
+  those digits to another UUID is still a conflict here. A caller that passes
+  the branch registry — §46.5's follow-up, which judges deliveries from
+  configured branches — asks only about the branches that person's own card
+  proves the number in, because another branch's card with the same digits is a
+  different customer record and contradicts nothing;
 * one customer UUID may hold cards in several branches. That is one recipient,
   not several conversions. The report lists the branches and merges nothing;
 * opening or refreshing the report fills no `Client` UUID, merges no cards and
@@ -123,7 +132,13 @@ Rules:
   appointment are one booking, never a second conversion.
 * Only a `booking-created` delivery can establish a creation. Two creation
   deliveries for one booking that disagree about the customer, the instant or
-  the branch are a conflict and are not a positive fact for anybody.
+  the branch are a conflict and are not a positive fact for anybody. The
+  disagreement is read from the SETS of customers, branches and instants the
+  creation deliveries named, so a delivery that could not state one of those
+  fields still contradicts a second delivery over the fields it did state: a
+  creation naming no customer still names a branch and, when its payload
+  carried a usable one, an instant. It is counted once per booking, it still
+  credits nobody, and it is still no conversion.
 * A late event about a booking created **before** the send is not counted.
 * Recipients are counted uniquely. Several bookings by one recipient are one
   recipient in the counter and several entries in the details.
@@ -149,10 +164,34 @@ Rules:
 * An identical Resend is recognised by the capture's own content identity
   (`payload_hash`) and adds no second fact, so replaying an old payload cannot
   move the answer. Nothing is replayed by this report.
+* A LIFECYCLE delivery whose branch and booking are proven and whose customer
+  is missing keeps its branch too. No `(branch, number)` pair is invented from
+  it, so it credits nobody and declares no change of person; what it records is
+  that something happened to that booking and that who holds it now is not
+  established, which a caller whose only view of a person is their current
+  booking list needs (§46.5). The branch it came from does not narrow that: a
+  numeric customer id is unique WITHIN a branch, so the branch that created a
+  booking holds every other customer of that branch too, and "somewhere in that
+  branch" is not "the same customer". The report itself neither counts nor
+  publishes it.
+* A booking the report cannot attribute is handed to such a caller with both
+  doubts stated: which BRANCHES a creation delivery of it named no customer
+  from, and whether any delivery of it left the holder unnamed. The branches
+  are reported rather than a bare flag, because one booking is made in exactly
+  one branch: a nameless creation from the branch an owned creation also named
+  may be that same creation again, and one from any other branch cannot be.
+  Which of those a caller needs is the caller's question — neither is a
+  conversion, neither credits anybody, and neither changes what this report
+  prints.
 * A booking some delivery assigns to another customer keeps the creation
   attributed to the customer its own creation delivery named, flags
   `customer_reassigned` in the details, and credits the other customer with
-  nothing.
+  nothing. The comparison is between `(branch, customer id)` **pairs** and not
+  between bare numbers: the same digits in two branches are two different
+  customer records, so a booking created in one branch and then named by a
+  delivery from another has been moved, and reporting it as unmoved hid that
+  from a caller whose only view of a person is their current list. It is still
+  one booking, one conversion and one creation.
 
 ## 6. Data completeness
 
@@ -173,6 +212,21 @@ Four answers are distinguished and never collapsed:
   captured payload, and ignores the inbox worker's status.
 * Incomplete, truncated and conflicting payloads never become positive facts.
   They are counted by reason in the coverage block, with no personal data.
+* A `booking_created_at` that is syntactically valid and cannot be expressed in
+  UTC at all — the first day of year one east of Greenwich, the last second of
+  year 9999 west of it — is counted as `booking_created_at_unusable` like any
+  other unreadable instant. The delivery's branch, booking and customer stay
+  proven, `received_at` is not substituted for the missing instant, and the
+  overflow is one delivery's problem rather than the whole read's.
+* A `booking-created` delivery whose branch and booking identity are proven and
+  whose **customer is missing** is counted as `customer_identity_unusable`, as
+  before: it credits nobody, is no conversion, moves no per-branch observation,
+  and — since nothing about it is in dispute either — produces no disputed
+  record for a caller to refuse on. What it does prove is kept: the booking
+  with that identity existed in that branch when the delivery was stored, which
+  is a lower bound on its existence for a caller holding the same booking uuid,
+  and never a creation date. A delivery that proves no branch or no booking
+  identity proves nothing and is counted as before.
 * The coverage block reports, per configured branch, how many new bookings were
   observed in the scanned range. A zero means "nothing observed here", not a
   proven absence of bookings.
@@ -185,6 +239,70 @@ Four answers are distinguished and never collapsed:
 * The capture scan is bounded: below by the earliest proven send minus one day
   of late-capture margin, above by the moment of reading, with a hard row cap.
   If the cap bites, the report says the coverage was truncated.
+* **An undated creation is still a counted gap here.** A creation delivery whose
+  branch, booking identity and customer are all proven and whose own
+  `booking_created_at` is missing or unreadable is still rejected as
+  `booking_created_at_unusable`, still absent from this report's conversions and still
+  absent from its per-branch observations. What changed is that the proven half
+  of it is no longer thrown away with the unproven half: the owner it named
+  reaches the disputed set below. `received_at` is never substituted for the
+  creation instant, here or anywhere.
+* **An undated creation can also be half of a creators' conflict.** WHO created
+  a booking is a fact a creation delivery states even when it could not state
+  WHEN, so two creation deliveries of one booking naming different customers
+  disagree about its owner however many of them carry a usable instant. Such a
+  booking is `conflicting_creation_events` and no conversion, in either delivery
+  order; before, the undated delivery left the aggregation before the comparison
+  was made and the booking was attributed to whichever creation was dated. One
+  conflicting pair is still exactly ONE counted conflict: the owners'
+  disagreement is counted where it is detected and not a second time by the
+  instant comparison. A repeated delivery of the same creation — including one
+  that merely adds the instant an earlier one omitted — is still the ordinary
+  case and counts nothing. The window, the conversion rules and the per-branch
+  observations are unchanged.
+* **And of a BRANCH conflict, read the same way.** WHERE a booking was created
+  is stated by a creation delivery that could not state when, and two creations
+  of one booking from two different branches are a contradiction even when they
+  name the same numeric customer id — because that id is unique per branch, so
+  the same digits in two branches are two different customers. Counted once,
+  like the owners' disagreement, and no longer compared only between two dated
+  creations. A disputed booking now carries every branch its creations named
+  beside every customer they named, which is what makes those ids readable at
+  all.
+* **An observed booking carries when it was first heard of.** The earliest
+  moment any delivery of it was received, kept beside its creation instant and
+  deliberately NOT published in the report's own rows: it is a lower bound on
+  when the booking existed and never a creation date, and this report has no
+  send anchor to compare it against. PR-22.2's follow-up has one, and uses it to
+  refuse a booking whose single creation claims it appeared after an attempt
+  that the capture's own earlier delivery says it predates.
+* **The identity resolver's scope is unchanged here.** `resolve_identities`
+  gained an optional branch scope for the follow-up, which asks about the
+  configured branches only. Called without it — as this report calls it — it
+  reads the same cards it always did, because the question "which cards speak
+  for one recipient" is not branch-limited.
+* **Disputed bookings are reported, not claimed.** `scan_capture` now also
+  returns the bookings it saw and cannot attribute — two creation deliveries of
+  one booking naming different owners, and a booking with lifecycle deliveries
+  and no creation — with every customer any delivery named and every creation
+  instant stated. This report still reads `bookings` and `rejected` exactly as
+  before and still counts those shapes among its rejections: a conversion needs
+  a proven creation, and nothing here claims one. The field exists for PR-22.2's
+  follow-up, which asks about a PERSON and for which a dropped dispute would
+  read as "nothing happened". Each disputed row also carries the EARLIEST moment
+  any delivery of that booking was received — a lower bound on when the booking
+  existed, never a creation date, and not read by this report at all.
+* **This report's own bounds are unchanged.** `scan_capture` now takes an
+  explicit `lookback`, and the report keeps passing the one day it was written
+  with — a conversion is a booking CREATED after the send, so a creation
+  delivered more than a day before it cannot be one. PR-22.2's follow-up
+  preview reuses the same scan with `lookback=None` for a different question:
+  when was a booking the live read can see actually made, which may be long
+  before the mailing. That variant reads the most recent capped number of
+  lifecycle deliveries newest-first through the primary key, applies them in
+  their own order, and reports truncation rather than a short answer — so it is
+  bounded in rows and in work, it is not a full-history scan, and it changes
+  nothing about what this report reads or claims.
 * With no proven send there is no window, so nothing is scanned at all.
 * Late events and a later proven identity binding are picked up by the next
   refresh, because each refresh re-reads.

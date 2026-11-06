@@ -50,6 +50,7 @@ import pytest_asyncio
 import altegio_bot.campaigns.runner as campaign_runner_module
 import altegio_bot.ops.campaigns_api as campaigns_api_module
 import altegio_bot.ops.router as ops_router_module
+import altegio_bot.ops.voucher_followup as voucher_followup_module
 import altegio_bot.ops.voucher_mailing as voucher_mailing_module
 from altegio_bot.ops.auth import SESSION_COOKIE
 from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import OPS_USER, session_cookie
@@ -90,6 +91,10 @@ async def ops_server(session_maker, monkeypatch, ops_credentials) -> AsyncIterat
     from altegio_bot.main import app
 
     monkeypatch.setattr(voucher_mailing_module, "SessionLocal", session_maker)
+    # The §46.2 follow-up preview screen lives in its own module and reads its
+    # own ``SessionLocal``, so it needs the same redirection or it would open
+    # the deployment's database from inside a test.
+    monkeypatch.setattr(voucher_followup_module, "SessionLocal", session_maker)
     monkeypatch.setattr(ops_router_module, "SessionLocal", session_maker)
     monkeypatch.setattr(campaigns_api_module, "SessionLocal", session_maker)
     monkeypatch.setattr(campaign_runner_module, "SessionLocal", session_maker)

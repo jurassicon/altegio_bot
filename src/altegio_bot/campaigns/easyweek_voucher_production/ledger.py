@@ -1490,6 +1490,32 @@ async def terminal_stop_active(session_maker: async_sessionmaker[AsyncSession], 
         return await _stop_is_terminal_schema(session, batch_id=batch_id)
 
 
+async def stop_facts_in_session(session: AsyncSession, *, batch_id: int) -> tuple[bool, int]:
+    """``(active, generation)`` inside a transaction the CALLER owns.
+
+    The same two facts :func:`stop_generation` returns, without opening a second
+    session for them. Added for the §46.2 follow-up preview, which has to read
+    the stop state and the generation in the one transaction that stores its
+    snapshot: a preview is not permission, so it takes no lock here, and the
+    generation it stamps is what lets a later phase notice that the stop moved
+    after the preview was taken.
+    """
+    return await _stop_facts_locked(session, batch_id=batch_id)
+
+
+async def terminal_stop_active_in_session(session: AsyncSession, *, batch_id: int) -> bool:
+    """Is this batch under a §45.4 terminal stop, in the caller's transaction?
+
+    Exactly :func:`terminal_stop_active`, reusing the caller's session. The stop
+    semantics stay in this module — an active stop plus a current fixed product
+    schema — so the follow-up preview cannot acquire its own opinion about what
+    a terminal stop is.
+    """
+    if not await _stop_is_active_locked(session, batch_id=batch_id):
+        return False
+    return await _stop_is_terminal_schema(session, batch_id=batch_id)
+
+
 async def stop_is_active(session_maker: async_sessionmaker[AsyncSession], *, batch_id: int) -> bool:
     """Is a stop in force? A standalone read, for the pre-claim shortcut.
 
@@ -2034,10 +2060,15 @@ async def record_item_outcome(
     Two §46.3 duties ride along, both inside this transaction's existing locks
     rather than in a second one of their own:
 
-    * ``provider_message_id`` claims any failure fact that arrived BEFORE this
-      commit. A ``failed`` callback can overtake the write that records the
-      identifier, and binding it here means the very commit that makes it
-      bindable also binds it;
+    * ``provider_message_id`` claims any callback fact that arrived BEFORE this
+      commit — a ``failed`` one, and a signed ``delivered``/``read`` one. Any of
+      them can overtake the write that records the identifier, and binding them
+      here means the very commit that makes them bindable also binds them. The
+      positive ones bind FIRST and advance this slot through the same transition
+      rule the live callback path uses; the failures bind after, so each is
+      judged against a slot that already carries whatever success was proven,
+      and a `failed` that overtook the commit alongside a `read` is recorded as
+      the conflict it is rather than as a confirmed failure;
     * ``proven_api_rejection`` records that META refused the request. Only the
       caller's proven-rejection branch may pass it. ``send_rejected`` alone is
       not that proof: this phase writes the same state for its own parameter
@@ -2147,6 +2178,39 @@ async def record_item_outcome(
                     attempt.completed_at = now
             if provider_message_id is not None:
                 await session.flush()
+                # §46.3's positive half FIRST, and the order is the contract
+                # rather than a convenience. A signed ``delivered``/``read`` can
+                # overtake this very commit and was kept unmatched because
+                # nothing owned the identifier yet; binding it here means the
+                # commit that makes it bindable also applies it, so a status
+                # that may never be re-sent is not lost.
+                #
+                # Applied in rank order, through the same transition rule the
+                # live callback path uses: ``read`` outranks ``delivered``, and
+                # neither can walk the slot backwards.
+                confirmed = await delivery_evidence.bind_unmatched_receipts(
+                    session,
+                    item=row,
+                    provider_message_id=provider_message_id,
+                    observed_at=now,
+                )
+                for receipt_kind, item_status in delivery_evidence.RECEIPT_KIND_STATUS:
+                    if receipt_kind in confirmed:
+                        _advance_delivery_status(row, status=item_status, now=now)
+                await session.flush()
+                # And the failures AFTER, so each one is judged against a slot
+                # that already carries whatever success was proven for it.
+                #
+                # This is §46.3's precedence, not a guess about arrival order:
+                # `read` and `delivered` keep their force against a later
+                # `failed`, whichever reached the webhook first, and the two
+                # tables' row ids are not comparable evidence of anything. With
+                # the failures bound first, a `delivered`/`failed` pair that BOTH
+                # overtook this commit left the slot read-or-delivered AND
+                # carrying `confirmed_delivery_failure`, because at that moment
+                # the slot's own timestamps were still empty and the failure
+                # looked uncontradicted. The same pair arriving after the commit
+                # was always recorded as a conflict; now both orders agree.
                 await delivery_evidence.bind_unmatched_failures(
                     session,
                     item=row,
@@ -2275,6 +2339,46 @@ async def _locate_message(session: AsyncSession, provider_message_id: str) -> tu
     return (int(found[0]), int(found[1])) if found is not None else None
 
 
+def _advance_delivery_status(
+    row: EasyWeekVoucherProductionBatchItem,
+    *,
+    status: str,
+    now: datetime,
+) -> bool:
+    """Move ONE slot to ``delivered``/``read``, or refuse to walk it backwards.
+
+    THE single definition of that transition, used by the live callback path and
+    by the binding of an early callback that arrived before this slot owned its
+    message id. One rule, so the two cannot disagree about monotonicity or about
+    which timestamps a status implies.
+
+    ``False`` means the status would lower the slot's rank: a duplicate, or a
+    ``delivered`` arriving after a ``read``. Acceptance is what Meta said and a
+    later webhook cannot unsay it.
+    """
+    if ITEM_RANK[status] < ITEM_RANK[row.status]:
+        return False
+    if row.provider_accepted_at is None:
+        # A callback can land beside the commit that recorded acceptance. The
+        # identifier only exists because Meta answered with it, so the callback
+        # itself is the proof — and refusing here would silently lose a status.
+        row.provider_accepted_at = now
+    if row.delivered_at is None:
+        # Read implies delivered. Recording read without it would leave a row
+        # the database itself refuses, so this same callback stamps both.
+        row.delivered_at = now
+    if status == VOUCHER_PRODUCTION_ITEM_READ and row.read_at is None:
+        row.read_at = now
+    row.status = status
+    row.reconciliation_required = False
+    # A delivered or read message means the voucher reached its person: there is
+    # no open draft left for anybody to close by hand. Forced rather than left
+    # alone, because the flag was set back when the order was still a draft.
+    row.manual_cleanup_required = False
+    row.updated_at = now
+    return True
+
+
 async def _apply_webhook_locked(
     session: AsyncSession,
     *,
@@ -2310,7 +2414,7 @@ async def _apply_webhook_locked(
         # The unlocked lookup saw something this transaction does not. Not ours
         # as far as this unit of work is concerned, and nothing is written.
         return RecordOutcome(False, RECORD_MISSING_ROW)
-    if ITEM_RANK[status] < ITEM_RANK[row.status]:
+    if not _advance_delivery_status(row, status=status, now=now):
         # A duplicate, or a callback that arrived out of order. Acceptance is
         # what Meta said and a later webhook cannot unsay it.
         return RecordOutcome(
@@ -2320,24 +2424,6 @@ async def _apply_webhook_locked(
             header.status == VOUCHER_PRODUCTION_HALTED,
             bool(header.reconciliation_required),
         )
-    if row.provider_accepted_at is None:
-        # A callback can land beside the commit that recorded acceptance. The
-        # identifier only exists because Meta answered with it, so the callback
-        # itself is the proof — and refusing here would silently lose a status.
-        row.provider_accepted_at = now
-    if row.delivered_at is None:
-        # Read implies delivered. Recording read without it would leave a row
-        # the database itself refuses, so this same callback stamps both.
-        row.delivered_at = now
-    if status == VOUCHER_PRODUCTION_ITEM_READ and row.read_at is None:
-        row.read_at = now
-    row.status = status
-    row.reconciliation_required = False
-    # A delivered or read message means the voucher reached its person: there is
-    # no open draft left for anybody to close by hand. Forced rather than left
-    # alone, because the flag was set back when the order was still a draft.
-    row.manual_cleanup_required = False
-    row.updated_at = now
 
     await session.flush()
     await _settle_header(session, header, now=now)
@@ -2484,7 +2570,9 @@ __all__ = [
     "request_stop",
     "resettle",
     "stop_generation",
+    "stop_facts_in_session",
     "terminal_stop_active",
+    "terminal_stop_active_in_session",
     "stop_is_active",
     "stop_state",
 ]

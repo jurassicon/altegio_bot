@@ -1653,3 +1653,115 @@ async def test_an_empty_preview_reports_zero_without_pretending_to_be_a_mailing(
     assert report.preview_active_count == 0
     assert report.summary()["recipients"] == 0
     assert report.any_send_confirmed is False
+
+
+# ===========================================================================
+# 16. What a delivery really named: the pair, and the proven half of a gap
+# ===========================================================================
+
+
+async def test_a_creation_that_named_only_a_booking_is_no_conversion_and_no_dispute(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """Review round 7, finding 4: the proven half of such a delivery is small.
+
+    A ``booking-created`` whose branch and booking identity are proven and
+    whose customer is missing says that this booking exists and nothing about
+    whose it is. The report keeps counting it as the gap it is: no conversion,
+    no booking on anybody's row, and — since nothing about it is in dispute
+    either — no disputed record for a caller to refuse on.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    await capture(
+        session_maker,
+        payload=booking_payload(
+            booking_uuid=str(uuid_module.uuid4()),
+            customer_id=None,
+            created_at=iso(SENT + timedelta(days=2)),
+        ),
+        received_at=SENT + timedelta(days=2),
+    )
+
+    report = await _report(session_maker, batch_id=batch_id)
+
+    assert _row(report).attribution_state == attribution.BOOKING_NOT_OBSERVED
+    assert _row(report).bookings == ()
+    assert report.summary()["booked_after_send"] == 0
+    assert report.scan.rejected == {attribution.REJECT_CUSTOMER_ID: 1}
+    assert report.scan.disputed == ()
+
+
+async def test_one_booking_moved_to_another_branch_is_still_one_conversion(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """Review round 7, finding 2: the same digits in two branches are two records.
+
+    A booking created under this recipient's number in their own branch, and
+    then a lifecycle delivery about the same booking from another branch naming
+    the same digits. A numeric customer id is unique per branch, so those are
+    two different customer records and the deliveries disagree about whose
+    booking it is — which the report reads from the observed (branch, number)
+    pairs rather than from the bare numbers.
+
+    What the report says is unchanged in every other respect: the creation is
+    still the historical fact, it is still one booking and one conversion, and
+    the disagreement is shown rather than hidden.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    created = SENT + timedelta(days=2)
+    booking_uuid = str(uuid_module.uuid4())
+    await capture(
+        session_maker,
+        payload=booking_payload(booking_uuid=booking_uuid, customer_id=NUMERIC, created_at=iso(created)),
+        received_at=created,
+    )
+    await capture(
+        session_maker,
+        payload=booking_payload(
+            booking_uuid=booking_uuid,
+            customer_id=NUMERIC,
+            created_at=iso(created),
+            company_id=ETTLINGEN_COMPANY_ID,
+        ),
+        event_hint="booking-canceled",
+        received_at=created + timedelta(days=1),
+    )
+
+    report = await _report(session_maker, batch_id=batch_id)
+    row = _row(report)
+
+    assert row.attribution_state == attribution.BOOKING_FOUND
+    assert len(row.bookings) == 1
+    assert row.bookings[0].company_id == COMPANY_ID
+    assert row.bookings[0].customer_reassigned is True
+    assert report.summary()["booked_after_send"] == 1
+
+
+async def test_the_reports_own_window_still_starts_one_day_before_the_send(
+    session_maker, production_configuration, workspace_branches, binding_key
+):
+    """And the report's floor is untouched by the follow-up's unbounded reach.
+
+    §46.5's follow-up asks when a booking was MADE, which may be months before
+    the mailing, and it passes ``lookback=None`` for that. The report asks
+    whether anything was created AFTER the send, so its own scan still begins
+    one day below the earliest proven send and a creation older than that is
+    not read at all.
+    """
+    _run_id, batch_id = await _one_sent_recipient(session_maker)
+    await capture(
+        session_maker,
+        payload=booking_payload(
+            booking_uuid=str(uuid_module.uuid4()),
+            customer_id=NUMERIC,
+            created_at=iso(SENT - timedelta(days=40)),
+        ),
+        received_at=SENT - timedelta(days=40),
+    )
+
+    report = await _report(session_maker, batch_id=batch_id)
+
+    assert report.scan.scan_from == SENT - attribution.LATE_CAPTURE_SLACK
+    assert report.scan.scanned_events == 0
+    assert _row(report).attribution_state == attribution.BOOKING_NOT_OBSERVED
+    assert report.summary()["booked_after_send"] == 0

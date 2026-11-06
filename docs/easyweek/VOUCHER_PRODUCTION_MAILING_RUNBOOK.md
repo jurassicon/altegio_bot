@@ -1696,5 +1696,151 @@ answer. Those people are unsubscribed for good as far as this mailing is
 concerned; an operator who needs to reverse one has to do it deliberately, as a
 data change, not through a message.
 
-No follow-up audience, text, confirmation, ledger or send exists at this stage,
-and none is reachable by a flag.
+At that stage no follow-up audience, text, confirmation, ledger or send existed,
+and none was reachable by a flag. Section 17 is what changed since.
+
+## 17. Follow-up PREVIEW (PR-22.2) — and what is still not implemented
+
+The contract lives in `VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md`. Read it before
+using this section on a production audience.
+
+### Implemented now
+
+One screen per original mailing, reached from that mailing's own page:
+«Повторное сообщение: предпросмотр». On it an operator selects one or more of
+the three groups of the original mailing's recipients, states explicitly how much
+time must have passed since the original send attempt, reads the exact repeat
+text with placeholders, and presses one button to check the composition. The
+answer is how many people are eligible, who is excluded, who could not be
+established, and the reason for each in words.
+
+The result is stored as an immutable, versioned snapshot. Pressing the button
+again adds the next version and leaves the previous one exactly as it was.
+
+What the server proves before anybody is included: the batch is one of the fixed
+€10 products of schema 3/4 — composed from earned visits, from an operator's
+manual selection or from both — with the branch's own confirmed sender and no
+terminal stop; the recipient is still the same person on the same number the
+original attempt actually went to, proven through the link their own basis
+carries; the delivered or read status they are selected by carries recorded
+proof of a verified callback on that frozen route; the chosen minimum interval
+has passed, measured from the proven original attempt; the original order is
+read back and its voucher proven, including a real check of the stored MAC
+against the code the order carries **and** a proven settlement — a paid state
+with every published amount equal to what that order's own schema contracts,
+because a code that exists is not an order that was paid for; the §46.4 consent
+aggregate allows it, and no refusal of theirs — sent from any number they are
+known by, at any branch — is sitting unaccounted in the stored-event backlog;
+the person has not replied since; and the bookings say nothing against it — no
+booking **created** after the attempt (from the captured creation deliveries,
+cancelled ones included, and every booking the live read can see needs a proven
+creation before "nothing new" may be asserted) and no active booking ahead
+(from the live, fully paginated history), across every configured branch of the
+workspace.
+
+Everything unestablished is reported as «не установлено» with its own reason,
+never as eligible. A saved result is shown as current only while it is young
+**and** the message contract, the policy and the source batch are still the ones
+it was computed under **and** nothing blocks a follow-up right now; otherwise it
+is shown as a historical result that needs recomputing, and a text that has
+changed since is not passed off as the text that composition was built with.
+
+Reading the page re-proves those three things and nothing else — opening a screen
+does not re-read anybody's consent, replies, voucher or bookings, because that is
+the explicit «Проверить состав» action. So the green state names what it checked
+and says in the same breath that the composition was not recomputed, every saved
+number is printed with the moment it was computed, and the page never claims that
+the recipients or their count are confirmed now. To learn the current count,
+recalculate.
+
+### What this is NOT
+
+**There is no sending.** No send button, no send confirmation, no endpoint, no
+queue, no job, no executor, and no path through the generic dispatch, the Outbox
+or the old follow-up worker. A stored preview authorises nothing: it is evidence
+of what was true at its check time, it expires after 24 hours, and it neither
+spends nor reserves a send attempt. The original mailing's ledger, its one-attempt
+limit, its stop rules and its booking report are untouched.
+
+Reading a preview changes nothing. A check that fails leaves the previous
+snapshot visibly stale rather than looking current — on the open page too, the
+moment the refusal or the transport failure comes back, without waiting for a
+reload.
+
+### Before this is used on a production audience
+
+Five things, none of them done by this stage:
+
+1. **Finish the historical consent reconciliation** of section 16. At the last
+   diagnosis supplied by the owner it was **not** finished: the stored-event
+   scan was incomplete and unapplied, and the suppression table was empty. **An
+   empty suppression table is not proof of consent.** This is a separate
+   mandatory owner step, and no number from that diagnosis is built into the
+   code.
+
+   The preview protects itself in the meantime: it scans the unaccounted stored
+   events for the recipients it is about, blocks anybody whose refusal is
+   sitting there unprocessed, and reports «не установлено» for everybody if that
+   scan cannot be completed. That is a fail-closed precondition, not a
+   replacement for running the projection.
+2. **Create and approve the follow-up Meta template**
+   (`kitilash_ka_new_client_voucher_followup_v1`, `de`, MARKETING, one BODY,
+   positional parameters) in Meta's own interface, and add its local row. This
+   application does not create or modify Meta templates, and will not send free
+   text instead. Until both exist the preview answers
+   `followup_template_unproven`, which is the honest state of the prerequisite.
+3. **Decide the failure-admissibility policy.** The shipped
+   `followup-failure-policy-v1` admits nothing, so the group «Подтверждённая
+   ошибка» yields zero by design. A waiting time and a list of permitted Meta
+   error codes have not been invented here; they are an owner decision, and a
+   permanent block, a policy restriction, an unknown reason and an unresolved
+   sender or template problem can never be admitted whatever that decision is.
+4. **Expect a small audience from mailings sent before this deploy.** A
+   `delivered`/`read` status now records its §46.3 proof — the verified
+   signature and the matching route — beside the slot's own transition, but only
+   for callbacks that arrive from now on. Slots of an older mailing have a
+   status and no proof, so a preview reports them as «не установлено». That is
+   the honest answer; the owner decides whether to wait for proven callbacks or
+   to confine the first follow-up to a mailing sent after this deploy.
+
+   From now on a positive callback is also not lost when it overtakes the write
+   that records the message id: a signed `delivered`/`read` whose identifier
+   nothing owns yet is kept and then bound by the very commit that records that
+   identifier, which also advances the slot. An unsigned one is still not kept,
+   and a foreign route still proves nothing.
+
+   And a slot no longer keeps a confirmed delivery failure that a proven success
+   for the same message has contradicted. Whichever of the pair this deployment
+   read first, the success stands, the failure stays in the audit as a conflict
+   with its reason and route intact, and the slot records that a confirmation
+   was made and then withdrawn. An unsigned or foreign-route callback cannot
+   withdraw anything, a failure with no success beside it keeps its
+   confirmation, and neither the failed group's policy nor the mailing's attempt
+   count is affected.
+
+   That withdrawal now also reaches the pair the slot's RANK hid. The slot's
+   status only ever moves forward, and the proof of a callback is a separate
+   fact about that callback. Asking for the proof only when the status moved
+   tied them together: a signed `delivered` on the frozen route, arriving after
+   an unproven `read` had already walked the slot to the higher rank, was
+   refused by the monotonicity rule and discarded with its proof — and the slot
+   went on asserting a delivery failure about a message Meta had signed for. The
+   proof is now recorded for every callback whose exact message id belongs to
+   the slot, whether or not the rank moved. The rank still never walks
+   backwards, an unproven callback still proves nothing, and a message id this
+   phase does not own is still untouched.
+5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
+   claim, the terminal tombstones, the executor and the follow-up callbacks all
+   belong to that stage. The source and dedupe contract it will claim against is
+   already in the schema — at most one included row per source slot, per
+   canonical customer uuid and per original entitlement within one preview
+   version.
+
+### Migration
+
+One additive revision, `b7d41f9c0a52`, over `a1c4e7b25d80`. Three new tables and
+nothing else — the two preview tables and
+`easyweek_voucher_production_delivery_receipts`: no existing column altered, no
+consent row, delivery fact, attempt counter, HMAC byte or financial value
+touched. Its downgrade refuses, before any DDL, while any preview or any
+delivery receipt is stored.

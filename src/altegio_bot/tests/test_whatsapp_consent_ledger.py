@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
+from sqlalchemy import update as sa_update
 
 import altegio_bot.webhooks.whatsapp as wa_module
 from altegio_bot.main import app
@@ -29,6 +30,7 @@ from altegio_bot.models.models import (
     CONSENT_COMMAND_NONE,
     CONSENT_COMMAND_START,
     CONSENT_COMMAND_STOP,
+    CONSENT_SOURCE_INBOUND,
     CONSENT_STATE_OPTED_IN,
     CONSENT_STATE_OPTED_OUT,
     INBOUND_AUTHENTICITY_SIGNED,
@@ -46,6 +48,7 @@ from altegio_bot.models.models import (
 )
 from altegio_bot.providers.base import WhatsAppProvider
 from altegio_bot.settings import settings
+from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_consent import (
     GUARD_ALLOWED,
     GUARD_PENDING_INBOUND,
@@ -1011,7 +1014,7 @@ def test_the_consent_writer_and_the_worker_agree_about_chatwoot_origin() -> None
     """
     from types import SimpleNamespace
 
-    from altegio_bot.whatsapp_consent import _is_chatwoot_sourced
+    from altegio_bot.whatsapp_consent import is_chatwoot_sourced
 
     cases = (
         ("chatwoot:mirror-1", {"_chatwoot": {"source": "mirror"}}),
@@ -1023,7 +1026,7 @@ def test_the_consent_writer_and_the_worker_agree_about_chatwoot_origin() -> None
     for dedupe_key, payload in cases:
         event = SimpleNamespace(dedupe_key=dedupe_key, payload=payload, id=1)
         worker_says = worker_module._is_chatwoot_origin(event, payload) or worker_module._is_operator_relay(payload)
-        assert _is_chatwoot_sourced(event, payload) == worker_says, (dedupe_key, payload)
+        assert is_chatwoot_sourced(event, payload) == worker_says, (dedupe_key, payload)
 
 
 async def test_the_refusal_is_already_durable_when_the_handler_runs(session_maker, monkeypatch) -> None:
@@ -2843,3 +2846,148 @@ async def test_a_refusal_in_one_delivery_does_not_revive_cancelled_jobs(session_
     assert (await _client_row(session_maker, cards[ADDRESS])).wa_opted_out is False
     async with session_maker() as session:
         assert (await session.scalars(select(MessageJob.status))).all() == ["canceled"]
+
+
+# ===========================================================================
+# A historical snapshot is answered only on its OWN number (review round 3)
+# ===========================================================================
+
+_SNAPSHOT_UUID = uuid_module.UUID("00000000-0000-4000-8000-00000000abcd")
+
+
+async def _opted_out_snapshots(session_maker, *addresses: str) -> None:
+    """One historical ``CampaignRecipient.is_opted_out`` row per address."""
+    async with session_maker() as session:
+        async with session.begin():
+            run = CampaignRun(
+                provider=PROVIDER_EASYWEEK,
+                campaign_code="snapshot-scope",
+                mode="preview",
+                company_ids=[322579],
+                period_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                period_end=datetime(2026, 1, 31, tzinfo=timezone.utc),
+                status="completed",
+            )
+            session.add(run)
+            await session.flush()
+            for index, address in enumerate(addresses):
+                session.add(
+                    CampaignRecipient(
+                        campaign_run_id=run.id,
+                        provider=PROVIDER_EASYWEEK,
+                        company_id=322579,
+                        phone_e164=address,
+                        display_name=f"Snapshot {index}",
+                        status="skipped",
+                        is_opted_out=True,
+                    )
+                )
+
+
+async def _proven_opt_in_row(session_maker, *, address: str, decided_at: datetime) -> None:
+    """A suppression row that now reads ``opted_in``, bound to the shared uuid.
+
+    Written directly rather than through ``apply_consent_decision`` because the
+    question under test is how a READER orders it against a snapshot, and the
+    writer's own ordering rules are tested in their own section above.
+    """
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppConsentSuppression(
+                    wa_address=address,
+                    state=CONSENT_STATE_OPTED_IN,
+                    consent_version=2,
+                    decision_command=CONSENT_COMMAND_START,
+                    decision_source=CONSENT_SOURCE_INBOUND,
+                    decision_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    decided_observed_at=decided_at,
+                    decided_event_at=decided_at,
+                    last_stop_observed_at=decided_at - timedelta(days=10),
+                    last_stop_event_at=decided_at - timedelta(days=10),
+                    last_start_observed_at=decided_at,
+                    last_start_event_at=decided_at,
+                    banned_easyweek_customer_uuid=_SNAPSHOT_UUID,
+                    banned_uuid_recorded_at=decided_at - timedelta(days=10),
+                )
+            )
+
+
+async def test_an_opt_in_on_another_number_does_not_answer_this_snapshot(session_maker) -> None:
+    """§46.4.7 — a START lifts the refusal on the number it arrived from.
+
+    The same person, the same uuid, two numbers. They resubscribed on one of
+    them; the historical refusal recorded against the other was never
+    withdrawn. The reader used to compare every snapshot against a single
+    newest-opt-in figure for the person, so one number's resubscribe silently
+    answered the other number's refusal.
+    """
+    await _opted_out_snapshots(session_maker, ADDRESS)
+    await _proven_opt_in_row(session_maker, address=OTHER_ADDRESS, decided_at=utcnow() + timedelta(hours=1))
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, easyweek_customer_uuid=_SNAPSHOT_UUID)
+    assert decision.suppressed
+    assert SOURCE_RECIPIENT_FLAG in decision.sources
+
+
+async def test_an_opt_in_on_this_number_answers_its_own_snapshot(session_maker) -> None:
+    """The control: on its own number a newer proven opt-in still answers it."""
+    await _opted_out_snapshots(session_maker, ADDRESS)
+    await _proven_opt_in_row(session_maker, address=ADDRESS, decided_at=utcnow() + timedelta(hours=1))
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, easyweek_customer_uuid=_SNAPSHOT_UUID)
+    assert not decision.suppressed
+
+
+async def test_an_opt_in_older_than_its_own_snapshot_answers_nothing(session_maker) -> None:
+    await _opted_out_snapshots(session_maker, ADDRESS)
+    await _proven_opt_in_row(session_maker, address=ADDRESS, decided_at=utcnow() - timedelta(days=5))
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, easyweek_customer_uuid=_SNAPSHOT_UUID)
+    assert decision.suppressed
+    assert SOURCE_RECIPIENT_FLAG in decision.sources
+
+
+async def test_an_opt_in_at_the_same_moment_as_its_snapshot_answers_nothing(session_maker) -> None:
+    """A tie is not an order, and an unordered pair falls to the refusal.
+
+    The snapshot's own time cannot be absent — ``campaign_recipients.created_at``
+    is NOT NULL — so the unprovable case this rule exists for is a tie, and the
+    code's ``undated`` guard stays as defence in depth for any row a future
+    schema or import might leave without one.
+    """
+    await _opted_out_snapshots(session_maker, ADDRESS)
+    async with session_maker() as session:
+        taken = (
+            await session.scalars(select(CampaignRecipient.created_at).where(CampaignRecipient.phone_e164 == ADDRESS))
+        ).one()
+    await _proven_opt_in_row(session_maker, address=ADDRESS, decided_at=taken)
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, easyweek_customer_uuid=_SNAPSHOT_UUID)
+    assert decision.suppressed
+    assert SOURCE_RECIPIENT_FLAG in decision.sources
+
+
+async def test_a_busy_answered_number_cannot_hide_a_live_refusal_elsewhere(session_maker) -> None:
+    """The read is per address, so no row limit can push a refusal out of sight.
+
+    The earlier query took the newest fifty snapshots across every matched
+    number, ordered by time. Sixty answered snapshots on one number therefore
+    filled it completely and the live refusal on the other number was never
+    read.
+    """
+    await _opted_out_snapshots(session_maker, *([OTHER_ADDRESS] * 60), ADDRESS)
+    async with session_maker() as session:
+        async with session.begin():
+            # The refusing number's snapshot is the OLDEST, so a time-ordered
+            # limit would reach it last.
+            await session.execute(
+                sa_update(CampaignRecipient)
+                .where(CampaignRecipient.phone_e164 == ADDRESS)
+                .values(created_at=utcnow() - timedelta(days=365))
+            )
+    await _proven_opt_in_row(session_maker, address=OTHER_ADDRESS, decided_at=utcnow() + timedelta(hours=1))
+    async with session_maker() as session:
+        decision = await consent_decision(session, phone=ADDRESS, easyweek_customer_uuid=_SNAPSHOT_UUID)
+    assert decision.suppressed
+    assert SOURCE_RECIPIENT_FLAG in decision.sources

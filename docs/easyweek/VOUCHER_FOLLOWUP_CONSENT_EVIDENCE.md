@@ -10,8 +10,9 @@ follow-up text, no follow-up ledger and no follow-up executor is part of this
 stage, and the send path for one is not open.
 
 Read with `VOUCHER_PRODUCTION_MAILING_RUNBOOK.md` (how the original mailing is
-operated) and `VOUCHER_MAILING_BOOKING_REPORT.md` (what the local report does
-and does not prove).
+operated), `VOUCHER_MAILING_BOOKING_REPORT.md` (what the local report does and
+does not prove) and `VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md` (PR-22.2, which
+consumes this evidence to compose a preview — and still sends nothing).
 
 ---
 
@@ -114,10 +115,49 @@ The legacy sources are **read, not replaced**. One aggregate answer consults:
 2. a suppression bound to this UUID by an earlier refusal;
 3. `Client.wa_opted_out` on any matching card, any branch, any provider;
 4. the historical `CampaignRecipient.is_opted_out` snapshot, unless a proven,
-   verified opt-in landed after that snapshot was taken.
+   verified opt-in landed after that snapshot was taken **on that snapshot's own
+   number**.
+
+That last qualifier is load-bearing. §46.4.7 lets a START lift the refusal on
+the number it arrived from and no other, and the reader used to compare every
+snapshot against one newest-opt-in figure for the whole person: the same uuid,
+two numbers, a resubscribe on one of them, and the historical refusal recorded
+against the other was silently answered. The opt-in times are now kept per
+address and each snapshot is ordered against the opt-in for its own number. An
+unknown time on either side and a tie still refuse, as everywhere else.
+
+The snapshot read is also per address rather than "the newest fifty rows", for a
+reason a limit cannot fix: one busy number's answered history filled the limit
+on its own and a live refusal on another number of the same person was never
+read at all. One grouped row per matched address has no ordering and no limit,
+and the number of matched addresses is already bounded by the aggregate.
 
 **The absence of a refusal is not evidence of marketing consent.** It means only
 that this database holds no proven refusal for that address.
+
+### The address set, and who may ask for it
+
+`matched_addresses` exposes the set this aggregate matches a person by, for a
+caller that has to ask a QUESTION about those numbers rather than read the
+decision. PR-22.2's §46.4.4 backlog scan is that caller: it is given the numbers
+a preview's recipients are known by and reports the refusals sitting unaccounted
+among them. Assembling that question from the cards left out exactly the numbers
+§46.4.2 cares about most — a number the card has since dropped, reachable only
+from the links written down so the ban could travel — so the scan never saw the
+event and the veto afterwards had nothing to find.
+
+Ban extension only, as everywhere in this section: a number in that set is a
+number a refusal for this person could be recorded against, and never a proof
+that it belongs to this customer or to their branch.
+
+That caller reads this set, the backlog it describes and the decision below in
+ONE snapshot, at REPEATABLE READ. They are three views of one state, and under
+READ COMMITTED each statement takes a fresh one: a card appearing mid-read made
+the question narrower than the fingerprint that was stored from it, and a START
+applied mid-read let a refusal the scan had just accounted for be answered by a
+ledger state that no longer existed. Nothing in this section's own writers
+changed for it — the snapshot is read-only, takes no lock, and delays no
+arriving STOP.
 
 ### Where it is enforced
 
@@ -148,6 +188,16 @@ take the state back (`stop_older_than_proven_opt_in`). It is recorded and
 reported. Only a provable order refuses it: an equal time, an unknown time on
 either side, or a newer STOP all apply, so a tie and an unproven order both fall
 to the refusal.
+
+That exception now has exactly one definition in the code,
+`stop_superseded_by_opt_in`, and `apply_consent_decision` is its first caller.
+It was lifted out because a second reader appeared: PR-22.2's §46.4.4 backlog
+scan asks the very same question of a STOP it finds in a stored event — "has a
+proven newer opt-in on this same address already answered this?" — and a scan
+with its own private answer would have drifted from the writer's. It had: the
+first round of that scan treated any STOP as unaccounted whenever the ledger did
+not currently read `opted_out`, which re-imposed a withdrawn refusal on every
+preview. One predicate, one rule, read by both.
 
 The bar that exception is measured against is **`decided_event_at` of the
 decision in force**, and nothing else. `last_start_observed_at` and
@@ -664,6 +714,19 @@ guess. A Meta error title, message or detail can quote the request it refused,
 which for this phase means a voucher code, a rendered body or a customer's name,
 so none of it is stored, logged or classified from. `observed_at` (when we saw
 it) and `event_at` (proven, NULL when unprovable) are kept apart.
+
+### The positive half, added by PR-22.2
+
+§46.3 asks the same of a `delivered`/`read` that it asks of a `failed`, and
+PR-22.1 recorded no proof behind a positive status: the slot's timestamps are
+the mailing's own record and keep neither the signature nor the route. PR-22.2
+adds `easyweek_voucher_production_delivery_receipts` beside this table, with the
+same vocabulary and the same early-callback protocol — `unmatched` kept on the
+identifier alone, bound by the acceptance that records it, re-judged against the
+frozen route — and the full contract lives in
+`VOUCHER_FOLLOWUP_PREVIEW_CONTRACT.md`. Nothing in this section's table, its
+match states or its slot marking changed, and the positive transition still
+applies whether or not a proof could be stored.
 
 ### A fact is not a permission
 

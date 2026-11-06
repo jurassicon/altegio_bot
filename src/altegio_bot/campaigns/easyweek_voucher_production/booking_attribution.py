@@ -77,9 +77,9 @@ from __future__ import annotations
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Final
+from typing import Any, Collection, Final
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.easyweek_locations import EasyWeekLocationRegistry, configured_easyweek_locations
@@ -279,6 +279,24 @@ class ObservedBooking:
     # not proof of business order, so all this says is that the deliveries
     # disagree.
     customer_reassigned: bool = False
+    # A delivery of this booking named no customer at all. That is weaker than
+    # a reassignment and is not the same fact: nobody is proven to have taken
+    # the booking over, and nothing proves it stayed either. No pair is
+    # invented from it — a branch alone names no customer record, because a
+    # numeric customer id is unique WITHIN a branch and a branch therefore
+    # holds many of them, so "somewhere in the branch that created it" is not
+    # "the same customer". Not serialised: the report prints what it can
+    # prove.
+    custody_unproven: bool = False
+    # The earliest moment any delivery of this booking was received. A lower
+    # bound on when the booking EXISTED and never its creation date.
+    #
+    # Deliberately not serialised below: the report publishes what it can prove
+    # about a booking, and a capture timestamp is an internal fact for a caller
+    # that holds a send anchor to compare it against. §46.5's follow-up does —
+    # a booking some delivery named before the attempt, whose creation claims
+    # it appeared after it, is making two claims that cannot both be true.
+    first_observed_at: datetime | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -315,6 +333,29 @@ class _BookingDraft:
     booking_created_at: datetime | None = None
     seen_creation: bool = False
     conflicting: bool = False
+    # Every customer and every instant a CREATION delivery of this booking
+    # named, including the ones a disagreeing second creation named. The first
+    # creation still decides the attribution above; these exist so a disputed
+    # booking can be reported with enough detail to refuse on.
+    creation_customer_ids: set[int] = field(default_factory=set)
+    creation_times: set[datetime] = field(default_factory=set)
+    # A creation delivery whose branch, booking and customer were proven and
+    # whose instant was not. It names an owner and dates nothing.
+    undated_creation: bool = False
+    # Two creation deliveries of this booking named DIFFERENT customers. Read
+    # from the set of owners above rather than from a comparison against
+    # whichever of them happened to carry a date, and counted once per booking.
+    owner_conflict: bool = False
+    # Every branch a CREATION delivery of this booking named, and whether two
+    # of them disagreed. A numeric customer id is unique per branch rather than
+    # per workspace, so two creations of one booking in two branches naming the
+    # same number are not one person twice — they are a contradiction about
+    # where the booking was made and about whose it is.
+    creation_company_ids: set[int] = field(default_factory=set)
+    branch_conflict: bool = False
+    # The earliest moment any delivery of this booking was received. A lower
+    # bound on when the booking existed; never its creation date.
+    first_observed_at: datetime | None = None
     # -- lifecycle facts, as a set of DISTINCT deliveries -------------------
     # Keyed by the capture's own content identity (``payload_hash``), so an
     # identical Resend of a delivery already seen adds nothing. A row whose
@@ -325,6 +366,39 @@ class _BookingDraft:
     completed_signals: set[str] = field(default_factory=set)
     # Every customer id any delivery of this booking named, creation included.
     customer_ids: set[int] = field(default_factory=set)
+    # And the same evidence as PAIRS. ``customer_ids`` stays, because the
+    # report's own questions are asked per branch already; these answer "did
+    # the deliveries about this booking name one customer record or two",
+    # which bare numbers cannot.
+    customer_pairs: set[tuple[int, int]] = field(default_factory=set)
+    creation_pairs: set[tuple[int, int]] = field(default_factory=set)
+    # Branches a delivery of this booking named while naming NO customer. The
+    # branch is proven and the pair cannot be formed, so this is kept apart
+    # from both sets above: it says something happened to this booking there,
+    # which is neither a proven change of person nor a proof that nothing
+    # changed.
+    unnamed_company_ids: set[int] = field(default_factory=set)
+    # The branches of the creation deliveries of this booking that named NO
+    # customer. Their instants are kept above, and whose creation each one was
+    # is not established by itself. The BRANCH is kept because it is what says
+    # whether another delivery could be speaking about the same creation: one
+    # booking is made in one branch, so a delivery from the branch an owned
+    # creation named may be that creation again, and one from any other branch
+    # cannot be.
+    ownerless_creation_company_ids: set[int] = field(default_factory=set)
+    # Two creation deliveries of this booking stated two DIFFERENT instants.
+    # Read from the set of instants rather than from a comparison against
+    # whichever of them was complete, and counted once per booking — a
+    # delivery that named no customer still states when, and a creation that
+    # disagrees with it disagrees with this booking's own record.
+    date_conflict: bool = False
+    # Was anything beyond the branch and the booking identity ever proven about
+    # this booking? A creation delivery that named no customer proves that this
+    # booking exists in this branch and nothing else — no owner to credit, no
+    # instant to believe, and nothing for anybody to dispute. Such a delivery
+    # must date the booking it names without becoming evidence of its own, so a
+    # draft that has only ever seen those leaves the scan entirely.
+    proved_more_than_identity: bool = False
 
     def resolved_state(self) -> tuple[str, str | None]:
         """The current state, or ``unknown`` with the reason there is none.
@@ -349,6 +423,97 @@ class _BookingDraft:
         return BOOKING_ACTIVE, None
 
 
+# Why a booking the capture saw is not a booking it can speak about. Both are
+# shapes that used to leave the scan silently, counted in ``rejected`` and
+# otherwise gone — which is correct for a conversion report, and dangerous for a
+# caller that has to decide about a PERSON: an empty answer about a disputed
+# booking reads as "nothing happened".
+DISPUTE_CONFLICTING_CREATION: Final = "conflicting_creation"
+DISPUTE_CREATION_NOT_OBSERVED: Final = "creation_not_observed"
+# A creation delivery whose branch, booking identity and customer were all
+# proven and whose own instant was missing or unreadable. It names an owner and
+# dates nothing, which is a different gap from never having seen a creation.
+DISPUTE_CREATION_UNDATED: Final = "creation_undated"
+
+
+@dataclass(frozen=True)
+class DisputedBooking:
+    """A booking the report cannot attribute, kept so a caller can refuse.
+
+    The report itself does not use these — a conversion needs a proven creation,
+    and `rejected` already counts the shapes for diagnostics. PR-22.2's
+    follow-up does: §46.5 asks whether a PERSON booked, and a booking whose
+    owner or creation is in dispute is exactly the case where neither answer may
+    be given. Dropping it meant an empty live history came out as "nothing
+    since the mailing".
+
+    ``customer_ids`` is every customer ANY delivery of this booking named, and
+    ``creation_customer_ids`` the subset that a creation delivery named. Their
+    disagreement is the dispute, and it needs no separate move delivery.
+    """
+
+    booking_uuid: uuid_module.UUID
+    reason: str
+    customer_ids: frozenset[int] = frozenset()
+    creation_customer_ids: frozenset[int] = frozenset()
+    # Every creation instant any creation delivery of it stated. Empty when no
+    # creation was observed at all, and empty for an undated one.
+    created_at: tuple[datetime, ...] = ()
+    # The (branch, customer id) pairs the deliveries really named: the creation
+    # ones, and every one. A caller that has to decide whose dispute this is
+    # must read these rather than combine the branches and the numbers below,
+    # because a product of the two invents customer records nothing observed.
+    creation_pairs: frozenset[tuple[int, int]] = frozenset()
+    customer_pairs: frozenset[tuple[int, int]] = frozenset()
+    # The branches of the creation deliveries of this booking that named no
+    # customer. Each is a claim about who made the booking that was never
+    # stated; whether another delivery already stated it is a question about
+    # the branch, and is the caller's to ask.
+    ownerless_creation_branches: frozenset[int] = frozenset()
+    # A delivery of this booking named no customer, so who holds it now is not
+    # established either — the same fact :class:`ObservedBooking` carries, and
+    # needed here for the same reason: the permissive rule for a card with no
+    # numeric bridge asks whether anything moved this booking.
+    custody_unproven: bool = False
+    # Every branch a creation delivery of it named. One entry is what makes the
+    # numeric ids above readable at all, because such an id means one person in
+    # one branch and somebody else in the next; two entries are a contradiction
+    # about where the booking was made, whatever the dates say.
+    creation_company_ids: frozenset[int] = frozenset()
+    # The earliest moment any delivery of this booking was received. A delivery
+    # about a booking proves the booking existed when it was made, so this is a
+    # lower bound on its existence — and never a creation date: §46.5's rule is
+    # about when a booking was MADE, and a late delivery says nothing about it.
+    first_observed_at: datetime | None = None
+
+    @property
+    def contradictory(self) -> bool:
+        """Do this booking's own creation deliveries disagree with each other?
+
+        A dispute that is merely INCOMPLETE — no creation was captured, or the
+        one that was states no usable instant — can still be settled by other
+        evidence about the same booking. One that is self-contradictory cannot:
+        two creations naming two owners, or two different instants, are claims
+        that cannot both be true, and no amount of surrounding proof decides
+        which of them to believe. So an early sighting answers the first kind
+        and is never allowed to paper over the second.
+        """
+        return (
+            self.reason == DISPUTE_CONFLICTING_CREATION
+            or len(self.creation_customer_ids) > 1
+            or len(self.creation_company_ids) > 1
+            or len(self.created_at) > 1
+        )
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "owners_named": len(self.customer_ids),
+            "creations_observed": len(self.created_at),
+            "first_observed_at": _iso(self.first_observed_at) if self.first_observed_at else None,
+        }
+
+
 @dataclass(frozen=True)
 class CaptureScan:
     """Every booking the bounded scan could prove, plus what it could not."""
@@ -364,12 +529,25 @@ class CaptureScan:
     # is NOT the same as "this branch has no bookings", which this report has
     # no way to establish.
     branch_observed: dict[int, int] = field(default_factory=dict)
+    # Bookings this scan saw and cannot attribute. Additive: the report reads
+    # ``bookings`` and ``rejected`` exactly as before.
+    disputed: tuple[DisputedBooking, ...] = ()
 
     def by_customer(self) -> dict[int, list[ObservedBooking]]:
         grouped: dict[int, list[ObservedBooking]] = {}
         for booking in self.bookings:
             grouped.setdefault(booking.customer_id, []).append(booking)
         return grouped
+
+    def by_booking_uuid(self) -> dict[uuid_module.UUID, ObservedBooking]:
+        """The same bookings keyed by their own identity.
+
+        For a caller that already knows WHICH bookings it is asking about — a
+        live read keyed on a proven customer uuid returns their booking ids —
+        and therefore needs no numeric customer id to find their creations.
+        Dedupe is by booking uuid, so this is one row per booking.
+        """
+        return {booking.booking_uuid: booking for booking in self.bookings}
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +647,12 @@ class RecipientIdentity:
     # Which branches hold a card for this one person. Informational: one
     # recipient with three cards is still one recipient.
     card_company_ids: tuple[int, ...] = ()
+    # Which of those branches hold a card carrying the proven NUMBER above. A
+    # numeric customer id is unique per branch rather than per workspace, so
+    # the same digits in a branch this person has no card in are a different
+    # customer record — and a caller comparing a captured creation's customer
+    # id against this one needs to know where the comparison is valid.
+    numeric_company_ids: tuple[int, ...] = ()
 
     def as_safe_dict(self) -> dict[str, Any]:
         return {
@@ -482,6 +666,7 @@ async def resolve_identities(
     session: AsyncSession,
     *,
     items: list[EasyWeekVoucherProductionBatchItem],
+    registry: EasyWeekLocationRegistry | None = None,
 ) -> dict[int, RecipientIdentity]:
     """One numeric id per slot, or a named reason there is none.
 
@@ -489,9 +674,19 @@ async def resolve_identities(
     frozen recipients, the cards that either the freeze bound or a UUID binding
     claims, and the reverse check that no candidate number belongs to anybody
     else.
+
+    ``registry`` limits every card this reads to the CONFIGURED branches, for a
+    caller whose question is about those branches. A card of a branch nobody
+    configured then neither supplies a numeric bridge nor contradicts one: it
+    is another workspace's row, or an Altegio-era one, and letting it do either
+    means an unrelated tenant's numbering decides this mailing's answers. The
+    §PR-17 report passes nothing and keeps the workspace-wide scope it was
+    written with, because its own question — which cards speak for one
+    recipient — is not branch-limited.
     """
     if not items:
         return {}
+    branch_scope = sorted(registry.locations) if registry is not None and registry.ready else None
 
     recipient_ids = {int(item.campaign_recipient_id) for item in items}
     uuids = {item.easyweek_customer_uuid for item in items if item.easyweek_customer_uuid is not None}
@@ -520,7 +715,11 @@ async def resolve_identities(
                     Client.company_id,
                     Client.altegio_client_id,
                     Client.easyweek_customer_uuid,
-                ).where(Client.provider == PROVIDER_EASYWEEK, or_(*conditions))
+                ).where(
+                    Client.provider == PROVIDER_EASYWEEK,
+                    Client.company_id.in_(branch_scope) if branch_scope is not None else true(),
+                    or_(*conditions),
+                )
             )
         ).all()
         for client_id, company_id, numeric, bound_uuid in rows:
@@ -538,24 +737,57 @@ async def resolve_identities(
 
     # The reverse direction. A number that another card binds to a different
     # UUID is not this person's number, whatever the first direction suggested.
-    numeric_bindings: dict[int, set[uuid_module.UUID]] = {}
+    #
+    # Read per (branch, number), because that is what a numeric customer id
+    # identifies: the same digits are one person in Karlsruhe and somebody else
+    # in Ettlingen. How the claims are then COMBINED depends on the question
+    # being asked, and the two callers ask different ones — see below.
+    numeric_bindings: dict[tuple[int, int], set[uuid_module.UUID]] = {}
     if candidate_numbers:
-        for numeric, bound_uuid in (
+        for company_id, numeric, bound_uuid in (
             await session.execute(
-                select(Client.altegio_client_id, Client.easyweek_customer_uuid).where(
+                select(Client.company_id, Client.altegio_client_id, Client.easyweek_customer_uuid).where(
                     Client.provider == PROVIDER_EASYWEEK,
+                    Client.company_id.in_(branch_scope) if branch_scope is not None else true(),
                     Client.altegio_client_id.in_(candidate_numbers),
                     Client.easyweek_customer_uuid.is_not(None),
                 )
             )
         ).all():
-            numeric_bindings.setdefault(int(numeric), set()).add(bound_uuid)
+            numeric_bindings.setdefault((int(company_id), int(numeric)), set()).add(bound_uuid)
+
+    def _claims_on(number: int, *, branches: Collection[int]) -> set[uuid_module.UUID]:
+        """Who else binds *number*, in the branches the question is about.
+
+        A branch-scoped caller — §46.5's follow-up, which judges deliveries
+        from configured branches — asks only about the branches this person's
+        own card proves the number in. Another branch's card carrying the same
+        digits is a different customer record and contradicts nothing: it used
+        to read as «two people claim this number» and refuse the whole booking
+        question with a completely empty history.
+
+        The §PR-17 report passes no scope and keeps the workspace-wide reading
+        it was written with, where any card binding those digits to somebody
+        else is a reason to credit nobody.
+        """
+        if branch_scope is None:
+            return {
+                owner
+                for (_company_id, numeric), owners in numeric_bindings.items()
+                if numeric == int(number)
+                for owner in owners
+            }
+        claims: set[uuid_module.UUID] = set()
+        for company_id in branches:
+            claims |= numeric_bindings.get((int(company_id), int(number)), set())
+        return claims
 
     resolved: dict[int, RecipientIdentity] = {}
     for item in items:
         slot = int(item.slot)
         proven_uuid = item.easyweek_customer_uuid
         numbers: dict[int, set[str]] = {}
+        number_branches: dict[int, set[int]] = {}
         branches: set[int] = set()
         conflict = False
 
@@ -569,11 +801,13 @@ async def resolve_identities(
             branches.add(company_id)
             if numeric is not None:
                 numbers.setdefault(numeric, set()).add(SOURCE_FROZEN_LOCAL_CARD)
+                number_branches.setdefault(numeric, set()).add(company_id)
 
         for company_id, numeric in uuid_cards.get(proven_uuid, []) if proven_uuid is not None else ():
             branches.add(company_id)
             if numeric is not None:
                 numbers.setdefault(numeric, set()).add(SOURCE_CLIENT_UUID_BINDING)
+                number_branches.setdefault(numeric, set()).add(company_id)
 
         if conflict or len(numbers) > 1:
             resolved[slot] = RecipientIdentity(IDENTITY_CONFLICT, card_company_ids=tuple(sorted(branches)))
@@ -583,7 +817,7 @@ async def resolve_identities(
             continue
 
         chosen = next(iter(numbers))
-        bound = numeric_bindings.get(chosen, set())
+        bound = _claims_on(chosen, branches=number_branches.get(chosen, set()))
         if proven_uuid is not None and any(value != proven_uuid for value in bound):
             resolved[slot] = RecipientIdentity(IDENTITY_CONFLICT, card_company_ids=tuple(sorted(branches)))
             continue
@@ -592,6 +826,7 @@ async def resolve_identities(
             customer_id=chosen,
             sources=tuple(sorted(numbers[chosen])),
             card_company_ids=tuple(sorted(branches)),
+            numeric_company_ids=tuple(sorted(number_branches.get(chosen, set()))),
         )
     return resolved
 
@@ -650,15 +885,50 @@ def _validate_delivery(
     }
 
     if event_hint == CREATED_HINT:
-        if facts["customer_id"] is None:
-            return None, REJECT_CUSTOMER_ID
+        # The instant is read BEFORE the owner is checked, because a creation
+        # delivery that named no customer can still state when and where — and
+        # those are facts a second creation of the same booking has to agree
+        # with. Which reason is reported does not change: a missing customer is
+        # reported as such, whatever the instant turned out to be.
         try:
             created_at = parse_iso_utc(payload.get("booking_created_at"), required=True)
         except NormalizationError:
-            return None, REJECT_CREATED_AT
-        if created_at is None or created_at.tzinfo is None:
-            return None, REJECT_CREATED_AT
-        facts["booking_created_at"] = created_at
+            created_at = None
+        except OverflowError:
+            # A syntactically valid instant that cannot be expressed in UTC at
+            # all: the first day of year one east of Greenwich, the last second
+            # of year 9999 west of it. The conversion overflows, and the
+            # exception used to leave this module, cross the whole preview and
+            # reach the operator as a 500 for the entire batch — no rows, no
+            # reasons, nothing to act on. It is an unusable creation time,
+            # exactly like an unreadable one, and it is one booking's problem.
+            created_at = None
+        if created_at is not None and created_at.tzinfo is not None:
+            facts["booking_created_at"] = created_at
+        if facts["customer_id"] is None:
+            # The branch and the booking identity are proven and the OWNER is
+            # not. Returning nothing at all threw those away with the missing
+            # one, so the scan never learned that this booking existed when
+            # the delivery was stored — and a later creation of the same
+            # booking claiming a much newer instant then looked like a new
+            # booking rather than a contradiction.
+            #
+            # So the proven half comes back WITH the rejection, which is still
+            # counted. It names nobody, so it credits nobody and is no
+            # conversion.
+            return facts, REJECT_CUSTOMER_ID
+        if facts.get("booking_created_at") is None:
+            # The branch, the booking identity and the customer are all proven
+            # and only the INSTANT is missing, unreadable or unrepresentable.
+            # Returning nothing at all threw the proven half away with the
+            # unproven one, so the scan never learned that a creation of this
+            # booking named this customer — and a caller asking about that
+            # person saw silence.
+            #
+            # So the facts come back WITH the rejection: the reason is still
+            # counted, ``booking_created_at`` stays absent, and nothing here
+            # substitutes ``received_at`` for it.
+            return facts, REJECT_CREATED_AT
     return facts, None
 
 
@@ -668,6 +938,7 @@ async def scan_capture(
     anchors: list[datetime],
     now: datetime,
     registry: EasyWeekLocationRegistry,
+    lookback: timedelta | None = LATE_CAPTURE_SLACK,
 ) -> CaptureScan:
     """Every booking of this workspace that could matter, once.
 
@@ -679,17 +950,32 @@ async def scan_capture(
     Deduplication is by booking identity, which is what makes a retried
     webhook, a Resend and a rescheduled appointment one booking rather than
     three conversions.
+
+    ``lookback`` is how far before the earliest anchor the scan reaches, and the
+    attribution report keeps the one-day slack it was written with: a conversion
+    is a booking CREATED after the send, so a creation delivered more than a day
+    before it cannot be one, and reading further back would only cost rows.
+
+    ``lookback=None`` removes the lower bound for a caller that needs creations
+    older than the anchor — §46.5's follow-up asks when a booking the live read
+    can see was MADE, and that may be long before the mailing. It is still
+    bounded in both rows and work: the newest :data:`MAX_SCANNED_EVENTS`
+    lifecycle deliveries are read, newest-first through the primary key, and are
+    then applied in their own order. More stored than that reports ``truncated``
+    rather than a short answer, so nothing here becomes an unbounded full scan
+    and no caller can mistake a partial pass for a complete one.
     """
     if not anchors or not registry.ready:
         return CaptureScan(branch_observed={location_id: 0 for location_id in registry.locations})
 
-    floor = min(anchors) - LATE_CAPTURE_SLACK
+    floor = min(anchors) - lookback if lookback is not None else None
     rows = (
         await session.execute(
             select(
                 EasyWeekEvent.id,
                 EasyWeekEvent.event_hint,
                 EasyWeekEvent.payload,
+                EasyWeekEvent.received_at,
                 EasyWeekEvent.body_truncated,
                 # The capture's own content identity: the sha256 of the
                 # canonicalised JSON body. This is what makes an identical
@@ -698,59 +984,148 @@ async def scan_capture(
                 EasyWeekEvent.payload_hash,
             )
             .where(EasyWeekEvent.event_hint.in_(LIFECYCLE_HINTS))
-            .where(EasyWeekEvent.received_at >= floor)
+            .where(EasyWeekEvent.received_at >= floor if floor is not None else true())
             .where(EasyWeekEvent.received_at <= now)
-            .order_by(EasyWeekEvent.id.asc())
+            # Newest-first only when there is no floor, so the cap keeps the
+            # deliveries nearest the question instead of the oldest ones in the
+            # table. The rows are put back into primary-key order below, which
+            # is what makes a later delivery apply after an earlier one.
+            .order_by(EasyWeekEvent.id.asc() if floor is not None else EasyWeekEvent.id.desc())
             .limit(MAX_SCANNED_EVENTS + 1)
         )
     ).all()
 
     truncated = len(rows) > MAX_SCANNED_EVENTS
     rows = rows[:MAX_SCANNED_EVENTS]
+    if floor is None:
+        rows = list(reversed(rows))
 
     rejected: dict[str, int] = {}
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
-    for event_id, event_hint, payload, body_truncated, payload_hash in rows:
+    def _note_branch_conflict(draft: _BookingDraft) -> None:
+        """Two creation deliveries of one booking naming two branches.
+
+        Counted once per booking, and read from the SET of branches: a
+        creation delivery that could not state the customer or the instant
+        still states where the booking was made, and a missing field must not
+        dissolve a disagreement about that.
+        """
+        if len(draft.creation_company_ids) > 1 and not draft.branch_conflict:
+            draft.branch_conflict = True
+            draft.conflicting = True
+            rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+
+    def _note_date_conflict(draft: _BookingDraft) -> None:
+        """Two creation deliveries of one booking naming two instants.
+
+        Also once per booking and also from the set, for the same reason: the
+        comparison used to be made against whichever delivery was COMPLETE, so
+        an instant stated beside a missing customer disagreed with nothing and
+        the complete delivery decided alone — `included` or `excluded`
+        according to the date it happened to carry.
+        """
+        if len(draft.creation_times) > 1 and not draft.date_conflict:
+            draft.date_conflict = True
+            draft.conflicting = True
+            rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+
+    for event_id, event_hint, payload, received_at, body_truncated, payload_hash in rows:
         facts, reason = _validate_delivery(
             event_hint=event_hint,
             payload=payload,
             body_truncated=bool(body_truncated),
             registry=registry,
         )
+        if reason is not None:
+            # Counted exactly as before, whether or not anything was proven.
+            rejected[reason] = rejected.get(reason, 0) + 1
         if facts is None:
-            code = reason or REJECT_INVALID_PAYLOAD
-            rejected[code] = rejected.get(code, 0) + 1
             continue
 
         booking_uuid = facts["booking_uuid"]
         draft = drafts.setdefault(booking_uuid, _BookingDraft(booking_uuid=booking_uuid))
+        # When this booking was first HEARD OF. A delivery about a booking
+        # proves the booking existed when that delivery was made, which is a
+        # lower bound on its existence and never a creation date.
+        if received_at is not None and (draft.first_observed_at is None or received_at < draft.first_observed_at):
+            draft.first_observed_at = received_at
+        if event_hint == CREATED_HINT and facts["customer_id"] is None:
+            # A creation delivery that named no customer. It credits nobody and
+            # is no conversion — but it has proven WHERE this booking was made
+            # and, when the payload carried a usable one, WHEN, and a second
+            # creation of the same booking has to agree with both. Those two
+            # facts are recorded here with no owner invented.
+            #
+            # It is still not evidence of its own: it does not set
+            # ``proved_more_than_identity``, so a booking nothing else was ever
+            # delivered about leaves the scan entirely rather than holding a
+            # whole batch open on a row whose owner nobody ever claimed.
+            draft.ownerless_creation_company_ids.add(int(facts["company_id"]))
+            draft.creation_company_ids.add(int(facts["company_id"]))
+            _note_branch_conflict(draft)
+            partial_created_at = facts.get("booking_created_at")
+            if partial_created_at is not None:
+                draft.creation_times.add(partial_created_at)
+                _note_date_conflict(draft)
+            continue
+        draft.proved_more_than_identity = True
         # Every delivery of this booking contributes whatever customer it named,
         # whether it arrived before or after the creation. The earlier version
         # compared against the creation's customer at read time and therefore
         # lost the evidence entirely whenever the lifecycle delivery came first.
         if facts["customer_id"] is not None:
             draft.customer_ids.add(int(facts["customer_id"]))
+            draft.customer_pairs.add((int(facts["company_id"]), int(facts["customer_id"])))
 
         if event_hint == CREATED_HINT:
+            created_at = facts.get("booking_created_at")
+            draft.creation_customer_ids.add(int(facts["customer_id"]))
+            draft.creation_pairs.add((int(facts["company_id"]), int(facts["customer_id"])))
+            if created_at is not None:
+                draft.creation_times.add(created_at)
+                _note_date_conflict(draft)
+            # WHO created a booking is a fact its creation delivery states even
+            # when it could not state WHEN, so the owners' disagreement is read
+            # from the SET of customers the creations named. The undated
+            # delivery used to leave this block before any comparison was made,
+            # and the booking then came out cleanly attributed to whichever
+            # creation happened to carry a date — in either delivery order. A
+            # missing instant on one of two creations is a second gap, not a
+            # resolution of the first.
+            if len(draft.creation_customer_ids) > 1 and not draft.owner_conflict:
+                draft.owner_conflict = True
+                draft.conflicting = True
+                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            # WHERE it was created is a fact of the same kind, and it is read
+            # from the set of branches for the same reason: a creation delivery
+            # that could not state the instant still states the branch, and a
+            # missing date must not dissolve a disagreement about it. The
+            # branches also decide what the numeric id in each delivery MEANS,
+            # since that id is unique per branch.
+            draft.creation_company_ids.add(int(facts["company_id"]))
+            _note_branch_conflict(draft)
+            if created_at is None:
+                # Proven owner, unproven instant. It contributes the owner and
+                # the conflict above, and does NOT count as a usable creation,
+                # so neither this report's conversions nor its per-branch
+                # observations move.
+                draft.undated_creation = True
+                continue
             if not draft.seen_creation:
                 draft.seen_creation = True
                 draft.company_id = facts["company_id"]
                 draft.branch_name = facts["branch_name"]
                 draft.customer_id = facts["customer_id"]
-                draft.booking_created_at = facts["booking_created_at"]
+                draft.booking_created_at = created_at
                 branch_observed[facts["company_id"]] = branch_observed.get(facts["company_id"], 0) + 1
-            elif (
-                draft.customer_id != facts["customer_id"]
-                or draft.booking_created_at != facts["booking_created_at"]
-                or draft.company_id != facts["company_id"]
-            ):
-                # Two creations of one booking that do not agree. A repeated
-                # delivery of the SAME creation is the ordinary case and lands
-                # in neither branch of this check.
-                draft.conflicting = True
-                rejected[REJECT_CONFLICTING_CREATION] = rejected.get(REJECT_CONFLICTING_CREATION, 0) + 1
+            # A disagreement about the instant is counted above, from the set,
+            # so one conflicting pair is still one counted conflict however the
+            # two deliveries arrived. A repeated delivery of the SAME creation —
+            # including one that merely adds the instant an earlier delivery
+            # omitted — adds nothing to any set and is the ordinary case.
+            #
             # A creation states WHAT WAS CREATED. It is never also a statement
             # that the booking is live now: a cancellation of it may already
             # have been delivered, and reading the creation as "active" is
@@ -761,6 +1136,15 @@ async def scan_capture(
         # updated appointment is the same appointment — and it contributes one
         # FACT to the set the state is derived from at the end.
         #
+        if facts["customer_id"] is None:
+            # A lifecycle delivery whose branch and booking are proven and whose
+            # customer is missing. The branch is kept: something happened to
+            # this booking in that branch. No pair is invented from it, so
+            # nobody is credited and no change of person is declared proven —
+            # and the delivery no longer disappears, which is what let a
+            # booking that may have left somebody's list read as a booking that
+            # never moved.
+            draft.unnamed_company_ids.add(int(facts["company_id"]))
         # Keyed by content identity so an identical Resend is not a second
         # fact. A delivery whose body was not JSON has no hash and is keyed by
         # its own row id, because nothing proves it identical to another.
@@ -776,12 +1160,48 @@ async def scan_capture(
         # would turn an edit into a claim about the salon's day.
 
     bookings: list[ObservedBooking] = []
+    disputed: list[DisputedBooking] = []
     for draft in drafts.values():
-        # A booking with no proven creation is not a booking this report can
-        # speak about, however many lifecycle deliveries it has.
-        if not draft.seen_creation or draft.conflicting:
+        if not draft.proved_more_than_identity:
+            # Every delivery about this booking proved its branch and its
+            # identity and nothing more. There is no owner in doubt and no
+            # instant to disbelieve, so this is neither a booking the report
+            # can speak about nor a dispute a caller could refuse on. It
+            # leaves the scan exactly as it did before its early sighting was
+            # kept — and it has dated the booking for a caller holding the
+            # same uuid, which is the whole point of keeping it.
             continue
-        if draft.customer_id is None or draft.booking_created_at is None:
+        # A booking with no proven creation is not a booking this report can
+        # speak about, however many lifecycle deliveries it has. It is RECORDED
+        # as disputed rather than forgotten, so a caller asking about a person
+        # cannot mistake the silence for "nothing happened".
+        if (
+            not draft.seen_creation
+            or draft.conflicting
+            or draft.customer_id is None
+            or draft.booking_created_at is None
+        ):
+            disputed.append(
+                DisputedBooking(
+                    booking_uuid=draft.booking_uuid,
+                    reason=(
+                        DISPUTE_CONFLICTING_CREATION
+                        if draft.conflicting
+                        else DISPUTE_CREATION_UNDATED
+                        if draft.undated_creation
+                        else DISPUTE_CREATION_NOT_OBSERVED
+                    ),
+                    customer_ids=frozenset(draft.customer_ids),
+                    creation_customer_ids=frozenset(draft.creation_customer_ids),
+                    created_at=tuple(sorted(draft.creation_times)),
+                    creation_company_ids=frozenset(draft.creation_company_ids),
+                    creation_pairs=frozenset(draft.creation_pairs),
+                    customer_pairs=frozenset(draft.customer_pairs),
+                    ownerless_creation_branches=frozenset(draft.ownerless_creation_company_ids),
+                    custody_unproven=bool(draft.unnamed_company_ids),
+                    first_observed_at=draft.first_observed_at,
+                )
+            )
             continue
         state, state_reason = draft.resolved_state()
         bookings.append(
@@ -793,9 +1213,20 @@ async def scan_capture(
                 booking_created_at=draft.booking_created_at,
                 state=state,
                 state_reason=state_reason,
-                # Any delivery of this booking naming a customer other than
-                # the one its creation named.
-                customer_reassigned=bool(draft.customer_ids - {draft.customer_id}),
+                # Any delivery of this booking naming a customer RECORD other
+                # than the one its creation named — the pair, because the same
+                # digits in another branch are somebody else. Comparing
+                # bare numbers reported no reassignment at all for a booking
+                # that had moved between two branches, and a caller whose only
+                # view of a person is their current list then had nothing
+                # saying a booking might have left it.
+                customer_reassigned=bool(draft.customer_pairs - {(int(draft.company_id or 0), int(draft.customer_id))}),
+                # And the weaker fact, kept apart from it: a delivery about
+                # this booking named nobody. Its branch does not narrow that —
+                # the branch that created a booking holds every other customer
+                # of that branch too.
+                custody_unproven=bool(draft.unnamed_company_ids),
+                first_observed_at=draft.first_observed_at,
             )
         )
     return CaptureScan(
@@ -806,6 +1237,7 @@ async def scan_capture(
         scan_to=now,
         rejected=rejected,
         branch_observed=branch_observed,
+        disputed=tuple(disputed),
     )
 
 
@@ -1210,6 +1642,10 @@ __all__ = [
     "IDENTITY_PROVEN",
     "INSUFFICIENT_DATA",
     "LIFECYCLE_HINTS",
+    "DISPUTE_CONFLICTING_CREATION",
+    "DISPUTE_CREATION_NOT_OBSERVED",
+    "DISPUTE_CREATION_UNDATED",
+    "DisputedBooking",
     "MAX_SCANNED_EVENTS",
     "MESSAGE_ACCEPTED",
     "MESSAGE_ATTEMPT_UNCONFIRMED",

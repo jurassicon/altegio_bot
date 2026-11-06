@@ -23,8 +23,10 @@ import re
 from datetime import timedelta
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import select
 
+import altegio_bot.settings as settings_module
 from altegio_bot.campaigns.easyweek_voucher_production import dispatch as dispatch_module
 from altegio_bot.campaigns.easyweek_voucher_production import ledger as ledger_module
 from altegio_bot.campaigns.easyweek_voucher_production import operations as operations_module
@@ -3324,3 +3326,463 @@ async def test_the_booking_report_shows_a_previews_real_size(
     assert "ещё не зафиксирована" in stage
     assert await page.locator("#report-rows tr[data-slot]").count() == 0
     assert_no_page_errors(page)
+
+
+async def test_followup_preview_real_browser_operator_path(page, monkeypatch, session_maker):
+    """§46.6, in Chromium: original mailing → groups → interval → text → check.
+
+    Every step is the operator's own. The follow-up page is reached by clicking
+    the link on the mailing page rather than by a URL assembled from a database
+    read, the groups are ticked, the interval is typed, the button is clicked,
+    and the page is then asserted to show the composition it computed. That is
+    the difference between proving the interface works and proving the contract
+    behind it does — and §43's R3 defect was exactly a right contract behind a
+    screen that dead-ended.
+
+    What this also proves, and could not be proved any other way: there is no
+    control on this screen that sends anything, the banner saying so is visible
+    to a real renderer, and the page carries no voucher code, phone number or
+    customer identifier.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings,
+        "easyweek_voucher_delivery_hmac_key",
+        SecretStr("k" * 48),
+        raising=False,
+    )
+
+    # The configured branch registry, which the booking CREATION capture needs
+    # in order to know which branches of the workspace the question covers.
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import location_map as followup_location_map
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    # The live Meta half, which the page and the action both reach after closing
+    # their read session.
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(
+        session_maker,
+        slots=[{"state": "delivered", "index": 1}, {"state": "read", "index": 2}],
+    )
+
+    # The operator starts where they always start: the mailing's own page.
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}")
+    await opened.click("text=Повторное сообщение: предпросмотр")
+    await opened.wait_for_url(re.compile(rf"/ops/voucher-mailings/{batch_id}/followup$"), timeout=15_000)
+
+    body = await opened.inner_text("body")
+    assert "Доступен только предпросмотр" in body
+    assert "[Vorname]" in body
+    # No control on this page can send anything.
+    buttons = await opened.inner_text("body")
+    for forbidden in ("Отправить", "Подтвердить отправку"):
+        assert forbidden not in buttons
+
+    # Nothing is selected by default, and the check refuses an empty choice.
+    assert await opened.is_checked("#group-delivered_unread") is False
+    assert await opened.is_checked("#group-read") is False
+    assert await opened.is_checked("#group-confirmed_failure") is False
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-result').textContent.includes('группу')",
+        timeout=15_000,
+    )
+
+    # Now the operator's real choice: one group, and an explicit interval.
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.body.innerText.includes('Результат проверки')",
+        timeout=15_000,
+    )
+
+    final = await opened.inner_text("body")
+    assert "подходили для повторного сообщения" in final
+    # §46.6: the standing of the result is stated, not implied.
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+    assert "Состав при этом не пересчитывался" in final
+    assert "Минимальный интервал после исходной попытки: 14 дн." in final
+    # The read slot was not selected, so it is not part of this proposal.
+    assert "Прочитано (подтверждено)" in final  # the checkbox label stays on screen
+    for forbidden in ("+4915100", "Person 1", "wamid.", "00000001-1111"):
+        assert forbidden not in final, forbidden
+    assert_no_page_errors(opened)
+
+    # And the server kept its side of the bargain: one stored version, nothing
+    # sent, no second attempt anywhere.
+    from altegio_bot.models.models import (
+        EasyWeekVoucherFollowupPreview,
+        EasyWeekVoucherProductionBatchItem,
+        MessageJob,
+        OutboxMessage,
+    )
+
+    async with session_maker() as session:
+        stored = list((await session.execute(select(EasyWeekVoucherFollowupPreview))).scalars())
+        jobs = list((await session.execute(select(MessageJob))).scalars())
+        outbox = list((await session.execute(select(OutboxMessage))).scalars())
+        attempts = list(
+            (await session.execute(select(EasyWeekVoucherProductionBatchItem.send_attempt_count))).scalars()
+        )
+    assert len(stored) == 1
+    assert stored[0].included_count == 1
+    assert (jobs, outbox) == ([], [])
+    assert set(attempts) == {1}
+
+
+async def test_followup_stored_result_standing_in_a_real_browser(page, monkeypatch, session_maker):
+    """§46.6 in Chromium: a saved result never looks newly confirmed.
+
+    The operator saves a preview, the follow-up template is then paused in Meta,
+    and the page is reopened. What must be visible is a historical result with
+    its standing stated — not the green block, and not the current text passed
+    off as the text that composition was computed with.
+
+    The same page is then checked at phone width, because §46.8 keeps the
+    screen usable on both and a block that only fits a laptop is not usable.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        approved_meta_templates,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False
+    )
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('Результат проверки')", timeout=15_000)
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+
+    # The template is paused in Meta between two page loads, which is exactly
+    # the case a TTL-only freshness rule cannot see.
+    paused = approved_meta_templates()
+    paused[0]["status"] = "PAUSED"
+    templates.templates = paused
+
+    await opened.reload()
+    body = await opened.inner_text("body")
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "historical"
+    assert "сейчас не подтверждён" in body
+    assert "НЕ подтверждены заново" in body
+    # And nothing personal appears on the historical block either.
+    for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
+        assert forbidden not in body, forbidden
+
+    # Phone width: the page still renders its three counters and its banner.
+    await opened.set_viewport_size({"width": 390, "height": 844})
+    await opened.reload()
+    narrow = await opened.inner_text("body")
+    assert "Доступен только предпросмотр" in narrow
+    assert "исключены" in narrow
+    overflow = await opened.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 1, overflow
+    assert_no_page_errors(opened)
+
+
+async def test_followup_failed_refresh_demotes_the_open_page(page, monkeypatch, session_maker):
+    """Review round 2, finding 6, in Chromium and without a reload.
+
+    The operator is looking at a green saved result. The Meta template is paused
+    behind their back. They press «Проверить состав», the POST comes back 409 —
+    and the old block used to stay green, still claiming «Эти проверки
+    актуальны», because the script only replaced
+    one line of status text. The click had just proved the opposite.
+
+    Three outcomes are checked on the one open page: a refusal, a network
+    failure, and a successful recalculation that really does produce a new
+    result. Then the same page at phone width, and no PII anywhere.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        approved_meta_templates,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False
+    )
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('Результат проверки')", timeout=15_000)
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+
+    # Paused in Meta while this page stays open. No reload.
+    paused = approved_meta_templates()
+    paused[0]["status"] = "PAUSED"
+    templates.templates = paused
+
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    body = await opened.inner_text("body")
+    assert "Состав при этом не пересчитывался" not in body
+    assert "НЕ подтверждены заново" in body
+    assert "не подтверждена" in body
+    # The snapshot itself is still readable as the history it is.
+    assert "исключены" in body
+    assert "не удалось установить" in body
+    classes = await opened.get_attribute("#followup-stored", "class")
+    assert "alert-success" not in classes
+    assert "alert-warning" in classes
+
+    # A network failure says the same thing. Reload first so the block starts
+    # green again, then take the connection away.
+    templates.templates = approved_meta_templates()
+    await opened.reload()
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+    await opened.evaluate("() => { window.fetch = () => Promise.reject(new Error('offline')); }")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    assert "Состав при этом не пересчитывался" not in await opened.inner_text("body")
+
+    # And a refresh that really does recalculate still produces a new version.
+    await opened.reload()
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.body.innerText.includes('версия 2')",
+        timeout=15_000,
+    )
+    fresh = await opened.inner_text("body")
+    assert "Состав при этом не пересчитывался" in fresh
+
+    await opened.set_viewport_size({"width": 390, "height": 844})
+    await opened.reload()
+    await opened.evaluate("() => { window.fetch = () => Promise.reject(new Error('offline')); }")
+    await opened.click("#followup-check")
+    await opened.wait_for_function(
+        "() => document.getElementById('followup-stored').dataset.followupStanding === 'historical'",
+        timeout=15_000,
+    )
+    narrow = await opened.inner_text("body")
+    assert "НЕ подтверждены заново" in narrow
+    for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
+        assert forbidden not in narrow, forbidden
+    overflow = await opened.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 1, overflow
+    assert_no_page_errors(opened)
+
+
+async def test_followup_saved_composition_is_shown_as_history_not_as_now(page, monkeypatch, session_maker):
+    """Review round 3, finding 5, in Chromium and through the real Ops route.
+
+    A composition is saved with one eligible recipient. That person then sends a
+    STOP. Nothing the GET re-proves has changed — the batch is open, the snapshot
+    is young, the template is still approved — so the block stays green, and the
+    question is what green is allowed to SAY.
+
+    It may say that nothing forbids a follow-up and that those three things were
+    re-checked. It may not say that the recipients or their number are confirmed
+    now, because no consent, reply, artifact or booking was read on this GET.
+    The stored figures are printed with the moment they were computed, and only
+    an explicit recalculation produces the new one — zero.
+    """
+    import contextlib as _contextlib
+
+    import altegio_bot.ops.voucher_followup as followup_ops
+    from altegio_bot.models.models import (
+        CONSENT_COMMAND_STOP,
+        CONSENT_SOURCE_INBOUND,
+        CONSENT_STATE_OPTED_OUT,
+        INBOUND_AUTHENTICITY_SIGNED,
+        WhatsAppConsentSuppression,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+        person,
+        seed_sender_and_template,
+        seed_source_batch,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+    from altegio_bot.utils import utcnow
+
+    monkeypatch.setattr(settings_module.settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False
+    )
+    monkeypatch.setattr(settings_module.settings, "easyweek_location_map", followup_location_map(), raising=False)
+
+    booking_reader = FakeHistoryReader()
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield booking_reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    meta_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(reader=None):
+        return await meta_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await seed_sender_and_template(session_maker, with_followup_template=True)
+    batch_id, _ = await seed_source_batch(session_maker, slots=[{"state": "delivered"}])
+
+    opened = watch_for_errors(page)
+    await opened.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await opened.check("#group-delivered_unread")
+    await opened.fill("#followup-interval", "14")
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('Результат проверки')", timeout=15_000)
+    saved = await opened.inner_text("body")
+    assert "версия 1" in saved
+    assert "подходили для повторного сообщения" in saved
+
+    # The person says stop. Nothing the GET re-proves has moved.
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                WhatsAppConsentSuppression(
+                    wa_address=person(1)["phone"],
+                    state=CONSENT_STATE_OPTED_OUT,
+                    consent_version=1,
+                    decision_command=CONSENT_COMMAND_STOP,
+                    decision_source=CONSENT_SOURCE_INBOUND,
+                    decision_authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    decided_observed_at=utcnow(),
+                    decided_event_at=utcnow(),
+                    opted_out_at=utcnow(),
+                )
+            )
+
+    await opened.reload()
+    historical = await opened.inner_text("body")
+    # Still green, because the three things a GET can prove are all still true.
+    assert await opened.get_attribute("#followup-stored", "data-followup-standing") == "current"
+    # And green says only what it proved.
+    assert "сама партия, срок действия снимка и контракт текста" in historical
+    assert "Состав при этом не пересчитывался" in historical
+    assert "Согласие, ответы и записи каждого получателя заново не проверялись" in historical
+    assert "текущее количество получателей этим не подтверждается" in historical
+    assert "Эти проверки актуальны" not in historical
+    assert "подтверждены и сейчас" not in historical
+    # The historical one is still readable, with the moment it was computed.
+    assert "версия 1" in historical
+    stamp = re.search(r"Проверено:\s*(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2} UTC)", historical)
+    assert stamp is not None, historical[:400]
+    assert historical.count(stamp.group(1)) >= 4
+
+    # Only the explicit recalculation produces the current answer.
+    await opened.click("#followup-check")
+    await opened.wait_for_function("() => document.body.innerText.includes('версия 2')", timeout=15_000)
+    recomputed = await opened.inner_text("body")
+    assert "Отказ от сообщений" in recomputed or "отпис" in recomputed.lower()
+    async with session_maker() as session:
+        rows = (
+            await session.scalars(
+                select(followup_ops.preview_module.EasyWeekVoucherFollowupPreview.included_count).order_by(
+                    followup_ops.preview_module.EasyWeekVoucherFollowupPreview.version
+                )
+            )
+        ).all()
+    assert list(rows) == [1, 0]
+    for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
+        assert forbidden not in recomputed, forbidden
+    assert_no_page_errors(opened)

@@ -74,12 +74,22 @@ from altegio_bot.models.models import (
     DELIVERY_FAILURE_REASON_CALLBACK_FAILED,
     DELIVERY_FAILURE_SOURCE_CALLBACK,
     DELIVERY_FAILURE_SOURCE_META_API,
+    DELIVERY_RECEIPT_KIND_DELIVERED,
+    DELIVERY_RECEIPT_KIND_READ,
+    DELIVERY_RECEIPT_KINDS,
+    DELIVERY_RECEIPT_MATCH_CONFIRMED,
+    DELIVERY_RECEIPT_MATCH_CONFLICTING,
+    DELIVERY_RECEIPT_MATCH_UNMATCHED,
     INBOUND_AUTHENTICITY_SIGNED,
     INBOUND_AUTHENTICITY_UNVERIFIED,
+    VOUCHER_PRODUCTION_ITEM_DELIVERED,
+    VOUCHER_PRODUCTION_ITEM_READ,
+    VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED,
     EasyWeekVoucherProductionBatch,
     EasyWeekVoucherProductionBatchAttempt,
     EasyWeekVoucherProductionBatchItem,
     EasyWeekVoucherProductionDeliveryFailure,
+    EasyWeekVoucherProductionDeliveryReceipt,
 )
 from altegio_bot.services.meta_error_classifier import (
     DELIVERY_CLASS_UNKNOWN,
@@ -245,20 +255,25 @@ def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else "none"
 
 
-async def _insert_fact(session: AsyncSession, values: dict[str, Any]) -> int | None:
+async def _insert_fact(
+    session: AsyncSession,
+    values: dict[str, Any],
+    *,
+    table: Any = EasyWeekVoucherProductionDeliveryFailure,
+) -> int | None:
     """Insert one fact, idempotently on ``fact_key``.
 
     ``ON CONFLICT DO NOTHING`` rather than a read-then-write: two callbacks can
     be processed concurrently by two workers, and losing the race on a unique
     index must be a no-op rather than an exception that fails a whole batch of
     status updates.
+
+    ``table`` defaults to the failure ledger, which every existing caller
+    means; the positive-status receipts of §46.3 share the same key column and
+    the same conflict rule, so they share this one insert rather than growing a
+    second copy of it that could drift.
     """
-    stmt = (
-        pg_insert(EasyWeekVoucherProductionDeliveryFailure)
-        .values(**values)
-        .on_conflict_do_nothing(index_elements=["fact_key"])
-        .returning(EasyWeekVoucherProductionDeliveryFailure.id)
-    )
+    stmt = pg_insert(table).values(**values).on_conflict_do_nothing(index_elements=["fact_key"]).returning(table.id)
     return (await session.execute(stmt)).scalars().first()
 
 
@@ -376,6 +391,101 @@ def _mark_item(
     merged["confirmed_delivery_failure_class"] = failure_class
     merged["confirmed_delivery_failure_observed_at"] = observed_at.isoformat()
     item.evidence = merged
+
+
+def _unmark_item(
+    item: EasyWeekVoucherProductionBatchItem,
+    *,
+    kind: str,
+    observed_at: datetime,
+) -> None:
+    """Withdraw a confirmed-failure mark a proven success has contradicted.
+
+    The mark says "this slot's one attempt provably failed", and a proven
+    ``delivered``/``read`` for the same message id says it provably did not —
+    §46.3 is explicit that a success keeps its force against a `failed`,
+    whichever of them this process happened to read first. So the mark goes.
+
+    What does NOT go is the evidence. The failure row keeps its reason code, its
+    class, its route and its times, re-stated as a conflict; and the withdrawal
+    itself is written down here, so the slot says that a confirmation was made
+    and then contradicted rather than quietly losing both halves.
+    """
+    merged = dict(item.evidence or {})
+    withdrawn = merged.pop("confirmed_delivery_failure_reason", None)
+    merged.pop("confirmed_delivery_failure", None)
+    merged.pop("confirmed_delivery_failure_class", None)
+    merged.pop("confirmed_delivery_failure_observed_at", None)
+    merged["withdrawn_delivery_failure_reason"] = withdrawn
+    merged["withdrawn_delivery_failure_by"] = kind
+    merged["withdrawn_delivery_failure_at"] = observed_at.isoformat()
+    item.evidence = merged
+
+
+async def demote_confirmed_failures_after_success(
+    session: AsyncSession,
+    *,
+    item: EasyWeekVoucherProductionBatchItem,
+    provider_message_id: str,
+    kind: str,
+    observed_at: datetime | None = None,
+) -> int:
+    """A PROVEN success re-states every confirmed failure of the same message.
+
+    One rule for both arrival orders, so the ledger ends in the same state
+    whichever way round this process read the pair:
+
+    * a `failed` read while the slot already carried a success was always
+      recorded as a conflict, by the route check in :func:`_store`;
+    * a `failed` read FIRST became ``confirmed`` and stamped the slot, and the
+      success that followed advanced the slot and left that stamp standing. The
+      same two facts, two different answers, and the wrong one asserted a
+      delivery failure about a message the customer had demonstrably read.
+
+    Called only where a success is PROVEN — a verified signature and a route
+    equal to the one the slot's single attempt froze — which is what keeps an
+    unsigned or foreign-route callback from clearing a real confirmation. The
+    decision is precedence, not chronology: no event time is required and the
+    row ids of two tables are never compared as clocks. Meta's own times are
+    recorded for the audit when it states them.
+
+    Runs in the CALLER's transaction, after the item lock is held, and takes no
+    lock of its own beyond the rows it re-states. Returns how many it moved.
+    """
+    now = observed_at or utcnow()
+    rows = list(
+        (
+            await session.scalars(
+                select(EasyWeekVoucherProductionDeliveryFailure)
+                .where(EasyWeekVoucherProductionDeliveryFailure.provider_message_id == provider_message_id)
+                .where(EasyWeekVoucherProductionDeliveryFailure.item_id == int(item.id))
+                .where(EasyWeekVoucherProductionDeliveryFailure.match_state == DELIVERY_FAILURE_MATCH_CONFIRMED)
+                .order_by(EasyWeekVoucherProductionDeliveryFailure.id.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not rows:
+        return 0
+    for row in rows:
+        row.match_state = DELIVERY_FAILURE_MATCH_CONFLICTING
+        merged = dict(row.evidence or {})
+        merged["conflict"] = CONFLICT_AFTER_SUCCESS
+        merged["superseded_by_status"] = kind
+        merged["superseded_at"] = now.isoformat()
+        if row.event_at is not None:
+            merged["superseded_failure_event_at"] = row.event_at.isoformat()
+        row.evidence = merged
+        row.updated_at = now
+    _unmark_item(item, kind=kind, observed_at=now)
+    logger.info(
+        "voucher_production_failure: %s superseded %s confirmed fact(s) batch=%s slot=%s",
+        kind,
+        len(rows),
+        item.batch_id,
+        item.slot,
+    )
+    return len(rows)
 
 
 async def _locate_item(
@@ -660,6 +770,368 @@ async def _store(
     )
 
 
+# ---------------------------------------------------------------------------
+# §46.3 — the proof behind a POSITIVE status
+# ---------------------------------------------------------------------------
+_RECEIPT_DOMAIN: Final = "altegio_bot/easyweek_voucher_production/delivery_receipt/v1"
+
+
+@dataclass(frozen=True)
+class ReceiptOutcome:
+    """Whether a positive status left proof behind, and why not when it did not."""
+
+    stored: bool
+    reason: str | None = None
+
+
+def _receipt_fact_key(
+    *,
+    kind: str,
+    provider_message_id: str,
+    sender_digest: str | None,
+    recipient_digest: str | None,
+    event_at: datetime | None,
+) -> str:
+    """ONE key for both paths, so an early callback and a late one are one fact.
+
+    Computed from the proven contents of the callback and from nothing about
+    when or how it was processed. That is what makes the unmatched row the
+    SAME row the matched path would have written: a Resend, a duplicate
+    delivery, and the identical callback arriving again after the slot owns its
+    message id all land on this key and add nothing.
+    """
+    return _fact_key(
+        (
+            _RECEIPT_DOMAIN,
+            kind,
+            provider_message_id,
+            sender_digest or "none",
+            recipient_digest or "none",
+            _iso(event_at),
+        )
+    )
+
+
+async def record_unmatched_status_receipt(
+    session: AsyncSession,
+    *,
+    status: dict[str, Any],
+    kind: str,
+    whatsapp_event_id: int | None = None,
+    signature_verified: bool = False,
+    observed_at: datetime | None = None,
+) -> ReceiptOutcome:
+    """Keep a signed ``delivered``/``read`` that NOBODY owns yet (§46.3).
+
+    The positive half of the early-callback contract, and the exact counterpart
+    of :func:`record_unmatched_callback_failure`. Meta can deliver a ``read``
+    for a message id while the transaction that records that id is still in
+    flight: the slot is ``send_claimed``, its POST has returned, and the commit
+    that stores the identifier has not landed. "No slot owns this id" is
+    therefore an ordinary momentary state, not evidence that the callback is
+    foreign — and dropping it loses a status that may never be sent again,
+    leaving the slot's audience ``unknown`` forever.
+
+    So the proof is stored now and bound later, by the very commit that makes it
+    bindable, on the exact identifier. Never on phone similarity and never on
+    timestamp proximity.
+
+    Two things are required even here. The SIGNATURE, because it is the one part
+    that cannot be established after the fact — an unsigned callback is not kept
+    at all, and no later binding can promote it. And a message id, which is what
+    the binding will match on.
+
+    One narrow gate keeps this table about this phase: a row is kept only while
+    some slot of this mailing could still claim a NEW message id — one that is
+    claimed for sending and has not recorded an identifier yet. That is the
+    window this function exists for, exactly; it decides whether to KEEP the
+    callback and never which slot it belongs to, so it matches nothing and
+    proves nothing.
+
+    Runs in the CALLER's transaction. The caller is expected to hold
+    :func:`lock_message_identity` for this identifier already — the status hook
+    takes it before its own lookup — which is what makes the gap between
+    "nothing owns this id" and this insert unreachable rather than merely
+    narrow; the lock is re-taken here so the function is safe on its own too.
+    """
+    if kind not in DELIVERY_RECEIPT_KINDS:
+        raise ValueError("unsupported status receipt kind")
+    now = observed_at or utcnow()
+    provider_message_id = str(status.get("provider_message_id") or "").strip()
+    if not provider_message_id:
+        return ReceiptOutcome(False, SKIPPED_NO_MESSAGE_ID)
+    if not signature_verified:
+        return ReceiptOutcome(False, UNPROVEN_CALLBACK_UNVERIFIED)
+
+    await lock_message_identity(session, provider_message_id)
+    with session.no_autoflush:
+        located = await _locate_item(session, provider_message_id)
+    if located is not None:
+        # It is owned after all, so the matched path is the right one and this
+        # function must not write a row that would never be bound.
+        return ReceiptOutcome(False, CONFLICT_ROUTE_UNVERIFIABLE)
+    if not await _send_could_claim_a_new_message_id(session):
+        return ReceiptOutcome(False, SKIPPED_NOT_OURS)
+
+    event_at = status.get("event_at") if isinstance(status.get("event_at"), datetime) else None
+    sender_digest = sender_route_digest(status.get("phone_number_id"))
+    recipient_digest = recipient_route_digest(status.get("recipient_id"))
+    inserted = await _insert_fact(
+        session,
+        {
+            "fact_key": _receipt_fact_key(
+                kind=kind,
+                provider_message_id=provider_message_id,
+                sender_digest=sender_digest,
+                recipient_digest=recipient_digest,
+                event_at=event_at,
+            ),
+            "kind": kind,
+            "authenticity": INBOUND_AUTHENTICITY_SIGNED,
+            "match_state": DELIVERY_RECEIPT_MATCH_UNMATCHED,
+            "provider_message_id": provider_message_id,
+            "observed_sender_digest": sender_digest,
+            "observed_recipient_digest": recipient_digest,
+            "route_proven": False,
+            "whatsapp_event_id": whatsapp_event_id,
+            "observed_at": now,
+            "event_at": event_at,
+            "evidence": {"source": DELIVERY_FAILURE_SOURCE_CALLBACK, "awaiting_binding": True},
+        },
+        table=EasyWeekVoucherProductionDeliveryReceipt,
+    )
+    return ReceiptOutcome(inserted is not None)
+
+
+async def _send_could_claim_a_new_message_id(session: AsyncSession) -> bool:
+    """Is a send of this phase in the window where a callback can overtake it?
+
+    True while some slot is claimed for sending and has recorded no provider
+    message id. That is the only state in which a positive callback can name an
+    identifier this phase is about to own, so it is the only state in which one
+    is worth keeping. A process that died mid-send leaves its slot in exactly
+    this state, which is when the keeping matters most.
+
+    This is NOT a match: it says nothing about which slot, and no row written
+    under it names one.
+    """
+    found = await session.scalar(
+        select(EasyWeekVoucherProductionBatchItem.id)
+        .where(EasyWeekVoucherProductionBatchItem.status == VOUCHER_PRODUCTION_ITEM_SEND_CLAIMED)
+        .where(EasyWeekVoucherProductionBatchItem.provider_message_id.is_(None))
+        .limit(1)
+    )
+    return found is not None
+
+
+async def bind_unmatched_receipts(
+    session: AsyncSession,
+    *,
+    item: EasyWeekVoucherProductionBatchItem,
+    provider_message_id: str,
+    observed_at: datetime | None = None,
+) -> frozenset[str]:
+    """Claim the positive callbacks that arrived before this id was committed.
+
+    Called from the acceptance write, inside the same transaction and under the
+    same header and item locks, so an early callback is bound by the very commit
+    that made it bindable. Matching is on the exact identifier and nothing else.
+
+    A bound receipt is re-judged from scratch against the frozen route: it is
+    not promoted just because it waited, and an unsigned one was never stored to
+    begin with. A foreign or unverifiable route makes it ``conflicting``, which
+    is kept for audit and is never read as proof.
+
+    Returns the kinds that became CONFIRMED, for the caller to apply to the slot
+    in its own monotonic order. This function writes no slot status itself: the
+    ledger owns that, and ``read`` outranking ``delivered`` is its rule.
+    """
+    now = observed_at or utcnow()
+    rows = list(
+        (
+            await session.scalars(
+                select(EasyWeekVoucherProductionDeliveryReceipt)
+                .where(EasyWeekVoucherProductionDeliveryReceipt.provider_message_id == provider_message_id)
+                .where(EasyWeekVoucherProductionDeliveryReceipt.match_state == DELIVERY_RECEIPT_MATCH_UNMATCHED)
+                .order_by(EasyWeekVoucherProductionDeliveryReceipt.id.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not rows:
+        return frozenset()
+
+    attempt = await _attempt_for(session, item)
+    confirmed: set[str] = set()
+    for row in rows:
+        route_proven, conflict = _route_verdict(
+            attempt,
+            observed_sender_digest=row.observed_sender_digest,
+            observed_recipient_digest=row.observed_recipient_digest,
+        )
+        row.item_id = int(item.id)
+        row.attempt_id = int(attempt.id) if attempt is not None else None
+        row.route_proven = bool(route_proven)
+        merged = dict(row.evidence or {})
+        merged.pop("awaiting_binding", None)
+        merged["bound_at"] = now.isoformat()
+        merged["route_proven"] = bool(route_proven)
+        if route_proven:
+            row.match_state = DELIVERY_RECEIPT_MATCH_CONFIRMED
+            row.batch_id = int(item.batch_id)
+            row.slot = int(item.slot)
+            confirmed.add(str(row.kind))
+            # Same rule, same transaction: a proven success withdraws any
+            # confirmed failure already bound to this message id. Ordinarily
+            # there is none at this point — the acceptance binds the positive
+            # callbacks before the failures — and saying it once here keeps the
+            # two paths on one model instead of two.
+            await demote_confirmed_failures_after_success(
+                session,
+                item=item,
+                provider_message_id=provider_message_id,
+                kind=str(row.kind),
+                observed_at=now,
+            )
+        else:
+            row.match_state = DELIVERY_RECEIPT_MATCH_CONFLICTING
+            merged["conflict"] = conflict or UNPROVEN_ROUTE_UNKNOWN
+        row.evidence = merged
+        row.updated_at = now
+
+    logger.info(
+        "voucher_production_receipt: bound=%s confirmed=%s batch=%s slot=%s",
+        len(rows),
+        len(confirmed),
+        item.batch_id,
+        item.slot,
+    )
+    return frozenset(confirmed)
+
+
+# The two slot statuses a confirmed receipt may advance a slot to, in rank
+# order. Named here so the ledger and this module cannot disagree about which
+# receipt kind means which status.
+RECEIPT_KIND_STATUS: Final[tuple[tuple[str, str], ...]] = (
+    (DELIVERY_RECEIPT_KIND_DELIVERED, VOUCHER_PRODUCTION_ITEM_DELIVERED),
+    (DELIVERY_RECEIPT_KIND_READ, VOUCHER_PRODUCTION_ITEM_READ),
+)
+
+
+async def record_status_receipt(
+    session: AsyncSession,
+    *,
+    status: dict[str, Any],
+    kind: str,
+    whatsapp_event_id: int | None = None,
+    signature_verified: bool = False,
+    observed_at: datetime | None = None,
+) -> ReceiptOutcome:
+    """Record the PROOF behind one ``delivered``/``read`` callback (§46.3).
+
+    Written beside the slot's own transition, never instead of it. The ledger
+    keeps applying the status exactly as before — it is the record of a mailing
+    that really happened — and this adds, for the cases where it can be proven,
+    the two things that record does not keep: that the delivery's signature was
+    verified, and that the route the callback named is the one this slot's single
+    attempt froze.
+
+    Nothing is written unless all three parts hold. A callback with no verified
+    signature is an unattributed claim; one naming a foreign sender or recipient
+    is about somebody else's message; one that names no route at all cannot be
+    compared with a route we did freeze, and the stricter check must not be
+    bypassable by omitting fields. In each case the slot keeps its status and
+    gains no proof, which is what makes a later audience fail closed.
+
+    Runs inside the CALLER's transaction, re-taking locks it already holds, and
+    is idempotent: the key is computed from the proven contents of the fact, so
+    a Resend or a duplicate delivery adds nothing.
+    """
+    if kind not in DELIVERY_RECEIPT_KINDS:
+        raise ValueError("unsupported status receipt kind")
+    now = observed_at or utcnow()
+    provider_message_id = str(status.get("provider_message_id") or "").strip()
+    if not provider_message_id:
+        return ReceiptOutcome(False, SKIPPED_NO_MESSAGE_ID)
+    if not signature_verified:
+        return ReceiptOutcome(False, UNPROVEN_CALLBACK_UNVERIFIED)
+
+    await lock_message_identity(session, provider_message_id)
+    with session.no_autoflush:
+        located = await _locate_item(session, provider_message_id)
+    if located is None:
+        return ReceiptOutcome(False, SKIPPED_NOT_OURS)
+
+    batch_id, _slot = located
+    item = (
+        await session.execute(
+            select(EasyWeekVoucherProductionBatchItem)
+            .where(EasyWeekVoucherProductionBatchItem.batch_id == batch_id)
+            .where(EasyWeekVoucherProductionBatchItem.provider_message_id == provider_message_id)
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        return ReceiptOutcome(False, SKIPPED_NOT_OURS)
+
+    attempt = await _attempt_for(session, item)
+    observed_sender = sender_route_digest(status.get("phone_number_id"))
+    observed_recipient = recipient_route_digest(status.get("recipient_id"))
+    route_proven, conflict = _route_verdict(
+        attempt,
+        observed_sender_digest=observed_sender,
+        observed_recipient_digest=observed_recipient,
+    )
+    if not route_proven:
+        # A foreign route, an unverifiable one, or an attempt that froze none.
+        # All three leave the status without proof, honestly.
+        return ReceiptOutcome(False, conflict or UNPROVEN_ROUTE_UNKNOWN)
+    assert observed_sender is not None and observed_recipient is not None
+
+    # The success is proven here, so §46.3's precedence applies now rather than
+    # depending on which of the pair this process read first. Done before the
+    # idempotent insert and not conditionally on it, so a duplicate delivery of
+    # the same callback reaches the same conclusion.
+    await demote_confirmed_failures_after_success(
+        session,
+        item=item,
+        provider_message_id=provider_message_id,
+        kind=kind,
+        observed_at=now,
+    )
+
+    event_at = status.get("event_at") if isinstance(status.get("event_at"), datetime) else None
+    fact_key = _receipt_fact_key(
+        kind=kind,
+        provider_message_id=provider_message_id,
+        sender_digest=observed_sender,
+        recipient_digest=observed_recipient,
+        event_at=event_at,
+    )
+    inserted = await _insert_fact(
+        session,
+        {
+            "fact_key": fact_key,
+            "kind": kind,
+            "authenticity": INBOUND_AUTHENTICITY_SIGNED,
+            "match_state": DELIVERY_RECEIPT_MATCH_CONFIRMED,
+            "item_id": int(item.id),
+            "attempt_id": int(attempt.id) if attempt is not None else None,
+            "batch_id": int(item.batch_id),
+            "slot": int(item.slot),
+            "provider_message_id": provider_message_id,
+            "observed_sender_digest": observed_sender,
+            "observed_recipient_digest": observed_recipient,
+            "route_proven": True,
+            "whatsapp_event_id": whatsapp_event_id,
+            "observed_at": now,
+            "event_at": event_at,
+            "evidence": {"source": DELIVERY_FAILURE_SOURCE_CALLBACK},
+        },
+        table=EasyWeekVoucherProductionDeliveryReceipt,
+    )
+    return ReceiptOutcome(inserted is not None)
+
+
 async def record_api_rejection(
     session: AsyncSession,
     *,
@@ -813,7 +1285,13 @@ __all__ = [
     "bind_unmatched_failures",
     "lock_callback_scope",
     "lock_message_identity",
+    "RECEIPT_KIND_STATUS",
+    "ReceiptOutcome",
+    "bind_unmatched_receipts",
+    "demote_confirmed_failures_after_success",
     "record_api_rejection",
+    "record_status_receipt",
     "record_callback_failure",
     "record_unmatched_callback_failure",
+    "record_unmatched_status_receipt",
 ]

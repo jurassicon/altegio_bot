@@ -494,6 +494,40 @@ async def _start_identifier_conflict(
     return bool(found)
 
 
+def stop_superseded_by_opt_in(
+    *,
+    stop_event_at: datetime | None,
+    state: str | None,
+    decision_command: str | None,
+    decided_event_at: datetime | None,
+) -> bool:
+    """Is this STOP a replay of something a PROVEN newer opt-in already answered?
+
+    THE single definition of the STOP/START order, so the writer that applies a
+    refusal and every reader that asks whether an old refusal still stands
+    cannot drift apart. Lifted out of :func:`apply_consent_decision`, which is
+    its original home and now its first caller.
+
+    Only a provable order refuses a STOP. The bar is the PROVEN event time of
+    the opt-in actually IN FORCE, and both sides must be known: an equal time,
+    an unknown time on either side, an opt-in that is not the decision in force,
+    and anything that is not a proven opt-in at all all leave the refusal
+    standing. That asymmetry is deliberate — a tie and an unproven order both
+    fall to the refusal — and it is the same rule in both directions, because
+    only a decision this ledger honoured can be read as an opt-in here. An
+    unsigned, older or refused START never became one.
+
+    About ONE address. A START proven for one number says nothing about another,
+    which is why the caller passes the row of the address the refusal was sent
+    from and never an aggregate.
+    """
+    if state != CONSENT_STATE_OPTED_IN or decision_command != CONSENT_COMMAND_START:
+        return False
+    if stop_event_at is None or decided_event_at is None:
+        return False
+    return stop_event_at < decided_event_at
+
+
 async def apply_consent_decision(
     session: AsyncSession,
     *,
@@ -568,8 +602,12 @@ async def apply_consent_decision(
             # 10:45 was discarded as a replay of something that never happened.
             # An audit trail of rejected attempts must not be able to license
             # ignoring a refusal.
-            opt_in_event_at = row.decided_event_at if row.decision_command == CONSENT_COMMAND_START else None
-            if event_at is not None and opt_in_event_at is not None and event_at < opt_in_event_at:
+            if stop_superseded_by_opt_in(
+                stop_event_at=event_at,
+                state=row.state,
+                decision_command=row.decision_command,
+                decided_event_at=row.decided_event_at,
+            ):
                 if row.last_stop_observed_at is None or observed_at > row.last_stop_observed_at:
                     row.last_stop_observed_at = observed_at
                 merged = dict(row.evidence or {})
@@ -863,7 +901,7 @@ async def _backfill_receipts(
     return await _receipts_for_event(session, int(event.id))
 
 
-def _is_chatwoot_sourced(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
+def is_chatwoot_sourced(event: WhatsAppEvent, payload: dict[str, Any]) -> bool:
     """A Chatwoot mirror or operator relay, which must not execute commands.
 
     Deliberately the same two markers the inbox worker uses for inbound loop
@@ -1018,7 +1056,7 @@ async def apply_inbound_consent(
             payload = event.payload or {}
             if not isinstance(payload, dict):
                 return ConsentApplication(event_id=event_id, skipped_reason="payload_not_object")
-            if _is_chatwoot_sourced(event, payload):
+            if is_chatwoot_sourced(event, payload):
                 return ConsentApplication(event_id=event_id, skipped_reason="chatwoot_sourced")
 
             receipts = await _receipts_for_event(session, event_id)
@@ -1356,6 +1394,35 @@ async def _resolve_identity(
     )
 
 
+async def matched_addresses(
+    session: AsyncSession,
+    *,
+    phone: object,
+    easyweek_customer_uuid: uuid_module.UUID | str | None = None,
+) -> tuple[str, ...]:
+    """Every address :func:`consent_decision` would match this person by.
+
+    The aggregate's own answer, exposed so that a caller which has to ask a
+    QUESTION about those addresses — rather than read the decision — cannot
+    assemble a narrower set of its own and then miss what the decision would
+    have found.
+
+    PR-22.2's §46.4.4 backlog scan is that caller. It is given the numbers a
+    preview's recipients are known by and reports the refusals sitting
+    unaccounted among them, and the preview then takes the veto against this
+    same set. Assembling the question from the cards alone left out exactly the
+    numbers §46.4.2 cares about most: a number the card has since dropped, which
+    is reachable only from the links this database wrote down for the ban to
+    travel. The scan never saw the event, so the later veto had nothing to find.
+
+    Ban extension only, as everywhere else: a number in this set is a number a
+    refusal for this person could be recorded against, and never a proof that it
+    belongs to this customer or to their branch.
+    """
+    identity = await _resolve_identity(session, phone=phone, easyweek_customer_uuid=easyweek_customer_uuid)
+    return identity.addresses
+
+
 async def consent_decision(
     session: AsyncSession,
     *,
@@ -1412,7 +1479,13 @@ async def consent_decision(
     sources: list[str] = []
     gaps: list[str] = list(identity.gaps)
     suppressed = False
-    newest_opt_in: datetime | None = None
+    # The newest proven opt-in PER ADDRESS. Not one figure for the person: a
+    # START is a decision about the number it arrived from, and §46.4.7 lets one
+    # lift only the refusal on that number. Collapsing them into a single
+    # high-water mark let an opt-in proven on B answer the historical refusal
+    # recorded against A — the same person, the same uuid, and a number they
+    # never resubscribed on.
+    opt_in_at: dict[str, datetime] = {}
     for row in rows:
         if row.state == CONSENT_STATE_OPTED_OUT:
             suppressed = True
@@ -1422,8 +1495,11 @@ async def consent_decision(
                 or (row.wa_address not in ordered_addresses and row.banned_easyweek_customer_uuid is not None)
                 else SOURCE_SUPPRESSION
             )
-        elif row.decided_observed_at is not None and (newest_opt_in is None or row.decided_observed_at > newest_opt_in):
-            newest_opt_in = row.decided_observed_at
+        elif row.decided_observed_at is not None:
+            for variant in address_variants(row.wa_address):
+                known = opt_in_at.get(variant)
+                if known is None or row.decided_observed_at > known:
+                    opt_in_at[variant] = row.decided_observed_at
         if row.banned_easyweek_customer_uuid is None and (row.evidence or {}).get("uuid_binding") == "ambiguous":
             gaps.append(GAP_UUID_BINDING_AMBIGUOUS)
 
@@ -1439,20 +1515,44 @@ async def consent_decision(
         suppressed = True
         sources.append(SOURCE_CLIENT_FLAG)
 
-    recipient_rows = (
-        await session.scalars(
-            select(CampaignRecipient.created_at)
+    # One row per matched ADDRESS, and no row limit. The earlier query took the
+    # newest fifty snapshots across every matched number ordered by time, which
+    # a single busy number's answered history can fill on its own while a live
+    # refusal on another number sits past the cut and is never read. Grouping
+    # removes both the ordering and the limit: the result is bounded by the
+    # number of addresses the aggregate matched, which is bounded already.
+    snapshots = (
+        await session.execute(
+            select(
+                CampaignRecipient.phone_e164,
+                func.max(CampaignRecipient.created_at),
+                # How many of this number's snapshots carry no time of their own.
+                func.count(CampaignRecipient.id) - func.count(CampaignRecipient.created_at),
+            )
             .where(CampaignRecipient.is_opted_out.is_(True))
             .where(CampaignRecipient.phone_e164.in_(ordered_addresses))
-            .order_by(CampaignRecipient.created_at.desc().nullslast())
-            .limit(50)
+            .group_by(CampaignRecipient.phone_e164)
         )
     ).all()
-    for created_at in recipient_rows:
-        # A snapshot taken BEFORE a proven, verified opt-in has been answered by
-        # that opt-in and is not a live refusal. One taken after it, or one whose
-        # own time is unknown, still refuses — an unproven order never grants.
-        if newest_opt_in is not None and created_at is not None and created_at < newest_opt_in:
+    for phone, newest_snapshot, undated in snapshots:
+        # A snapshot taken BEFORE a proven, verified opt-in ON ITS OWN NUMBER has
+        # been answered by that opt-in and is not a live refusal. One taken
+        # after it, one whose own time is unknown, and one on a number that was
+        # never resubscribed all still refuse — an unproven order never grants,
+        # and neither does somebody's opt-in on a different line.
+        answered_at: datetime | None = None
+        normalised = normalize_wa_address(phone)
+        if normalised is not None:
+            for variant in address_variants(normalised):
+                found = opt_in_at.get(variant)
+                if found is not None and (answered_at is None or found > answered_at):
+                    answered_at = found
+        if (
+            int(undated or 0) == 0
+            and answered_at is not None
+            and newest_snapshot is not None
+            and newest_snapshot < answered_at
+        ):
             continue
         suppressed = True
         sources.append(SOURCE_RECIPIENT_FLAG)
@@ -1522,10 +1622,26 @@ class LedgerState:
     # against — our own clock on both sides, never a timestamp invented for the
     # snapshot.
     decided_observed_at: datetime | None = None
+    # WHICH decision is in force, and the PROVEN event time it was made at.
+    # Carried so a reader asking whether an old refusal still stands can apply
+    # :func:`stop_superseded_by_opt_in` — the writer's own order — instead of
+    # comparing arrival times, which prove nothing about what the customer sent
+    # first.
+    decision_command: str | None = None
+    decided_event_at: datetime | None = None
 
     @property
     def refuses(self) -> bool:
         return self.state == CONSENT_STATE_OPTED_OUT
+
+    def supersedes_stop(self, stop_event_at: datetime | None) -> bool:
+        """Has a proven newer opt-in on THIS address already answered that STOP?"""
+        return stop_superseded_by_opt_in(
+            stop_event_at=stop_event_at,
+            state=self.state,
+            decision_command=self.decision_command,
+            decided_event_at=self.decided_event_at,
+        )
 
     @property
     def permits(self) -> bool:
@@ -1557,18 +1673,22 @@ async def ledger_state(session: AsyncSession, *, phone: object) -> LedgerState:
                 WhatsAppConsentSuppression.consent_version,
                 WhatsAppConsentSuppression.evidence,
                 WhatsAppConsentSuppression.decided_observed_at,
+                WhatsAppConsentSuppression.decision_command,
+                WhatsAppConsentSuppression.decided_event_at,
             ).where(WhatsAppConsentSuppression.wa_address == address)
         )
     ).first()
     if row is None:
         return LedgerState(None)
-    state, version, evidence, decided_observed_at = row
+    state, version, evidence, decided_observed_at, decision_command, decided_event_at = row
     reason = (evidence or {}).get("last_refused_start_reason")
     return LedgerState(
         str(state),
         int(version),
         str(reason) if isinstance(reason, str) else None,
         decided_observed_at,
+        str(decision_command) if decision_command is not None else None,
+        decided_event_at,
     )
 
 
@@ -1925,6 +2045,8 @@ __all__ = [
     "extract_inbound_receipts",
     "final_send_guard",
     "is_suppressed",
+    "matched_addresses",
+    "is_chatwoot_sourced",
     "iter_payload_consent_commands",
     "ledger_matches_clause",
     "ledger_state",
@@ -1936,4 +2058,5 @@ __all__ = [
     "recipient_route_digest",
     "record_inbound_receipts",
     "sender_route_digest",
+    "stop_superseded_by_opt_in",
 ]
