@@ -138,10 +138,13 @@ What this module refuses to do
   evidence of its own: a booking nothing else was delivered about holds nobody
   open.
 * It never lets what one delivery proved answer for what another left open.
-  A creation delivery that named nobody leaves whose creation it was
-  unestablished, and a second creation naming a proven owner speaks for its own
-  delivery only — so a contradiction about where a booking was made is not set
-  aside because one of the two deliveries is demonstrably a stranger's.
+  A creation delivery that named nobody, from a branch no owned creation of
+  that booking named, leaves whose creation it was unestablished, and a second
+  creation naming a proven owner speaks for its own delivery only — so a
+  contradiction about where a booking was made is not set aside because one of
+  the two deliveries is demonstrably a stranger's. From the branch an owned
+  creation DID name it is that creation again as far as anything here can tell,
+  and refusing on it withdrew an owner the capture had already proven.
 * It never reads a delivery that named nobody as proof that nothing moved. The
   permissive rule for a card with no numeric bridge needs both halves: no
   delivery naming a different customer record, and none that named no customer
@@ -475,6 +478,34 @@ def _attribution(
     return ATTRIBUTION_THEIRS
 
 
+def _unowned_creation_branches(dispute: DisputedBooking) -> frozenset[int]:
+    """Branches whose creation of this booking named nobody and nothing else did.
+
+    A creation delivery that named no customer leaves one claim about who made
+    the booking unstated. Whether that claim is a SECOND one depends on the
+    branch it came from, and one booking is made in exactly one branch:
+
+    * from a branch an OWNED creation of the same booking also named, it may be
+      that same creation delivered again. It adds no candidate owner that the
+      capture cannot already name — the one thing that would make it a separate
+      claim, a different customer, is precisely what it did not state — and a
+      disagreement of any other kind it does carry (a second instant, a second
+      owner beside it) is counted where disagreements are counted and refuses
+      there;
+    * from any OTHER branch it cannot be that creation again, because the two
+      deliveries cannot both be right about where the booking was made. Then
+      whose creation that one was is a second, unanswered question, and a
+      proven owner for the first branch does not answer it.
+
+    Refusing on the bare flag made no such distinction, so an ownerless repeat
+    of a creation withdrew the owner its own branch had already proven: their
+    own cancelled booking, known since before the mailing, became unknown, and
+    one stranger's booking held a whole batch open.
+    """
+    owned = {int(company_id) for company_id, _customer_id in dispute.creation_pairs}
+    return frozenset(int(branch) for branch in dispute.ownerless_creation_branches if int(branch) not in owned)
+
+
 def _dispute_owner(
     dispute: DisputedBooking,
     *,
@@ -504,13 +535,14 @@ def _dispute_owner(
     Then nothing about whose it is has been established, which is not the same
     as its being anybody's.
     """
-    if not dispute.creation_pairs or dispute.creation_without_owner:
-        # A creation delivery that named nobody leaves one of the claims about
-        # who made this booking simply absent, and a second creation naming a
-        # proven owner speaks for its own delivery and not for that one. The
-        # known owner was allowed to answer for both, so a contradiction about
-        # where the booking was made was set aside as "demonstrably somebody
-        # else's" while whose the contradicting delivery was had never been
+    if not dispute.creation_pairs or _unowned_creation_branches(dispute):
+        # A creation delivery that named nobody, from a branch no owned
+        # creation of this booking named, leaves one of the claims about who
+        # made it simply absent — and a second creation naming a proven owner
+        # speaks for its own delivery and not for that one. The known owner was
+        # allowed to answer for both, so a contradiction about where the
+        # booking was made was set aside as "demonstrably somebody else's"
+        # while whose the contradicting delivery was had never been
         # established.
         return None
     verdicts = {
@@ -704,11 +736,11 @@ def _dispute_touches(
         # theirs this deployment cannot see, so matching digits are not the
         # question there — the absence of an answer is.
         branches = {int(value) for value in numeric_branches}
-        if not dispute.creation_pairs or dispute.creation_without_owner:
-            # And a creation delivery that named nobody is the same position
-            # seen from the other side: one of the claims about who made this
-            # booking is absent, so comparing their number against the claims
-            # that ARE present answers nothing.
+        if not dispute.creation_pairs or _unowned_creation_branches(dispute):
+            # And an unanswered claim from a branch of its own is the same
+            # position seen from the other side: one of the claims about who
+            # made this booking is absent, so comparing their number against
+            # the claims that ARE present answers nothing.
             return True
         return any(
             int(customer_id) == int(numeric_id) if int(company_id) in branches else True

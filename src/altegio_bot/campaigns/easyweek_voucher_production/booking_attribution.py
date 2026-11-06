@@ -378,11 +378,14 @@ class _BookingDraft:
     # which is neither a proven change of person nor a proof that nothing
     # changed.
     unnamed_company_ids: set[int] = field(default_factory=set)
-    # A creation delivery of this booking named NO customer. Its branch and its
-    # instant are kept above, and whose creation it was is simply not
-    # established — which a second creation naming a known owner cannot answer
-    # for it.
-    ownerless_creation: bool = False
+    # The branches of the creation deliveries of this booking that named NO
+    # customer. Their instants are kept above, and whose creation each one was
+    # is not established by itself. The BRANCH is kept because it is what says
+    # whether another delivery could be speaking about the same creation: one
+    # booking is made in one branch, so a delivery from the branch an owned
+    # creation named may be that creation again, and one from any other branch
+    # cannot be.
+    ownerless_creation_company_ids: set[int] = field(default_factory=set)
     # Two creation deliveries of this booking stated two DIFFERENT instants.
     # Read from the set of instants rather than from a comparison against
     # whichever of them was complete, and counted once per booking — a
@@ -462,10 +465,11 @@ class DisputedBooking:
     # because a product of the two invents customer records nothing observed.
     creation_pairs: frozenset[tuple[int, int]] = frozenset()
     customer_pairs: frozenset[tuple[int, int]] = frozenset()
-    # A creation delivery of this booking named no customer, so one of the
-    # claims about who made it is simply absent. A second creation naming a
-    # proven owner speaks for its own delivery and not for that one.
-    creation_without_owner: bool = False
+    # The branches of the creation deliveries of this booking that named no
+    # customer. Each is a claim about who made the booking that was never
+    # stated; whether another delivery already stated it is a question about
+    # the branch, and is the caller's to ask.
+    ownerless_creation_branches: frozenset[int] = frozenset()
     # A delivery of this booking named no customer, so who holds it now is not
     # established either — the same fact :class:`ObservedBooking` carries, and
     # needed here for the same reason: the permissive rule for a card with no
@@ -1058,7 +1062,7 @@ async def scan_capture(
             # ``proved_more_than_identity``, so a booking nothing else was ever
             # delivered about leaves the scan entirely rather than holding a
             # whole batch open on a row whose owner nobody ever claimed.
-            draft.ownerless_creation = True
+            draft.ownerless_creation_company_ids.add(int(facts["company_id"]))
             draft.creation_company_ids.add(int(facts["company_id"]))
             _note_branch_conflict(draft)
             partial_created_at = facts.get("booking_created_at")
@@ -1193,7 +1197,7 @@ async def scan_capture(
                     creation_company_ids=frozenset(draft.creation_company_ids),
                     creation_pairs=frozenset(draft.creation_pairs),
                     customer_pairs=frozenset(draft.customer_pairs),
-                    creation_without_owner=bool(draft.ownerless_creation),
+                    ownerless_creation_branches=frozenset(draft.ownerless_creation_company_ids),
                     custody_unproven=bool(draft.unnamed_company_ids),
                     first_observed_at=draft.first_observed_at,
                 )

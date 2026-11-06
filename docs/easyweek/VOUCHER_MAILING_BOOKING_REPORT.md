@@ -175,9 +175,14 @@ Rules:
   branch" is not "the same customer". The report itself neither counts nor
   publishes it.
 * A booking the report cannot attribute is handed to such a caller with both
-  doubts stated: whether a creation delivery of it named NO customer, and
-  whether any delivery of it left the holder unnamed. Neither is a conversion,
-  neither credits anybody, and neither changes what this report prints.
+  doubts stated: which BRANCHES a creation delivery of it named no customer
+  from, and whether any delivery of it left the holder unnamed. The branches
+  are reported rather than a bare flag, because one booking is made in exactly
+  one branch: a nameless creation from the branch an owned creation also named
+  may be that same creation again, and one from any other branch cannot be.
+  Which of those a caller needs is the caller's question — neither is a
+  conversion, neither credits anybody, and neither changes what this report
+  prints.
 * A booking some delivery assigns to another customer keeps the creation
   attributed to the customer its own creation delivery named, flags
   `customer_reassigned` in the details, and credits the other customer with

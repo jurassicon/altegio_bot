@@ -393,11 +393,35 @@ uuid: the booking came out "demonstrably somebody else's", the contradiction
 about where it was made was set aside with it, and recipients with completely
 empty histories came out `included`, bridged and manual alike. Whose creation
 the second delivery was had never been established, and a known owner cannot
-answer for a claim nobody made. So a dispute one of whose creation deliveries
-named nobody leaves the owner question open, and the recipient stays unknown
-until something else settles it: the second delivery naming the same stranger
-or another one closes it, and a number nobody has a card for, or one that
-resolves to the recipient themselves, does not.
+answer for a claim nobody made. So a dispute with such a delivery leaves the
+owner question open, and the recipient stays unknown until something else
+settles it: a complete delivery from that second branch naming the same
+stranger — or another one — closes it, and a number nobody has a card for, or
+one that resolves to the recipient themselves, does not.
+
+Which deliveries are "such a delivery" is decided by the BRANCH, because one
+booking is made in exactly one branch:
+
+* a creation naming nobody, from a branch an OWNED creation of the same
+  booking also named, may be that same creation delivered again. It adds no
+  candidate owner the capture cannot already name — the one thing that would
+  make it a separate claim, a different customer, is exactly what it did not
+  state;
+* one from any other branch cannot be that creation again, since the two
+  cannot both be right about where the booking was made, so whose creation it
+  was is a second unanswered question.
+
+Refusing on the bare fact of a nameless creation made no such distinction, and
+an ownerless REPEAT then withdrew an owner its own branch had already proven:
+somebody's own cancelled booking, known to this deployment since before the
+mailing and visible in their complete current history, became `unknown`, and a
+single stranger's booking held a whole batch open again. The exemption is
+narrow by construction — it answers only the question the repeat leaves open,
+and every other disagreement such a delivery can carry is counted where
+disagreements are counted: a second instant, a second owner beside it in the
+same branch, an instant later than the booking was first heard of or later than
+the preview, and a nameless LIFECYCLE delivery, which is about who holds the
+booking and is untouched by any of this.
 
 Who HOLDS a booking is not who made it, and only a creation delivery answers
 the second question. An update or a cancellation naming somebody else is an
@@ -1323,6 +1347,25 @@ The ninth round's three findings, each failing before its fix:
    agreeing older instant and no instant at all are still settled by the
    sighting, and their own new booking or a booking ahead still excludes for
    its own reason.
+
+The tenth round's finding, failing before its fix:
+
+1. an ownerless creation delivery refused unconditionally, whether or not it
+   disagreed with anything. Three reproductions: their own undated creation,
+   stored before the mailing and visible as a cancelled booking in their
+   complete history, turned `unknown` by an ownerless repeat from the same
+   branch with a consistent older instant or none at all; a stranger's undated
+   creation after the mailing, proven through a card of its own branch and
+   absent from two independent recipients' histories, turning both `unknown`
+   on the same kind of repeat; and the second branch of a two-branch
+   contradiction, correctly `unknown` while only a nameless delivery spoke for
+   it and still `unknown` after a complete delivery from that branch confirmed
+   the same stranger, in either arrival order. Controls: an ownerless repeat
+   claiming an instant after the first sighting or after the preview, two of
+   them claiming two instants, two owners in one branch beside a repeat, a
+   nameless lifecycle delivery beside a repeat — visible and not, same branch
+   and other — and their own new booking or a booking ahead, which still
+   exclude for their own reasons.
 
 ## 11. Rollout prerequisites — NOT satisfied
 
