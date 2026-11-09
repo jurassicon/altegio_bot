@@ -1753,14 +1753,19 @@ number is printed with the moment it was computed, and the page never claims tha
 the recipients or their count are confirmed now. To learn the current count,
 recalculate.
 
-### What this is NOT
+### What this step is NOT
 
-**There is no sending.** No send button, no send confirmation, no endpoint, no
-queue, no job, no executor, and no path through the generic dispatch, the Outbox
-or the old follow-up worker. A stored preview authorises nothing: it is evidence
-of what was true at its check time, it expires after 24 hours, and it neither
-spends nor reserves a send attempt. The original mailing's ledger, its one-attempt
-limit, its stop rules and its booking report are untouched.
+**This step does not send.** Checking the composition has no send button, no send
+confirmation, no endpoint, no queue, no job and no executor, and no path through
+the generic dispatch, the Outbox or the old follow-up worker. A stored preview
+authorises nothing: it is evidence of what was true at its check time, it expires
+after 24 hours, and it neither spends nor reserves a send attempt. The original
+mailing's ledger, its one-attempt limit, its stop rules and its booking report
+are untouched.
+
+Sending is the SEPARATE scenario of §18, behind its own fence, with its own
+confirmation and its own executor. It re-proves every condition again rather
+than trusting this snapshot.
 
 Reading a preview changes nothing. A check that fails leaves the previous
 snapshot visibly stale rather than looking current — on the open page too, the
@@ -1829,12 +1834,12 @@ Five things, none of them done by this stage:
    the slot, whether or not the rank moved. The rank still never walks
    backwards, an unproven callback still proves nothing, and a message id this
    phase does not own is still untouched.
-5. **Sending itself is not implemented** (PR-22.3): the one-shot execution
-   claim, the terminal tombstones, the executor and the follow-up callbacks all
-   belong to that stage. The source and dedupe contract it will claim against is
-   already in the schema — at most one included row per source slot, per
-   canonical customer uuid and per original entitlement within one preview
-   version.
+5. **Sending is a separate stage** (PR-22.3, §18 below): the one-shot execution
+   claim, the terminal tombstones, the dedicated executor and the follow-up
+   callbacks all live there, in their own ledger and behind their own fence. The
+   source and dedupe contract they claim against starts here — at most one
+   included row per source slot, per canonical customer uuid and per original
+   entitlement within one preview version — and §18 extends it across runs.
 
 ### Migration
 
@@ -1844,3 +1849,230 @@ nothing else — the two preview tables and
 consent row, delivery fact, attempt counter, HMAC byte or financial value
 touched. Its downgrade refuses, before any DDL, while any preview or any
 delivery receipt is stored.
+
+## 18. Follow-up SEND (PR-22.3) — operation, and what is still required first
+
+The contract lives in `VOUCHER_FOLLOWUP_SEND_CONTRACT.md`. Read it before using
+this section on a production audience. Section 17 above is the preview this acts
+on; nothing here replaces it.
+
+**Nothing in this section is a production send.** The fence below is closed by
+default and the prerequisites in §18.7 are not satisfied.
+
+### 18.1 Administrator: deployment with sending CLOSED
+
+Two new variables, both default `false`, and they are read only by the follow-up
+path:
+
+```
+EASYWEEK_VOUCHER_FOLLOWUP_SEND_ENABLED=false
+EASYWEEK_VOUCHER_FOLLOWUP_EXECUTOR_ENABLED=false
+```
+
+`EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED` does **not** open the follow-up.
+It is not consulted anywhere in this path, so a deployment that is running the
+original mailing still refuses every follow-up plan, every confirmation and
+every claim by name. There is no third flag and no combination that sends.
+
+One new service, one instance, no rolling deploy:
+
+```bash
+cd /opt/altegio_bot && docker compose up -d --build altegio-easyweek-voucher-followup-executor
+```
+
+It is a supervised service rather than something run with `exec`: a run over a
+real audience must survive the request that confirmed it, the tab that was
+closed and the process that was restarted, and `exec` gives it none of that.
+Starting the container authorises nothing.
+
+Why one instance: at start-up it interrupts every run that claims to be
+`running`, which is correct for a single executor — such a row can only belong
+to a dead process — and wrong for two overlapping ones. Every row such a run
+left `claimed` becomes `unknown`, never `planned`: the attempt was spent before
+the POST, so the message may already have reached a real person.
+
+The migration is additive and goes in before the application:
+
+```bash
+cd /opt/altegio_bot && docker compose --profile ops run --rm migrate
+```
+
+### 18.2 Administrator: the one controlled local template row
+
+The application never creates this row. No migration, no startup hook and no
+shared seed adds it, and `reconcile_easyweek_voucher_template` serves other
+contracts and must **not** be run as a tool for the follow-up.
+
+What has to be true afterwards: exactly **one** row for
+`provider='easyweek'`, this branch's `company_id`, code
+`new_client_voucher_followup_v1`, language `de`, carrying the Meta name
+`kitilash_ka_new_client_voucher_followup_v1` and the exact approved body, and it
+must be `is_active`. An inactive duplicate is not ignored — it makes the contract
+unproven, which is what the application reports.
+
+The scope, the transaction and the refusal are therefore all explicit. Run it as
+one statement inside one transaction, in exactly this shape, and read the result
+before committing:
+
+```bash
+cd /opt/altegio_bot && docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+```
+
+```sql
+BEGIN;
+LOCK TABLE message_templates IN SHARE ROW EXCLUSIVE MODE;
+SELECT id, is_active, meta_template_name, md5(body)
+  FROM message_templates
+ WHERE provider = 'easyweek'
+   AND company_id = :company_id
+   AND code = 'new_client_voucher_followup_v1'
+   AND language = 'de';
+```
+
+Read that result first:
+
+* **one active row that already matches** — commit nothing, `ROLLBACK`, and stop.
+  The step is done;
+* **any row that does not match**, active or not — `ROLLBACK` and stop. Do not
+  edit it in place and do not deactivate it blindly: the mismatch has to be
+  explained first, because the index on
+  `(provider, company_id, code, language)` is **not** unique and a wrong row may
+  be somebody's deliberate state;
+* **no row at all** — insert exactly one, with the body copied verbatim from
+  §10 of `VOUCHER_FOLLOWUP_SEND_CONTRACT.md`, then verify and commit:
+
+```sql
+INSERT INTO message_templates (provider, company_id, code, language, body, meta_template_name, is_active)
+VALUES ('easyweek', :company_id, 'new_client_voucher_followup_v1', 'de', :body,
+        'kitilash_ka_new_client_voucher_followup_v1', true);
+SELECT count(*) FROM message_templates
+ WHERE provider = 'easyweek' AND company_id = :company_id
+   AND code = 'new_client_voucher_followup_v1' AND language = 'de';
+COMMIT;
+```
+
+The `LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE` is what protects against a
+concurrent duplicate: without it two administrators doing this at the same time
+each see no row and each insert one, and the result is the ambiguity the
+application then refuses on. The final `SELECT count(*)` must read exactly `1`
+before `COMMIT`; anything else is a `ROLLBACK`.
+
+A live Meta read still has to prove the exact APPROVED contract afterwards. The
+local row is one half; the application proves the other half in the evaluation
+that uses it, every time, because an approved template can be paused between two
+page loads.
+
+### 18.3 Operator: prerequisites before the audience is opened
+
+* the unsubscribe reconciliation of §16 applied, and reviewed with no external
+  effects. A stored `source_gaps` is not proof that an old event's authenticity
+  was recovered;
+* the delivery evidence of §16 read, knowing what it does and does not prove.
+  The receipts table being empty does **not** permit using old `delivered` /
+  `read` timestamps as proof: there is no historical replay and no positive
+  evidence is manufactured from an old status;
+* the interval chosen by the owner, explicitly, in days. There is no default
+  anywhere and none is invented;
+* the groups chosen deliberately. The confirmed-failure group currently yields
+  an honest zero, because `followup-failure-policy-v1` admits no cause;
+* an empty audience is a correct result, not a reason to loosen anything.
+
+### 18.4 Operator: preview, then the separate confirmation
+
+On the mailing's follow-up page, in order:
+
+1. tick the groups and type the interval — nothing is selected by default and an
+   empty selection is not «all»;
+2. **«Проверить состав»**. This stores a preview version. It sends nothing and
+   spends nothing, and running it again adds the next version;
+3. **«Подготовить отправку»**. This re-proves the batch, the message contract,
+   the live Meta approval and the sender, and states the exact number of
+   messages the next button can produce. That number is narrower than the
+   preview's included count on purpose: a recipient whose one extra attempt is
+   already accounted for is left out here rather than discovered later. It still
+   sends nothing and spends nothing, and it expires in ten minutes;
+4. read the panel: the count, the groups, the interval, the template and the
+   expiry. **«Подтвердить и отправить»** creates the run. **«Отмена»** spends
+   nothing;
+5. the dedicated executor does the work. Closing the tab, pressing twice,
+   opening a second tab and reloading do not produce a second run or a second
+   message.
+
+What the confirmation is bound to: the operator, this one action, the preview
+version and its composition digest, the exact slots, the count, the groups, the
+interval, the full template identity and body digest, the policy version, the
+branch sender, the frozen composition and the source batch's stop generation.
+Change any of them and a new confirmation is required.
+
+### 18.5 Operator: reading the result
+
+The page shows the first message and the follow-up **separately**, slot by slot:
+
+| Follow-up state | What it means |
+| --- | --- |
+| запланировано | reserved; nothing spent yet |
+| принято провайдером | Meta took responsibility. **Not** delivery |
+| доставлено / прочитано | a proven callback said so |
+| отказ провайдера | Meta refused the request itself; the attempt is spent |
+| ошибка доставки | a proven `failed` callback about this message |
+| результат неизвестен | the attempt is spent and the result is not proven |
+| исключено | lost eligibility before the attempt; nothing spent |
+| остановлено | terminal stop; nothing spent, and it blocks for good |
+
+«Прочтение не подтверждено» never means «did not read»: a device can be
+configured never to send a read receipt, and the page says so next to the group.
+A follow-up outcome is never shown as a statistic of the original mailing.
+
+### 18.6 Operator: stopping, and an unknown outcome
+
+**Stopping** is available while the run is queued, running or finished, and with
+the fence closed. It is terminal: it tombstones every recipient the run has not
+started, and a new run, a new preview, a new group selection and a new template
+cannot reopen them. A request already in flight cannot be promised cancelled —
+its row keeps its own honest outcome, and the report shows both moments. Nothing
+clears a follow-up stop, and a later START does not resume one.
+
+**An unknown outcome** means the attempt was spent and the result is not proven.
+There is no resend: not by confirming again, not by restarting the executor, not
+by a new run, not by a new preview. What is available is reconciliation of facts
+— a later proven callback about that exact message id still binds and still moves
+the row forward. If nothing ever arrives, the row stays `unknown`, honestly.
+
+An **interrupted** run means the executor died while holding the lease. Its
+claimed rows are recorded as `unknown` and the run is terminal. A human decides
+what to do next; nothing retries.
+
+### 18.7 Limits and rollback
+
+Not in this version: repeating chains, an automatic scheduler, several follow-up
+waves per original recipient, an automatic resend after an error, more branches,
+any financial operation, any change to Altegio campaigns, a new redemption
+engine, and follow-up attribution in the booking report.
+
+**Rollback of the application** is ordinary: set
+`EASYWEEK_VOUCHER_FOLLOWUP_SEND_ENABLED=false`, recreate the API, and stop the
+follow-up executor. Every action then refuses by name. Nothing is lost and
+nothing is retried.
+
+**Rollback of the schema** is deliberately refused while facts exist whose loss
+would allow a second message:
+
+* a **spent attempt** — the only record that stops a new run claiming the same
+  recipient again;
+* a **terminal stop tombstone** — an operator's decision that this person gets
+  no follow-up to this mailing;
+* a stored follow-up **callback** — the signature it was proven with is stripped
+  from the stored event and cannot be recovered.
+
+The downgrade refuses **before any DDL** in each case, naming which fact and how
+many, and the tables are locked first so a concurrent writer cannot land between
+the count and the drop. With none of those present — only reservations and
+skipped rows — the rollback is exactly as available as it was, and the re-upgrade
+leaves one Alembic head.
+
+### 18.8 Migration
+
+One additive revision, `c3f8a95d2e14`, over `b7d41f9c0a52`. Four new tables and
+nothing else — the approvals, the runs, the per-recipient sends and the follow-up
+callbacks: no existing column altered, and no consent row, delivery fact,
+attempt counter, HMAC byte, financial value or schema 3/4 rule read or rewritten.

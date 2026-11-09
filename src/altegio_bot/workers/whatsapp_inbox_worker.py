@@ -2344,6 +2344,86 @@ async def _apply_voucher_production_failure(
     return outcome.claimed
 
 
+async def _apply_voucher_followup_status(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+    kind: str,
+) -> bool:
+    """Record a delivered/read/failed callback for a §46 FOLLOW-UP message.
+
+    The sixth hook, and the only place a follow-up message's status can ever be
+    observed: like every voucher ledger in this family its rows own their
+    message ids and deliberately have no ``OutboxMessage``, so a callback naming
+    one would otherwise fall through to a lookup that finds nothing.
+
+    Routed on the exact ``provider_message_id``, which is UNIQUE across every
+    follow-up run, and then judged against the sender and recipient digests that
+    row froze with its claim plus the signature the ingress verified. Anything
+    short of all three is kept and marked rather than acted on.
+
+    Returning ``True`` means this callback belonged to the follow-up ledger and
+    has been accounted for, whatever the fact turned out to be — confirmed,
+    conflicting or unproven. It must then NOT fall through to the generic
+    handler, whose matching is looser and which knows nothing about this phase's
+    frozen route.
+
+    Deliberately NOT behind the follow-up send fence, for the same reason its
+    production siblings are not behind the §42 one: this is a fact about a
+    message that has already been sent, not a new effect to fence off. And it
+    never touches the ORIGINAL message's status, counters or report — §46.5
+    keeps the two records apart.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import callbacks as followup_callbacks
+
+    outcome = await followup_callbacks.record_followup_callback(
+        session,
+        status=status,
+        kind=kind,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.claimed:
+        logger.info(
+            "status_webhook: voucher follow-up %s recorded match=%s advanced=%s contradiction=%s",
+            kind,
+            outcome.match_state,
+            outcome.advanced,
+            outcome.contradiction,
+        )
+    return outcome.claimed
+
+
+async def _keep_unmatched_voucher_followup_status(
+    session: AsyncSession,
+    event: WhatsAppEvent | None,
+    status: dict[str, Any],
+    kind: str,
+) -> None:
+    """Keep a signed follow-up callback that no row owns yet (§46.3).
+
+    Reached only after every ledger lookup and the ``OutboxMessage`` lookup came
+    back empty, which is an ordinary momentary state: Meta can deliver a status
+    while the transaction recording the message id is still in flight. The
+    binding happens later on the exact identifier, under the lock the status
+    hook already holds — never by phone similarity or timestamp proximity.
+
+    An unsigned callback is not kept: authenticity cannot be established after
+    the fact, and no later binding may promote one.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import callbacks as followup_callbacks
+
+    outcome = await followup_callbacks.record_unmatched_followup_callback(
+        session,
+        status=status,
+        kind=kind,
+        whatsapp_event_id=int(event.id) if event is not None else None,
+        signature_verified=_event_authenticity_verified(event),
+    )
+    if outcome.stored:
+        logger.info("status_webhook: unmatched follow-up %s callback kept for later binding", kind)
+
+
 async def _keep_unmatched_voucher_failure(
     session: AsyncSession,
     event: WhatsAppEvent | None,
@@ -2495,6 +2575,17 @@ async def _handle_delivery_statuses(
         if kind == "failed" and await _apply_voucher_production_failure(session, event, status):
             continue
 
+        # And the §46 FOLLOW-UP messages, asked sixth and on the same terms.
+        # Their rows own their message ids in a table of their own, so one
+        # identifier belongs to at most one of the six ledgers. All three kinds
+        # go through one hook, because a follow-up's `failed` is a fact about
+        # its own message and belongs beside its `delivered` and `read` rather
+        # than in the original mailing's failure ledger.
+        if kind in {"delivered", "read", "failed"} and await _apply_voucher_followup_status(
+            session, event, status, kind
+        ):
+            continue
+
         outbox = await _find_outbox_by_provider_message_id(session, provider_message_id)
         if outbox is None:
             # Reached by every callback kind that nothing above claimed, which is
@@ -2530,6 +2621,13 @@ async def _handle_delivery_statuses(
                 # it leaves the slot's audience unprovable for ever. The hook
                 # above already holds this identifier's lock.
                 await _keep_unmatched_voucher_status(session, event, status, kind)
+            if kind in {"delivered", "read", "failed"}:
+                # And the follow-up ledger's own early callbacks, in its own
+                # table. Its gate is its own — a follow-up row claimed for
+                # sending with no identifier yet — so a callback is kept here
+                # only while this phase really could be about to own that
+                # identifier, and the two keepers cannot claim each other's.
+                await _keep_unmatched_voucher_followup_status(session, event, status, kind)
             continue
 
         chain_resolution = None

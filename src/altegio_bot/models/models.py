@@ -6200,3 +6200,607 @@ class EasyWeekVoucherFollowupPreviewRow(Base):
     evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# §46.7 / §46.8 — the EasyWeek voucher follow-up SEND ledger (PR-22.3)
+# ---------------------------------------------------------------------------
+# PR-22.2 ended at a proposal. This is the half that can reach a person, so it
+# is its own isolated ledger rather than a flag on anything that already exists:
+# the original slot keeps ``send_attempt_count <= 1`` untouched, the old
+# follow-up worker and the generic Outbox gain no authority, and nothing here
+# writes into the production tables.
+#
+# Four tables, four jobs:
+#
+# * ``..._followup_approvals`` — one immutable offer: the operator, the exact
+#   action, the preview version and its composition digest, the groups, the
+#   interval, the full message contract, the source stop generation and the
+#   count. Its own TTL and a single-use status, so a replayed POST cannot buy a
+#   second run.
+# * ``..._followup_runs`` — the durable record that an approval was spent, with
+#   the executor's lease and the run's own terminal stop. UNIQUE on
+#   ``approval_id``, which is what makes a double click, a refresh, two tabs and
+#   two executors converge on ONE run.
+# * ``..._followup_sends`` — one row per original recipient, and the single
+#   place the one-attempt rule lives. Its partial unique indexes are scoped to
+#   the ORIGINAL mailing and the ORIGINAL entitlement, never to the customer for
+#   all time: a future independent primary mailing to the same person is not
+#   forbidden by anything here, while a second follow-up to the same original
+#   send is impossible whatever preview, group, template or run it is attempted
+#   from. A terminal stop writes a row in the same key space, so a tombstone
+#   blocks a resend exactly as a spent attempt does.
+# * ``..._followup_callbacks`` — delivered / read / failed evidence for the
+#   follow-up's OWN message ids, including a callback that arrived before the
+#   acceptance was committed. It never touches the original message's status.
+
+FOLLOWUP_APPROVAL_PENDING = "pending"
+FOLLOWUP_APPROVAL_CONSUMED = "consumed"
+
+FOLLOWUP_APPROVAL_STATUSES = (
+    FOLLOWUP_APPROVAL_PENDING,
+    FOLLOWUP_APPROVAL_CONSUMED,
+)
+
+_FOLLOWUP_APPROVAL_STATUS_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_APPROVAL_STATUSES)
+
+# The one action an approval of this ledger may authorise. A column rather than
+# an implication, so an approval can never be spent on a different verb than the
+# one the operator read and confirmed.
+FOLLOWUP_ACTION_SEND = "followup_send"
+
+FOLLOWUP_RUN_QUEUED = "queued"
+FOLLOWUP_RUN_RUNNING = "running"
+FOLLOWUP_RUN_COMPLETED = "completed"
+FOLLOWUP_RUN_STOPPED = "stopped"
+# The executor died holding this run's lease. Terminal, and deliberately never
+# returned to ``queued``: a claimed row may already have reached Meta, and the
+# only safe next step is a human reading the evidence.
+FOLLOWUP_RUN_INTERRUPTED = "interrupted"
+FOLLOWUP_RUN_REFUSED = "refused"
+
+FOLLOWUP_RUN_STATUSES = (
+    FOLLOWUP_RUN_QUEUED,
+    FOLLOWUP_RUN_RUNNING,
+    FOLLOWUP_RUN_COMPLETED,
+    FOLLOWUP_RUN_STOPPED,
+    FOLLOWUP_RUN_INTERRUPTED,
+    FOLLOWUP_RUN_REFUSED,
+)
+
+FOLLOWUP_RUN_TERMINAL = (
+    FOLLOWUP_RUN_COMPLETED,
+    FOLLOWUP_RUN_STOPPED,
+    FOLLOWUP_RUN_INTERRUPTED,
+    FOLLOWUP_RUN_REFUSED,
+)
+
+_FOLLOWUP_RUN_STATUS_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_RUN_STATUSES)
+
+# The states of one recipient's follow-up row.
+#
+# ``planned`` is a reservation and nothing more: it spends no attempt, and
+# §46.7 allows such a row to be recomputed. Every other state is durable
+# evidence that this original recipient's one extra attempt is accounted for —
+# either because it was consumed, or because an operator stopped it for good.
+FOLLOWUP_SEND_PLANNED = "planned"
+# Lost eligibility before the attempt was consumed. No attempt spent, so it does
+# NOT block a later recomputation; its place is never filled by somebody else.
+FOLLOWUP_SEND_SKIPPED = "skipped"
+# The attempt is spent. This row's commit IS the consumption boundary: it is
+# written and committed before the external POST, so a crash immediately after
+# it leaves an honest "we may have messaged this person".
+FOLLOWUP_SEND_CLAIMED = "claimed"
+FOLLOWUP_SEND_ACCEPTED = "accepted"
+FOLLOWUP_SEND_DELIVERED = "delivered"
+FOLLOWUP_SEND_READ = "read"
+# Meta refused the request itself, before acting on the message.
+FOLLOWUP_SEND_REJECTED = "rejected"
+# A proven ``failed`` callback about the follow-up's own message.
+FOLLOWUP_SEND_FAILED = "failed"
+# The honest answer after a timeout, a transport failure, an unreadable answer,
+# a 2xx with no message id, or a crash past the consumption boundary. The
+# attempt is spent and no resend is available: only reconciliation of facts.
+FOLLOWUP_SEND_UNKNOWN = "unknown"
+# The durable tombstone of a terminal operator stop. Zero attempts, and it
+# occupies the same key space as a spent one, which is what stops a new run,
+# preview, group or template from reopening this recipient (§46.7).
+FOLLOWUP_SEND_STOPPED = "stopped"
+
+FOLLOWUP_SEND_STATUSES = (
+    FOLLOWUP_SEND_PLANNED,
+    FOLLOWUP_SEND_SKIPPED,
+    FOLLOWUP_SEND_CLAIMED,
+    FOLLOWUP_SEND_ACCEPTED,
+    FOLLOWUP_SEND_DELIVERED,
+    FOLLOWUP_SEND_READ,
+    FOLLOWUP_SEND_REJECTED,
+    FOLLOWUP_SEND_FAILED,
+    FOLLOWUP_SEND_UNKNOWN,
+    FOLLOWUP_SEND_STOPPED,
+)
+
+# The states that account for the one extra attempt and therefore occupy the
+# single-attempt key. ``claimed`` is in it because the attempt is spent at the
+# claim, not at the answer; ``stopped`` is in it because a terminal stop is a
+# decision that must survive a new run.
+FOLLOWUP_SEND_BLOCKING_STATUSES = (
+    FOLLOWUP_SEND_CLAIMED,
+    FOLLOWUP_SEND_ACCEPTED,
+    FOLLOWUP_SEND_DELIVERED,
+    FOLLOWUP_SEND_READ,
+    FOLLOWUP_SEND_REJECTED,
+    FOLLOWUP_SEND_FAILED,
+    FOLLOWUP_SEND_UNKNOWN,
+    FOLLOWUP_SEND_STOPPED,
+)
+
+# The states in which the one external attempt really was consumed. Narrower
+# than the blocking set: a tombstone blocks without having sent anything.
+FOLLOWUP_SEND_ATTEMPTED_STATUSES = (
+    FOLLOWUP_SEND_CLAIMED,
+    FOLLOWUP_SEND_ACCEPTED,
+    FOLLOWUP_SEND_DELIVERED,
+    FOLLOWUP_SEND_READ,
+    FOLLOWUP_SEND_REJECTED,
+    FOLLOWUP_SEND_FAILED,
+    FOLLOWUP_SEND_UNKNOWN,
+)
+
+_FOLLOWUP_SEND_STATUS_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_SEND_STATUSES)
+_FOLLOWUP_SEND_BLOCKING_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_SEND_BLOCKING_STATUSES)
+_FOLLOWUP_SEND_ATTEMPTED_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_SEND_ATTEMPTED_STATUSES)
+
+# The SQL predicate of the single-attempt key, in one place so the model, the
+# migration and every query mean the same set of rows.
+FOLLOWUP_SEND_BLOCKING_PREDICATE = f"status IN ({_FOLLOWUP_SEND_BLOCKING_SQL})"
+
+FOLLOWUP_CALLBACK_DELIVERED = "delivered"
+FOLLOWUP_CALLBACK_READ = "read"
+FOLLOWUP_CALLBACK_FAILED = "failed"
+
+FOLLOWUP_CALLBACK_KINDS = (
+    FOLLOWUP_CALLBACK_DELIVERED,
+    FOLLOWUP_CALLBACK_READ,
+    FOLLOWUP_CALLBACK_FAILED,
+)
+
+# Why a stored callback is, or is not, evidence about the row it names. The
+# vocabulary of PR-22.1's receipts, reused rather than reinvented so an operator
+# reads the same three words in both reports.
+FOLLOWUP_CALLBACK_CONFIRMED = "confirmed"
+FOLLOWUP_CALLBACK_UNMATCHED = "unmatched"
+FOLLOWUP_CALLBACK_CONFLICTING = "conflicting"
+
+FOLLOWUP_CALLBACK_MATCH_STATES = (
+    FOLLOWUP_CALLBACK_CONFIRMED,
+    FOLLOWUP_CALLBACK_UNMATCHED,
+    FOLLOWUP_CALLBACK_CONFLICTING,
+)
+
+_FOLLOWUP_CALLBACK_KIND_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_CALLBACK_KINDS)
+_FOLLOWUP_CALLBACK_MATCH_SQL = ", ".join(f"'{value}'" for value in FOLLOWUP_CALLBACK_MATCH_STATES)
+
+
+class EasyWeekVoucherFollowupApproval(Base):
+    """One immutable offer to send a follow-up for one preview version.
+
+    Everything a confirmation may rest on is written here by the SERVER, so a
+    request body can name nothing that widens it. The browser gets an id and a
+    signature; the composition, the digest, the count, the contract and the stop
+    generation all come from this row.
+
+    Single use, with its own expiry. ``plan_signature`` is a keyed digest over
+    the material below, so a row whose values were edited in the database no
+    longer verifies, and a nonce makes two offers of the same plan two different
+    approvals rather than one replayable token.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_approvals"
+
+    __table_args__ = (
+        UniqueConstraint("nonce", name="uq_ew_followup_approval_nonce"),
+        ForeignKeyConstraint(
+            ["preview_id"],
+            ["easyweek_voucher_followup_previews.id"],
+            name="fk_ew_followup_approval_preview",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(f"status IN ({_FOLLOWUP_APPROVAL_STATUS_SQL})", name="ck_ew_followup_approval_status"),
+        CheckConstraint(f"action = '{FOLLOWUP_ACTION_SEND}'", name="ck_ew_followup_approval_action"),
+        CheckConstraint("expires_at > issued_at", name="ck_ew_followup_approval_window"),
+        CheckConstraint("approved_recipient_count >= 0", name="ck_ew_followup_approval_count"),
+        CheckConstraint("min_interval_seconds > 0", name="ck_ew_followup_approval_interval"),
+        CheckConstraint(
+            "jsonb_array_length(selected_groups) >= 1",
+            name="ck_ew_followup_approval_groups_present",
+        ),
+        CheckConstraint(
+            f"(status = '{FOLLOWUP_APPROVAL_CONSUMED}') = (consumed_at IS NOT NULL)",
+            name="ck_ew_followup_approval_consumed_paired",
+        ),
+        Index("ix_ew_followup_approval_preview", "preview_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # -- what is being authorised ------------------------------------------
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    preview_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    preview_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    location_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    source_request_schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_frozen_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The source batch's stop counter when this plan was built. A stop that
+    # happened afterwards invalidates the offer rather than being resumed.
+    source_stop_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- the exact composition and terms -----------------------------------
+    composition_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    selected_groups: Mapped[list] = mapped_column(JSONB, nullable=False)
+    min_interval_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    approved_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # A digest over the exact slots this offer covers, so a confirmation cannot
+    # be about a different set of people with the same count.
+    recipient_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- the message contract ----------------------------------------------
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    meta_template_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_language: Mapped[str] = mapped_column(String(8), nullable=False)
+    template_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_parameter_order: Mapped[list] = mapped_column(JSONB, nullable=False)
+    template_body_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_policy_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The branch sender this plan was built against, as a digest.
+    sender_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # -- who, and for how long ---------------------------------------------
+    principal: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    identification_limit: Mapped[str] = mapped_column(String(32), nullable=False)
+    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_signature: Mapped[str] = mapped_column(String(64), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekVoucherFollowupRun(Base):
+    """One confirmed follow-up execution: the durable unit the executor owns.
+
+    ``approval_id`` is UNIQUE, so one offer becomes at most one run however many
+    times the POST arrives. The lease is how a dead executor is told from a busy
+    one, and the stop columns are the operator's terminal control — checked
+    inside the same transaction as the next claim rather than by a hidden
+    button.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_runs"
+
+    __table_args__ = (
+        UniqueConstraint("approval_id", name="uq_ew_followup_run_approval"),
+        ForeignKeyConstraint(
+            ["approval_id"],
+            ["easyweek_voucher_followup_approvals.id"],
+            name="fk_ew_followup_run_approval",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["preview_id"],
+            ["easyweek_voucher_followup_previews.id"],
+            name="fk_ew_followup_run_preview",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(f"status IN ({_FOLLOWUP_RUN_STATUS_SQL})", name="ck_ew_followup_run_status"),
+        CheckConstraint("planned_count >= 0", name="ck_ew_followup_run_planned_count"),
+        CheckConstraint(
+            f"(status = '{FOLLOWUP_RUN_RUNNING}') OR lease_owner IS NULL",
+            name="ck_ew_followup_run_lease_only_while_running",
+        ),
+        CheckConstraint(
+            "stop_requested_at IS NOT NULL OR stop_requested_by IS NULL",
+            name="ck_ew_followup_run_stop_paired",
+        ),
+        Index("ix_ew_followup_run_source", "source_batch_id", "id"),
+        Index(
+            "ix_ew_followup_run_queued",
+            "id",
+            postgresql_where=text(f"status = '{FOLLOWUP_RUN_QUEUED}'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    approval_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    preview_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    preview_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    campaign_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    company_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    composition_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    principal: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    identification_limit: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    planned_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # The run's own terminal stop. Terminal by contract: nothing clears it, and
+    # a new confirmation cannot resume it (§46.7).
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stop_requested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason_codes: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Safe aggregates only: counts and reason labels.
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekVoucherFollowupSend(Base):
+    """One original recipient's ONE extra attempt — or the reason there is none.
+
+    This is where §46.7's uniqueness lives, and the scope of the key is the
+    point. It is the ORIGINAL mailing and the ORIGINAL entitlement:
+
+    * ``(source_batch_id, source_slot)`` — the slot of the original send;
+    * ``(source_batch_id, easyweek_customer_uuid)`` — the canonical person, so a
+      duplicated card or a second representation of the same human in the same
+      mailing cannot buy a second message;
+    * ``(source_entitlement_digest)`` — the original voucher artifact, whose
+      digest already carries the batch and the slot.
+
+    All three are partial, over the states that account for the attempt, so a
+    ``planned`` reservation can still be recomputed and a ``skipped`` row never
+    blocks anybody. What they deliberately do NOT do is ban a customer uuid for
+    life: a future independent primary mailing to the same person is outside
+    this key space entirely.
+
+    Nothing personal is stored. One-way digests, labels and counts — no phone
+    number, no name, no voucher code, no rendered body.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_sends"
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "source_item_id", name="uq_ew_followup_send_run_item"),
+        UniqueConstraint("intent_uuid", name="uq_ew_followup_send_intent"),
+        UniqueConstraint("provider_message_id", name="uq_ew_followup_send_message"),
+        ForeignKeyConstraint(
+            ["run_id"],
+            ["easyweek_voucher_followup_runs.id"],
+            name="fk_ew_followup_send_run",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_item_id"],
+            ["easyweek_voucher_production_batch_items.id"],
+            name="fk_ew_followup_send_item",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(f"status IN ({_FOLLOWUP_SEND_STATUS_SQL})", name="ck_ew_followup_send_status"),
+        # The one-attempt invariant, in the database and not only in the writer.
+        CheckConstraint("attempt_count >= 0 AND attempt_count <= 1", name="ck_ew_followup_send_attempt_bound"),
+        CheckConstraint(
+            f"(attempt_count = 1) = (status IN ({_FOLLOWUP_SEND_ATTEMPTED_SQL}))",
+            name="ck_ew_followup_send_attempt_paired",
+        ),
+        # A spent attempt has a durable intent and a moment; a reservation and a
+        # tombstone have neither.
+        CheckConstraint(
+            f"(status IN ({_FOLLOWUP_SEND_ATTEMPTED_SQL})) = (intent_uuid IS NOT NULL AND claimed_at IS NOT NULL)",
+            name="ck_ew_followup_send_claim_paired",
+        ),
+        # Only a state that got an answer from Meta may name a message id, and
+        # every positive status must have one to be about anything.
+        CheckConstraint(
+            f"provider_message_id IS NULL OR status IN ("
+            f"'{FOLLOWUP_SEND_ACCEPTED}', '{FOLLOWUP_SEND_DELIVERED}', '{FOLLOWUP_SEND_READ}',"
+            f" '{FOLLOWUP_SEND_FAILED}', '{FOLLOWUP_SEND_UNKNOWN}')",
+            name="ck_ew_followup_send_message_state",
+        ),
+        CheckConstraint(
+            f"status NOT IN ('{FOLLOWUP_SEND_ACCEPTED}', '{FOLLOWUP_SEND_DELIVERED}', '{FOLLOWUP_SEND_READ}')"
+            " OR provider_message_id IS NOT NULL",
+            name="ck_ew_followup_send_positive_has_message",
+        ),
+        # A row that is not a plain reservation has to say why it is where it is.
+        CheckConstraint(
+            f"status <> '{FOLLOWUP_SEND_SKIPPED}' OR reason_code IS NOT NULL",
+            name="ck_ew_followup_send_skip_reason",
+        ),
+        CheckConstraint(
+            f"status <> '{FOLLOWUP_SEND_STOPPED}' OR stopped_at IS NOT NULL",
+            name="ck_ew_followup_send_stop_paired",
+        ),
+        # The route is frozen with the claim, exactly as §46.3 freezes the
+        # original's, and both halves are required of a spent attempt: a
+        # callback has to be checked against the route the message really took.
+        CheckConstraint(
+            f"status NOT IN ({_FOLLOWUP_SEND_ATTEMPTED_SQL})"
+            " OR (sender_digest IS NOT NULL AND recipient_digest IS NOT NULL)",
+            name="ck_ew_followup_send_route_frozen",
+        ),
+        Index(
+            "uq_ew_followup_send_source_slot",
+            "source_batch_id",
+            "source_slot",
+            unique=True,
+            postgresql_where=text(FOLLOWUP_SEND_BLOCKING_PREDICATE),
+        ),
+        Index(
+            "uq_ew_followup_send_source_customer",
+            "source_batch_id",
+            "easyweek_customer_uuid",
+            unique=True,
+            postgresql_where=text(FOLLOWUP_SEND_BLOCKING_PREDICATE),
+        ),
+        Index(
+            "uq_ew_followup_send_source_entitlement",
+            "source_entitlement_digest",
+            unique=True,
+            postgresql_where=text(FOLLOWUP_SEND_BLOCKING_PREDICATE),
+        ),
+        Index("ix_ew_followup_send_run_status", "run_id", "status"),
+        Index("ix_ew_followup_send_source_batch", "source_batch_id", "source_slot"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # -- the immutable source links, copied from the preview row -----------
+    source_batch_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_slot: Mapped[int] = mapped_column(Integer, nullable=False)
+    campaign_recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    easyweek_customer_uuid: Mapped[uuid.UUID] = mapped_column(PostgresUUID(as_uuid=True), nullable=False)
+    source_entitlement_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    group_code: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # -- the attempt --------------------------------------------------------
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    intent_uuid: Mapped[uuid.UUID | None] = mapped_column(PostgresUUID(as_uuid=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- the route and the contract this attempt used -----------------------
+    sender_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    template_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    meta_template_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    template_language: Mapped[str] = mapped_column(String(8), nullable=False)
+    template_body_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The consent fingerprint the final guard allowed this claim at.
+    consent_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # -- the follow-up's own statuses, kept apart from the original's -------
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A contradiction the provider's own account contains — a late ``failed``
+    # after a delivery or a read. Kept for audit; it never rolls a success back.
+    contradiction_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    # Safe facts only: booleans, labels and counts.
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EasyWeekVoucherFollowupCallback(Base):
+    """One delivery status about a FOLLOW-UP message, and what it proved.
+
+    Routed by the exact ``provider_message_id`` of a follow-up attempt, plus the
+    sender and recipient digests that attempt froze, plus the signature the
+    ingress verified. Anything short of all three is kept and marked rather than
+    acted on: an unsigned callback is an unattributed claim, and a callback
+    naming another route is about another message.
+
+    ``unmatched`` is the ordinary early case — Meta can deliver a status while
+    the transaction recording the message id is still in flight — and is bound
+    later on the exact identifier, never by phone similarity or timestamp
+    proximity.
+
+    Nothing here touches the ORIGINAL message's status, its counters or its
+    report.
+    """
+
+    __tablename__ = "easyweek_voucher_followup_callbacks"
+
+    __table_args__ = (
+        UniqueConstraint("fact_key", name="uq_ew_followup_callback_fact"),
+        ForeignKeyConstraint(
+            ["send_id"],
+            ["easyweek_voucher_followup_sends.id"],
+            name="fk_ew_followup_callback_send",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["whatsapp_event_id"],
+            ["whatsapp_events.id"],
+            name="fk_ew_followup_callback_event",
+            ondelete="SET NULL",
+        ),
+        CheckConstraint(f"kind IN ({_FOLLOWUP_CALLBACK_KIND_SQL})", name="ck_ew_followup_callback_kind"),
+        CheckConstraint(f"match_state IN ({_FOLLOWUP_CALLBACK_MATCH_SQL})", name="ck_ew_followup_callback_match"),
+        CheckConstraint(
+            "authenticity IN ('signature_verified', 'unverified')",
+            name="ck_ew_followup_callback_authenticity",
+        ),
+        # A CONFIRMED row IS the proof, so the database requires every part of
+        # it: the verified signature, the row it belongs to and a proven route.
+        CheckConstraint(
+            f"match_state <> '{FOLLOWUP_CALLBACK_CONFIRMED}' OR ("
+            "send_id IS NOT NULL AND route_proven AND authenticity = 'signature_verified'"
+            ")",
+            name="ck_ew_followup_callback_confirmed_proof",
+        ),
+        CheckConstraint(
+            f"match_state <> '{FOLLOWUP_CALLBACK_UNMATCHED}' OR (send_id IS NULL AND NOT route_proven)",
+            name="ck_ew_followup_callback_unmatched_has_no_row",
+        ),
+        CheckConstraint(
+            "NOT route_proven OR (observed_sender_digest IS NOT NULL AND observed_recipient_digest IS NOT NULL)",
+            name="ck_ew_followup_callback_route_proven",
+        ),
+        Index("ix_ew_followup_callback_send_kind", "send_id", "kind"),
+        Index(
+            "ix_ew_followup_callback_unmatched",
+            "provider_message_id",
+            postgresql_where=text(f"match_state = '{FOLLOWUP_CALLBACK_UNMATCHED}'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    authenticity: Mapped[str] = mapped_column(String(24), nullable=False)
+    match_state: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    send_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    provider_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    observed_sender_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    observed_recipient_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_proven: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # Meta's own numeric error code, for a ``failed`` callback. A number, never
+    # the provider's message text.
+    meta_error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    whatsapp_event_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

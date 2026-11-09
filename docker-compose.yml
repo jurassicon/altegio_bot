@@ -281,6 +281,46 @@ services:
     command:
       ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_easyweek_voucher_production_worker"]
 
+  # §46.8: the dedicated executor of confirmed voucher FOLLOW-UP runs (PR-22.3).
+  #
+  # Its own service, and that is the contract rather than a convenience. The old
+  # altegio-followup-worker above drives the historical campaign follow-ups through
+  # MessageJob and the Outbox and gains no authority over this ledger; the
+  # production executor above owns CREATE/PAY/DELIVER/REFUND of real vouchers and
+  # this one creates, pays for and refunds nothing. Sharing either process would
+  # mean sharing a queue, a lease and a fence.
+  #
+  # ONE of these, and no rolling deploy, for the same reason as the executor above:
+  # it interrupts every `running` run it finds at start-up, which is correct for a
+  # single executor and wrong for two overlapping ones. Every row such a run left
+  # `claimed` becomes `unknown` — the attempt was spent before the POST, so the
+  # message may already be on its way to a real person and nothing may retry it.
+  #
+  # Starting the container authorises NOTHING. With
+  # EASYWEEK_VOUCHER_FOLLOWUP_SEND_ENABLED false — the default — every plan, every
+  # confirmation and every claim still refuses, and
+  # EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED does not open it.
+  #
+  # `stop_grace_period` is generous on purpose: SIGTERM is checked BETWEEN runs,
+  # never during one, so a run that is mid-flight finishes and records each row's
+  # outcome instead of being cut in half. A run that outlasts the grace period is
+  # killed, which reads as `interrupted` with honest unknowns — see the runbook.
+  altegio-easyweek-voucher-followup-executor:
+    build: .
+    restart: always
+    env_file:
+      - .env
+      - path: easyweek.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    stop_grace_period: 120s
+    command:
+      ["/app/.venv/bin/python", "-m", "altegio_bot.scripts.run_easyweek_voucher_followup_worker"]
+
   # Migration runner — not started by default `docker compose up -d`.
   # Run explicitly: docker compose --profile ops run --rm migrate
   migrate:

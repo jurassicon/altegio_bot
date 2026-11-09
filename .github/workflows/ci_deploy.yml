@@ -622,6 +622,7 @@ jobs:
             altegio-followup-worker
             altegio-easyweek-inbox-worker
             altegio-easyweek-voucher-executor
+            altegio-easyweek-voucher-followup-executor
             "
 
             for SERVICE in $CRITICAL_SERVICES; do

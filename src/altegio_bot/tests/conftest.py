@@ -186,6 +186,17 @@ from altegio_bot.tests.easyweek_voucher_delivery_fixtures import (  # noqa: E402
     configuration,
 )
 
+# §46.8 follow-up send (PR-22.3). The two fence fixtures are re-exported for the
+# same reason as the rest: a module that imported them would shadow its own
+# parameter names. They are deliberately separate — `send_fence` opens the
+# follow-up's own switch with the primary mailing's pinned CLOSED, and
+# `primary_fence_only` is the opposite, which is the configuration §46.8 says
+# must still refuse every follow-up action.
+from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (  # noqa: E402,F401
+    primary_fence_only,
+    send_fence,
+)
+
 # The browser acceptance fixtures (review R8). Re-exported for the same reason, and
 # deliberately importing nothing heavy at module scope: `ops_server` imports uvicorn
 # and the app lazily, inside the fixture, so a suite that never opens a browser pays

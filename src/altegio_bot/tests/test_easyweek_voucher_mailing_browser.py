@@ -40,6 +40,7 @@ from altegio_bot.tests.easyweek_voucher_10eur_fixtures import (
     seed_template_and_sender,
 )
 from altegio_bot.tests.easyweek_voucher_mailing_browser_fixtures import (
+    WAIT_MS,
     assert_no_page_errors,
     tab_with_no_cache,
     watch_for_errors,
@@ -3398,12 +3399,13 @@ async def test_followup_preview_real_browser_operator_path(page, monkeypatch, se
     await opened.wait_for_url(re.compile(rf"/ops/voucher-mailings/{batch_id}/followup$"), timeout=15_000)
 
     body = await opened.inner_text("body")
-    assert "Доступен только предпросмотр" in body
+    assert "Четыре отдельных шага" in body
     assert "[Vorname]" in body
-    # No control on this page can send anything.
-    buttons = await opened.inner_text("body")
-    for forbidden in ("Отправить", "Подтвердить отправку"):
-        assert forbidden not in buttons
+    # PR-22.3 added the send, and this environment opens neither fence — so the
+    # page must SAY the send is closed rather than offer a control that fails,
+    # and it must say that the primary mailing's permission is not this one.
+    assert "Отправка закрыта отдельным переключателем" in body
+    assert "Разрешение первичной рассылки этот переключатель не открывает" in body
 
     # Nothing is selected by default, and the check refuses an empty choice.
     assert await opened.is_checked("#group-delivered_unread") is False
@@ -3534,7 +3536,7 @@ async def test_followup_stored_result_standing_in_a_real_browser(page, monkeypat
     await opened.set_viewport_size({"width": 390, "height": 844})
     await opened.reload()
     narrow = await opened.inner_text("body")
-    assert "Доступен только предпросмотр" in narrow
+    assert "Четыре отдельных шага" in narrow
     assert "исключены" in narrow
     overflow = await opened.evaluate(
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
@@ -3786,3 +3788,222 @@ async def test_followup_saved_composition_is_shown_as_history_not_as_now(page, m
     for forbidden in ("+4915100", "Person 1", "wamid.", "FOLLOWUP-TEST-CODE"):
         assert forbidden not in recomputed, forbidden
     assert_no_page_errors(opened)
+
+
+# ---------------------------------------------------------------------------
+# §46.6 / §46.8 — the follow-up operator scenario, in a real browser (PR-22.3)
+# ---------------------------------------------------------------------------
+# Every step below is the operator's: a checkbox they tick, a number they type,
+# a button they click, a panel they read, a progress area they watch and a stop
+# they press. Nothing here posts to the API to move the workflow along and
+# nothing opens a screen by a URL assembled from a database read — the product
+# of §46.8 IS the interface, and the API tests prove the contracts behind it.
+
+
+async def test_followup_real_browser_preview_confirm_execute_and_terminal_stop(page, monkeypatch, session_maker):
+    """Groups → interval → preview → separate confirmation → progress → stop.
+
+    The audience is three recipients and they end in three different states, on
+    purpose: one accepted, one whose external result is UNKNOWN, and one the
+    operator stops before it is started. That is the partial execution §46.9
+    asks the browser gate to cover, and it is also the case an operator is most
+    likely to misread — so the screen has to show all three apart.
+    """
+    import contextlib as _contextlib
+
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as followup_dispatch
+    from altegio_bot.ops import voucher_followup as followup_ops
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        StubTransports,
+        accepted,
+        seed_ready_batch,
+        unknown,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", followup_location_map(), raising=False)
+    # The follow-up's OWN fence, and only it: the primary mailing stays closed,
+    # so the scenario below cannot be inheriting its permission.
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
+
+    batch_id = await seed_ready_batch(
+        session_maker,
+        slots=[{"state": "delivered"}, {"state": "delivered"}, {"state": "delivered"}],
+    )
+    reader = FakeHistoryReader(batch_id=batch_id)
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    original_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(given=None):
+        return await original_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    # The page must say what it is before anything is clicked.
+    assert "Четыре отдельных шага" in await page.inner_text("body")
+    assert "устройство может не отправлять отметку о прочтении" in await page.inner_text("body")
+
+    # Step 1 and 2: the operator picks a group and types the interval. Neither
+    # has a default, and the page refuses to proceed without them.
+    await page.click("#followup-check")
+    await page.wait_for_function(
+        "document.getElementById('followup-result').textContent.includes('Выберите хотя бы одну группу')"
+    )
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+
+    # Step 3: check the composition. The page reloads with the stored result, and
+    # the navigation is waited for explicitly: asserting on the pre-reload
+    # document would be asserting on a page that is about to be replaced.
+    async with page.expect_navigation(timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    assert "подходили для повторного сообщения" in await page.inner_text("body")
+
+    # Step 4: prepare the send. Still nothing sent; the panel states the exact
+    # number the next click can produce.
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "3"
+    panel = await page.inner_text("#followup-confirm-panel")
+    assert "не создаёт новый ваучер" in panel
+
+    # Cancelling is a real way out, and it spends nothing.
+    await page.click("#followup-cancel")
+    await page.wait_for_selector("#followup-confirm-panel", state="hidden", timeout=WAIT_MS)
+    assert "Ничего не отправлено" in await page.inner_text("#followup-send-result")
+
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    await page.click("#followup-confirm")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Отправка подтверждена')",
+        timeout=WAIT_MS,
+    )
+
+    # The executor is the real one and runs between operator actions, exactly as
+    # it does in the deployment. Two of the three rows are reached here: one is
+    # accepted and one comes back with an unknown external result.
+    sender = CountingSender(answers=[accepted("wamid.browser.1"), unknown("meta_timeout")])
+
+    class OneRowAtATime(StubTransports):
+        """A sender that stops the run after two rows, by the operator pressing stop.
+
+        The third row is never claimed, which is what makes this a PARTIAL
+        execution rather than a finished one — and the tombstone it then gets is
+        the terminal stop the screen has to show.
+        """
+
+        async def __aenter__(self):  # pragma: no cover - not used as a context
+            return self
+
+    transports = OneRowAtATime(reader=reader, sender=sender)
+    monkeypatch.setattr(followup_dispatch, "Transports", lambda: transports)
+
+    async def stop_after_two():
+        from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+
+        while sender.count < 2:
+            await asyncio.sleep(0.01)
+        run = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+        assert run is not None
+        await followup_ledger.request_terminal_stop(session_maker, run_id=run.id, requested_by="ops-operator")
+
+    stopper = asyncio.create_task(stop_after_two())
+    await followup_worker.run_once(
+        session_maker,
+        owner="browser-executor",
+        transports=transports,
+        heartbeat_interval=60.0,
+    )
+    await stopper
+    assert sender.count == 2
+
+    # The operator watches the result repaint, and the three states are three
+    # different words on the screen.
+    await page.reload()
+    await page.wait_for_selector("#followup-send-table", timeout=WAIT_MS)
+    table = await page.inner_text("#followup-send-table")
+    assert "принято провайдером" in table
+    assert "результат неизвестен" in table
+    assert "остановлено" in table
+    # And the first message's own status is shown beside it, never instead of it.
+    assert "Доставлено, прочтение не подтверждено" in table
+    body = await page.inner_text("body")
+    assert "Остановлена оператором" in body
+    assert "«Принято провайдером» — это не доставка" in body
+
+    # Phone width, with a real run on the page: the per-row result table and the
+    # counters have to stay readable and nothing may scroll sideways. §46.8 asks
+    # for both widths, and the result table is the part a narrow screen breaks.
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.reload()
+    await page.wait_for_selector("#followup-send-table", timeout=WAIT_MS)
+    narrow = await page.inner_text("body")
+    assert "принято провайдером" in narrow
+    assert "результат неизвестен" in narrow
+    overflow = await page.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    assert overflow <= 1, overflow
+    # The wide result table scrolls inside its own box rather than taking the
+    # page with it. Asserted directly, because the `table-responsive` class does
+    # not carry overflow-x in this deployment's stylesheet and the page sets it.
+    scrollable = await page.evaluate(
+        "() => Array.from(document.querySelectorAll('.table-responsive'))"
+        ".every(el => getComputedStyle(el).overflowX === 'auto')"
+    )
+    assert scrollable is True
+    await page.set_viewport_size({"width": 1280, "height": 900})
+
+    # Pressing stop again is honest about having changed nothing.
+    if await page.is_visible("#followup-stop"):
+        await page.click("#followup-stop")
+        await page.wait_for_function(
+            "document.getElementById('followup-send-result').textContent.length > 0",
+            timeout=WAIT_MS,
+        )
+
+    # And the bypass §46.9 names explicitly: a NEW preview and a NEW run must not
+    # reopen the stopped recipients. The operator does it from the page.
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "0"
+    await page.click("#followup-confirm", timeout=WAIT_MS)
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Отправка подтверждена')",
+        timeout=WAIT_MS,
+    )
+    second = CountingSender()
+    monkeypatch.setattr(followup_dispatch, "Transports", lambda: StubTransports(reader=reader, sender=second))
+    await followup_worker.run_once(
+        session_maker,
+        owner="browser-executor",
+        transports=StubTransports(reader=reader, sender=second),
+        heartbeat_interval=60.0,
+    )
+    assert second.count == 0, "a new run must not reopen a spent attempt or a terminal stop"

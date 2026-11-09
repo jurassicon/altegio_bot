@@ -283,6 +283,27 @@ def test_both_workers_still_read_easyweek_env_and_nothing_new_was_added() -> Non
         # row says, within target slots it may not widen, and with the production fence
         # false by default it refuses every stage it picks up.
         "altegio-easyweek-voucher-executor",
+        # §46.8 (PR-22.3): the dedicated executor of confirmed voucher FOLLOW-UP
+        # runs, admitted on the same terms and for the same reason as the one
+        # above — it is a standing service rather than an ops-profile one-off,
+        # and it needs easyweek.env for the EasyWeek read credentials, the
+        # branch registry the approved booking link comes from, the voucher MAC
+        # key id its binding re-proof compares, and its own send fence.
+        #
+        # Its power is deliberately NARROWER than the executor above it: it
+        # creates no voucher, pays for nothing, refunds nothing and changes no
+        # financial record. It sends at most ONE WhatsApp template per recipient
+        # of an original mailing, only for a run a named operator confirmed
+        # through the CSRF-protected UI against an immutable, single-use,
+        # signed approval whose composition it may not widen. With
+        # EASYWEEK_VOUCHER_FOLLOWUP_SEND_ENABLED false — the default — it
+        # refuses every run it picks up, and
+        # EASYWEEK_VOUCHER_PRODUCTION_MAILING_ENABLED does not open it.
+        #
+        # It cannot create a customer, a booking, a message job or an outbox
+        # row, it has no retry path of any kind, and it is not reachable from
+        # the network: no ports, no Docker socket.
+        "altegio-easyweek-voucher-followup-executor",
     }, f"easyweek.env reached an unexpected service: {with_easyweek_env}"
 
 

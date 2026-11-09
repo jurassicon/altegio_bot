@@ -1007,21 +1007,34 @@ old approval or an action substitution cannot create a send through the generic
 dispatch, the Outbox or the old follow-up worker: those paths are untouched, and
 there is no follow-up code that calls them.
 
-## 9. What is deliberately NOT implemented (PR-22.3 and later)
+## 9. What is deliberately NOT part of THIS stage
 
-- sending a follow-up, confirming a send, claiming one, or any executor,
-  scheduler or transport retry for it;
-- follow-up `MessageJob` / Outbox rows, follow-up callbacks, follow-up send
-  statistics;
+Nothing in the preview sends, confirms a send, claims one, reaches an executor
+or touches a transport. That is unchanged and is the whole point of the stage: a
+preview is a proposal and an audit record.
+
+What has since been built BESIDE it, in its own ledger and behind its own fence,
+is PR-22.3 — the separate confirmation, the one-attempt claim, the dedicated
+executor, the terminal tombstones and the follow-up callbacks. Its contract is
+`VOUCHER_FOLLOWUP_SEND_CONTRACT.md` and its operation is §18 of
+`VOUCHER_PRODUCTION_MAILING_RUNBOOK.md`. A stored preview still authorises
+nothing: PR-22.3 re-proves every condition at its own plan, at its own
+confirmation and again inside its own claim.
+
+Still not implemented by either stage:
+
 - CREATE / PAY / DELIVER / REFUND for a follow-up, or any new financial schema;
-- multiple waves, retry after an unknown result, a new redemption engine;
+- multiple waves per original recipient, an automatic scheduler, a retry after
+  an unknown result, a new redemption engine;
+- follow-up `MessageJob` / Outbox rows, or any authority for the old follow-up
+  worker, the generic Outbox or the generic EasyWeek campaign send;
 - changes to the Altegio campaign paths, or production reconciliation / replay /
   recovery of stuck events;
 - follow-up attribution in the booking report.
 
-The existing send fence stays closed. The primary DELIVER authorisation grants no
-follow-up authority, and the previous `send_attempt_count <= 1` and primary STOP
-rules are unchanged.
+The follow-up has its OWN send fence, closed by default. The primary DELIVER
+authorisation grants no follow-up authority and does not open it, and the
+previous `send_attempt_count <= 1` and primary STOP rules are unchanged.
 
 ## 10. Verification
 

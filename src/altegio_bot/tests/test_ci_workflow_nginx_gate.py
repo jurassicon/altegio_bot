@@ -652,6 +652,12 @@ _EXPECTED_CRITICAL_SERVICES = frozenset(
         # most, because a confirmed stage with no executor running does not fail
         # loudly: it sits in `queued` until somebody notices.
         "altegio-easyweek-voucher-executor",
+        # §46.8 (PR-22.3): the voucher FOLLOW-UP executor. A standing service on
+        # the same terms, and it matters for the same reason: a confirmed run
+        # with no executor running does not fail loudly — it sits in `queued`
+        # until somebody notices, with the operator believing the messages are
+        # on their way.
+        "altegio-easyweek-voucher-followup-executor",
     }
 )
 

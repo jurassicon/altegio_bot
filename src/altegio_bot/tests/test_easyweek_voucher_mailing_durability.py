@@ -2040,3 +2040,375 @@ async def test_an_empty_database_still_downgrades_and_re_upgrades(disposable_dat
     assert "(head)" in current.stdout
     heads = [line for line in _alembic(_repo_root(), "heads").stdout.splitlines() if "(head)" in line]
     assert len(heads) == 1
+
+
+# ---------------------------------------------------------------------------
+# §46.7–46.8 — the follow-up SEND ledger: concurrency and migration (PR-22.3)
+# ---------------------------------------------------------------------------
+# The property defended here is the one that cannot be apologised for
+# afterwards: a person who already received the one extra message must never
+# receive a second one. So every test below ends in a count — how many claims
+# were granted, how many POSTs were made — rather than in a status.
+
+FOLLOWUP_SEND_PARENT_REVISION = "b7d41f9c0a52"
+
+FOLLOWUP_SEND_TABLES = (
+    "easyweek_voucher_followup_approvals",
+    "easyweek_voucher_followup_runs",
+    "easyweek_voucher_followup_sends",
+    "easyweek_voucher_followup_callbacks",
+)
+
+
+@pytest.fixture
+def followup_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The follow-up's own fence open, the primary mailing's pinned closed."""
+    from pydantic import SecretStr
+
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import location_map
+
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map(), raising=False)
+    monkeypatch.setattr(settings, "ops_secret", "synthetic-ops-signing-secret", raising=False)
+    monkeypatch.setattr(settings, "ops_pass", "synthetic-ops-password", raising=False)
+
+
+async def _followup_ready(session_maker, *, slots: list[dict[str, Any]] | None = None) -> tuple[int, Any]:
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import build_preview, seed_ready_batch
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    batch_id = await seed_ready_batch(session_maker, slots=slots)
+    reader = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(session_maker, batch_id=batch_id, reader=reader)
+    return batch_id, reader
+
+
+async def test_two_concurrent_confirmations_of_one_offer_produce_one_run(session_maker, followup_environment) -> None:
+    """The double click, raced for real on PostgreSQL.
+
+    Both coroutines read a pending approval and both try to consume it. The
+    approval's row lock plus the UNIQUE on ``approval_id`` decide it: one creates
+    the run, the other is handed the same run back, and the ledger holds one.
+    """
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import confirm, offer
+
+    batch_id, _reader = await _followup_ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.ready
+
+    first, second = await asyncio.gather(
+        confirm(session_maker, plan=plan),
+        confirm(session_maker, plan=plan),
+        return_exceptions=True,
+    )
+    outcomes = [value for value in (first, second) if not isinstance(value, BaseException)]
+    assert len(outcomes) == 2, (first, second)
+    assert sum(1 for value in outcomes if value.created) == 1
+    runs = [value.run.id for value in outcomes if value.run is not None]
+    assert len(set(runs)) == 1
+    async with session_maker() as session:
+        count = (await session.execute(text("SELECT count(*) FROM easyweek_voucher_followup_runs"))).scalar_one()
+    assert int(count) == 1
+
+
+async def test_two_executors_racing_one_row_grant_exactly_one_attempt(session_maker, followup_environment) -> None:
+    """Two claims for the same recipient, concurrently. One attempt, never two.
+
+    Both tasks hold a valid lease for the same run — which the supported
+    topology does not produce and a mis-deploy can — and both re-prove consent
+    and ask for the row. The row lock serialises them and the second finds the
+    attempt already accounted for.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_identity as send_ids
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.campaigns.easyweek_voucher_followup.eligibility import consent_snapshot
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import SENDER_DIGEST
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        confirm,
+        offer,
+        person_phone,
+        person_uuid,
+        rows_of,
+    )
+    from altegio_bot.whatsapp_consent import recipient_route_digest
+
+    batch_id, _reader = await _followup_ready(session_maker, slots=[{"state": "delivered"}])
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await followup_ledger.claim_next_run(session_maker, owner="executor-a")
+    assert claimed is not None
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    send_id = int(rows[1].id)
+
+    async with session_maker() as session:
+        snapshot = await consent_snapshot(session, phone=person_phone(1), easyweek_customer_uuid=person_uuid(1))
+
+    async def claim() -> Any:
+        return await followup_ledger.claim_send(
+            session_maker,
+            run_id=outcome.run.id,
+            send_id=send_id,
+            owner="executor-a",
+            address=person_phone(1),
+            easyweek_customer_uuid=person_uuid(1),
+            expected_consent_fingerprint=snapshot.fingerprint,
+            sender_digest=SENDER_DIGEST,
+            recipient_digest=str(recipient_route_digest(person_phone(1))),
+            source_batch_id=batch_id,
+        )
+
+    first, second = await asyncio.gather(claim(), claim())
+    granted = [value for value in (first, second) if value.granted]
+    assert len(granted) == 1
+    refused = [value for value in (first, second) if not value.granted]
+    assert refused[0].reason == send_ids.ATTEMPT_ALREADY_USED
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    assert int(rows[1].attempt_count) == 1
+
+
+async def test_a_stop_racing_the_boundary_never_lets_two_things_happen(session_maker, followup_environment) -> None:
+    """A stop and a claim, concurrently. Either zero attempts or one, never both.
+
+    The ordering is single and checkable because both take the run's row lock:
+    whichever commits first is seen by the other. What must never happen is a
+    tombstone AND a spent attempt for the same recipient, which would mean the
+    stop was recorded as having prevented a message that went out.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.campaigns.easyweek_voucher_followup.eligibility import consent_snapshot
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import SENDER_DIGEST
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        confirm,
+        offer,
+        person_phone,
+        person_uuid,
+        rows_of,
+    )
+    from altegio_bot.whatsapp_consent import recipient_route_digest
+
+    batch_id, _reader = await _followup_ready(session_maker, slots=[{"state": "delivered"}])
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await followup_ledger.claim_next_run(session_maker, owner="executor-a")
+    assert claimed is not None
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    send_id = int(rows[1].id)
+    async with session_maker() as session:
+        snapshot = await consent_snapshot(session, phone=person_phone(1), easyweek_customer_uuid=person_uuid(1))
+
+    claim, stop = await asyncio.gather(
+        followup_ledger.claim_send(
+            session_maker,
+            run_id=outcome.run.id,
+            send_id=send_id,
+            owner="executor-a",
+            address=person_phone(1),
+            easyweek_customer_uuid=person_uuid(1),
+            expected_consent_fingerprint=snapshot.fingerprint,
+            sender_digest=SENDER_DIGEST,
+            recipient_digest=str(recipient_route_digest(person_phone(1))),
+            source_batch_id=batch_id,
+        ),
+        followup_ledger.request_terminal_stop(session_maker, run_id=outcome.run.id, requested_by="operator"),
+    )
+    assert stop.applied is True
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    row = rows[1]
+    if claim.granted:
+        # The claim won: the attempt is spent and the stop found nothing left to
+        # tombstone. The stop is still durable for every other row.
+        assert int(row.attempt_count) == 1
+        assert stop.tombstoned == 0
+    else:
+        # The stop won: zero attempts and a durable tombstone.
+        assert int(row.attempt_count) == 0
+        assert stop.tombstoned == 1
+        assert str(row.status) == "stopped"
+
+
+async def test_a_stop_that_commits_before_the_boundary_yields_zero_meta_requests(
+    session_maker, followup_environment
+) -> None:
+    """The one-sided guarantee of §46.4.6, with the ordering forced rather than raced.
+
+    The stop is committed while the executor is between rows, so it is durable
+    BEFORE the next boundary. The counted sender proves the consequence.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as followup_dispatch
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        StubTransports,
+        confirm,
+        offer,
+    )
+
+    batch_id, reader = await _followup_ready(session_maker, slots=[{"state": "delivered"}, {"state": "delivered"}])
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    await followup_ledger.request_terminal_stop(session_maker, run_id=outcome.run.id, requested_by="operator")
+    # The stop finished the queued run, so the executor finds nothing at all.
+    assert await followup_ledger.claim_next_run(session_maker, owner="executor-a") is None
+    sender = CountingSender()
+    report = await followup_dispatch.execute_run(
+        session_maker,
+        run=outcome.run,
+        owner="executor-a",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+    assert report.attempted == 0
+
+
+async def test_the_followup_send_ledger_upgrades_downgrades_and_re_upgrades_when_empty(
+    disposable_database: str,
+) -> None:
+    """The four tables appear, disappear and reappear, and the head stays single.
+
+    Addressed by REVISION rather than by "-1", for the reason this file's other
+    migration tests already learned: a later revision makes one step back mean
+    something else.
+    """
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, FOLLOWUP_SEND_TABLES) == set(FOLLOWUP_SEND_TABLES)
+
+    assert _alembic(disposable_database, "downgrade", FOLLOWUP_SEND_PARENT_REVISION).returncode == 0
+    assert await _tables(disposable_database, FOLLOWUP_SEND_TABLES) == set()
+    # Everything the follow-up refers to is untouched by the rollback.
+    historical = (
+        "easyweek_voucher_production_batches",
+        "easyweek_voucher_production_batch_items",
+        "easyweek_voucher_production_batch_attempts",
+        "easyweek_voucher_followup_previews",
+        "easyweek_voucher_followup_preview_rows",
+        "whatsapp_consent_suppressions",
+    )
+    assert await _tables(disposable_database, historical) == set(historical)
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert await _tables(disposable_database, FOLLOWUP_SEND_TABLES) == set(FOLLOWUP_SEND_TABLES)
+    current = _alembic(disposable_database, "current")
+    assert "(head)" in current.stdout
+    heads = [line for line in _alembic(_repo_root(), "heads").stdout.splitlines() if "(head)" in line]
+    assert len(heads) == 1
+
+
+async def _seed_followup_send_row(database_url: str, *, status: str) -> None:
+    """One follow-up row in a given state, written in SQL rather than the ORM.
+
+    Spelled out in SQL for the same reason this file's other migration seeds
+    are: the point is that a REAL row blocks the rollback, and a row built from
+    today's model would prove only that today's model round-trips.
+
+    The two foreign keys to the approval and the preview are dropped first, and
+    said out loud rather than worked around: this seed is about the SEND row's
+    guard, and satisfying the whole chain — an approval, a preview, a batch, an
+    item — would make the test about the fixtures instead.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    attempted = status != "stopped"
+    moment = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("ALTER TABLE easyweek_voucher_followup_runs ALTER COLUMN approval_id DROP NOT NULL")
+            )
+            await conn.execute(text("ALTER TABLE easyweek_voucher_followup_runs ALTER COLUMN preview_id DROP NOT NULL"))
+            await conn.execute(
+                text("ALTER TABLE easyweek_voucher_followup_sends ALTER COLUMN source_item_id DROP NOT NULL")
+            )
+            run_id = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO easyweek_voucher_followup_runs ("
+                        " approval_id, preview_id, preview_version, source_batch_id, campaign_run_id,"
+                        " company_id, composition_digest, principal, session_fingerprint,"
+                        " identification_limit, status, planned_count, queued_at)"
+                        " VALUES (NULL, NULL, 1, 1, 1, 322579, :digest, 'ops', :fp, 'shared_ops_account',"
+                        " 'completed', 1, :moment) RETURNING id"
+                    ),
+                    {"digest": "d" * 64, "fp": "a" * 64, "moment": moment},
+                )
+            ).scalar_one()
+            await conn.execute(
+                text(
+                    "INSERT INTO easyweek_voucher_followup_sends ("
+                    " run_id, source_batch_id, source_item_id, source_slot, campaign_recipient_id,"
+                    " easyweek_customer_uuid, source_entitlement_digest, group_code, status, attempt_count,"
+                    " intent_uuid, claimed_at, stopped_at, sender_digest, recipient_digest, template_code,"
+                    " meta_template_name, template_language, template_body_digest)"
+                    " VALUES (:run, 1, NULL, 1, 1, :uuid, :ent, 'delivered_unread', :status, :attempts,"
+                    " :intent, :claimed, :stopped, :sender, :recipient,"
+                    " 'new_client_voucher_followup_v1', 'kitilash_ka_new_client_voucher_followup_v1',"
+                    " 'de', :body)"
+                ),
+                {
+                    "run": run_id,
+                    "uuid": "00000001-1111-4111-8111-111111111111",
+                    "ent": "e" * 64,
+                    "status": status,
+                    "attempts": 1 if attempted else 0,
+                    "intent": str(uuid_module.uuid4()) if attempted else None,
+                    "claimed": moment if attempted else None,
+                    "stopped": None if attempted else moment,
+                    "sender": ("s" * 64) if attempted else None,
+                    "recipient": ("r" * 64) if attempted else None,
+                    "body": "b" * 64,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_a_destructive_downgrade_refuses_while_a_spent_attempt_exists(
+    disposable_database: str,
+) -> None:
+    """§46.9: the facts whose loss would re-open an attempt are not droppable.
+
+    A spent attempt is the only record that stops a new run claiming the same
+    recipient again, so the rollback refuses BEFORE any DDL and the row is still
+    there afterwards.
+    """
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    await _seed_followup_send_row(disposable_database, status="unknown")
+
+    attempt = _alembic(disposable_database, "downgrade", FOLLOWUP_SEND_PARENT_REVISION)
+    assert attempt.returncode != 0
+    assert "spent follow-up attempt" in (attempt.stderr + attempt.stdout)
+    assert await _tables(disposable_database, FOLLOWUP_SEND_TABLES) == set(FOLLOWUP_SEND_TABLES)
+    from altegio_bot.tests.test_easyweek_voucher_production_migration import _fetch
+
+    rows = await _fetch(disposable_database, "SELECT status, attempt_count FROM easyweek_voucher_followup_sends")
+    assert rows == [("unknown", 1)]
+
+
+async def test_a_destructive_downgrade_refuses_while_a_terminal_tombstone_exists(
+    disposable_database: str,
+) -> None:
+    """A tombstone spends nothing and is just as undroppable.
+
+    Dropping it would let a new run send to somebody an operator stopped for
+    good, which §46.7 forbids whatever the attempt count says.
+    """
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    await _seed_followup_send_row(disposable_database, status="stopped")
+
+    attempt = _alembic(disposable_database, "downgrade", FOLLOWUP_SEND_PARENT_REVISION)
+    assert attempt.returncode != 0
+    assert "terminal stop tombstone" in (attempt.stderr + attempt.stdout)
+    from altegio_bot.tests.test_easyweek_voucher_production_migration import _fetch
+
+    rows = await _fetch(disposable_database, "SELECT status, attempt_count FROM easyweek_voucher_followup_sends")
+    assert rows == [("stopped", 0)]
