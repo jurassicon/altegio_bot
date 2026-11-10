@@ -69,7 +69,16 @@ confirmation, a new preview and a new run all find the row occupied, and none of
 them gives the attempt back. What is available afterwards is reconciliation of
 facts, never a resend.
 
-In the one transaction the claim also:
+In the one transaction the claim also re-proves the remaining LOCAL conditions —
+the whole per-attempt check, once more, with every lock already granted. That is
+not a duplicate of the pass before it: this transaction can WAIT for a lock, and
+everything the caller proved describes the world before that wait. A reply
+processed, a template switched off, a read receipt moving the row out of the
+selected groups or an identity reassigned while the claim was queued are all
+caught here, and the consent fingerprint is a version of CONSENT and of nothing
+else. Local reads only, so nothing external runs under the locks.
+
+And:
 
 * takes the **original batch header's row lock** and reads that batch's terminal
   stop under it. That header is the lock the primary mailing's own
@@ -144,8 +153,8 @@ and pins:
 * the branch sender's digest;
 * the source batch's frozen digest, its request schema and its **stop
   generation** at plan time;
-* `issued_at`, `expires_at` (ten minutes from issue, never from the write) and a
-  nonce;
+* `issued_at`, `expires_at` (ten minutes from issue, never from the write; the
+  offer is already expired at `expires_at`) and a nonce;
 * a keyed signature over all of the above.
 
 A request may name a batch (in the path) and a preview version. Nothing else. A
@@ -164,9 +173,9 @@ differs, the offer has expired, the count differs, the message contract or the
 failure policy moved, the live Meta approval is gone, the sender or the frozen
 composition moved, the source batch was stopped (or stopped again) since, the
 offered rows are no longer the preview's own or no longer digest to what was
-offered, the approval carries no pinned offer at all
-(`followup_approval_offer_unproven` — fail-closed for a row written before that
-column existed), or another run of this mailing is in flight.
+offered, the approval carries no pinned offer at all (fail-closed for a row
+written before that column existed), or another run of this mailing is in flight.
+An older signature may fail validation before the missing-offer check.
 
 The admission — both stop reads and the "one active run" check — happens under
 the original batch header's row lock, so two different approvals of one source
@@ -334,7 +343,8 @@ phase extends it to the right rather than inserting anything to the left:
 * a **confirmation**: the original batch header → the approval row → the run and
   its rows;
 * a **claim**: the original batch header (reading that batch's stop under it) →
-  the consent address locks → the run row → the send row;
+  the consent address locks → the run row → the send row, and then the final
+  local re-check inside that same transaction;
 * a **stop**: the original batch header → the run row → its send rows. The
   header is what makes "which recipients does another run already account for"
   unable to change under the transaction;
@@ -449,8 +459,31 @@ one `accepted`, one `unknown` and one terminal-stop tombstone shown as three
 different words, the original message's status shown beside the follow-up's, and
 a new preview plus a new run proven unable to reopen the stopped recipients.
 
-Round 1 of review added these, each reproducing a path that really sent or
-really lost a stop:
+Round 2 of review added these, each verified to fail on the previous commit:
+
+* a stop that waited for the batch header while an executor claimed the run —
+  the stale ORM read used to write ``stopped`` over an active lease, violate
+  ``ck_ew_followup_run_lease_only_while_running`` and roll the whole stop back;
+  two concurrent stops; a run that finishes while a stop waits keeping its own
+  outcome;
+* **every** result of a concurrent confirmation of one approval carrying that
+  approval's run, with exactly one ``created``. Nothing is filtered out of the
+  assertion, which is how the losing refusal was being hidden;
+* a processed client reply, and a deactivated local template, each committed
+  while the real executor's claim is provably queued behind the batch header
+  (``pg_stat_activity`` is the barrier) — zero requests, a reason, and
+  ``attempt_count = 0``; plus the positive control, where nothing moves and
+  exactly one attempt happens;
+* an unreadable 502 answer to a confirmation that really committed: the page
+  reports an unknown result, finds the stored run, and stops it in the browser;
+  and the separate case of a request that never reached the server;
+* a live pending offer blocking the column's rollback, an expired one not
+  blocking it, the TTL boundary from both sides, a consumed approval and the
+  ledger's own guard keeping their guarantees, and a concurrent writer unable to
+  slip past the table lock.
+
+Round 1 added these, each reproducing a path that really sent or really lost a
+stop:
 
 * the claim **waiting** for the original batch header while a stop is written
   inside that header's transaction, and refusing once it is released; the other

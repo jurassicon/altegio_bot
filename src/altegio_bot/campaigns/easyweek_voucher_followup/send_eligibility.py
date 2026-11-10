@@ -38,6 +38,7 @@ transaction.
 from __future__ import annotations
 
 import uuid as uuid_module
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Final, Sequence
@@ -106,6 +107,7 @@ from altegio_bot.models.models import (
 
 __all__ = [
     "BOOKING_LINK_UNPROVEN",
+    "claim_time_guard",
     "TEMPLATE_PARAMETERS_UNPROVEN",
     "LocalRecheck",
     "RowRecheck",
@@ -767,3 +769,66 @@ async def prepare_row(
 def selected_groups_cover(groups: Sequence[str], group_code: str | None) -> bool:
     """Is this row's proven group one the operator actually selected?"""
     return group_code is not None and group_code in tuple(groups)
+
+
+def claim_time_guard(
+    *,
+    gate: preview_module.BatchGate,
+    source_item_id: int,
+    contract: SendContract,
+    expected: RowRecheck,
+    policy: FailurePolicy = CURRENT_FAILURE_POLICY,
+    now: datetime,
+) -> Callable[[AsyncSession], Awaitable[Any]]:
+    """The LAST local word, to be run inside the claiming transaction.
+
+    Why this exists on top of the two passes in :func:`prepare_row`: those both
+    finish before the claim opens its transaction, and that transaction can then
+    WAIT — for the original batch header, for a consent address — while another
+    writer holds the lock. Whatever moved locally during that wait was never
+    looked at again, and the consent fingerprint the claim does compare is a
+    version of CONSENT and of nothing else.
+
+    What is re-proven, with every lock already granted: the whole local
+    per-attempt check (identity and bindings, the proven group and the operator's
+    selection, the interval, the failure policy, the entitlement, the approved
+    contract, the local template row, the active sender, the consent aggregate
+    including unresolved inbound, the stored-event backlog and the replies). It
+    then has to still be about the same PERSON and the same ROUTE the external
+    proofs were spent on.
+
+    The GROUP is deliberately not compared with the earlier pass: §46.5 allows a
+    move between two groups the operator already selected under one approved
+    contract, and ``local_recheck`` refuses a move out of the selection itself.
+
+    Local reads only, so nothing external runs under the locks, and bounded: it
+    is the same per-row check, once more.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup.send_ledger import GuardVerdict
+
+    configured_key_id = preview_module.configured_binding_key_id()
+
+    async def guard(session: AsyncSession) -> Any:
+        verdict = await local_recheck(
+            session,
+            gate=gate,
+            source_item_id=int(source_item_id),
+            contract=contract,
+            policy=policy,
+            now=now,
+            configured_key_id=configured_key_id,
+        )
+        if not verdict.eligible:
+            return GuardVerdict(False, verdict.reason)
+        if (
+            verdict.address != expected.address
+            or verdict.customer_uuid != expected.customer_uuid
+            or verdict.recipient_digest != expected.recipient_digest
+            or verdict.sender_digest != expected.sender_digest
+        ):
+            return GuardVerdict(False, IDENTITY_CONFLICT)
+        if not verdict.display_name:
+            return GuardVerdict(False, TEMPLATE_PARAMETERS_UNPROVEN)
+        return GuardVerdict(True, None)
+
+    return guard

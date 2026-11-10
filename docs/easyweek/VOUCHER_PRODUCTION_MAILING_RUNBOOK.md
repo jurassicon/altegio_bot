@@ -2083,18 +2083,35 @@ counter, HMAC byte, financial value or schema 3/4 rule is read or rewritten.
 
 Both downgrades refuse before any DDL while a fact would be lost that could let
 a second message reach somebody: a spent attempt or a terminal tombstone for the
-tables, and a PENDING offer's pinned identities for the column. A pending offer
-is cheap to recreate — let it expire or consume it, then roll back.
+tables, and — for the column — the pinned identities of an offer that could
+still be CONFIRMED, meaning pending **and inside its ten-minute TTL**.
+At `expires_at` the offer is already expired, in both confirmation and rollback
+checks.
 
-### 18.9 What changed after the first review round
+An offer whose TTL has run out does **not** block the rollback. It cannot be
+confirmed, and after a rollback and a fresh upgrade it stays unconfirmable:
+its TTL is unchanged and the original signed identities are not restored.
+The refusal may be reported by signature validation before the expiry or offer
+checks. So the safe path is simply to wait: an
+abandoned preparation clears the way on its own within ten minutes, with no
+approvals deleted by hand and without running a send in order to roll back.
+A consumed approval never blocks it either.
 
-Seven confirmed defects were fixed; the operator-visible parts are:
+### 18.9 What changed after the review rounds
 
+The operator-visible corrections are:
+
+* **an unknown answer to a confirmation is no longer reported as a refusal.**
+  A proxy error, a truncated body or a dropped connection means the result is
+  UNKNOWN: the page says so, reads the saved state and shows the run and its
+  stop button if one was created. It never confirms again by itself. If the
+  status cannot be read at all, the page says it does not know rather than
+  claiming there is no send;
 * **a stop of the ORIGINAL mailing now stops the follow-up atomically.** The
   claim takes that batch's header before it reads the stop, which is the same
-  lock `request_stop` takes, so «stopped» and «sent» can no longer both be true
-  for one recipient. A stop that lands mid-run also tombstones every row the run
-  had not started;
+  lock `request_stop` takes. A source stop committed before the attempt boundary
+  prevents that attempt; an already claimed request retains its actual outcome.
+  A stop that lands mid-run also tombstones every row the run had not started;
 * **the confirmation is bound to the exact rows the offer covered.** A recipient
   who becomes eligible again between «Подготовить отправку» and «Подтвердить»
   is NOT added: they are listed as `followup_not_offered` and wait for the next

@@ -1361,11 +1361,28 @@ document.getElementById('followup-confirm')?.addEventListener('click', async (ev
       body: JSON.stringify({{approval_id: followupOffer.id, plan_signature: followupOffer.signature,
                              confirmed_count: followupOffer.count}}),
     }});
+    // A PROVEN refusal and an UNKNOWN answer are different facts, and
+    // collapsing them was a defect: an unreadable body — a proxy's 502 HTML, a
+    // truncated response — was reported as «Отправка не подтверждена» and the
+    // page returned without reconciling, while the confirmation had actually
+    // committed and a run was queued with no stop button on screen.
+    //
+    // So the only thing that counts as a refusal is a readable answer that says
+    // so. Everything else is unknown, and unknown means: go and read the
+    // durable state. Never a second confirm — the approval is single-use and
+    // this page does not retry it.
     let data = null;
     try {{ data = await response.json(); }} catch (parseError) {{ data = null; }}
-    if (data === null || !data.accepted) {{
-      followupSay('Отправка не подтверждена. ' + ((data && data.detail) || '')
-        + ' ' + ((data && data.reasons) || []).join(', '));
+    if (data !== null && data.accepted === false) {{
+      followupSay('Отправка не подтверждена. ' + (data.detail || '')
+        + ' ' + ((data.reasons) || []).join(', '));
+      return;
+    }}
+    if (data === null || data.accepted !== true) {{
+      followupHideConfirm();
+      followupSay('Ответ сервера не удалось прочитать, поэтому результат подтверждения неизвестен. '
+        + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
+      await followupPoll();
       return;
     }}
     followupHideConfirm();
@@ -1373,13 +1390,15 @@ document.getElementById('followup-confirm')?.addEventListener('click', async (ev
       ? ('Отправка подтверждена: позиций ' + data.planned + ', исключено ' + data.skipped
          + '. Исполняет выделенный исполнитель.')
       : 'Эта отправка уже была подтверждена ранее. Второй отправки не создано.');
-    followupPoll();
+    await followupPoll();
   }} catch (error) {{
-    // An answer we cannot read is not an answer: the confirmation may have
-    // committed. The status below is the only honest source, so it is polled
-    // rather than guessed at.
-    followupSay('Ответ сервера не получен. Состояние отправки показано ниже после обновления статуса.');
-    followupPoll();
+    // The request itself failed — aborted, offline, DNS. It may still have
+    // reached the server and committed, so this is unknown too and is settled
+    // the same way: by reading the durable state, never by confirming again.
+    followupHideConfirm();
+    followupSay('Ответ сервера не получен, результат подтверждения неизвестен. '
+      + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
+    await followupPoll();
   }} finally {{
     button.disabled = false;
   }}
@@ -1508,8 +1527,16 @@ async function followupPoll(options) {{
       followupPollTimer = window.setTimeout(followupPoll, 2000);
     }}
   }} catch (error) {{
-    // A failed poll says nothing about the run. The durable row is the truth,
-    // and the next poll or a reload will read it.
+    // A failed poll says nothing about the run, so the page must not say
+    // «Отправок по этой рассылке ещё не было» — that is a claim about durable
+    // state this request could not read. It says it does not know instead, and
+    // keeps whatever it was already showing.
+    const host = document.getElementById('followup-run');
+    if (host !== null && document.getElementById('followup-run-status') === null) {{
+      host.innerHTML = '<p class="text-muted mb-0" id="followup-run-unknown">'
+        + 'Состояние отправки сейчас прочитать не удалось. Это не значит, что отправки нет — '
+        + 'обновите страницу.</p>';
+    }}
   }}
 }}
 

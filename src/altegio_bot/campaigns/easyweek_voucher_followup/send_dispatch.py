@@ -751,6 +751,17 @@ async def execute_run(
                 sender_digest=verdict.sender_digest,
                 recipient_digest=verdict.recipient_digest,
                 source_batch_id=run.source_batch_id,
+                # The last word on the local conditions, taken INSIDE the
+                # claiming transaction once its locks are granted. The pass
+                # above describes the world before this claim waited for them.
+                final_guard=recheck_module.claim_time_guard(
+                    gate=gate,
+                    source_item_id=source_item_id,
+                    contract=contract,
+                    expected=verdict,
+                    policy=policy,
+                    now=moment,
+                ),
                 now=moment,
             )
             if claim.stopped:

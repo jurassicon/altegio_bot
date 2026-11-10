@@ -4160,3 +4160,211 @@ async def test_followup_first_confirmation_shows_the_run_and_stops_it_in_the_bro
         runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
     assert int(runs) == 1, "a lost answer must not create a second run"
     assert sender.count == 0
+
+
+@pytest.mark.parametrize("status_unavailable", [False, True], ids=["status-readable", "status-unreadable"])
+async def test_followup_a_lost_confirm_answer_after_the_commit_still_shows_the_run_and_stops_it(
+    page, monkeypatch, session_maker, status_unavailable
+):
+    """§46.8 review R2/F3: an unreadable answer is UNKNOWN, never a refusal.
+
+    The defect: ``response.json()`` failing produced ``data = null``, the page
+    said «Отправка не подтверждена» and returned without reconciling. So a
+    confirmation that had really committed left a queued run on the server and
+    an operator looking at a refusal, with no stop button.
+
+    Reproduced the way it happens in production rather than by aborting before
+    the server: the real request is forwarded, the server commits, and only the
+    ANSWER is replaced with a proxy's 502 HTML. The browser then has to find the
+    stored run and stop it in the browser. If the status read also fails, the
+    page must say it is unknown until the operator reloads after recovery.
+    """
+    import contextlib as _contextlib
+
+    from sqlalchemy import func as sql_func
+
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as followup_dispatch
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.models.models import EasyWeekVoucherFollowupRun
+    from altegio_bot.ops import voucher_followup as followup_ops
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        StubTransports,
+        seed_ready_batch,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", followup_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
+
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}, {"state": "delivered"}])
+    reader = FakeHistoryReader(batch_id=batch_id)
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    original_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(given=None):
+        return await original_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    # The workflow needs the parsed page and its controls, not completion of
+    # every document resource. Subsequent waits assert the actual application
+    # state; waiting for load here can time out after that state is ready.
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup", wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-check", timeout=WAIT_MS)
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(wait_until="domcontentloaded", timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "2"
+
+    # The request IS forwarded and the server DOES commit; only the answer the
+    # browser receives is replaced with something it cannot read.
+    forwarded: list[int] = []
+
+    async def break_the_answer(route):
+        response = await route.fetch()
+        forwarded.append(response.status)
+        await route.fulfill(
+            status=502,
+            content_type="text/html; charset=utf-8",
+            body="<html><head><title>502</title></head><body>Bad Gateway</body></html>",
+        )
+
+    async def break_status_after_commit(route):
+        if not forwarded:
+            await route.continue_()
+            return
+        await route.fulfill(status=502, content_type="text/html", body="<html>Status temporarily unavailable</html>")
+
+    if status_unavailable:
+        await page.route("**/followup/status", break_status_after_commit)
+    await page.route("**/followup/confirm", break_the_answer)
+    await page.click("#followup-confirm")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('неизвестен')",
+        timeout=WAIT_MS,
+    )
+    assert forwarded == [200], "the confirmation must really have reached the server"
+
+    # It must NOT read as a refusal, and the page must have gone and read the
+    # durable state: the run and a stop button addressing it.
+    result = await page.inner_text("#followup-send-result")
+    assert "Отправка не подтверждена" not in result
+    assert "Повторное подтверждение не отправляется" in result
+    if status_unavailable:
+        await page.wait_for_selector("#followup-run-unknown", timeout=WAIT_MS)
+        visible_status = await page.inner_text("#followup-run")
+        assert "Состояние отправки сейчас прочитать не удалось" in visible_status
+        assert "Отправок по этой рассылке ещё не было" not in visible_status
+        assert await page.query_selector("#followup-stop") is None
+        pending = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+        assert pending is not None and pending.status == "queued"
+        assert forwarded == [200], "a failed status read must not repeat confirmation"
+        await page.unroute("**/followup/status")
+        # Follow the recovery action the page actually offers. This reads the
+        # durable run; it must not resubmit the confirmation that created it.
+        await page.reload(wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-run-status", timeout=WAIT_MS)
+    await page.wait_for_selector("#followup-stop", timeout=WAIT_MS)
+    stored = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+    assert stored is not None
+    run_id = await page.get_attribute("#followup-stop", "data-run-id")
+    assert run_id == str(stored.id)
+
+    # Stopped in the browser as soon as its durable state is available.
+    await page.click("#followup-stop")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('остановлена окончательно')",
+        timeout=WAIT_MS,
+    )
+    await page.wait_for_selector("#followup-stop", state="detached", timeout=WAIT_MS)
+    after_stop = await followup_ledger.load_run(session_maker, run_id=int(run_id))
+    assert after_stop is not None and after_stop.stop_requested_at is not None
+
+    sender = CountingSender()
+    transports = StubTransports(reader=reader, sender=sender, templates=templates)
+    monkeypatch.setattr(followup_dispatch, "Transports", lambda: transports)
+    assert (
+        await followup_worker.run_once(
+            session_maker,
+            owner="browser-lost-answer",
+            transports=transports,
+            heartbeat_interval=60.0,
+        )
+        is None
+    )
+    assert sender.count == 0
+
+    # One run, not two: an unknown answer is reconciled, never re-confirmed.
+    async with session_maker() as session:
+        runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
+    assert int(runs) == 1
+    assert forwarded == [200], "reconciliation and stopping must not repeat confirmation"
+    await page.unroute("**/followup/confirm")
+
+    # And the other half of the same contract: a request that genuinely never
+    # reached the server. Also unknown, also reconciled, and it creates nothing.
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup", wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-check", timeout=WAIT_MS)
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(wait_until="domcontentloaded", timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    await page.route("**/followup/confirm", lambda route: route.abort("failed"))
+    await page.click("#followup-confirm")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Ответ сервера не получен')",
+        timeout=WAIT_MS,
+    )
+    await page.unroute("**/followup/confirm")
+    await page.wait_for_selector("#followup-run-status", timeout=WAIT_MS)
+    async with session_maker() as session:
+        runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
+    assert int(runs) == 1, "a request that never arrived must not create a run"
+    assert sender.count == 0
+
+    # A real, readable server refusal is different from both lost-answer cases.
+    # Close the fence only after preparing the offer, so confirm reaches its
+    # own guard and returns accepted:false without creating another run.
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", False)
+    async with page.expect_response(lambda response: response.url.endswith("/followup/confirm")) as refusal:
+        await page.click("#followup-confirm")
+    response = await refusal.value
+    assert response.status == 409
+    assert (await response.json())["accepted"] is False
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Отправка не подтверждена')",
+        timeout=WAIT_MS,
+    )
+    assert "неизвестен" not in await page.inner_text("#followup-send-result")
+    async with session_maker() as session:
+        runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
+    assert int(runs) == 1
+    assert sender.count == 0

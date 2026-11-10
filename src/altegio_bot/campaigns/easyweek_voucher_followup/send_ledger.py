@@ -76,6 +76,7 @@ import json
 import logging
 import secrets
 import uuid as uuid_module
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final, Sequence
@@ -120,6 +121,7 @@ logger = logging.getLogger("easyweek_voucher_followup_send")
 __all__ = [
     "ClaimOutcome",
     "ConfirmOutcome",
+    "GuardVerdict",
     "PlanOffer",
     "SendRowView",
     "StoredApproval",
@@ -281,7 +283,7 @@ class StoredApproval:
         return self.status == FOLLOWUP_APPROVAL_PENDING
 
     def expired_at(self, now: datetime) -> bool:
-        return now > self.expires_at
+        return now >= self.expires_at
 
     def contract(self) -> SendContract:
         return SendContract(
@@ -761,15 +763,20 @@ async def confirm_approval(
     moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
-            # The approval row only, first, so the id can be resolved to a
-            # source batch before the header is taken. It is read WITHOUT a lock
-            # here for exactly that reason; the locked read happens below, after
-            # the header, which is the order this phase documents.
-            with session.no_autoflush:
-                unlocked = await session.get(EasyWeekVoucherFollowupApproval, int(approval_id))
-            if unlocked is None:
+            # Which source batch this approval belongs to, so the header can be
+            # taken first. Deliberately a SCALAR read and not a whole row: an
+            # ORM object loaded before the lock stays in the identity map, and
+            # the locked SELECT below would then hand back those STALE
+            # attributes rather than what the lock just made visible. That was a
+            # real defect — see the comment on the locked read.
+            source_batch_id = await session.scalar(
+                select(EasyWeekVoucherFollowupApproval.source_batch_id).where(
+                    EasyWeekVoucherFollowupApproval.id == int(approval_id)
+                )
+            )
+            if source_batch_id is None:
                 return ConfirmOutcome(None, (ids.APPROVAL_UNKNOWN,))
-            source_batch_id = int(unlocked.source_batch_id)
+            source_batch_id = int(source_batch_id)
 
             # The ORIGINAL batch header, which is this phase's one serialiser
             # per source batch. It makes three things atomic that used to be
@@ -782,11 +789,19 @@ async def confirm_approval(
             if header is None:
                 return ConfirmOutcome(None, (ids.APPROVAL_UNKNOWN,))
 
+            # ``populate_existing`` is load-bearing, not a precaution. A SELECT
+            # FOR UPDATE does not refresh an instance SQLAlchemy already holds,
+            # so without it this read could return the state from before the
+            # lock was granted — which is how a losing confirmation used to see
+            # ``pending`` after the winner had consumed the approval, fall
+            # through to the admission check and answer ``run=None`` with
+            # ``followup_run_already_active`` instead of the run that exists.
             row = (
                 await session.execute(
                     select(EasyWeekVoucherFollowupApproval)
                     .where(EasyWeekVoucherFollowupApproval.id == int(approval_id))
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if row is None:
@@ -1283,13 +1298,19 @@ async def request_terminal_stop(
     moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
-            with session.no_autoflush:
-                unlocked = await session.get(EasyWeekVoucherFollowupRun, int(run_id))
-            if unlocked is None:
-                return StopOutcome(False, ids.APPROVAL_UNKNOWN)
-            header = await session.get(
-                EasyWeekVoucherProductionBatch, int(unlocked.source_batch_id), with_for_update=True
+            # A SCALAR read, for the same reason as in the confirmation: a whole
+            # row loaded before the lock would be handed back unchanged by the
+            # locked SELECT below. That was the defect this guards — the stop
+            # read ``queued`` with no lease, an executor claimed the run and
+            # made it ``running``, and the stop then wrote ``stopped`` over
+            # it and violated ``ck_ew_followup_run_lease_only_while_running``,
+            # rolling the whole stop back and leaving ``stop_requested_at`` NULL.
+            source_batch_id = await session.scalar(
+                select(EasyWeekVoucherFollowupRun.source_batch_id).where(EasyWeekVoucherFollowupRun.id == int(run_id))
             )
+            if source_batch_id is None:
+                return StopOutcome(False, ids.APPROVAL_UNKNOWN)
+            header = await session.get(EasyWeekVoucherProductionBatch, int(source_batch_id), with_for_update=True)
             if header is None:
                 return StopOutcome(False, ids.APPROVAL_UNKNOWN)
 
@@ -1298,6 +1319,7 @@ async def request_terminal_stop(
                     select(EasyWeekVoucherFollowupRun)
                     .where(EasyWeekVoucherFollowupRun.id == int(run_id))
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if run is None:
@@ -1373,6 +1395,14 @@ async def request_terminal_stop(
 
 
 @dataclass(frozen=True)
+class GuardVerdict:
+    """What the claim-time local re-check concluded. Eligible, or why not."""
+
+    eligible: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class ClaimOutcome:
     """Whether this row's one attempt is now spent, or the reason it is not."""
 
@@ -1397,6 +1427,7 @@ async def claim_send(
     sender_digest: str,
     recipient_digest: str,
     source_batch_id: int,
+    final_guard: Callable[[AsyncSession], Awaitable[GuardVerdict]] | None = None,
     now: datetime | None = None,
 ) -> ClaimOutcome:
     """Spend this original recipient's ONE extra attempt, before the POST.
@@ -1421,10 +1452,14 @@ async def claim_send(
        requests;
     3. re-reads the run under its row lock and refuses if the operator stopped
        it or if this executor no longer holds the lease;
-    4. moves this row to ``claimed`` with ``attempt_count = 1``, a durable
+    4. re-proves the remaining LOCAL conditions through ``final_guard``, inside
+       this transaction and after every lock has been granted. Waiting for a
+       lock is waiting, and the caller's last local pass describes the world
+       before that wait;
+    5. moves this row to ``claimed`` with ``attempt_count = 1``, a durable
        intent and the frozen route.
 
-    The three partial unique indexes make step 4 atomic against everything this
+    The three partial unique indexes make step 5 atomic against everything this
     function cannot see: a second executor, a second run, another preview
     version, another template, a duplicate card. One of the two transactions
     wins and the other's INSERT or UPDATE violates the index.
@@ -1461,6 +1496,7 @@ async def claim_send(
                     select(EasyWeekVoucherFollowupRun)
                     .where(EasyWeekVoucherFollowupRun.id == int(run_id))
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if run is None:
@@ -1476,6 +1512,7 @@ async def claim_send(
                     select(EasyWeekVoucherFollowupSend)
                     .where(EasyWeekVoucherFollowupSend.id == int(send_id))
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
             if row is None or int(row.run_id) != int(run_id):
@@ -1484,6 +1521,28 @@ async def claim_send(
                 # Somebody else already accounted for this attempt: another
                 # executor, a stop, or this very row in an earlier pass.
                 return ClaimOutcome(False, ids.ATTEMPT_ALREADY_USED)
+
+            # The remaining LOCAL conditions, re-proven inside this
+            #    transaction, after every lock has been granted.
+            #
+            #    This is the fix for a confirmed defect, and it is the reason
+            #    the guard runs here rather than before the claim. The caller's
+            #    last local pass finishes before this transaction opens, and
+            #    this transaction can then WAIT — on the batch header, on a
+            #    consent address — for as long as another writer holds it.
+            #    Everything local the caller had proven is a statement about a
+            #    snapshot taken before that wait: a customer reply processed, a
+            #    template switched off, a read receipt moving the row out of the
+            #    selected groups, an identity reassigned. The consent
+            #    fingerprint is a version of CONSENT and of nothing else, so it
+            #    cannot stand in for any of them.
+            #
+            #    Local reads only, so nothing external runs under these locks,
+            #    and bounded: it is the same per-row check the caller ran.
+            if final_guard is not None:
+                verdict = await final_guard(session)
+                if not verdict.eligible:
+                    return ClaimOutcome(False, verdict.reason or ids.CONSENT_MOVED)
 
             intent = uuid_module.uuid4()
             row.status = FOLLOWUP_SEND_CLAIMED
