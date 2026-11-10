@@ -63,6 +63,7 @@ from altegio_bot.settings import settings
 from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
     NOW,
     SENDER_DIGEST,
+    TemplateReader,
     location_map,
     person,
 )
@@ -1520,3 +1521,1020 @@ async def test_no_lock_is_held_while_the_external_request_is_in_flight(session_m
     assert observed.get("acquired") is True
     assert sender.count == 1
     assert report.accepted == 1
+
+
+# ===========================================================================
+# Review round 1 — the seven confirmed defects, as regressions
+# ===========================================================================
+# Each test below reproduces a path that really sent, or really lost a stop, on
+# the reviewed commit. They are written as statements about the contract, so
+# they keep their meaning once the hole is closed rather than describing the
+# patch.
+
+
+async def _set_card_phone(session_maker, *, index: int, phone: str) -> None:
+    """Move one synthetic card's number, as a reassignment would.
+
+    The card and the campaign row are both moved, because §46.5's identity
+    proof compares them: moving only one of them is a different defect (an
+    identity conflict), and these tests are about the row being eligible again.
+    """
+    from altegio_bot.models.models import CampaignRecipient, Client
+
+    async with session_maker() as session:
+        async with session.begin():
+            card = (
+                await session.execute(select(Client).where(Client.easyweek_customer_uuid == person_uuid(index)))
+            ).scalar_one()
+            card.phone_e164 = phone
+            recipient = (
+                await session.execute(select(CampaignRecipient).where(CampaignRecipient.client_id == int(card.id)))
+            ).scalar_one()
+            recipient.phone_e164 = phone
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — the original mailing's STOP and the follow-up claim are one order
+# ---------------------------------------------------------------------------
+
+
+async def test_a_source_stop_committed_after_the_confirmation_produces_zero_requests(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """§46.5: a terminal stop of the original mailing forbids executing its follow-up.
+
+    The confirmation happened while the batch was healthy, so this is the window
+    the claim is responsible for — not the one the confirmation covers.
+    """
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    await production_ledger.request_stop(session_maker, batch_id=batch_id, requested_by="owner")
+
+    sender = CountingSender()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+    assert report.stopped is True
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert all(int(row.attempt_count) == 0 for row in rows.values())
+
+
+async def test_the_claim_waits_for_the_source_batch_header_and_then_sees_the_stop(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """The ordering is a lock, not two reads that happen to be in the right order.
+
+    A transaction holds the original batch header and writes the stop inside it.
+    The claim is started while that is held: it must BLOCK — asserted, not
+    assumed — and once the holder commits it must see the stop and refuse. On
+    the reviewed commit the claim read the stop without the header and could
+    prove "no stop" while exactly this was in flight.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup.eligibility import consent_snapshot
+    from altegio_bot.models.models import (
+        EasyWeekVoucherProductionBatch,
+        EasyWeekVoucherProductionStopRequest,
+    )
+
+    batch_id, _reader = await _ready(session_maker, slots=[{"state": "delivered"}])
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    async with session_maker() as session:
+        snapshot = await consent_snapshot(session, phone=person_phone(1), easyweek_customer_uuid=person_uuid(1))
+
+    blocked: list[bool] = []
+    async with session_maker() as holder:
+        transaction = await holder.begin()
+        await holder.get(EasyWeekVoucherProductionBatch, batch_id, with_for_update=True)
+        holder.add(
+            EasyWeekVoucherProductionStopRequest(
+                batch_id=batch_id,
+                requested_by="owner",
+                requested_at=NOW,
+                stop_count=1,
+            )
+        )
+        await holder.flush()
+
+        task = asyncio.create_task(
+            ledger_module.claim_send(
+                session_maker,
+                run_id=outcome.run.id,
+                send_id=int(rows[1].id),
+                owner="executor-1",
+                address=person_phone(1),
+                easyweek_customer_uuid=person_uuid(1),
+                expected_consent_fingerprint=snapshot.fingerprint,
+                sender_digest=SENDER_DIGEST,
+                recipient_digest=str(recipient_route_digest(person_phone(1))),
+                source_batch_id=batch_id,
+            )
+        )
+        # Several event-loop turns: enough for the claim to reach the header and
+        # wait on it, and not enough for it to finish if it is waiting.
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if task.done():
+                break
+        blocked.append(not task.done())
+        await transaction.commit()
+        claim = await task
+
+    assert blocked == [True], "the claim must wait for the source batch header, not read around it"
+    assert claim.granted is False
+    assert claim.reason == send_ids.SOURCE_TERMINAL_STOP
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    assert int(rows[1].attempt_count) == 0
+
+
+async def test_an_attempt_committed_before_the_stop_is_one_attempt_and_the_rest_are_stopped(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """The other order, and its honest outcome.
+
+    The first row's attempt is already spent when the operator presses stop, so
+    it keeps it — a request that may have left cannot be pretended cancelled —
+    and every row that had not started is tombstoned.
+    """
+    batch_id, reader = await _ready(
+        session_maker, slots=[{"state": "delivered"}, {"state": "delivered"}, {"state": "delivered"}]
+    )
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    run_id = outcome.run.id
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    class StopAfterFirst(CountingSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            answer = await super().send_voucher_template(**kwargs)
+            if len(self.calls) == 1:
+                await production_ledger.request_stop(session_maker, batch_id=batch_id, requested_by="owner")
+            return answer
+
+    sender = StopAfterFirst()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 1
+    assert report.stopped is True
+    rows = await rows_of(session_maker, run_id=run_id)
+    assert int(rows[1].attempt_count) == 1
+    assert {rows[2].status, rows[3].status} == {send_ids.STOPPED}
+
+
+async def test_a_repeated_source_stop_changes_nothing_about_a_spent_attempt(
+    session_maker, ops_signing, send_fence
+) -> None:
+    batch_id, reader = await _ready(session_maker, slots=[{"state": "delivered"}])
+    sender = CountingSender()
+    report = await _run(session_maker, batch_id=batch_id, sender=sender, reader=reader)
+    assert sender.count == 1
+    for _ in range(3):
+        await production_ledger.request_stop(session_maker, batch_id=batch_id, requested_by="owner")
+    rows = await rows_of(session_maker, run_id=report.run_id)
+    assert rows[1].status == send_ids.ACCEPTED
+    assert int(rows[1].attempt_count) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — the confirmation is bound to the exact offered identities
+# ---------------------------------------------------------------------------
+
+
+async def test_a_recipient_who_regained_eligibility_after_the_offer_is_not_added_to_the_run(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """The review's own reproduction, as a contract statement.
+
+    Two recipients in the preview; the second one's card number does not match
+    when the plan is built, so the offer covers ONE. The number is then fixed and
+    the operator confirms the one they were shown. On the reviewed commit this
+    created two planned rows and the executor sent twice.
+    """
+    batch_id, reader = await _ready(session_maker)
+    await _set_card_phone(session_maker, index=2, phone="+4915100099999")
+
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.approval is not None
+    assert plan.approval.approved_recipient_count == 1
+    assert plan.approval.offered_source_item_ids is not None
+    assert len(plan.approval.offered_source_item_ids) == 1
+
+    # The obstacle disappears between the offer and the confirmation.
+    await _set_card_phone(session_maker, index=2, phone=str(person(2)["phone"]))
+
+    outcome = await confirm(session_maker, plan=plan, count=1)
+    assert outcome.created is True
+    assert outcome.planned == 1
+    assert outcome.skipped == 1
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    assert rows[1].status == send_ids.PLANNED
+    assert rows[2].status == send_ids.SKIPPED
+    assert rows[2].reason_code == send_ids.NOT_OFFERED
+
+    sender = CountingSender()
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 1
+    assert report.attempted == 1
+
+
+async def test_one_person_cannot_be_swapped_for_another_at_the_same_count(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """A count comparison cannot see a substitution; pinned identities can.
+
+    The offer covers slot 1 only. Then slot 1 breaks and slot 2 heals, so the
+    number of eligible recipients is still one — and it is a different person.
+    Nothing is sent: the offered row is excluded with its own reason and the
+    substitute was never offered.
+    """
+    batch_id, reader = await _ready(session_maker)
+    await _set_card_phone(session_maker, index=2, phone="+4915100099999")
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.approval is not None and plan.approval.approved_recipient_count == 1
+
+    await _set_card_phone(session_maker, index=1, phone="+4915100088888")
+    await _set_card_phone(session_maker, index=2, phone=str(person(2)["phone"]))
+
+    outcome = await confirm(session_maker, plan=plan, count=1)
+    assert outcome.created is True
+    assert outcome.planned == 0
+    rows = await rows_of(session_maker, run_id=outcome.run.id)
+    assert rows[1].status == send_ids.SKIPPED
+    assert rows[1].reason_code == "followup_identity_conflict"
+    assert rows[2].status == send_ids.SKIPPED
+    assert rows[2].reason_code == send_ids.NOT_OFFERED
+
+    sender = CountingSender()
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+
+
+async def test_an_approval_with_no_pinned_offer_cannot_be_confirmed(session_maker, ops_signing, send_fence) -> None:
+    """Fail closed: an offer whose identities are unknown authorises nobody.
+
+    Only reachable for a row written before the column existed. Re-signed after
+    the column is cleared, so the refusal is about the missing offer and not
+    about a signature that no longer verifies.
+    """
+    from altegio_bot.models.models import EasyWeekVoucherFollowupApproval
+
+    batch_id, _reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.approval is not None
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(EasyWeekVoucherFollowupApproval, int(plan.approval.id))
+            assert row is not None
+            row.offered_source_item_ids = None
+            row.plan_signature = ledger_module.plan_signature(ledger_module._approval_material(row))
+            signature = row.plan_signature
+
+    refused = await confirm(session_maker, plan=plan, signature=signature)
+    assert refused.run is None
+    assert refused.reasons == (send_ids.OFFER_UNPROVEN,)
+
+
+async def test_editing_the_pinned_offer_breaks_the_signature(session_maker, ops_signing, send_fence) -> None:
+    """The identities are part of what the keyed signature covers."""
+    from altegio_bot.models.models import EasyWeekVoucherFollowupApproval
+
+    batch_id, _reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.approval is not None
+    offered = list(plan.approval.offered_source_item_ids or ())
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(EasyWeekVoucherFollowupApproval, int(plan.approval.id))
+            assert row is not None
+            row.offered_source_item_ids = offered[:-1]
+
+    refused = await confirm(session_maker, plan=plan)
+    assert refused.reasons == (send_ids.APPROVAL_SIGNATURE_INVALID,)
+
+
+async def test_an_unchanged_offered_composition_is_confirmed_in_full(session_maker, ops_signing, send_fence) -> None:
+    """The positive control for the whole binding: nothing moved, everything sends."""
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    assert plan.approval is not None and plan.approval.approved_recipient_count == 2
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.planned == 2 and outcome.skipped == 0
+    sender = CountingSender()
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 2 and report.accepted == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — the template and the sender are re-proven before every attempt
+# ---------------------------------------------------------------------------
+
+
+async def _deactivate_template(session_maker) -> None:
+    from altegio_bot.models.models import MessageTemplate
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(MessageTemplate).where(MessageTemplate.code == message.FOLLOWUP_TEMPLATE_CODE)
+                )
+            ).scalar_one()
+            row.is_active = False
+
+
+async def _deactivate_sender(session_maker) -> None:
+    from altegio_bot.models.models import WhatsAppSender
+
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(WhatsAppSender))).scalars().first()
+            assert row is not None
+            row.is_active = False
+
+
+async def test_a_template_deactivated_after_the_confirmation_sends_nobody(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """§46.6: the approved contract is proven before each attempt, not once per plan.
+
+    On the reviewed commit the local row was proven at the plan and at the
+    confirmation and never again, so switching it off afterwards changed
+    nothing and the executor still sent.
+    """
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    await _deactivate_template(session_maker)
+
+    sender = CountingSender()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+    assert report.skipped == 2
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert {row.reason_code for row in rows.values()} == {"followup_template_unproven"}
+    assert all(int(row.attempt_count) == 0 for row in rows.values())
+
+
+async def test_a_template_switched_off_between_two_rows_stops_the_second(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """Per ATTEMPT, not per run: the first row's proof does not cover the second."""
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    class DeactivateAfterFirst(CountingSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            answer = await super().send_voucher_template(**kwargs)
+            if len(self.calls) == 1:
+                await _deactivate_template(session_maker)
+            return answer
+
+    sender = DeactivateAfterFirst()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 1
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].status == send_ids.ACCEPTED
+    assert rows[2].status == send_ids.SKIPPED
+    assert rows[2].reason_code == "followup_template_unproven"
+
+
+async def test_an_edited_local_template_body_sends_nobody(session_maker, ops_signing, send_fence) -> None:
+    """A row that merely exists is not the contract; its body has to match."""
+    from altegio_bot.models.models import MessageTemplate
+
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    async with session_maker() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(MessageTemplate).where(MessageTemplate.code == message.FOLLOWUP_TEMPLATE_CODE)
+                )
+            ).scalar_one()
+            row.body = "Hallo {client_name}, {booking_link}."
+
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+
+
+@pytest.mark.parametrize("status", ["PAUSED", "PENDING", "DISABLED"])
+async def test_a_meta_template_that_is_not_approved_right_now_sends_nobody(
+    session_maker, ops_signing, send_fence, status
+) -> None:
+    """The live half, asked in THIS evaluation. A previous proof is not evidence."""
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import approved_meta_templates
+
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    listing = approved_meta_templates()
+    listing[0]["status"] = status
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender, templates=TemplateReader(listing)),
+    )
+    assert sender.count == 0
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert {row.reason_code for row in rows.values()} == {"followup_template_unproven"}
+
+
+async def test_a_meta_listing_that_cannot_be_read_sends_nobody(session_maker, ops_signing, send_fence) -> None:
+    """An unreadable listing is unknown, and unknown is not permission."""
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender, templates=TemplateReader([])),
+    )
+    assert sender.count == 0
+
+
+async def test_a_sender_switched_off_between_two_rows_stops_the_second(session_maker, ops_signing, send_fence) -> None:
+    """The route is re-proven per attempt too, and nothing falls back to another."""
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    class DeactivateSenderAfterFirst(CountingSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            answer = await super().send_voucher_template(**kwargs)
+            if len(self.calls) == 1:
+                await _deactivate_sender(session_maker)
+            return answer
+
+    sender = DeactivateSenderAfterFirst()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 1
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].status == send_ids.ACCEPTED
+    assert rows[2].status == send_ids.SKIPPED
+    assert rows[2].reason_code == "followup_sender_unproven"
+
+
+async def test_a_sender_repointed_at_another_number_sends_nobody(session_maker, ops_signing, send_fence) -> None:
+    """§46.1: the repeat message stays on the original send geography."""
+    from altegio_bot.models.models import WhatsAppSender
+
+    batch_id, reader = await _ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    async with session_maker() as session:
+        async with session.begin():
+            row = (await session.execute(select(WhatsAppSender))).scalars().first()
+            assert row is not None
+            row.phone_number_id = "222222222222222"
+
+    sender = CountingSender()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+    assert report.reasons == ("followup_sender_unproven",)
+    # Not terminal: a sender that was repointed can be repointed back, so the
+    # reservations are kept rather than tombstoned, and nothing was spent.
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert {row.status for row in rows.values()} == {send_ids.PLANNED}
+    assert all(int(row.attempt_count) == 0 for row in rows.values())
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — the local conditions are re-proven AFTER the external reads
+# ---------------------------------------------------------------------------
+
+
+class _MutatingHistoryReader(FakeHistoryReader):
+    """A booking read that performs a local change while it is "in flight".
+
+    This is the window the review found: the local pass had already run, the
+    artifact and the history were being read, and anything that moved locally in
+    between was simply not looked at again. Driving it from inside the reader is
+    what makes the test deterministic — the change lands between the two local
+    passes by construction, not by timing.
+    """
+
+    def __init__(self, *, during: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._during = during
+        self.fired = 0
+
+    async def list_customer_bookings(self, customer_uuid: str, page: int, **kwargs: Any) -> Any:
+        if self.fired == 0:
+            self.fired += 1
+            await self._during()
+        return await super().list_customer_bookings(customer_uuid, page, **kwargs)
+
+
+async def _mark_read(session_maker, *, batch_id: int, slot: int, index: int) -> None:
+    """A PROVEN read receipt lands for this slot's original message."""
+    from altegio_bot.models.models import (
+        DELIVERY_RECEIPT_KIND_READ,
+        INBOUND_AUTHENTICITY_SIGNED,
+        EasyWeekVoucherProductionDeliveryReceipt,
+    )
+
+    async with session_maker() as session:
+        item = (
+            await session.execute(
+                select(EasyWeekVoucherProductionBatchItem)
+                .where(EasyWeekVoucherProductionBatchItem.batch_id == int(batch_id))
+                .where(EasyWeekVoucherProductionBatchItem.slot == int(slot))
+            )
+        ).scalar_one()
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(EasyWeekVoucherProductionBatchItem, int(item.id))
+            assert row is not None
+            row.read_at = NOW
+            session.add(
+                EasyWeekVoucherProductionDeliveryReceipt(
+                    fact_key=f"late-read-{batch_id}-{slot}",
+                    kind=DELIVERY_RECEIPT_KIND_READ,
+                    authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                    item_id=int(item.id),
+                    batch_id=int(batch_id),
+                    slot=int(slot),
+                    provider_message_id=str(item.provider_message_id),
+                    observed_sender_digest=SENDER_DIGEST,
+                    observed_recipient_digest=str(recipient_route_digest(person_phone(index))),
+                    route_proven=True,
+                    observed_at=NOW,
+                    event_at=NOW,
+                    evidence={},
+                )
+            )
+
+
+async def test_a_read_that_lands_during_the_external_reads_excludes_a_delivered_only_row(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """The review's own reproduction. Only ``delivered_unread`` was selected.
+
+    A proven read arrives while the booking history is being read, so this
+    person is no longer in a group the operator chose. On the reviewed commit the
+    verdict still carried the first pass's values and the executor sent to them.
+    """
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}])
+    base = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(session_maker, batch_id=batch_id, reader=base)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None and outcome.planned == 1
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    async def during() -> None:
+        await _mark_read(session_maker, batch_id=batch_id, slot=1, index=1)
+
+    reader = _MutatingHistoryReader(during=during, batch_id=batch_id)
+    sender = CountingSender()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert reader.fired == 1
+    assert sender.count == 0
+    assert report.skipped == 1
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].status == send_ids.SKIPPED
+    assert rows[1].reason_code == "followup_group_moved_out_of_selection"
+    assert int(rows[1].attempt_count) == 0
+
+
+async def test_a_move_between_two_selected_groups_still_sends(session_maker, ops_signing, send_fence) -> None:
+    """§46.5 allows the move when BOTH groups were selected and the text is one.
+
+    The positive control for the test above: the same event, with the operator
+    having chosen both groups, is not a reason to exclude anybody.
+    """
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}])
+    base = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(
+        session_maker,
+        batch_id=batch_id,
+        reader=base,
+        groups=(FOLLOWUP_GROUP_READ, "delivered_unread"),
+    )
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None and outcome.planned == 1
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    async def during() -> None:
+        await _mark_read(session_maker, batch_id=batch_id, slot=1, index=1)
+
+    reader = _MutatingHistoryReader(during=during, batch_id=batch_id)
+    sender = CountingSender()
+    report = await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert reader.fired == 1
+    assert sender.count == 1
+    assert report.accepted == 1
+
+
+async def test_a_reply_processed_during_the_external_reads_excludes_the_person(
+    session_maker, ops_signing, send_fence
+) -> None:
+    from altegio_bot.models.models import INBOUND_AUTHENTICITY_SIGNED, WhatsAppInboundReceipt
+
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}])
+    base = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(session_maker, batch_id=batch_id, reader=base)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    async def during() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                session.add(
+                    WhatsAppInboundReceipt(
+                        receipt_key="reply-during-history",
+                        message_index=0,
+                        wa_address=person_phone(1).lstrip("+"),
+                        command="none",
+                        authenticity=INBOUND_AUTHENTICITY_SIGNED,
+                        observed_at=NOW,
+                        event_at=NOW,
+                        resolved_at=NOW,
+                        resolution="noop",
+                    )
+                )
+
+    reader = _MutatingHistoryReader(during=during, batch_id=batch_id)
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert reader.fired == 1
+    assert sender.count == 0
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].reason_code == "followup_customer_replied"
+
+
+async def test_an_identity_that_moves_during_the_external_reads_does_not_substitute_the_addressee(
+    session_maker, ops_signing, send_fence
+) -> None:
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}])
+    base = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(session_maker, batch_id=batch_id, reader=base)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    async def during() -> None:
+        await _set_card_phone(session_maker, index=1, phone="+4915100077777")
+
+    reader = _MutatingHistoryReader(during=during, batch_id=batch_id)
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert reader.fired == 1
+    assert sender.count == 0
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].reason_code == "followup_identity_conflict"
+
+
+async def test_a_refusal_that_lands_during_the_external_reads_produces_zero_requests(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """STOP before the boundary, with the boundary reached from the other side."""
+    from altegio_bot.whatsapp_consent import ProjectedRefusal, apply_projected_refusal
+
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}])
+    base = FakeHistoryReader(batch_id=batch_id)
+    await build_preview(session_maker, batch_id=batch_id, reader=base)
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+
+    async def during() -> None:
+        async with session_maker() as session:
+            async with session.begin():
+                await apply_projected_refusal(
+                    session,
+                    ProjectedRefusal(
+                        wa_address=person_phone(1).lstrip("+"),
+                        origin="test_projection",
+                        observed_at=NOW,
+                        event_at=NOW,
+                        authenticity="signature_verified",
+                    ),
+                )
+
+    reader = _MutatingHistoryReader(during=during, batch_id=batch_id)
+    sender = CountingSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert reader.fired == 1
+    assert sender.count == 0
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].reason_code == "followup_consent_refused"
+    assert int(rows[1].attempt_count) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — a proven failure outranks Meta having accepted the request
+# ---------------------------------------------------------------------------
+
+
+async def test_a_proven_failed_after_accepted_moves_the_row_and_says_why(
+    session_maker, ops_signing, send_fence
+) -> None:
+    """Accepting the request is not a proven outcome; a signed failure is.
+
+    On the reviewed commit ``failed`` ranked below ``accepted``, so the fact was
+    stored and the row went on reading ``принято провайдером`` — the screen kept
+    claiming a message was on its way that Meta had said it would not deliver.
+    """
+    _batch, row, _reader = await _sent_one(session_maker)
+    outcome = await _deliver(
+        session_maker,
+        status_payload(
+            provider_message_id="wamid.followup.A",
+            kind="failed",
+            recipient_phone=person_phone(1),
+            error_code=131026,
+        ),
+        kind="failed",
+    )
+    assert outcome.claimed is True
+    assert outcome.match_state == FOLLOWUP_CALLBACK_CONFIRMED
+    assert outcome.advanced is True
+    assert outcome.contradiction is False
+    rows = await rows_of(session_maker, run_id=int(row.run_id))
+    assert rows[1].status == send_ids.FAILED
+    assert rows[1].reason_code == callbacks_module.CALLBACK_FAILED_REASON
+    assert rows[1].failed_at is not None
+    # The attempt stays spent and no contradiction is claimed: the provider did
+    # not contradict itself, it finished its account of one message.
+    assert int(rows[1].attempt_count) == 1
+    assert int(rows[1].contradiction_count) == 0
+
+    # And the live report an operator reads says so.
+    counters = await ledger_module.run_counters(session_maker, run_id=int(row.run_id))
+    assert counters.get(send_ids.FAILED) == 1
+    assert counters.get(send_ids.ACCEPTED) is None
+
+
+async def test_a_proven_failed_after_an_unknown_moves_the_row(session_maker, ops_signing, send_fence) -> None:
+    """A status arriving for a message whose answer was lost is better news."""
+    batch_id, reader = await _ready(session_maker, slots=[{"state": "delivered"}])
+    from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import DELIVERY_UNKNOWN, DeliveryOutcome
+
+    # An unknown that nevertheless carries a message id: a 2xx whose body could
+    # not be read, a redirect, a timeout after the id was handed back. That is
+    # the row a later callback can still find.
+    sender = CountingSender(
+        answers=[
+            DeliveryOutcome(
+                outcome=DELIVERY_UNKNOWN,
+                reason="meta_timeout",
+                provider_message_id="wamid.followup.U",
+            )
+        ]
+    )
+    report = await _run(session_maker, batch_id=batch_id, sender=sender, reader=reader)
+    rows = await rows_of(session_maker, run_id=report.run_id)
+    assert rows[1].status == send_ids.UNKNOWN
+
+    outcome = await _deliver(
+        session_maker,
+        status_payload(
+            provider_message_id="wamid.followup.U",
+            kind="failed",
+            recipient_phone=person_phone(1),
+            error_code=131026,
+        ),
+        kind="failed",
+    )
+    assert outcome.advanced is True
+    rows = await rows_of(session_maker, run_id=report.run_id)
+    assert rows[1].status == send_ids.FAILED
+    assert int(rows[1].attempt_count) == 1
+
+
+async def test_an_early_failed_callback_is_bound_and_applied(session_maker, ops_signing, send_fence) -> None:
+    """A failure can overtake the commit that records the message id."""
+    batch_id, reader = await _ready(session_maker, slots=[{"state": "delivered"}])
+    plan = await offer(session_maker, batch_id=batch_id)
+    outcome = await confirm(session_maker, plan=plan)
+    assert outcome.run is not None
+    claimed = await ledger_module.claim_next_run(session_maker, owner="executor-1")
+    assert claimed is not None
+    phone = person_phone(1)
+
+    class EarlyFailureSender(CountingSender):
+        async def send_voucher_template(self, **kwargs: Any) -> Any:
+            async with session_maker() as session:
+                async with session.begin():
+                    kept = await callbacks_module.record_unmatched_followup_callback(
+                        session,
+                        status=status_payload(
+                            provider_message_id="wamid.followup.EF",
+                            kind="failed",
+                            recipient_phone=phone,
+                            error_code=131026,
+                        ),
+                        kind="failed",
+                        signature_verified=True,
+                    )
+            assert kept.stored is True
+            return accepted("wamid.followup.EF")
+
+    sender = EarlyFailureSender()
+    await dispatch_module.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-1",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    rows = await rows_of(session_maker, run_id=claimed.id)
+    assert rows[1].status == send_ids.FAILED
+    assert rows[1].failed_at is not None
+    assert int(rows[1].attempt_count) == 1
+
+
+async def test_a_failed_callback_does_not_touch_the_original_message_or_add_an_attempt(
+    session_maker, ops_signing, send_fence
+) -> None:
+    _batch, row, _reader = await _sent_one(session_maker)
+    async with session_maker() as session:
+        before = (
+            await session.execute(
+                select(
+                    EasyWeekVoucherProductionBatchItem.status,
+                    EasyWeekVoucherProductionBatchItem.send_attempt_count,
+                    EasyWeekVoucherProductionBatchItem.delivered_at,
+                    EasyWeekVoucherProductionBatchItem.read_at,
+                ).where(EasyWeekVoucherProductionBatchItem.id == int(row.source_item_id))
+            )
+        ).all()
+    await _deliver(
+        session_maker,
+        status_payload(
+            provider_message_id="wamid.followup.A",
+            kind="failed",
+            recipient_phone=person_phone(1),
+            error_code=131026,
+        ),
+        kind="failed",
+    )
+    async with session_maker() as session:
+        after = (
+            await session.execute(
+                select(
+                    EasyWeekVoucherProductionBatchItem.status,
+                    EasyWeekVoucherProductionBatchItem.send_attempt_count,
+                    EasyWeekVoucherProductionBatchItem.delivered_at,
+                    EasyWeekVoucherProductionBatchItem.read_at,
+                ).where(EasyWeekVoucherProductionBatchItem.id == int(row.source_item_id))
+            )
+        ).all()
+    assert after == before
+    rows = await rows_of(session_maker, run_id=int(row.run_id))
+    assert int(rows[1].attempt_count) == 1
+
+
+async def test_a_duplicate_and_a_reordered_failure_change_nothing_twice(session_maker, ops_signing, send_fence) -> None:
+    _batch, row, _reader = await _sent_one(session_maker)
+    payload = status_payload(
+        provider_message_id="wamid.followup.A",
+        kind="failed",
+        recipient_phone=person_phone(1),
+        error_code=131026,
+    )
+    first = await _deliver(session_maker, payload, kind="failed")
+    second = await _deliver(session_maker, payload, kind="failed")
+    assert first.advanced is True
+    assert second.advanced is False
+    # And a DELIVERED arriving after the failure is a proven success, which
+    # outranks it — §46.3's precedence, from the other direction.
+    late = await _deliver(
+        session_maker,
+        status_payload(provider_message_id="wamid.followup.A", kind="delivered", recipient_phone=person_phone(1)),
+        kind="delivered",
+    )
+    assert late.advanced is True
+    rows = await rows_of(session_maker, run_id=int(row.run_id))
+    assert rows[1].status == send_ids.DELIVERED

@@ -6443,9 +6443,19 @@ class EasyWeekVoucherFollowupApproval(Base):
     selected_groups: Mapped[list] = mapped_column(JSONB, nullable=False)
     min_interval_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     approved_recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    # A digest over the exact slots this offer covers, so a confirmation cannot
-    # be about a different set of people with the same count.
+    # A digest over the exact rows this offer covers — the SENDABLE subset the
+    # operator was shown a number for, not every included row of the preview.
+    # So a confirmation cannot be about a different set of people, and cannot be
+    # about the same number of different people.
     recipient_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # And their identities, pinned. The digest proves the set did not change;
+    # this says WHICH set it was, so the confirmation can only ever narrow it.
+    #
+    # NULL on an approval written before this column existed. Deliberately
+    # nullable and deliberately fail-closed at the far end: such a row cannot be
+    # confirmed at all, because inventing the offered set for it would be
+    # exactly the widening this column exists to stop.
+    offered_source_item_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     # -- the message contract ----------------------------------------------
     template_code: Mapped[str] = mapped_column(String(64), nullable=False)

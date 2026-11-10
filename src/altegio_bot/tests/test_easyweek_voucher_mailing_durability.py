@@ -2412,3 +2412,273 @@ async def test_a_destructive_downgrade_refuses_while_a_terminal_tombstone_exists
 
     rows = await _fetch(disposable_database, "SELECT status, attempt_count FROM easyweek_voucher_followup_sends")
     assert rows == [("stopped", 0)]
+
+
+# ---------------------------------------------------------------------------
+# §46.8 review round 1 — competing approvals, and a stop that cannot be lost
+# ---------------------------------------------------------------------------
+
+
+async def test_two_different_approvals_of_one_batch_create_at_most_one_active_run(
+    session_maker, followup_environment
+) -> None:
+    """Two offers, two confirmations, one run — decided by a lock, not a read.
+
+    Both confirmations are started while a third transaction holds the ORIGINAL
+    batch header, so neither can run its admission check until that is released:
+    the barrier is asserted rather than hoped for. On the reviewed commit both
+    passed an unserialised ``busy`` SELECT and two queued runs were created with
+    the same recipients, which is also what later made a terminal stop abort.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_identity as send_ids
+    from altegio_bot.models.models import EasyWeekVoucherProductionBatch
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import confirm, offer
+
+    batch_id, _reader = await _followup_ready(session_maker)
+    first = await offer(session_maker, batch_id=batch_id)
+    second = await offer(session_maker, batch_id=batch_id)
+    assert first.ready and second.ready
+    assert first.approval is not None and second.approval is not None
+    assert first.approval.id != second.approval.id
+
+    blocked: list[bool] = []
+    async with session_maker() as holder:
+        transaction = await holder.begin()
+        await holder.get(EasyWeekVoucherProductionBatch, batch_id, with_for_update=True)
+
+        tasks = [
+            asyncio.create_task(confirm(session_maker, plan=first)),
+            asyncio.create_task(confirm(session_maker, plan=second)),
+        ]
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if all(task.done() for task in tasks):
+                break
+        blocked.append(not any(task.done() for task in tasks))
+        await transaction.commit()
+        outcomes = await asyncio.gather(*tasks)
+
+    assert blocked == [True], "both confirmations must wait for the source batch header"
+    created = [outcome for outcome in outcomes if outcome.created]
+    refused = [outcome for outcome in outcomes if not outcome.created]
+    assert len(created) == 1
+    assert len(refused) == 1
+    assert refused[0].reasons == (send_ids.RUN_ALREADY_ACTIVE,)
+    async with session_maker() as session:
+        count = (await session.execute(text("SELECT count(*) FROM easyweek_voucher_followup_runs"))).scalar_one()
+    assert int(count) == 1
+
+
+async def test_repeating_one_approval_returns_the_same_run(session_maker, followup_environment) -> None:
+    """The loser of a double click is not an error, and not a second run."""
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import confirm, offer
+
+    batch_id, _reader = await _followup_ready(session_maker)
+    plan = await offer(session_maker, batch_id=batch_id)
+    first, second = await asyncio.gather(
+        confirm(session_maker, plan=plan),
+        confirm(session_maker, plan=plan),
+    )
+    runs = {outcome.run.id for outcome in (first, second) if outcome.run is not None}
+    assert len(runs) == 1
+    assert sum(1 for outcome in (first, second) if outcome.created) == 1
+
+
+async def test_a_terminal_stop_survives_a_recipient_another_run_already_accounts_for(
+    session_maker, followup_environment
+) -> None:
+    """A unique-index conflict must never be able to cancel an operator's stop.
+
+    On the reviewed commit the stop tombstoned every planned row in one
+    statement set, so a recipient another run had already tombstoned or sent to
+    raised a partial-index violation — and the whole transaction rolled back,
+    leaving ``stop_requested_at`` NULL while the operator had been told the run
+    was stopped.
+
+    The admission fixed above makes two ACTIVE runs impossible, so this state is
+    now only reachable by editing a row by hand — which is exactly why the stop
+    has to survive it rather than rely on the admission.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_identity as send_ids
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.models.models import EasyWeekVoucherFollowupSend
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        build_preview,
+        confirm,
+        offer,
+        rows_of,
+    )
+
+    batch_id, reader = await _followup_ready(session_maker, slots=[{"state": "delivered"}])
+
+    # Run one: confirmed, then stopped before it started. Its row is a tombstone.
+    first = await offer(session_maker, batch_id=batch_id)
+    first_run = await confirm(session_maker, plan=first)
+    assert first_run.run is not None
+    stop_one = await followup_ledger.request_terminal_stop(
+        session_maker, run_id=first_run.run.id, requested_by="operator"
+    )
+    assert stop_one.applied and stop_one.tombstoned == 1
+
+    # Run two: confirmed afterwards. Its row is correctly SKIPPED, because the
+    # tombstone already accounts for this recipient.
+    await build_preview(session_maker, batch_id=batch_id, reader=reader)
+    second = await offer(session_maker, batch_id=batch_id)
+    second_run = await confirm(session_maker, plan=second)
+    assert second_run.run is not None
+    rows = await rows_of(session_maker, run_id=second_run.run.id)
+    assert rows[1].reason_code == send_ids.TERMINALLY_STOPPED
+
+    # Forced back to a reservation, which is the state the admission no longer
+    # allows the application to produce.
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(EasyWeekVoucherFollowupSend, int(rows[1].id))
+            assert row is not None
+            row.status = "planned"
+            row.reason_code = None
+
+    stop_two = await followup_ledger.request_terminal_stop(
+        session_maker, run_id=second_run.run.id, requested_by="operator"
+    )
+    assert stop_two.applied is True
+    assert stop_two.tombstoned == 0
+    assert stop_two.already_accounted == 1
+
+    # The stop is durable, which is the whole point.
+    stored = await followup_ledger.load_run(session_maker, run_id=second_run.run.id)
+    assert stored is not None
+    assert stored.stop_requested_at is not None
+    assert stored.status == "stopped"
+
+    # And no claim can reach that recipient afterwards.
+    sender = CountingSender()
+    assert await followup_ledger.claim_next_run(session_maker, owner="executor-after-stop") is None
+    rows = await rows_of(session_maker, run_id=second_run.run.id)
+    assert rows[1].status in {"skipped", "stopped"}
+    assert int(rows[1].attempt_count) == 0
+    assert sender.count == 0
+
+
+async def test_a_stopped_run_is_not_bypassed_by_a_later_confirmation(session_maker, followup_environment) -> None:
+    """§46.7: a new preview, a new offer and a new run reach nobody who was stopped."""
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as followup_dispatch
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        StubTransports,
+        build_preview,
+        confirm,
+        offer,
+    )
+
+    batch_id, reader = await _followup_ready(session_maker, slots=[{"state": "delivered"}])
+    first = await offer(session_maker, batch_id=batch_id)
+    first_run = await confirm(session_maker, plan=first)
+    assert first_run.run is not None
+    await followup_ledger.request_terminal_stop(session_maker, run_id=first_run.run.id, requested_by="operator")
+
+    await build_preview(session_maker, batch_id=batch_id, reader=reader)
+    again = await offer(session_maker, batch_id=batch_id)
+    assert again.approval is not None and again.approval.approved_recipient_count == 0
+    later = await confirm(session_maker, plan=again)
+    assert later.run is not None and later.planned == 0
+
+    claimed = await followup_ledger.claim_next_run(session_maker, owner="executor-bypass")
+    assert claimed is not None
+    sender = CountingSender()
+    report = await followup_dispatch.execute_run(
+        session_maker,
+        run=claimed,
+        owner="executor-bypass",
+        transports=StubTransports(reader=reader, sender=sender),
+    )
+    assert sender.count == 0
+    assert report.attempted == 0
+
+
+FOLLOWUP_OFFER_COLUMN_PARENT = "c3f8a95d2e14"
+
+
+async def test_the_offer_identity_column_upgrades_downgrades_and_re_upgrades(
+    disposable_database: str,
+) -> None:
+    """One nullable column, added and removed, with the head staying single."""
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert "offered_source_item_ids" in await _columns(disposable_database, "easyweek_voucher_followup_approvals")
+
+    assert _alembic(disposable_database, "downgrade", FOLLOWUP_OFFER_COLUMN_PARENT).returncode == 0
+    assert "offered_source_item_ids" not in await _columns(disposable_database, "easyweek_voucher_followup_approvals")
+    # The ledger itself is untouched by this rollback.
+    assert await _tables(disposable_database, FOLLOWUP_SEND_TABLES) == set(FOLLOWUP_SEND_TABLES)
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    assert "offered_source_item_ids" in await _columns(disposable_database, "easyweek_voucher_followup_approvals")
+    heads = [line for line in _alembic(_repo_root(), "heads").stdout.splitlines() if "(head)" in line]
+    assert len(heads) == 1
+
+
+async def test_dropping_the_offer_identities_refuses_while_a_pending_offer_carries_them(
+    disposable_database: str,
+) -> None:
+    """§46.8: an offer whose identities are dropped could reach people it never covered.
+
+    So the rollback refuses before any DDL while such an offer is still
+    pending. A consumed one is history — its run and its rows already exist, and
+    the single-attempt key is what protects those.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    assert _alembic(disposable_database, "upgrade", "head").returncode == 0
+    moment = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+    engine = create_async_engine(disposable_database)
+    try:
+        async with engine.begin() as conn:
+            # The approval's own foreign key is to a preview, which this seed has
+            # no business building: the guard is about the column, so the key is
+            # relaxed for this one insert exactly as the seeds above do.
+            await conn.execute(
+                text("ALTER TABLE easyweek_voucher_followup_approvals ALTER COLUMN preview_id DROP NOT NULL")
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO easyweek_voucher_followup_approvals ("
+                    " action, preview_id, preview_version, source_batch_id, campaign_run_id, company_id,"
+                    " location_uuid, source_request_schema_version, source_frozen_digest,"
+                    " source_stop_generation, composition_digest, selected_groups, min_interval_seconds,"
+                    " approved_recipient_count, recipient_digest, offered_source_item_ids, template_code,"
+                    " meta_template_name, template_language, template_category, template_parameter_order,"
+                    " template_body_digest, contract_version, failure_policy_version, sender_digest,"
+                    " principal, session_fingerprint, identification_limit, nonce, plan_signature,"
+                    " issued_at, expires_at, status)"
+                    " VALUES ('followup_send', NULL, 1, 1, 1, 322579, :loc, '4', :frozen, 0, :comp,"
+                    " '[\"delivered_unread\"]'::jsonb, 1209600, 1, :recip, '[1]'::jsonb,"
+                    " 'new_client_voucher_followup_v1', 'kitilash_ka_new_client_voucher_followup_v1',"
+                    " 'de', 'MARKETING', '[\"client_name\", \"booking_link\"]'::jsonb, :body,"
+                    " 'followup-send-v1', 'followup-failure-policy-v1', :sender, 'ops', :fp,"
+                    " 'shared_ops_account', :nonce, :sig, :issued, :expires, 'pending')"
+                ),
+                {
+                    "loc": "8395fab6-7ee8-4702-88d9-fd78f92539c3",
+                    "frozen": "f" * 64,
+                    "comp": "c" * 64,
+                    "recip": "r" * 64,
+                    "body": "b" * 64,
+                    "sender": "s" * 64,
+                    "fp": "a" * 64,
+                    "nonce": "n" * 32,
+                    "sig": "g" * 64,
+                    "issued": moment,
+                    "expires": moment + timedelta(minutes=10),
+                },
+            )
+    finally:
+        await engine.dispose()
+
+    attempt = _alembic(disposable_database, "downgrade", FOLLOWUP_OFFER_COLUMN_PARENT)
+    assert attempt.returncode != 0
+    assert "pending offer" in (attempt.stderr + attempt.stdout)
+    assert "offered_source_item_ids" in await _columns(disposable_database, "easyweek_voucher_followup_approvals")

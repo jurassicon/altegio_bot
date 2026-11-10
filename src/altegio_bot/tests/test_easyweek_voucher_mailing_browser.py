@@ -4007,3 +4007,156 @@ async def test_followup_real_browser_preview_confirm_execute_and_terminal_stop(p
         heartbeat_interval=60.0,
     )
     assert second.count == 0, "a new run must not reopen a spent attempt or a terminal stop"
+
+
+async def test_followup_first_confirmation_shows_the_run_and_stops_it_in_the_browser(page, monkeypatch, session_maker):
+    """§46.8 review R7: the FIRST send on a mailing must appear and be stoppable.
+
+    The defect this is written against: on a mailing that had never been sent
+    the page rendered no status badge, no counters and no stop button, and the
+    poll only updated elements that already existed. So after a confirmation the
+    operator was told the send was queued while the section below still read
+    «Отправок по этой рассылке ещё не было» — with no way to stop it.
+
+    Every step here is the operator's, and the stop is pressed IN THE BROWSER:
+    calling the ledger directly is exactly how the earlier test hid this.
+    """
+    import contextlib as _contextlib
+
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as followup_dispatch
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.ops import voucher_followup as followup_ops
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        TemplateReader,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import (
+        location_map as followup_location_map,
+    )
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import (
+        CountingSender,
+        StubTransports,
+        seed_ready_batch,
+    )
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1", raising=False)
+    monkeypatch.setattr(settings, "easyweek_location_map", followup_location_map(), raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False, raising=False)
+
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}, {"state": "delivered"}])
+    reader = FakeHistoryReader(batch_id=batch_id)
+    templates = TemplateReader()
+
+    @_contextlib.asynccontextmanager
+    async def fake_client():
+        yield reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **k: fake_client())
+    original_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def meta_with_reader(given=None):
+        return await original_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", meta_with_reader)
+
+    # A mailing with no previous send at all: the state the defect needed.
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    assert "Отправок по этой рассылке ещё не было" in await page.inner_text("#followup-run")
+    assert await page.query_selector("#followup-stop") is None
+
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "2"
+    await page.click("#followup-confirm")
+
+    # No reload, and no manual navigation: the run, its counters and its stop
+    # button have to appear on their own.
+    await page.wait_for_selector("#followup-run-status", timeout=WAIT_MS)
+    await page.wait_for_selector("#followup-stop", timeout=WAIT_MS)
+    await page.wait_for_function("document.getElementById('followup-send-counters') !== null", timeout=WAIT_MS)
+    assert "Отправок по этой рассылке ещё не было" not in await page.inner_text("#followup-run")
+    run_id = await page.get_attribute("#followup-stop", "data-run-id")
+    stored = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+    assert stored is not None
+    assert run_id == str(stored.id), "the stop button must address the CURRENT run"
+
+    # The operator stops it before the executor starts, in the browser.
+    await page.click("#followup-stop")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('остановлена окончательно')",
+        timeout=WAIT_MS,
+    )
+    await page.wait_for_selector("#followup-stop", state="detached", timeout=WAIT_MS)
+    body = await page.inner_text("body")
+    assert "Остановлена оператором" in body
+    assert "Уже остановлена" in body
+
+    after_stop = await followup_ledger.load_run(session_maker, run_id=int(run_id))
+    assert after_stop is not None and after_stop.stop_requested_at is not None
+
+    # And the executor, run afterwards, reaches nobody.
+    sender = CountingSender()
+    transports = StubTransports(reader=reader, sender=sender, templates=templates)
+    monkeypatch.setattr(followup_dispatch, "Transports", lambda: transports)
+    assert (
+        await followup_worker.run_once(
+            session_maker,
+            owner="browser-stop-executor",
+            transports=transports,
+            heartbeat_interval=60.0,
+        )
+        is None
+    )
+    assert sender.count == 0
+
+    # A reload shows the same durable state, and the counters say it.
+    await page.reload()
+    await page.wait_for_selector("#followup-send-table", timeout=WAIT_MS)
+    reloaded = await page.inner_text("body")
+    assert "остановлено" in reloaded
+    assert "Остановлена оператором" in reloaded
+
+    # A LOST confirm answer is read back from durable state rather than resent.
+    # The page is pointed at a prepared offer whose confirmation the browser
+    # never sees the answer to: it must show the run that really exists and must
+    # not create a second one.
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup")
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    # Everyone is tombstoned, so the next allowable run is an honest zero.
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "0"
+
+    await page.route("**/followup/confirm", lambda route: route.abort("failed"))
+    await page.click("#followup-confirm")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Ответ сервера не получен')",
+        timeout=WAIT_MS,
+    )
+    await page.unroute("**/followup/confirm")
+    # The aborted request never reached the server, so the durable state is still
+    # the stopped run — which is what the page goes and reads.
+    await page.wait_for_selector("#followup-run-status", timeout=WAIT_MS)
+    from sqlalchemy import func as sql_func
+
+    from altegio_bot.models.models import EasyWeekVoucherFollowupRun
+
+    async with session_maker() as session:
+        runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
+    assert int(runs) == 1, "a lost answer must not create a second run"
+    assert sender.count == 0

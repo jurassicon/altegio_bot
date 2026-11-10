@@ -109,17 +109,26 @@ SKIPPED_NO_MESSAGE_ID: Final = "callback_without_message_id"
 # What a row says about itself once a proven ``failed`` callback has moved it.
 CALLBACK_FAILED_REASON: Final = "followup_meta_callback_failed"
 
-# Rank, so a callback can only ever move a row forwards. ``accepted`` is where a
-# row sits after its POST; ``unknown`` is deliberately rankable too, because a
-# status can arrive for a message whose answer was lost — and that status is
-# better news than the unknown, not worse.
+# Rank, so a callback can only ever move a row forwards.
+#
+# The order encodes one distinction the first version got wrong: Meta ACCEPTING
+# the request is not a proven outcome, while a signed ``failed`` on the frozen
+# route is. So ``accepted`` and ``unknown`` share the "no proven outcome" tier
+# and a proven failure outranks both — an ``accepted`` row that then genuinely
+# failed must say ``failed``, in its status, its reason and the live report, or
+# the screen keeps claiming a message is on its way that the provider has said
+# it will not deliver.
+#
+# A proven DELIVERY still outranks a failure, which is §46.3's precedence: a
+# ``read`` or a ``delivered`` is never unsaid by a later ``failed``, and that
+# contradiction is kept in the audit instead.
 _RANK: Final[dict[str, int]] = {
     FOLLOWUP_SEND_CLAIMED: 0,
+    FOLLOWUP_SEND_ACCEPTED: 1,
     FOLLOWUP_SEND_UNKNOWN: 1,
     FOLLOWUP_SEND_FAILED: 2,
-    FOLLOWUP_SEND_ACCEPTED: 3,
-    FOLLOWUP_SEND_DELIVERED: 4,
-    FOLLOWUP_SEND_READ: 5,
+    FOLLOWUP_SEND_DELIVERED: 3,
+    FOLLOWUP_SEND_READ: 4,
 }
 
 _KIND_TO_STATUS: Final[dict[str, str]] = {

@@ -71,13 +71,20 @@ facts, never a resend.
 
 In the one transaction the claim also:
 
+* takes the **original batch header's row lock** and reads that batch's terminal
+  stop under it. That header is the lock the primary mailing's own
+  `request_stop` takes first, so an operator stopping the original mailing and
+  this claim are serialised by PostgreSQL: once the stop has committed the claim
+  sees it and refuses, and once the claim has committed the stop waits for it
+  and finds the attempt already spent. Reading that stop without the lock was a
+  confirmed defect — a claim could prove "no stop", the stop could commit and be
+  reported to the operator, and the attempt was spent anyway;
 * re-proves the consent boundary under the consent **address locks**, through
   `whatsapp_consent.recheck_consent_boundary` — so a durable refusal, a durable
   unresolved inbound message, an address set that moved, or a consent decision
   that landed and was answered since all refuse here;
 * re-reads the run under its row lock and refuses if the operator stopped it or
-  if this executor no longer holds the lease;
-* re-reads the **original** batch's terminal stop, which forbids its follow-up.
+  if this executor no longer holds the lease.
 
 No network call happens inside it.
 
@@ -122,8 +129,15 @@ An approval row (`easyweek_voucher_followup_approvals`) is written by the server
 and pins:
 
 * the operator (account plus session fingerprint) and the one `action`;
-* the preview version, its composition digest, and a digest over the exact
-  slots it covers — because a count is not an audience;
+* the preview version and its composition digest; and, for the exact **sendable
+  subset** the operator was shown a number for, that subset's own digest, its
+  count and its `offered_source_item_ids`. All three are derived from one list,
+  which is the fix for a confirmed defect: the digest used to cover every
+  included row of the preview while the count covered only the sendable subset,
+  so a recipient who regained eligibility between the offer and the confirmation
+  joined a run the operator never saw them in. A count comparison could not have
+  caught it either — one person swapped for another leaves the count identical —
+  which is why the identities are pinned and not only their number;
 * the selected groups and the explicit minimum interval;
 * the whole message contract: code, Meta name, language, category, parameter
   order, body digest, plus the preview contract and failure policy versions;
@@ -140,13 +154,25 @@ operator is refused by name (`extra="forbid"`), and the three values a
 confirmation does carry — approval id, signature, count — are **compared** and
 discarded.
 
+A confirmation **may only narrow** the offer. A row the offer did not cover is
+written down as `skipped` with `followup_not_offered` and waits for the next
+offer; it is never added to this run.
+
 A confirmation is refused when: the signature does not verify, the presented
 signature is not the stored one, the action is not this ledger's, the principal
 differs, the offer has expired, the count differs, the message contract or the
 failure policy moved, the live Meta approval is gone, the sender or the frozen
 composition moved, the source batch was stopped (or stopped again) since, the
-preview no longer describes the same people, or another run of this mailing is
-in flight.
+offered rows are no longer the preview's own or no longer digest to what was
+offered, the approval carries no pinned offer at all
+(`followup_approval_offer_unproven` — fail-closed for a row written before that
+column existed), or another run of this mailing is in flight.
+
+The admission — both stop reads and the "one active run" check — happens under
+the original batch header's row lock, so two different approvals of one source
+batch resolve against each other. On the reviewed commit both passed an
+unserialised `SELECT` and queued two runs with the same recipients, which is
+also what later made a terminal stop abort.
 
 A second confirmation of the same offer returns **the existing run** with
 `created: false`. One offer becomes at most one run: the approval's single-use
@@ -163,18 +189,40 @@ from this path and none of them gains authority over these rows. The generic
 paths exist to retry what they find, which is right for an idempotent job and
 wrong here.
 
-Per planned row, with nothing held across a request:
+Per planned row, with nothing held across a request, and four phases rather
+than two:
 
-1. re-prove eligibility — locally (source attempt and its group, the sender
-   geography, the interval, the failure policy, the entitlement, the identity,
-   the consent aggregate, the stored-event backlog, the replies) and then
-   externally (the original artifact, the live fully paginated booking history,
-   the stored creation deliveries). A row that lost it is `skipped` with a
-   reason, and **nobody takes its place**;
-2. claim (§3);
-3. one POST, through `VoucherDeliveryClient`: one request, no redirect followed,
+1. **local** — the source attempt and its group, the sender geography, the
+   interval, the failure policy, the entitlement, the identity, the consent
+   aggregate, the stored-event backlog, the replies, **the approved contract,
+   the local template row and the active sender**. The last three are
+   re-proven for every attempt, not once per plan: a template switched off after
+   the confirmation, a template whose body was edited, and a sender deactivated
+   or repointed between two recipients each stopped nothing on the reviewed
+   commit;
+2. **the live Meta proof** of the exact APPROVED template, in this evaluation.
+   An approved template can be paused between two rows, so a previous proof is
+   not evidence — and it must be the contract this run was confirmed under, not
+   merely some approved template;
+3. **the external proofs** — the original artifact and the live fully paginated
+   booking history, plus the stored creation deliveries;
+4. **local again**, in a fresh snapshot. It must still be eligible, and it must
+   still agree with the first pass about the addressee, the route and the
+   consent version; the values the claim then acts on are the second pass's.
+   Without this, anything local that moved while the network was busy was never
+   looked at again: a proven `read` arriving for a row chosen as "delivered,
+   read not confirmed", and the customer's own reply being processed, both left
+   the row eligible and the executor sent. A move between two groups the
+   operator **already selected** is still allowed — that is §46.5 — and a move
+   out of the selection is refused with its own reason.
+
+A row that lost eligibility in any phase is `skipped` with that reason, and
+**nobody takes its place**. Then:
+
+5. claim (§3);
+6. one POST, through `VoucherDeliveryClient`: one request, no redirect followed,
    no backoff, no attempt count, no requeue;
-4. record the answer — `accepted` with its message id, `rejected`, or `unknown`.
+7. record the answer — `accepted` with its message id, `rejected`, or `unknown`.
 
 Outcomes, and what each means:
 
@@ -213,7 +261,18 @@ exactly the moments an operator wants it. Pressing it twice is reported as such.
 
 * A stop that becomes durable **before** a row's boundary produces **zero** Meta
   requests for that row and every row after it, and the executor ends the run
-  rather than skipping one person.
+  rather than skipping one person — tombstoning every row it had not started on
+  the way out. That also covers the ORIGINAL mailing's terminal stop, which no
+  follow-up row knows about until the claim reads it: those rows are tombstoned
+  too, because that stop is irreversible. Every other refusal of the batch gate
+  — a sender momentarily gone, a template not proven — is **not** terminal, so
+  those rows keep their reservation for a later run;
+* A stop is **idempotent against the key**: a recipient another run already
+  accounts for, by a spent attempt or by its own tombstone, is recorded as
+  already accounted for instead of being tombstoned twice. Writing the second
+  tombstone used to violate a partial unique index and abort the whole
+  transaction, which left `stop_requested_at` NULL after the operator had been
+  told the run was stopped. The stop itself always commits;
 * A request already in flight cannot be promised cancelled. Its row keeps its
   own state and its own honest outcome, and the report shows both moments.
 * The tombstones occupy the single-attempt key, so a new run, a new preview, a
@@ -230,9 +289,18 @@ Routed by three things at once: the exact `provider_message_id` the row recorded
 with its claim, and the signature the ingress verified. Anything short of all
 three is stored and marked rather than acted on.
 
-* `read` outranks `delivered`; both outrank a late `failed`. A failure after a
-  proven success is kept as `conflicting`, counts a contradiction and rolls
-  nothing back. Both timestamps are recorded even when the status does not move.
+* Meta ACCEPTING the request is not a proven outcome, while a signed `failed` on
+  the frozen route is — so a proven failure outranks both `accepted` and
+  `unknown`, and such a row moves to `failed` with its reason and in the live
+  report. On the reviewed commit `failed` ranked below `accepted`: the fact was
+  stored and the row went on reading "accepted by the provider" about a message
+  Meta had said it would not deliver;
+* a proven DELIVERY still outranks a failure. `read` outranks `delivered`, and
+  both outrank a late `failed`: that failure is kept as `conflicting`, counts a
+  contradiction and rolls nothing back. A failure after an `accepted` is **not**
+  a contradiction — the provider did not contradict itself, it finished its
+  account of one message. Both timestamps are recorded even when the status does
+  not move.
 * Duplicates and reordering are one fact: the key is computed from the
   callback's proven contents, never from when it was processed.
 * An early callback — Meta can deliver a status while the commit recording the
@@ -248,18 +316,36 @@ three is stored and marked rather than acted on.
 
 ## 9. The lock order
 
-Three orders are used, and `run` always precedes `send`:
+The order is derived from the paths that already exist rather than chosen for
+this phase. Two of them matter: the primary mailing takes the production batch
+**header** first and then the item, in every claim and in `request_stop`; and
+the WhatsApp status/inbound unit of work takes the message-identifier advisory
+locks, then the production headers behind them, and only then — when the same
+transaction goes on to process that delivery's inbound messages — the consent
+**address** advisory locks.
 
-* a **claim**: consent address advisory locks → the run row → the send row;
-* a **stop**: the run row → its send rows;
+So the existing global order is
+`message id → production header → production item → consent address`, and this
+phase extends it to the right rather than inserting anything to the left:
+
+**production batch header → consent address → follow-up approval → follow-up run
+→ follow-up send.**
+
+* a **confirmation**: the original batch header → the approval row → the run and
+  its rows;
+* a **claim**: the original batch header (reading that batch's stop under it) →
+  the consent address locks → the run row → the send row;
+* a **stop**: the original batch header → the run row → its send rows. The
+  header is what makes "which recipients does another run already account for"
+  unable to change under the transaction;
 * a **callback**: the message-identifier advisory lock (the one
   `lock_callback_scope` already holds for every identifier in a delivery) → the
   send row.
 
-Nothing in this phase holds a production batch header or item lock while asking
-for a consent address lock, which is the property `lock_consent_address`
-documents and relies on. The source batch's own stop is **read**, never locked,
-for the same reason. No HTTP call happens under any of them.
+Header-before-consent is the direction the status/inbound path already uses, so
+nothing here can be the reverse half of a cycle. No HTTP call happens under any
+of these locks: every external proof runs before the claim opens its
+transaction.
 
 ## 10. The message
 
@@ -363,10 +449,37 @@ one `accepted`, one `unknown` and one terminal-stop tombstone shown as three
 different words, the original message's status shown beside the follow-up's, and
 a new preview plus a new run proven unable to reopen the stopped recipients.
 
-Migration: one additive revision over the current head; upgrade, downgrade and
+Round 1 of review added these, each reproducing a path that really sent or
+really lost a stop:
+
+* the claim **waiting** for the original batch header while a stop is written
+  inside that header's transaction, and refusing once it is released; the other
+  order leaving exactly one spent attempt with the rest tombstoned; a repeated
+  source stop changing nothing;
+* a recipient who regained eligibility after the offer not being added to the
+  run; one person not substitutable for another at the same count; an approval
+  with no pinned offer refused; editing the pinned offer breaking the signature;
+  and the unchanged composition confirmed in full;
+* a template deactivated after the confirmation, edited, switched off between two
+  rows, or not APPROVED right now (paused, pending, disabled, unreadable listing)
+  sending nobody; a sender deactivated between two rows or repointed at another
+  number sending nobody;
+* a proven `read`, a processed reply, an identity change and a refusal each
+  landing **during** the external reads and excluding that row with zero
+  requests; and the in-selection group move still sending;
+* two different approvals of one batch behind a header barrier producing at most
+  one active run; one approval repeated returning the same run; a terminal stop
+  surviving a recipient another run already accounts for; a stopped run not
+  bypassed by a later confirmation;
+* a proven `failed` after `accepted` and after `unknown` moving the row, said in
+  the live counters; an early `failed` bound by the commit that records the
+  message id; duplicates and reordering; the original message untouched.
+
+Migration: two additive revisions over the previous head; upgrade, downgrade and
 re-upgrade on an empty ledger; the destructive downgrade refusing **before any
-DDL** while a spent attempt or a terminal tombstone exists; the historical
-tables untouched by the rollback.
+DDL** while a spent attempt or a terminal tombstone exists; the offer-identity
+column's own downgrade refusing while a PENDING offer carries one; the
+historical tables untouched by the rollback.
 
 ## 13. Rollout prerequisites — NOT satisfied
 

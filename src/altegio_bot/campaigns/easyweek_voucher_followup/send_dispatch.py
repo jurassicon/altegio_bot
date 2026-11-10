@@ -46,7 +46,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -83,6 +83,11 @@ from altegio_bot.models.models import (
 from altegio_bot.utils import utcnow
 
 logger = logging.getLogger("easyweek_voucher_followup_send_dispatch")
+
+# Who the audit records as having stopped a run the ORIGINAL mailing's terminal
+# stop ended. Not an operator account: no operator pressed this run's own stop,
+# and attributing it to one would be a claim about a person.
+_SOURCE_STOP_PRINCIPAL: Final = "source_batch_terminal_stop"
 
 __all__ = [
     "RunReport",
@@ -147,6 +152,17 @@ class Transports:
     async def sender(self) -> AsyncIterator[Any]:
         async with VoucherDeliveryClient() as client:
             yield client
+
+    def template_reader(self) -> Any | None:
+        """The Meta template listing seam for the per-attempt proof.
+
+        ``None`` means "read it the way the deployment does", which is what
+        :func:`...preview.prove_meta_followup_template` then does from the
+        settings. A test returns its own listing here, so the proof that runs
+        before every attempt is the real one with a replaced transport rather
+        than a check that was skipped.
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +238,6 @@ async def offer_send(
     if not gate.sender_digest:
         return ledger.PlanOffer(False, (SENDER_UNPROVEN,))
 
-    all_rows = [(int(item.source_slot), str(item.source_entitlement_digest)) for item in rows]
     # The count has to be the number of messages the NEXT click can produce, so
     # the local conditions are re-proven here too: a row whose consent, identity,
     # group, interval or entitlement moved since the preview is left out of the
@@ -238,8 +253,13 @@ async def offer_send(
         )
     except SQLAlchemyError:
         return ledger.PlanOffer(False, (ids.DATABASE_UNAVAILABLE,))
-    sendable = [
-        (int(item.source_slot), str(item.source_entitlement_digest))
+    # The OFFER is this subset and nothing wider: the rows that could still be
+    # sent to when the plan was built. Its identities, its digest and its count
+    # are all derived from this one list, so the confirmation can only narrow it
+    # — a recipient who regains eligibility afterwards waits for the next offer
+    # rather than joining this run.
+    offered = [
+        (int(item.source_item_id), int(item.source_slot), str(item.source_entitlement_digest))
         for item in rows
         if int(item.source_item_id) not in blocked and int(item.source_item_id) not in refused_now
     ]
@@ -249,18 +269,22 @@ async def offer_send(
         principal=principal,
         stored_preview=stored,
         gate=gate,
-        rows=all_rows,
-        approved_recipient_count=len(sendable),
+        offered=offered,
         now=moment,
     )
     logger.info(
         "followup_send: offered batch=%s preview_version=%s count=%s approval=%s",
         int(batch_id),
         stored.version,
-        len(sendable),
+        len(offered),
         approval.id,
     )
-    return ledger.PlanOffer(True, (), approval=approval, rows=tuple(sendable))
+    return ledger.PlanOffer(
+        True,
+        (),
+        approval=approval,
+        rows=tuple((slot, digest) for _item_id, slot, digest in offered),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +425,9 @@ def _offer_contract_probe(
         min_interval_seconds=int(stored.min_interval_seconds),
         approved_recipient_count=0,
         recipient_digest="",
+        # The probe is never stored and never confirmed; it exists only to carry
+        # the contract into the row-by-row re-check, so it pins nobody.
+        offered_source_item_ids=None,
         source_frozen_digest=str(gate.frozen_digest),
         source_request_schema_version=str(gate.schema_version),
         source_stop_generation=int(gate.stop_generation),
@@ -579,6 +606,7 @@ async def execute_run(
     run: ledger.StoredRun,
     owner: str,
     transports: Transports | None = None,
+    template_reader: Any | None = None,
     policy: FailurePolicy = CURRENT_FAILURE_POLICY,
     now: Callable[[], datetime] = utcnow,
 ) -> RunReport:
@@ -626,6 +654,19 @@ async def execute_run(
     async with session_maker() as session:
         gate = await preview_module.batch_gate(session, batch_id=run.source_batch_id)
     if not gate.allowed:
+        # A TERMINAL stop of the original mailing is irreversible, so its
+        # follow-up rows are tombstoned here rather than left ``planned`` for a
+        # later run to claim (§46.7). Every other gate refusal — a sender that
+        # is momentarily gone, a template that is not proven — is NOT terminal,
+        # so those rows keep their reservation and a later run may use it.
+        terminal = gate.reason == BATCH_TERMINAL_STOP
+        if terminal:
+            await ledger.request_terminal_stop(
+                session_maker,
+                run_id=run.id,
+                requested_by=_SOURCE_STOP_PRINCIPAL,
+                now=moment,
+            )
         await ledger.finish_run(
             session_maker,
             run_id=run.id,
@@ -636,7 +677,12 @@ async def execute_run(
             result={"attempted": 0, "meta_requests": 0},
             now=moment,
         )
-        return RunReport(run.id, "refused", reasons=(gate.reason or ids.SOURCE_TERMINAL_STOP,))
+        return RunReport(
+            run.id,
+            "stopped" if terminal else "refused",
+            stopped=terminal,
+            reasons=(gate.reason or ids.SOURCE_TERMINAL_STOP,),
+        )
 
     approval = await ledger.load_approval(session_maker, approval_id=run.approval_id)
     assert approval is not None
@@ -660,6 +706,10 @@ async def execute_run(
         )
         return RunReport(run.id, "refused", reasons=(SENDER_UNPROVEN,))
 
+    # One seam object for the whole run; each attempt still performs its own
+    # live read through it.
+    templates = template_reader if template_reader is not None else carrier.template_reader()
+
     pending = await _planned_rows(session_maker, run_id=run.id)
     async with carrier.reader() as reader:
         for send_id, source_item_id, slot in pending:
@@ -670,6 +720,7 @@ async def execute_run(
                 source_item_id=source_item_id,
                 contract=contract,
                 booking_reader=reader,
+                template_reader=templates,
                 policy=policy,
                 now=moment,
             )
@@ -704,9 +755,24 @@ async def execute_run(
             )
             if claim.stopped:
                 # The operator's stop, or the original mailing's terminal stop.
-                # Zero requests from here on, and the run ends.
+                # Zero requests from here on, and the run ends — but not before
+                # every row it had not started is TOMBSTONED. §46.7 keeps a
+                # terminal cancellation durable per original recipient even at
+                # zero attempts, and leaving them ``planned`` would have left
+                # them claimable by a later run. The operator's own stop has
+                # already written those tombstones; this call is idempotent and
+                # is what covers the source batch's terminal stop, which no
+                # follow-up row knew about until now.
                 stopped = True
                 reasons.append(claim.reason or ids.RUN_STOPPED)
+                await ledger.request_terminal_stop(
+                    session_maker,
+                    run_id=run.id,
+                    requested_by=(
+                        _SOURCE_STOP_PRINCIPAL if claim.reason == ids.SOURCE_TERMINAL_STOP else run.principal
+                    ),
+                    now=now(),
+                )
                 break
             if not claim.granted:
                 await _skip(
@@ -723,12 +789,34 @@ async def execute_run(
             # Past the boundary. This recipient's one extra attempt is spent
             # whatever happens from here, and nothing may try again.
             attempted += 1
+            # The raw sender id for THIS request, read now rather than cached at
+            # the start of the run: the per-row re-check above just proved the
+            # sender is active and still digests to the frozen route, and this
+            # reads the value that proof was about. ``None`` cannot happen after
+            # that proof; it is handled as an unknown rather than asserted,
+            # because the attempt is already spent.
+            row_sender_id = await _active_sender_id(
+                session_maker,
+                company_id=run.company_id,
+                expected_digest=contract.sender_digest,
+            )
+            if row_sender_id is None:
+                await ledger.record_send_outcome(
+                    session_maker,
+                    send_id=send_id,
+                    status=FOLLOWUP_SEND_UNKNOWN,
+                    reason_code=SENDER_UNPROVEN,
+                    now=now(),
+                )
+                unknown += 1
+                reasons.append(SENDER_UNPROVEN)
+                continue
             params = verdict.params()
             try:
                 async with carrier.sender() as sender:
                     meta_requests += 1
                     answer = await sender.send_voucher_template(
-                        phone_number_id=sender_id,
+                        phone_number_id=row_sender_id,
                         to_e164=verdict.address,
                         template_name=contract.meta_template_name,
                         language=contract.template_language,

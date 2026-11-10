@@ -161,9 +161,16 @@ class StubTransports(dispatch_module.Transports):
     replaced and none of the authorisation path changes with it.
     """
 
-    def __init__(self, *, reader: Any = None, sender: Any = None) -> None:
+    def __init__(self, *, reader: Any = None, sender: Any = None, templates: Any = None) -> None:
         self.reader_obj = reader
         self.sender_obj = sender
+        # The per-attempt Meta template proof runs for real; only its transport
+        # is replaced. Defaulting to an APPROVED listing keeps every suite that
+        # is not about the template itself describing a healthy deployment.
+        self.templates_obj = templates if templates is not None else TemplateReader()
+
+    def template_reader(self) -> Any:
+        return self.templates_obj
 
     def reader(self) -> Any:  # noqa: D102 - the base class documents it
         import contextlib

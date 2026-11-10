@@ -62,6 +62,8 @@ __all__ = [
     "FOLLOWUP_ACTION_SEND",
     "LEASE",
     "META_ACCEPTED",
+    "NOT_OFFERED",
+    "OFFER_UNPROVEN",
     "META_REJECTED",
     "META_UNKNOWN",
     "PLAN_MAX_AGE",
@@ -123,8 +125,19 @@ APPROVAL_PRINCIPAL_MISMATCH: Final = "followup_approval_principal_mismatch"
 APPROVAL_SIGNATURE_INVALID: Final = "followup_approval_signature_invalid"
 APPROVAL_COUNT_UNCONFIRMED: Final = "followup_approval_count_unconfirmed"
 # Something the approval pinned has changed since: the template, the policy, the
-# sender, the source composition, the source stop generation, the preview.
+# sender, the source composition, the source stop generation, the preview, or the
+# exact set of people the offer covered.
 APPROVAL_CONTRACT_MOVED: Final = "followup_approval_contract_moved"
+# The approval carries no pinned offered set, so there is nothing a confirmation
+# could be narrowed from. Only reachable for an approval written before the
+# column existed, and deliberately fail-closed: reconstructing the offer from
+# today's facts is exactly the widening the pinned set exists to prevent.
+OFFER_UNPROVEN: Final = "followup_approval_offer_unproven"
+# This recipient is an included row of the preview that the OFFER did not cover:
+# they were not sendable when the plan was built, and §46.5 lets a confirmation
+# only narrow what was offered. Their own refusal is reported when it is still
+# true; this code is for the one who became eligible again afterwards.
+NOT_OFFERED: Final = "followup_not_offered"
 RUN_ALREADY_ACTIVE: Final = "followup_run_already_active"
 RUN_STOPPED: Final = "followup_run_stopped"
 RUN_INTERRUPTED: Final = "followup_run_interrupted"

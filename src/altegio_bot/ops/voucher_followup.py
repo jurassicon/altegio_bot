@@ -250,7 +250,16 @@ _REASON_LABELS: Final[dict[str, str]] = {
     ),
     "followup_approval_contract_moved": (
         "После подготовки отправки изменилось что-то из зафиксированного: шаблон, политика, отправитель, "
-        "состав исходной рассылки или её остановка. Требуется новое подтверждение."
+        "состав исходной рассылки, её остановка или сам предложенный состав. Требуется новое подтверждение."
+    ),
+    "followup_approval_offer_unproven": (
+        "В подготовленной отправке не зафиксирован точный состав получателей, поэтому подтвердить её нельзя. "
+        "Подготовьте отправку заново."
+    ),
+    "followup_not_offered": (
+        "Этот получатель не входил в подготовленную отправку: на момент подготовки отправить ему было нельзя. "
+        "Подтверждение только сужает предложенный состав, поэтому он не добавляется — "
+        "чтобы включить его, подготовьте отправку заново."
     ),
     "followup_run_already_active": (
         "По этой исходной рассылке уже есть отправка в очереди или в работе. Одновременно выполняется одна."
@@ -315,6 +324,19 @@ _SEND_STATUS_BADGES: Final[dict[str, str]] = {
     send_ids.UNKNOWN: "bg-warning text-dark",
     send_ids.STOPPED: "bg-dark",
 }
+
+# The order the counters are shown in, declared once so the server-rendered
+# tiles and the ones the script repaints cannot disagree.
+_COUNTER_ORDER: Final[tuple[str, ...]] = (
+    send_ids.PLANNED,
+    send_ids.ACCEPTED,
+    send_ids.DELIVERED,
+    send_ids.READ,
+    send_ids.FAILED,
+    send_ids.UNKNOWN,
+    send_ids.SKIPPED,
+    send_ids.STOPPED,
+)
 
 _RUN_STATUS_LABELS: Final[dict[str, str]] = {
     "queued": "в очереди",
@@ -947,10 +969,23 @@ def _send_block(
 ) -> str:
     """Steps 4 and 5: the separate confirmation, then the run and its stop.
 
-    Rendered server-side as well as polled, so a reload shows the real state
-    rather than an empty panel waiting for a script. The confirmation panel is hidden
-    until an offer has been prepared: §46.8 forbids a hidden selection, and an
-    operator may not confirm a number they have not been shown.
+    Rendered server-side AND owned by the page's script afterwards. Both halves
+    matter, and the second one is the fix for a real defect: the first
+    confirmation on a mailing that had never been sent produced a run with no
+    badge, no counters and no stop button, because the page had rendered none of
+    those and the poll only updated elements that already existed. The operator
+    was told the send was confirmed while the section below still said there had
+    never been one — with no way to stop it.
+
+    So ``#followup-run`` is a container the script fills from the status
+    endpoint, every time, whether or not the server rendered a run into it. The
+    server-rendered copy is what a reload shows and what a browser with no
+    script would see; the script replaces it with the same shape built from
+    durable state.
+
+    The confirmation panel stays hidden until an offer has been prepared: §46.8
+    forbids a hidden selection, and an operator may not confirm a number they
+    have not been shown.
     """
     fence = ""
     if not send_enabled:
@@ -973,7 +1008,7 @@ def _send_block(
         else "Сначала пересчитайте состав: подтверждать можно только актуальный предпросмотр."
     )
 
-    run_block = "<p class='text-muted mb-0' id='followup-run-empty'>Отправок по этой рассылке ещё не было.</p>"
+    run_block = "<p class='text-muted mb-0'>Отправок по этой рассылке ещё не было.</p>"
     if run is not None:
         status_label = _RUN_STATUS_LABELS.get(run.status, run.status)
         stop_note = (
@@ -993,16 +1028,7 @@ def _send_block(
             f"<div class='h5 mb-0'>{int(counters.get(state, 0))}</div>"
             f"<div class='small text-muted'>{_esc(_SEND_STATUS_LABELS[state])}</div>"
             "</div></div></div>"
-            for state in (
-                send_ids.PLANNED,
-                send_ids.ACCEPTED,
-                send_ids.DELIVERED,
-                send_ids.READ,
-                send_ids.FAILED,
-                send_ids.UNKNOWN,
-                send_ids.SKIPPED,
-                send_ids.STOPPED,
-            )
+            for state in _COUNTER_ORDER
         )
         # ``flex-wrap`` is load-bearing, not decoration: at phone width the
         # badge, the sentence and the stop button do not fit on one line, and a
@@ -1390,54 +1416,107 @@ document.addEventListener('click', async (event) => {{
 
 const FOLLOWUP_STATUS_LABELS = {_json_object(_SEND_STATUS_LABELS)};
 const FOLLOWUP_RUN_LABELS = {_json_object(_RUN_STATUS_LABELS)};
+const FOLLOWUP_GROUP_LABELS = {_json_object(_GROUP_LABELS)};
+const FOLLOWUP_REASON_LABELS = {_json_object(_REASON_LABELS)};
+const FOLLOWUP_STATUS_BADGES = {_json_object(_SEND_STATUS_BADGES)};
+const FOLLOWUP_COUNTER_ORDER = {_json_literal_list(_COUNTER_ORDER)};
 
-async function followupPoll() {{
+function followupEscape(value) {{
+  const box = document.createElement('div');
+  box.textContent = value === null || value === undefined ? '' : String(value);
+  return box.innerHTML;
+}}
+
+// The whole run block, built from DURABLE state rather than patched into
+// whatever the server happened to render. That is what makes the first
+// confirmation on a mailing with no previous send show its status, its counters
+// and its stop button without a reload — and it is the same shape the server
+// renders, so a reload and a repaint agree.
+function followupRenderRun(data) {{
+  const host = document.getElementById('followup-run');
+  if (host === null) {{ return; }}
+  if (data.run === null) {{
+    host.innerHTML = '<p class="text-muted mb-0">Отправок по этой рассылке ещё не было.</p>';
+    return;
+  }}
+  const run = data.run;
+  const label = FOLLOWUP_RUN_LABELS[run.status] || run.status;
+  const stopped = run.stop_requested === true;
+  const stopControl = stopped
+    ? '<button class="btn btn-outline-secondary btn-sm" disabled>Уже остановлена</button>'
+    : '<button class="btn btn-outline-danger btn-sm" id="followup-stop" data-run-id="'
+      + String(run.run_id) + '">Остановить окончательно</button>';
+  const stopNote = stopped
+    ? '<div class="small text-danger mt-1">Остановлена оператором. Остановка окончательная: '
+      + 'новая партия, новый предпросмотр, другая группа и другой шаблон её не обходят.</div>'
+    : '';
+  const tiles = FOLLOWUP_COUNTER_ORDER.map((state) =>
+    '<div class="col"><div class="card"><div class="card-body py-2">'
+    + '<div class="h5 mb-0">' + ((data.counters || {{}})[state] || 0) + '</div>'
+    + '<div class="small text-muted">' + followupEscape(FOLLOWUP_STATUS_LABELS[state] || state)
+    + '</div></div></div></div>').join('');
+  const rows = (data.rows || []).map((row) => {{
+    const reason = row.reason
+      ? followupEscape(FOLLOWUP_REASON_LABELS[row.reason] || '')
+        + ' <code class="text-break">' + followupEscape(row.reason) + '</code>'
+      : '';
+    const contradictions = row.contradictions
+      ? ' <span class="badge bg-warning text-dark">противоречий: ' + String(row.contradictions) + '</span>'
+      : '';
+    return '<tr><td class="text-nowrap">' + String(row.slot) + '</td>'
+      + '<td class="small">' + followupEscape(FOLLOWUP_GROUP_LABELS[row.group] || row.group) + '</td>'
+      + '<td><span class="badge ' + (FOLLOWUP_STATUS_BADGES[row.status] || 'bg-light text-dark') + '">'
+      + followupEscape(FOLLOWUP_STATUS_LABELS[row.status] || row.status) + '</span></td>'
+      + '<td class="small">' + (row.attempt_spent ? 'да' : 'нет') + '</td>'
+      + '<td class="small text-break">' + reason + contradictions + '</td></tr>';
+  }}).join('');
+  const table = rows === ''
+    ? '<p class="text-muted">В этой отправке нет позиций.</p>'
+    : '<div class="table-responsive" style="overflow-x:auto">'
+      + '<table class="table table-sm align-middle" id="followup-send-table">'
+      + '<thead><tr><th>Позиция</th><th>Первое сообщение</th><th>Повторное сообщение</th>'
+      + '<th>Попытка израсходована</th><th>Причина</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>';
+  host.innerHTML =
+    '<div class="d-flex flex-wrap align-items-center gap-2 mb-2">'
+    + '<span class="badge bg-secondary" id="followup-run-status" data-followup-finished="'
+    + (run.finished ? 'true' : 'false') + '">' + followupEscape(label) + '</span>'
+    + '<span class="small text-muted">отправка №' + String(run.run_id)
+    + ', подтверждено позиций: ' + String(run.planned_count) + '</span>'
+    + '<span class="ms-sm-auto">' + stopControl + '</span>'
+    + '</div>' + stopNote
+    + '<div class="row row-cols-2 row-cols-md-4 g-2 mb-3" id="followup-send-counters">' + tiles + '</div>'
+    + table;
+}}
+
+let followupPollTimer = null;
+
+async function followupPoll(options) {{
+  const keepPolling = !(options && options.once === true);
   try {{
     const response = await fetch(window.location.pathname + '/status', {{
       method: 'GET', credentials: 'same-origin', cache: 'no-store',
     }});
     const data = await response.json();
-    if (data.run === null) {{ return; }}
-    const badge = document.getElementById('followup-run-status');
-    if (badge !== null) {{
-      badge.textContent = FOLLOWUP_RUN_LABELS[data.run.status] || data.run.status;
-    }}
-    const counters = document.getElementById('followup-send-counters');
-    if (counters !== null) {{
-      const order = ['planned', 'accepted', 'delivered', 'read', 'failed', 'unknown', 'skipped', 'stopped'];
-      counters.innerHTML = order.map((state) =>
-        '<div class="col"><div class="card"><div class="card-body py-2">'
-        + '<div class="h5 mb-0">' + (data.counters[state] || 0) + '</div>'
-        + '<div class="small text-muted">' + (FOLLOWUP_STATUS_LABELS[state] || state) + '</div>'
-        + '</div></div></div>').join('');
-    }}
-    // Keep polling only while the run can still change. A finished run is
-    // final, and a page that kept asking would suggest otherwise.
-    if (!data.run.finished) {{
-      window.setTimeout(followupPoll, 2000);
-      return;
-    }}
-    // It has just finished, so the page is repainted ONCE to pick up the
-    // per-row table the server renders. Only when this page was rendered while
-    // the run was still open: reloading on a page that already shows a finished
-    // run would reload for ever, since every fresh load would see it finished
-    // again.
-    if (badge !== null && badge.dataset.followupFinished === 'false') {{
-      badge.dataset.followupFinished = 'true';
-      window.setTimeout(() => window.location.reload(), 300);
+    followupRenderRun(data);
+    // Keep asking only while the run can still change. A finished run is
+    // final, and a page that kept asking would suggest otherwise. No reload is
+    // involved either way: the block above is built from the same durable state
+    // a reload would read.
+    if (keepPolling && data.run !== null && !data.run.finished) {{
+      if (followupPollTimer !== null) {{ window.clearTimeout(followupPollTimer); }}
+      followupPollTimer = window.setTimeout(followupPoll, 2000);
     }}
   }} catch (error) {{
-    // A failed poll says nothing about the run. The durable row is the truth
-    // and a reload will read it.
+    // A failed poll says nothing about the run. The durable row is the truth,
+    // and the next poll or a reload will read it.
   }}
 }}
 
-// Polled only while the run this page was rendered with could still move. A
-// page showing a finished run has nothing to wait for.
-const followupBadge = document.getElementById('followup-run-status');
-if (followupBadge !== null && followupBadge.dataset.followupFinished === 'false') {{
-  followupPoll();
-}}
+// Always, on every load. The status endpoint is a read and answers `null` when
+// this mailing has never been sent, so this costs one request and removes the
+// class of defect where the page could only update what it had already drawn.
+followupPoll();
 </script>
 """
     return HTMLResponse(content=_page("Повторное сообщение", body), headers=_PRIVATE_HEADERS)
@@ -1466,6 +1545,18 @@ def _json_literal(value: Any) -> str:
     import json
 
     return json.dumps(str(value)).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _json_literal_list(value: tuple[str, ...]) -> str:
+    """One JSON array literal for the page's script, escaped the same way."""
+    import json
+
+    return (
+        json.dumps(list(value), ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
 
 
 def _json_object(value: dict[str, str]) -> str:

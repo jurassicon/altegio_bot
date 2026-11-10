@@ -241,6 +241,39 @@ async def _proven_receipt_kinds(session: AsyncSession, *, item_id: int) -> set[s
     return {str(kind) for (kind,) in rows}
 
 
+async def _sender_still_approved(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    expected_digest: str,
+) -> bool:
+    """Is this branch's WhatsApp sender still active AND still the frozen route?
+
+    Both, and the digest comparison is the load-bearing half: a deployment
+    repointed at another number must not inherit this audience, and a sender row
+    switched off must not be sent from. ``None`` of the two is a reason to pick a
+    different sender — this phase has exactly one route.
+    """
+    from altegio_bot.campaigns.easyweek_voucher_production.dispatch import SENDER_CODE
+    from altegio_bot.models.models import WhatsAppSender
+    from altegio_bot.whatsapp_consent import sender_route_digest
+
+    row = (
+        await session.execute(
+            select(WhatsAppSender)
+            .where(WhatsAppSender.provider == PROVIDER_EASYWEEK)
+            .where(WhatsAppSender.company_id == int(company_id))
+            .where(WhatsAppSender.sender_code == SENDER_CODE)
+        )
+    ).scalar_one_or_none()
+    if row is None or not row.is_active:
+        return False
+    identifier = (row.phone_number_id or "").strip()
+    if not identifier:
+        return False
+    return bool(expected_digest) and sender_route_digest(identifier) == expected_digest
+
+
 def booking_link_for(company_id: int) -> str:
     """This branch's approved booking page, from the server-side registry.
 
@@ -280,6 +313,26 @@ async def local_recheck(
     item = await session.get(EasyWeekVoucherProductionBatchItem, int(source_item_id))
     if item is None or int(item.batch_id) != int(gate.batch_id or 0):
         return LocalRecheck(False, IDENTITY_CONFLICT, unknown=True)
+
+    # §46.6, before anything else about this person: the approved message
+    # contract and the route it would go out on, re-proven at this instant.
+    #
+    # Both halves used to be checked once per PLAN and never again, so a
+    # template deactivated after the confirmation still sent, and a sender
+    # deactivated between two recipients still sent to the second. They are
+    # local reads, so they belong in this pass and are re-run for every attempt.
+    if not contract.matches_today(policy=policy):
+        return LocalRecheck(False, TEMPLATE_UNPROVEN)
+    if not await preview_module.local_template_row_proven(session, company_id=int(gate.company_id or 0)):
+        return LocalRecheck(False, TEMPLATE_UNPROVEN)
+    if not await _sender_still_approved(
+        session,
+        company_id=int(gate.company_id or 0),
+        expected_digest=contract.sender_digest,
+    ):
+        # §46.1 keeps the repeat message on the original send geography, and
+        # nothing here falls back to whichever sender the settings now name.
+        return LocalRecheck(False, SENDER_UNPROVEN)
 
     attempt = (
         await session.execute(
@@ -460,15 +513,40 @@ async def prepare_row(
     contract: SendContract,
     booking_reader: Any | None,
     order_reader: Any | None = None,
+    template_reader: Any | None = None,
     policy: FailurePolicy = CURRENT_FAILURE_POLICY,
     now: datetime,
     read_bookings: Callable[..., Any] = _read_customer_bookings,
     prove_artifact: Callable[..., Any] = _prove_source_artifact,
+    prove_meta_template: Callable[..., Any] | None = None,
 ) -> RowRecheck:
-    """The whole re-check for one row: local, then the two external proofs.
+    """The whole re-check for one row: local, external, then local AGAIN.
 
-    No transaction and no lock is held across either request, which is §46.5's
-    rule and the reason the local phase closes its session first.
+    Four phases, and the fourth is the fix for a real hole. The old shape was
+    local-then-external and returned the FIRST pass's values, so anything local
+    that moved while the artifact and the history were being read was simply not
+    seen: a proven ``read`` arriving for a row chosen as "delivered, read not
+    confirmed", or the customer's own reply being processed, both left the row
+    eligible and the executor then sent to them. A consent fingerprint does not
+    cover any of that — it covers consent.
+
+    So:
+
+    1. **local** — identity, group, sender geography, interval, failure policy,
+       entitlement, the approved contract, the local template row, the active
+       sender, consent, the stored-event backlog, replies;
+    2. **the live Meta proof** of the exact APPROVED template, in THIS
+       evaluation, because an approved template can be paused between two rows;
+    3. **the external proofs** — the original artifact and the fully paginated
+       booking history;
+    4. **local again**, in a fresh snapshot. It must still be eligible, and it
+       must still agree with the first pass about the things the claim will act
+       on: the group, the addressee, the route and the consent version. The
+       values returned are the SECOND pass's, so the claim acts on what was true
+       after the network, not before it.
+
+    No transaction and no lock is held across any request, which is §46.5's
+    rule and the reason each local phase closes its session first.
 
     A missing reader is never an empty answer: without a configured EasyWeek
     read the booking history is UNKNOWN, and unknown excludes rather than
@@ -496,6 +574,35 @@ async def prepare_row(
         )
 
     assert local.customer_uuid is not None and local.address is not None
+
+    # §46.6: the live Meta half, with no session open. Asked per attempt rather
+    # than per plan, because a template paused between two recipients must stop
+    # the second one.
+    # Resolved at call time rather than bound at import: the module attribute is
+    # the seam the Ops suites replace, and a reference captured at import would
+    # quietly keep the real one.
+    prove_template = prove_meta_template or preview_module.prove_meta_followup_template
+    template = await prove_template(template_reader)
+    if not template.proven or not template.meta_verified:
+        return RowRecheck(
+            False,
+            TEMPLATE_UNPROVEN,
+            group_code=local.group_code,
+            evidence={"phase": "meta_template"},
+        )
+    if (
+        template.template_code != contract.template_code
+        or template.meta_template_name != contract.meta_template_name
+        or template.language != contract.template_language
+        or template.category != contract.template_category
+    ):
+        # Proven, but not the contract this run was confirmed under.
+        return RowRecheck(
+            False,
+            TEMPLATE_UNPROVEN,
+            group_code=local.group_code,
+            evidence={"phase": "meta_template"},
+        )
 
     # §46.6: the ORIGINAL artifact, read and proven rather than inferred from
     # the presence of its binding columns. First, because a slot whose voucher
@@ -584,11 +691,59 @@ async def prepare_row(
             booking_reads=1,
             evidence={"phase": "contract"},
         )
-    if not local.display_name:
+    # Phase 4: local AGAIN, in a fresh snapshot, after everything external.
+    async with session_maker() as session:
+        await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        again = await local_recheck(
+            session,
+            gate=gate,
+            source_item_id=int(source_item_id),
+            contract=contract,
+            policy=policy,
+            now=now,
+            configured_key_id=configured_key_id,
+        )
+    if not again.eligible:
+        # Something local moved while the network was busy. Excluded with the
+        # reason it moved for, and nobody takes its place.
+        return RowRecheck(
+            False,
+            again.reason,
+            unknown=again.unknown,
+            group_code=again.group_code or local.group_code,
+            booking_reads=1,
+            evidence={"phase": "local_after_external"},
+        )
+    if (
+        again.address != local.address
+        or again.customer_uuid != local.customer_uuid
+        or again.recipient_digest != local.recipient_digest
+        or again.sender_digest != local.sender_digest
+        or again.consent_fingerprint != local.consent_fingerprint
+    ):
+        # Still eligible, but not about the same PERSON or the same route the
+        # external proofs were spent on. §46.5 wants a new preview for that, not
+        # a send.
+        #
+        # The GROUP is deliberately not compared here. §46.5 allows a move
+        # between two groups the operator already selected under one approved
+        # message contract, and that is exactly what a read receipt arriving
+        # mid-run is; a move OUT of the selection is refused by the local pass
+        # itself, with its own reason.
+        return RowRecheck(
+            False,
+            IDENTITY_CONFLICT,
+            unknown=True,
+            group_code=again.group_code,
+            booking_reads=1,
+            evidence={"phase": "local_after_external", "recheck": "facts_changed"},
+        )
+
+    if not again.display_name:
         return RowRecheck(
             False,
             TEMPLATE_PARAMETERS_UNPROVEN,
-            group_code=local.group_code,
+            group_code=again.group_code,
             booking_reads=1,
             evidence={"phase": "contract"},
         )
@@ -596,14 +751,14 @@ async def prepare_row(
     return RowRecheck(
         True,
         None,
-        address=local.address,
-        customer_uuid=local.customer_uuid,
-        display_name=local.display_name,
+        address=again.address,
+        customer_uuid=again.customer_uuid,
+        display_name=again.display_name,
         booking_link=link,
-        consent_fingerprint=local.consent_fingerprint,
-        sender_digest=local.sender_digest,
-        recipient_digest=local.recipient_digest,
-        group_code=local.group_code,
+        consent_fingerprint=again.consent_fingerprint,
+        sender_digest=again.sender_digest,
+        recipient_digest=again.recipient_digest,
+        group_code=again.group_code,
         booking_reads=1,
         evidence={"booking_count": verdict.booking_count, "booking_pages_read": verdict.pages_read},
     )

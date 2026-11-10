@@ -28,22 +28,38 @@ for the runbook and the tests to point at.
 
 The lock order, and why it cannot deadlock with what already exists
 -------------------------------------------------------------------
-Three orders are used here, and ``run`` always precedes ``send``:
+The order was derived from the paths that already exist rather than chosen for
+this phase. Two of them matter:
 
-* a claim takes the consent ADDRESS advisory locks (through
-  :func:`...whatsapp_consent.recheck_consent_boundary`), then the run row, then
-  the send row;
-* a terminal stop takes the run row, then its send rows;
-* a callback takes the message-identifier advisory lock (the one
-  ``lock_callback_scope`` already holds for every identifier in a delivery),
+* the primary mailing takes the production batch HEADER first and then the item,
+  in every claim and in ``request_stop``;
+* the WhatsApp status/inbound unit of work takes the message-identifier advisory
+  locks, then the production headers behind those identifiers, and only then —
+  when the same transaction goes on to process the delivery's inbound messages —
+  the consent ADDRESS advisory locks.
+
+So the existing global order is
+``message id → production header → production item → consent address``, and this
+phase extends it to the right rather than inserting anything to the left:
+
+**production batch header → consent address → follow-up approval → follow-up run
+→ follow-up send.**
+
+* a CONFIRM takes the original batch header, then the approval row, then inserts
+  the run and its rows. The header is what makes two different approvals of one
+  source batch resolve against each other, and what makes the batch's terminal
+  stop and generation read atomic with the admission;
+* a CLAIM takes the original batch header (reading that batch's stop under it),
+  then the consent address locks, then the run row, then the send row;
+* a terminal STOP of a follow-up run takes the run row, then its send rows. It
+  takes no header and no consent lock;
+* a CALLBACK takes the message-identifier advisory lock — the one
+  ``lock_callback_scope`` already holds for every identifier in a delivery — and
   then the send row.
 
-Nothing in this phase holds a production batch header or item lock while asking
-for a consent address lock, which is the property
-:func:`...whatsapp_consent.lock_consent_address` documents and relies on. The
-source batch's own stop is READ here, never locked, for the same reason: taking
-the production header under a consent lock would invent the one ordering that
-could cross with the existing stages.
+Header-before-consent is the direction the status/inbound path already uses, so
+nothing here can be the reverse half of a cycle. No HTTP happens under any of
+these locks: the external proofs run before the claim opens its transaction.
 
 No HTTP under a lock
 --------------------
@@ -94,6 +110,7 @@ from altegio_bot.models.models import (
     EasyWeekVoucherFollowupPreviewRow,
     EasyWeekVoucherFollowupRun,
     EasyWeekVoucherFollowupSend,
+    EasyWeekVoucherProductionBatch,
 )
 from altegio_bot.utils import utcnow
 from altegio_bot.whatsapp_consent import recheck_consent_boundary
@@ -193,6 +210,11 @@ def _approval_material(row: EasyWeekVoucherFollowupApproval) -> dict[str, Any]:
         "min_interval_seconds": int(row.min_interval_seconds),
         "approved_recipient_count": int(row.approved_recipient_count),
         "recipient_digest": str(row.recipient_digest),
+        # The pinned identities are part of what the signature covers, so an
+        # offered set edited in the database no longer verifies.
+        "offered_source_item_ids": (
+            None if row.offered_source_item_ids is None else sorted(int(value) for value in row.offered_source_item_ids)
+        ),
         "template_code": str(row.template_code),
         "meta_template_name": str(row.meta_template_name),
         "template_language": str(row.template_language),
@@ -231,6 +253,9 @@ class StoredApproval:
     min_interval_seconds: int
     approved_recipient_count: int
     recipient_digest: str
+    # The exact rows the offer covered. ``None`` for an approval written before
+    # the column existed, which cannot be confirmed at all.
+    offered_source_item_ids: tuple[int, ...] | None
     source_frozen_digest: str
     source_request_schema_version: str
     source_stop_generation: int
@@ -409,6 +434,11 @@ def _approval(row: EasyWeekVoucherFollowupApproval) -> StoredApproval:
         min_interval_seconds=int(row.min_interval_seconds),
         approved_recipient_count=int(row.approved_recipient_count),
         recipient_digest=str(row.recipient_digest),
+        offered_source_item_ids=(
+            None
+            if row.offered_source_item_ids is None
+            else tuple(sorted(int(value) for value in row.offered_source_item_ids))
+        ),
         source_frozen_digest=str(row.source_frozen_digest),
         source_request_schema_version=str(row.source_request_schema_version),
         source_stop_generation=int(row.source_stop_generation or 0),
@@ -559,22 +589,27 @@ async def store_approval(
     principal: OpsPrincipal,
     stored_preview: preview_module.StoredPreview,
     gate: preview_module.BatchGate,
-    rows: Sequence[tuple[int, str]],
-    approved_recipient_count: int,
+    offered: Sequence[tuple[int, int, str]],
     now: datetime,
     ttl: timedelta = ids.PLAN_MAX_AGE,
 ) -> StoredApproval:
     """Write the immutable offer. Only ever called for a plan that was READY.
 
-    ``rows`` is every INCLUDED row of the stored preview, and its digest is what
-    ties this offer to that exact composition: the snapshot is immutable, so a
-    digest that stops matching can only mean the approval and the preview are
-    about different people.
+    ``offered`` is the SENDABLE subset — ``(source_item_id, slot,
+    entitlement_digest)`` for each row this offer actually covers, with every
+    row that could not be sent to when the plan was built left out. Three things
+    are derived from it and all three are part of the signature:
 
-    ``approved_recipient_count`` is narrower on purpose — the rows that could
-    still be sent to when the plan was built, with the ones whose extra attempt
-    is already accounted for left out. That is the number an operator confirms,
-    because it is the number of messages pressing the button can produce.
+    * ``approved_recipient_count`` — the number the operator confirms, because
+      it is the number of messages pressing the button can produce;
+    * ``recipient_digest`` — a digest over those rows' slots and entitlements, so
+      the same number of DIFFERENT people is refused;
+    * ``offered_source_item_ids`` — their identities, so a confirmation can only
+      ever narrow the set rather than regain a row that became eligible since.
+
+    Deriving all three from one argument is the point: the earlier version took
+    the count from the sendable subset and the digest from every included row of
+    the preview, and that mismatch is what let a confirmation widen.
 
     ``expires_at`` is derived from when the plan was ISSUED, so queueing or a
     slow browser cannot extend the window.
@@ -596,8 +631,11 @@ async def store_approval(
                 composition_digest=str(stored_preview.composition_digest),
                 selected_groups=list(stored_preview.selected_groups),
                 min_interval_seconds=int(stored_preview.min_interval_seconds),
-                approved_recipient_count=int(approved_recipient_count),
-                recipient_digest=recipient_digest_for_rows(rows),
+                approved_recipient_count=len(offered),
+                recipient_digest=recipient_digest_for_rows(
+                    [(int(slot), str(digest)) for _item_id, slot, digest in offered]
+                ),
+                offered_source_item_ids=sorted(int(item_id) for item_id, _slot, _digest in offered),
                 template_code=str(stored_preview.template_code),
                 meta_template_name=str(stored_preview.meta_template_name),
                 template_language=str(stored_preview.template_language),
@@ -691,12 +729,19 @@ async def confirm_approval(
     * the message contract and the failure policy are still the ones the
       approval pinned, and the source batch has neither been terminally stopped
       nor stopped again since the plan was built;
-    * no other run of this source batch is still in flight.
+    * no other run of this source batch is still in flight. That and the two
+      stop reads above happen under the ORIGINAL batch header's row lock, so two
+      different approvals racing on one batch resolve against each other instead
+      of both passing and queueing two runs with the same recipients;
+    * the offer pins the exact rows it covered, and all three of its facts — the
+      count, the digest over those rows and their identities — must still agree
+      with the stored preview. So the same number of different people is refused,
+      and an approval with no pinned offer cannot be confirmed at all.
 
     Then the rows. Each included preview row becomes a ``planned`` reservation —
     which spends nothing — unless it is refused, in which case it is written as
-    ``skipped`` with its reason and **nobody takes its place** (§46.5). Two kinds
-    of refusal arrive here:
+    ``skipped`` with its reason and **nobody takes its place** (§46.5). Three
+    kinds of refusal arrive here:
 
     * this original recipient's extra attempt is already accounted for — spent in
       an earlier run, or tombstoned by a terminal stop;
@@ -704,14 +749,39 @@ async def confirm_approval(
       CONFIRMATION time: §46.5 asks for the eligibility to be proven again here
       and again before the send, and a row that lost consent, identity, its
       group, its interval or its entitlement since the preview is excluded now
-      rather than discovered by the executor.
+      rather than discovered by the executor;
+    * the offer did not cover this row at all, which is the one a recipient who
+      regained eligibility after the plan was built lands on. They wait for the
+      next offer rather than joining this run.
 
-    Both are pre-reads, and neither is the guarantee: the guarantee is the three
-    partial unique indexes plus the locked consent boundary inside the claim.
+    The first two are pre-reads, and neither is the guarantee: the guarantee is
+    the three partial unique indexes plus the locked consent boundary inside the
+    claim. The third is not a pre-read at all — it is the offer itself.
     """
     moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
+            # The approval row only, first, so the id can be resolved to a
+            # source batch before the header is taken. It is read WITHOUT a lock
+            # here for exactly that reason; the locked read happens below, after
+            # the header, which is the order this phase documents.
+            with session.no_autoflush:
+                unlocked = await session.get(EasyWeekVoucherFollowupApproval, int(approval_id))
+            if unlocked is None:
+                return ConfirmOutcome(None, (ids.APPROVAL_UNKNOWN,))
+            source_batch_id = int(unlocked.source_batch_id)
+
+            # The ORIGINAL batch header, which is this phase's one serialiser
+            # per source batch. It makes three things atomic that used to be
+            # three separate reads: the batch's terminal stop, its stop
+            # generation, and the admission of ONE active run. Two different
+            # approvals racing here now resolve against each other instead of
+            # both passing the busy check and creating two queued runs with the
+            # same recipients.
+            header = await session.get(EasyWeekVoucherProductionBatch, source_batch_id, with_for_update=True)
+            if header is None:
+                return ConfirmOutcome(None, (ids.APPROVAL_UNKNOWN,))
+
             row = (
                 await session.execute(
                     select(EasyWeekVoucherFollowupApproval)
@@ -753,9 +823,10 @@ async def confirm_approval(
             if confirmed_count != stored.approved_recipient_count:
                 return ConfirmOutcome(None, (ids.APPROVAL_COUNT_UNCONFIRMED,))
 
-            # The SOURCE batch's stop, read rather than locked. §45.4 makes it
-            # terminal on this contract, and §46.5 extends that to the
-            # follow-up: nothing resumes it, so a fresh plan is not a way back.
+            # The SOURCE batch's stop, read under the header lock this
+            # transaction already holds. §45.4 makes it terminal on this
+            # contract, and §46.5 extends that to the follow-up: nothing resumes
+            # it, so a fresh plan is not a way back.
             if await production_ledger.terminal_stop_active_in_session(session, batch_id=stored.source_batch_id):
                 return ConfirmOutcome(None, (ids.SOURCE_TERMINAL_STOP,))
             _active, generation = await production_ledger.stop_facts_in_session(
@@ -766,6 +837,8 @@ async def confirm_approval(
                 # plan was built, so its author had not seen that stop.
                 return ConfirmOutcome(None, (ids.APPROVAL_CONTRACT_MOVED,))
 
+            # Read under the header lock, so two different approvals of this
+            # batch cannot both find it free.
             busy = (
                 await session.execute(
                     select(EasyWeekVoucherFollowupRun.id)
@@ -777,15 +850,31 @@ async def confirm_approval(
             if busy is not None:
                 return ConfirmOutcome(None, (ids.RUN_ALREADY_ACTIVE,))
 
+            # The exact rows this offer covered, pinned on the approval. An
+            # approval with no offered set cannot be confirmed: reconstructing
+            # one from today's facts is the widening this is here to stop.
+            offered_ids = [int(value) for value in (row.offered_source_item_ids or [])]
+            if row.offered_source_item_ids is None:
+                return ConfirmOutcome(None, (ids.OFFER_UNPROVEN,))
+
             preview_rows = await included_preview_rows(session, preview_id=stored.preview_id)
+            offered_set = set(offered_ids)
+            offered_rows = [item for item in preview_rows if int(item.source_item_id) in offered_set]
+            if len(offered_rows) != len(offered_set):
+                # The preview is immutable, so an offered row that is no longer
+                # an included row of it cannot happen — and if it ever does, the
+                # offer no longer describes a composition this server can prove.
+                return ConfirmOutcome(None, (ids.APPROVAL_CONTRACT_MOVED,))
             if (
                 recipient_digest_for_rows(
-                    [(int(item.source_slot), str(item.source_entitlement_digest)) for item in preview_rows]
+                    [(int(item.source_slot), str(item.source_entitlement_digest)) for item in offered_rows]
                 )
                 != stored.recipient_digest
             ):
-                # The stored snapshot is immutable, so this can only mean the
-                # approval and the preview no longer describe the same people.
+                # Same count, different people, or the same people under a
+                # different entitlement. Either way not the offer that was made.
+                return ConfirmOutcome(None, (ids.APPROVAL_CONTRACT_MOVED,))
+            if len(offered_rows) != stored.approved_recipient_count:
                 return ConfirmOutcome(None, (ids.APPROVAL_CONTRACT_MOVED,))
 
             row.status = FOLLOWUP_APPROVAL_CONSUMED
@@ -822,9 +911,17 @@ async def confirm_approval(
             skipped = 0
             for item in preview_rows:
                 # A spent attempt or a tombstone is the stronger statement and
-                # is reported as such; otherwise this confirmation's own
-                # re-check has the say.
-                refusal = blocked.get(int(item.source_item_id)) or refused_now.get(int(item.source_item_id))
+                # is reported as such; then this confirmation's own re-check;
+                # and last, the offer itself. A row the offer did not cover is
+                # written down with that reason rather than planned: §46.5 lets
+                # a confirmation only ever NARROW what was offered, so a
+                # recipient who regained eligibility after the offer waits for
+                # the next one instead of being added to this run.
+                refusal = (
+                    blocked.get(int(item.source_item_id))
+                    or refused_now.get(int(item.source_item_id))
+                    or (None if int(item.source_item_id) in offered_set else ids.NOT_OFFERED)
+                )
                 session.add(
                     EasyWeekVoucherFollowupSend(
                         run_id=int(run.id),
@@ -1141,6 +1238,10 @@ class StopOutcome:
     reason: str | None = None
     run_id: int | None = None
     tombstoned: int = 0
+    # Rows this stop did not have to tombstone because another run already
+    # accounts for that recipient — a spent attempt or its own tombstone. Kept
+    # apart from ``tombstoned`` so a report never overstates what this press did.
+    already_accounted: int = 0
     already_stopped: bool = False
 
     def as_safe_dict(self) -> dict[str, Any]:
@@ -1149,6 +1250,7 @@ class StopOutcome:
             "reason": self.reason,
             "run_id": self.run_id,
             "tombstoned": self.tombstoned,
+            "already_accounted": self.already_accounted,
             "already_stopped": self.already_stopped,
         }
 
@@ -1172,13 +1274,25 @@ async def request_terminal_stop(
     fence closed: those are exactly the moments an operator wants it. Pressing
     it twice is reported as such rather than as an error.
 
-    Takes the run row first and its send rows second, which is this phase's one
-    order; it takes no consent lock and no production lock, so it cannot take
-    part in a cycle with either.
+    Takes the ORIGINAL batch header, then the run row, then its send rows —
+    this phase's one order, shared with the confirmation and the claim. The
+    header is what makes the read below authoritative: no claim of this batch
+    can commit while this stop holds it, so "which recipients does another run
+    already account for" cannot change under this transaction.
     """
     moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
+            with session.no_autoflush:
+                unlocked = await session.get(EasyWeekVoucherFollowupRun, int(run_id))
+            if unlocked is None:
+                return StopOutcome(False, ids.APPROVAL_UNKNOWN)
+            header = await session.get(
+                EasyWeekVoucherProductionBatch, int(unlocked.source_batch_id), with_for_update=True
+            )
+            if header is None:
+                return StopOutcome(False, ids.APPROVAL_UNKNOWN)
+
             run = (
                 await session.execute(
                     select(EasyWeekVoucherFollowupRun)
@@ -1207,11 +1321,30 @@ async def request_terminal_stop(
                 .scalars()
                 .all()
             )
+            # Which of these recipients another run has already accounted for.
+            # A tombstone and a spent attempt both occupy the single-attempt key,
+            # so writing a SECOND tombstone for the same source identity would
+            # violate a partial unique index — and that used to abort the whole
+            # transaction, losing the stop itself. The stop is the operator's
+            # decision and must survive, so such a row is recorded as already
+            # accounted for instead: the recipient is just as unreachable, by
+            # the other run's row.
+            accounted = await unsendable_source_items(session, source_batch_id=int(run.source_batch_id))
+            tombstoned = 0
+            already_elsewhere = 0
             for row in rows:
+                existing = accounted.get(int(row.source_item_id))
+                if existing is not None:
+                    row.status = FOLLOWUP_SEND_SKIPPED
+                    row.reason_code = existing
+                    row.updated_at = moment
+                    already_elsewhere += 1
+                    continue
                 row.status = FOLLOWUP_SEND_STOPPED
                 row.reason_code = ids.TERMINALLY_STOPPED
                 row.stopped_at = moment
                 row.updated_at = moment
+                tombstoned += 1
             # A run that has nothing left to do is finished here, so a stopped
             # run never sits in ``queued`` waiting for an executor that would
             # only find tombstones. A RUNNING one is left to its executor, which
@@ -1228,7 +1361,8 @@ async def request_terminal_stop(
                 True,
                 None,
                 run_id=int(run_id),
-                tombstoned=len(rows),
+                tombstoned=tombstoned,
+                already_accounted=already_elsewhere,
                 already_stopped=already,
             )
 
@@ -1269,15 +1403,24 @@ async def claim_send(
 
     This is the attempt boundary. In one committed transaction it:
 
-    1. re-proves the consent boundary under the consent ADDRESS locks, through
+    1. takes the ORIGINAL batch header's row lock and reads that batch's
+       terminal stop under it. This is the lock
+       :func:`...easyweek_voucher_production.ledger.request_stop` takes first,
+       so an operator stopping the original mailing and this claim are
+       serialised by PostgreSQL rather than by two reads that can interleave:
+       once ``request_stop`` has committed, this read sees it and the claim is
+       refused; once this claim has committed, the stop waits for it and finds
+       the attempt already spent. Reading the stop without this lock was the
+       defect — a claim could prove "no stop", a stop could commit and be
+       reported to the operator, and the attempt would then be spent anyway;
+    2. re-proves the consent boundary under the consent ADDRESS locks, through
        :func:`...whatsapp_consent.recheck_consent_boundary` — so a durable
        refusal, a durable unresolved inbound message, an address set that moved
        or a consent decision that landed and was answered since the re-check all
        refuse here, and a STOP that commits before this point produces zero Meta
        requests;
-    2. re-reads the run under its row lock and refuses if the operator stopped
+    3. re-reads the run under its row lock and refuses if the operator stopped
        it or if this executor no longer holds the lease;
-    3. re-reads the ORIGINAL batch's terminal stop, which forbids its follow-up;
     4. moves this row to ``claimed`` with ``attempt_count = 1``, a durable
        intent and the frozen route.
 
@@ -1292,7 +1435,17 @@ async def claim_send(
     moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
-            # 1. The final consent boundary, with the address locks held.
+            # 1. The ORIGINAL batch header first, which is this phase's
+            #    serialiser against the primary mailing's own stop and claims.
+            #    Header-before-consent is the order the existing status/inbound
+            #    path already uses, so adding it here introduces no inversion.
+            header = await session.get(EasyWeekVoucherProductionBatch, int(source_batch_id), with_for_update=True)
+            if header is None:
+                return ClaimOutcome(False, ids.APPROVAL_UNKNOWN)
+            if await production_ledger.terminal_stop_active_in_session(session, batch_id=int(source_batch_id)):
+                return ClaimOutcome(False, ids.SOURCE_TERMINAL_STOP, stopped=True)
+
+            # 2. The final consent boundary, with the address locks held.
             guard = await recheck_consent_boundary(
                 session,
                 phone=address,
@@ -1302,7 +1455,7 @@ async def claim_send(
             if not guard.allowed:
                 return ClaimOutcome(False, ids.CONSENT_MOVED)
 
-            # 2. The run, under its own row lock.
+            # 3. The run, under its own row lock.
             run = (
                 await session.execute(
                     select(EasyWeekVoucherFollowupRun)
@@ -1316,10 +1469,6 @@ async def claim_send(
                 return ClaimOutcome(False, ids.RUN_STOPPED, stopped=True)
             if run.status != FOLLOWUP_RUN_RUNNING or run.lease_owner != owner:
                 return ClaimOutcome(False, ids.CLAIM_LEASE_LOST)
-
-            # 3. The original mailing's terminal stop, read and not locked.
-            if await production_ledger.terminal_stop_active_in_session(session, batch_id=int(source_batch_id)):
-                return ClaimOutcome(False, ids.SOURCE_TERMINAL_STOP, stopped=True)
 
             # 4. The row itself.
             row = (

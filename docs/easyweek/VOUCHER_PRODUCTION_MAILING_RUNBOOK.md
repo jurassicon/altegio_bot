@@ -2016,7 +2016,7 @@ The page shows the first message and the follow-up **separately**, slot by slot:
 | отказ провайдера | Meta refused the request itself; the attempt is spent |
 | ошибка доставки | a proven `failed` callback about this message |
 | результат неизвестен | the attempt is spent and the result is not proven |
-| исключено | lost eligibility before the attempt; nothing spent |
+| исключено | lost eligibility before the attempt, or was not part of the prepared offer; nothing spent |
 | остановлено | terminal stop; nothing spent, and it blocks for good |
 
 «Прочтение не подтверждено» never means «did not read»: a device can be
@@ -2072,7 +2072,48 @@ leaves one Alembic head.
 
 ### 18.8 Migration
 
-One additive revision, `c3f8a95d2e14`, over `b7d41f9c0a52`. Four new tables and
-nothing else — the approvals, the runs, the per-recipient sends and the follow-up
-callbacks: no existing column altered, and no consent row, delivery fact,
-attempt counter, HMAC byte, financial value or schema 3/4 rule read or rewritten.
+Two additive revisions. `c3f8a95d2e14`, over `b7d41f9c0a52`, adds four tables
+and nothing else — the approvals, the runs, the per-recipient sends and the
+follow-up callbacks. `d4a1c6b87e03`, over it, adds one nullable column,
+`offered_source_item_ids` on the approvals, which pins the exact rows an offer
+covered.
+
+No existing column is altered, and no consent row, delivery fact, attempt
+counter, HMAC byte, financial value or schema 3/4 rule is read or rewritten.
+
+Both downgrades refuse before any DDL while a fact would be lost that could let
+a second message reach somebody: a spent attempt or a terminal tombstone for the
+tables, and a PENDING offer's pinned identities for the column. A pending offer
+is cheap to recreate — let it expire or consume it, then roll back.
+
+### 18.9 What changed after the first review round
+
+Seven confirmed defects were fixed; the operator-visible parts are:
+
+* **a stop of the ORIGINAL mailing now stops the follow-up atomically.** The
+  claim takes that batch's header before it reads the stop, which is the same
+  lock `request_stop` takes, so «stopped» and «sent» can no longer both be true
+  for one recipient. A stop that lands mid-run also tombstones every row the run
+  had not started;
+* **the confirmation is bound to the exact rows the offer covered.** A recipient
+  who becomes eligible again between «Подготовить отправку» and «Подтвердить»
+  is NOT added: they are listed as `followup_not_offered` and wait for the next
+  offer. Prepare again if you want them in;
+* **the template and the sender are re-proven before every single attempt.**
+  Switching the local template row off, editing its body, a Meta template that
+  is paused or pending, a sender switched off or repointed — any of them stops
+  the next recipient, with a readable reason, mid-run;
+* **what moved during the external checks is seen.** A read receipt, a customer
+  reply, an identity change or an unsubscribe arriving while a recipient's
+  bookings were being read now excludes them;
+* **two prepared offers cannot both become runs.** The loser reads
+  `followup_run_already_active`;
+* **a terminal stop can no longer be lost.** A recipient another run already
+  accounts for is reported as such instead of aborting the stop;
+* **a proven delivery failure after «принято провайдером» now shows as
+  «ошибка доставки»**, with its reason, in the per-row table and in the
+  counters. A proven `delivered`/`read` still outranks a later failure;
+* **the first confirmation on a mailing shows its run immediately** — status,
+  counters and the stop button appear without a reload, and the stop button
+  addresses that run. A confirmation whose answer is lost is read back from the
+  durable state; it never resends.
