@@ -535,12 +535,19 @@ class CaptureScan:
     # ``bookings`` and ``rejected`` exactly as before.
     disputed: tuple[DisputedBooking, ...] = ()
     # In-memory freshness evidence for callers that read a live booking list.
-    # Canonical duplicates have one identity; payloads are never carried here.
+    # Canonical duplicates have one fact identity; payloads are never carried here.
     delivery_fingerprints: dict[uuid_module.UUID, frozenset[tuple[str, str]]] | None = field(default=None, repr=False)
     unattributed_fingerprints: frozenset[tuple[str, str]] | None = field(default=None, repr=False)
     # Who each delivery names, distinct from the original creator. Keeping the
     # fingerprint lets a caller judge only facts added since its live read.
     delivery_customers: dict[uuid_module.UUID, dict[tuple[str, str], tuple[int, int | None]]] | None = field(
+        default=None, repr=False
+    )
+    # A fresh lifecycle receipt can repeat an old state without being the same
+    # occurrence. Keep every visible local ID, not a watermark: transactions
+    # may commit out of ID order. None cannot be attributed or proven foreign.
+    # Creation retries still use the canonical fact identity above.
+    lifecycle_deliveries: dict[int, tuple[uuid_module.UUID, int, int | None] | None] | None = field(
         default=None, repr=False
     )
 
@@ -990,7 +997,7 @@ async def scan_capture(
                 EasyWeekEvent.body_truncated,
                 # The capture's own content identity: the sha256 of the
                 # canonicalised JSON body. This is what makes an identical
-                # Resend recognisable as the same delivery without replaying
+                # Resend recognisable as the same content without replaying
                 # anything.
                 EasyWeekEvent.payload_hash,
             )
@@ -1016,6 +1023,7 @@ async def scan_capture(
     delivery_fingerprints: dict[uuid_module.UUID, set[tuple[str, str]]] = {}
     unattributed_fingerprints: set[tuple[str, str]] = set()
     delivery_customers: dict[uuid_module.UUID, dict[tuple[str, str], tuple[int, int | None]]] = {}
+    lifecycle_deliveries: dict[int, tuple[uuid_module.UUID, int, int | None] | None] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
     def _note_branch_conflict(draft: _BookingDraft) -> None:
@@ -1062,11 +1070,15 @@ async def scan_capture(
         if facts is None:
             if reason != REJECT_FOREIGN_LOCATION:
                 unattributed_fingerprints.add(fingerprint)
+                if event_hint != CREATED_HINT:
+                    lifecycle_deliveries[event_id] = None
             continue
 
         booking_uuid = facts["booking_uuid"]
         delivery_fingerprints.setdefault(booking_uuid, set()).add(fingerprint)
         delivery_customers.setdefault(booking_uuid, {})[fingerprint] = (facts["company_id"], facts["customer_id"])
+        if event_hint != CREATED_HINT:
+            lifecycle_deliveries[event_id] = (booking_uuid, facts["company_id"], facts["customer_id"])
         draft = drafts.setdefault(booking_uuid, _BookingDraft(booking_uuid=booking_uuid))
         # When this booking was first HEARD OF. A delivery about a booking
         # proves the booking existed when that delivery was made, which is a
@@ -1263,6 +1275,7 @@ async def scan_capture(
         delivery_fingerprints={key: frozenset(values) for key, values in delivery_fingerprints.items()},
         unattributed_fingerprints=frozenset(unattributed_fingerprints),
         delivery_customers=delivery_customers,
+        lifecycle_deliveries=lifecycle_deliveries,
     )
 
 

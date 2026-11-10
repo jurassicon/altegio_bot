@@ -85,12 +85,16 @@ the attempt. A new fact that cannot be attributed safely leaves eligibility
 unproven; it is not treated as an empty booking history. A proven booking of
 another customer does not exclude this one.
 
-Freshness is compared using bounded sets of canonical delivery fingerprints
-kept only in memory. A reschedule of the same booking UUID invalidates its
-cached live state; an identical delivery does not. Newly visible events are
-checked even when their receipt time predates the external read. Unattributable
-changes remain unknown. These extra capture fields are not added to the booking
-report, approval, audit or stored preview.
+Freshness uses bounded canonical fact fingerprints together with the set of
+visible local lifecycle delivery IDs, kept only in memory. A new lifecycle
+delivery can repeat a previous payload when a booking returns to an earlier
+holder; matching content does not prove it is the same occurrence. Newly visible
+deliveries are checked even when their IDs or receipt times precede the external
+read: a transaction may commit later than one with a higher ID. Unattributable
+changes remain unknown. An identical `booking-created` retry retains its
+existing deduplication semantics. These extra capture fields are not added to
+the booking report, approval, audit or stored preview, and receipt order is not
+used to infer the current business state.
 
 Each new delivery's customer is checked in its own branch. A booking created by
 somebody else can since have been assigned to this recipient, so its creator

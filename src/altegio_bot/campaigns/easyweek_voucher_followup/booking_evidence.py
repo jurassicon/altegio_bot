@@ -811,6 +811,8 @@ async def load_creation_evidence(
             or scan.unattributed_fingerprints is None
             or previous_capture.delivery_customers is None
             or scan.delivery_customers is None
+            or previous_capture.lifecycle_deliveries is None
+            or scan.lifecycle_deliveries is None
         )
     ):
         # A partial pass is not an answer about anybody, so nothing below has
@@ -867,6 +869,24 @@ async def load_creation_evidence(
         removed_delivery = removed_delivery or bool(before - after)
         customers = (scan.delivery_customers or {}).get(booking_uuid, {})
         changed_customers.update(customers.get(fingerprint) for fingerprint in after - before)
+    # Identical payloads can be separate lifecycle occurrences (for example,
+    # returning to a previous holder). Compare every visible receipt ID, so a
+    # lower-ID transaction committed after the live read is also detected.
+    # Keep these UUIDs apart from changed_bookings: a new receipt names its
+    # current holder and must not reapply the original creator's ownership.
+    lifecycle_changed_ids: set[uuid_module.UUID] = set()
+    if previous_capture is not None:
+        previous_lifecycle = previous_capture.lifecycle_deliveries or {}
+        current_lifecycle = scan.lifecycle_deliveries or {}
+        removed_delivery = removed_delivery or bool(previous_lifecycle.keys() - current_lifecycle.keys())
+        for event_id in current_lifecycle.keys() - previous_lifecycle.keys():
+            delivery = current_lifecycle[event_id]
+            if delivery is None:
+                changed_customers.add(None)
+            else:
+                booking_uuid, company_id, customer_id = delivery
+                lifecycle_changed_ids.add(booking_uuid)
+                changed_customers.add((company_id, customer_id))
     # Bookings that may have left somebody's list. Two shapes, and the second
     # one used to be invisible: a delivery naming a DIFFERENT customer record,
     # and a delivery from another branch naming no customer at all. The second
@@ -960,7 +980,7 @@ async def load_creation_evidence(
         contradicted: set[uuid_module.UUID] = set()
         # A changed booking in the cached live list invalidates its live state
         # even when the creation/owner summary stayed the same (rescheduling).
-        live_proof_moved = bool(live & changed_ids) or (
+        live_proof_moved = bool(live & (changed_ids | lifecycle_changed_ids)) or (
             previous_capture is not None
             and previous_capture.unattributed_fingerprints != scan.unattributed_fingerprints
         )
