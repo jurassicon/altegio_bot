@@ -92,6 +92,14 @@ checked even when their receipt time predates the external read. Unattributable
 changes remain unknown. These extra capture fields are not added to the booking
 report, approval, audit or stored preview.
 
+Each new delivery's customer is checked in its own branch. A booking created by
+somebody else can since have been assigned to this recipient, so its creator
+does not prove the change unrelated. A new delivery naming this recipient or
+leaving its owner unproven invalidates the cached history, including when the
+creation itself is disputed. Changes proven to concern other people remain
+allowed. The check uses the new deliveries, not every historical holder, and
+does not change the report's attribution of the original creation.
+
 And:
 
 * takes the **original batch header's row lock** and reads that batch's terminal

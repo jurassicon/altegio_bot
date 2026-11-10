@@ -2139,7 +2139,10 @@ The operator-visible corrections are:
   reply, an identity change or an unsubscribe arriving while a recipient's
   bookings were being read now excludes them. Booking evidence is also checked
   after waiting for the claim's locks: a newly captured booking excludes that
-  recipient before an attempt is spent;
+  recipient before an attempt is spent. A change assigning a previously foreign
+  booking to the recipient, or leaving its holder unproven, also invalidates
+  the cached history and excludes the row without spending an attempt. A
+  change proven to concern other customers does not exclude this recipient;
 * **two prepared offers cannot both become runs.** The loser reads
   `followup_run_already_active`;
 * **a terminal stop can no longer be lost.** A recipient another run already

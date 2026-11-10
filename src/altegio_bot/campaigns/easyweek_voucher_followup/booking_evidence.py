@@ -809,6 +809,8 @@ async def load_creation_evidence(
             or scan.delivery_fingerprints is None
             or previous_capture.unattributed_fingerprints is None
             or scan.unattributed_fingerprints is None
+            or previous_capture.delivery_customers is None
+            or scan.delivery_customers is None
         )
     ):
         # A partial pass is not an answer about anybody, so nothing below has
@@ -854,6 +856,17 @@ async def load_creation_evidence(
         if previous_capture is not None
         else []
     )
+    # Creation attribution cannot settle who a new lifecycle delivery names.
+    # Check the delta even for disputed creations, and do not reapply old
+    # holders/ownerless facts the complete live read already covered.
+    changed_customers: set[tuple[int, int | None] | None] = set()
+    removed_delivery = False
+    for booking_uuid in changed_ids:
+        before = previous_deliveries.get(booking_uuid, frozenset())
+        after = current_deliveries.get(booking_uuid, frozenset())
+        removed_delivery = removed_delivery or bool(before - after)
+        customers = (scan.delivery_customers or {}).get(booking_uuid, {})
+        changed_customers.update(customers.get(fingerprint) for fingerprint in after - before)
     # Bookings that may have left somebody's list. Two shapes, and the second
     # one used to be invisible: a delivery naming a DIFFERENT customer record,
     # and a delivery from another branch naming no customer at all. The second
@@ -898,6 +911,9 @@ async def load_creation_evidence(
             if booking is not None:
                 needed_owners.add((int(booking.company_id), int(booking.customer_id)))
     if judged:
+        for pair in changed_customers:
+            if pair is not None and pair[1] is not None:
+                needed_owners.add((pair[0], pair[1]))
         for booking in changed_bookings:
             needed_owners.add((int(booking.company_id), int(booking.customer_id)))
         # And the bookings OUTSIDE anybody's list that a reassignment touched.
@@ -948,6 +964,21 @@ async def load_creation_evidence(
             previous_capture is not None
             and previous_capture.unattributed_fingerprints != scan.unattributed_fingerprints
         )
+        if removed_delivery or any(
+            pair is None
+            or pair[1] is None
+            or _owner_verdict(
+                company_id=pair[0],
+                customer_id=pair[1],
+                numeric_id=numeric_id,
+                numeric_branches=numeric_branches,
+                slot_uuid=item.easyweek_customer_uuid,
+                owners=owners,
+            )
+            != ATTRIBUTION_ANOTHERS
+            for pair in changed_customers
+        ):
+            live_proof_moved = True
         represented = set(by_uuid) | {dispute.booking_uuid for dispute in scan.disputed}
         if changed_ids - represented:
             # An ownerless/removed candidate cannot be proven unrelated to the

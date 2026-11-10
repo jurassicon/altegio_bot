@@ -538,6 +538,11 @@ class CaptureScan:
     # Canonical duplicates have one identity; payloads are never carried here.
     delivery_fingerprints: dict[uuid_module.UUID, frozenset[tuple[str, str]]] | None = field(default=None, repr=False)
     unattributed_fingerprints: frozenset[tuple[str, str]] | None = field(default=None, repr=False)
+    # Who each delivery names, distinct from the original creator. Keeping the
+    # fingerprint lets a caller judge only facts added since its live read.
+    delivery_customers: dict[uuid_module.UUID, dict[tuple[str, str], tuple[int, int | None]]] | None = field(
+        default=None, repr=False
+    )
 
     def by_customer(self) -> dict[int, list[ObservedBooking]]:
         grouped: dict[int, list[ObservedBooking]] = {}
@@ -1010,6 +1015,7 @@ async def scan_capture(
     drafts: dict[uuid_module.UUID, _BookingDraft] = {}
     delivery_fingerprints: dict[uuid_module.UUID, set[tuple[str, str]]] = {}
     unattributed_fingerprints: set[tuple[str, str]] = set()
+    delivery_customers: dict[uuid_module.UUID, dict[tuple[str, str], tuple[int, int | None]]] = {}
     branch_observed: dict[int, int] = {location_id: 0 for location_id in registry.locations}
 
     def _note_branch_conflict(draft: _BookingDraft) -> None:
@@ -1060,6 +1066,7 @@ async def scan_capture(
 
         booking_uuid = facts["booking_uuid"]
         delivery_fingerprints.setdefault(booking_uuid, set()).add(fingerprint)
+        delivery_customers.setdefault(booking_uuid, {})[fingerprint] = (facts["company_id"], facts["customer_id"])
         draft = drafts.setdefault(booking_uuid, _BookingDraft(booking_uuid=booking_uuid))
         # When this booking was first HEARD OF. A delivery about a booking
         # proves the booking existed when that delivery was made, which is a
@@ -1255,6 +1262,7 @@ async def scan_capture(
         disputed=tuple(disputed),
         delivery_fingerprints={key: frozenset(values) for key, values in delivery_fingerprints.items()},
         unattributed_fingerprints=frozenset(unattributed_fingerprints),
+        delivery_customers=delivery_customers,
     )
 
 
