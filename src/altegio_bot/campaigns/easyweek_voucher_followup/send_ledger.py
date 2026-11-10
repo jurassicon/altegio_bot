@@ -136,6 +136,7 @@ __all__ = [
     "load_run",
     "plan_signature",
     "recipient_digest_for_rows",
+    "reconcile_confirmation",
     "record_send_outcome",
     "renew_lease",
     "request_terminal_stop",
@@ -682,7 +683,7 @@ async def load_approval(
 
 @dataclass(frozen=True)
 class ConfirmOutcome:
-    """What a confirmation did: created a run, found one, or refused."""
+    """A created/existing run, a proven refusal, or an unresolved commit."""
 
     run: StoredRun | None
     reasons: tuple[str, ...] = ()
@@ -692,6 +693,7 @@ class ConfirmOutcome:
     # result may be smaller than the confirmed count and nobody replaces them.
     planned: int = 0
     skipped: int = 0
+    uncertain: bool = False
 
     @property
     def accepted(self) -> bool:
@@ -760,7 +762,6 @@ async def confirm_approval(
     the three partial unique indexes plus the locked consent boundary inside the
     claim. The third is not a pre-read at all — it is the offer itself.
     """
-    moment = now or utcnow()
     async with session_maker() as session:
         async with session.begin():
             # Which source batch this approval belongs to, so the header can be
@@ -831,6 +832,10 @@ async def confirm_approval(
                     return ConfirmOutcome(_run(existing), (ids.APPROVAL_ALREADY_CONSUMED,))
                 return ConfirmOutcome(None, (ids.APPROVAL_ALREADY_CONSUMED,))
 
+            # Sample after the lock wait; a request's start time is not the
+            # time its pending permission is consumed. Explicit ``now`` is
+            # retained for deterministic callers/tests.
+            moment = now or utcnow()
             if stored.expired_at(moment):
                 return ConfirmOutcome(None, (ids.APPROVAL_EXPIRED,))
             if not live_contract_matches:
@@ -892,6 +897,11 @@ async def confirm_approval(
             if len(offered_rows) != stored.approved_recipient_count:
                 return ConfirmOutcome(None, (ids.APPROVAL_CONTRACT_MOVED,))
 
+            # The intervening validation can wait too. Check once more at the
+            # mutation boundary, and use this instant for the durable audit.
+            moment = now or utcnow()
+            if stored.expired_at(moment):
+                return ConfirmOutcome(None, (ids.APPROVAL_EXPIRED,))
             row.status = FOLLOWUP_APPROVAL_CONSUMED
             row.consumed_at = moment
             row.updated_at = moment
@@ -966,6 +976,53 @@ async def confirm_approval(
             run.planned_count = planned
             await session.flush()
             return ConfirmOutcome(_run(run), (), created=True, planned=planned, skipped=skipped)
+
+
+async def reconcile_confirmation(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    approval_id: int,
+    presented_signature: str,
+    principal: OpsPrincipal,
+    confirmed_count: int | None,
+) -> ConfirmOutcome:
+    """Read the outcome of an uncertain commit without consuming an approval.
+
+    Absence in a read snapshot is not proof that an interrupted COMMIT failed.
+    Only an authenticated, already committed run resolves the uncertainty.
+    """
+    async with session_maker() as session:
+        pair = (
+            await session.execute(
+                select(EasyWeekVoucherFollowupApproval, EasyWeekVoucherFollowupRun)
+                .outerjoin(
+                    EasyWeekVoucherFollowupRun,
+                    EasyWeekVoucherFollowupRun.approval_id == EasyWeekVoucherFollowupApproval.id,
+                )
+                .where(EasyWeekVoucherFollowupApproval.id == int(approval_id))
+            )
+        ).one_or_none()
+        if pair is None:
+            return ConfirmOutcome(None, (ids.DATABASE_UNAVAILABLE,), uncertain=True)
+        row, run = pair
+        stored = _approval(row)
+        expected = plan_signature(_approval_material(row))
+        if (
+            not stored.plan_signature
+            or not hmac.compare_digest(stored.plan_signature, expected)
+            or not presented_signature
+            or not hmac.compare_digest(str(presented_signature), expected)
+        ):
+            return ConfirmOutcome(None, (ids.APPROVAL_SIGNATURE_INVALID,))
+        if stored.action != FOLLOWUP_ACTION_SEND:
+            return ConfirmOutcome(None, (ids.APPROVAL_UNKNOWN,))
+        if stored.principal != principal.account:
+            return ConfirmOutcome(None, (ids.APPROVAL_PRINCIPAL_MISMATCH,))
+        if confirmed_count != stored.approved_recipient_count:
+            return ConfirmOutcome(None, (ids.APPROVAL_COUNT_UNCONFIRMED,))
+        if stored.status != FOLLOWUP_APPROVAL_CONSUMED or run is None:
+            return ConfirmOutcome(None, (ids.DATABASE_UNAVAILABLE,), uncertain=True)
+        return ConfirmOutcome(_run(run), (ids.APPROVAL_ALREADY_CONSUMED,))
 
 
 async def run_for_approval(

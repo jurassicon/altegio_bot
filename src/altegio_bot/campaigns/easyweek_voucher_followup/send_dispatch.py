@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Final
 
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from altegio_bot.campaigns.easyweek_voucher_delivery.delivery import (
@@ -379,15 +379,21 @@ async def confirm_send(
             confirmed_count=confirmed_count,
             live_contract_matches=contract_matches,
             row_refusals=row_refusals,
-            now=moment,
+            now=now,
         )
-    except IntegrityError:
-        # The other half of a double confirmation committed first. One run
-        # exists, which is the whole point; it is returned rather than failed.
-        existing = await ledger.run_for_approval(session_maker, approval_id=int(approval_id))
-        return ledger.ConfirmOutcome(existing, (ids.APPROVAL_ALREADY_CONSUMED,))
     except SQLAlchemyError:
-        return ledger.ConfirmOutcome(None, (ids.DATABASE_UNAVAILABLE,))
+        # COMMIT may have succeeded before its acknowledgement was lost. Read
+        # back this exact authenticated approval; never repeat its mutation.
+        try:
+            return await ledger.reconcile_confirmation(
+                session_maker,
+                approval_id=int(approval_id),
+                presented_signature=presented_signature,
+                principal=principal,
+                confirmed_count=confirmed_count,
+            )
+        except SQLAlchemyError:
+            return ledger.ConfirmOutcome(None, (ids.DATABASE_UNAVAILABLE,), uncertain=True)
     if outcome.created and outcome.run is not None:
         logger.info(
             "followup_send: confirmed run=%s planned=%s skipped=%s",
@@ -760,7 +766,7 @@ async def execute_run(
                     contract=contract,
                     expected=verdict,
                     policy=policy,
-                    now=moment,
+                    now=now,
                 ),
                 now=moment,
             )

@@ -91,6 +91,7 @@ from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     STATUS_EVIDENCE_UNPROVEN,
     TEMPLATE_UNPROVEN,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.booking_attribution import CaptureScan, scan_capture
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.models.models import (
     DELIVERY_FAILURE_MATCH_CONFIRMED,
@@ -206,6 +207,9 @@ class RowRecheck:
     group_code: str | None = None
     booking_reads: int = 0
     evidence: dict[str, Any] = field(default_factory=dict)
+    # In-memory proof inputs only; never included in audit or approval data.
+    bookings: CustomerBookingSet | None = field(default=None, repr=False)
+    booking_capture: CaptureScan | None = field(default=None, repr=False)
 
     def params(self) -> list[str]:
         """The approved BODY parameters, in the approved order.
@@ -566,6 +570,17 @@ async def prepare_row(
             now=now,
             configured_key_id=configured_key_id,
         )
+        capture = (
+            await scan_capture(
+                session,
+                anchors=[local.source_attempted_at],
+                now=now,
+                registry=configured_easyweek_locations(),
+                lookback=None,
+            )
+            if local.eligible and local.source_attempted_at is not None
+            else None
+        )
     if not local.eligible:
         return RowRecheck(
             False,
@@ -664,6 +679,7 @@ async def prepare_row(
                 if bookings.complete
                 else {}
             ),
+            previous_capture=capture,
         )
 
     assert local.source_attempted_at is not None
@@ -763,6 +779,8 @@ async def prepare_row(
         group_code=again.group_code,
         booking_reads=1,
         evidence={"booking_count": verdict.booking_count, "booking_pages_read": verdict.pages_read},
+        bookings=bookings,
+        booking_capture=capture,
     )
 
 
@@ -778,7 +796,7 @@ def claim_time_guard(
     contract: SendContract,
     expected: RowRecheck,
     policy: FailurePolicy = CURRENT_FAILURE_POLICY,
-    now: datetime,
+    now: Callable[[], datetime],
 ) -> Callable[[AsyncSession], Awaitable[Any]]:
     """The LAST local word, to be run inside the claiming transaction.
 
@@ -809,13 +827,14 @@ def claim_time_guard(
     configured_key_id = preview_module.configured_binding_key_id()
 
     async def guard(session: AsyncSession) -> Any:
+        moment = now()
         verdict = await local_recheck(
             session,
             gate=gate,
             source_item_id=int(source_item_id),
             contract=contract,
             policy=policy,
-            now=now,
+            now=moment,
             configured_key_id=configured_key_id,
         )
         if not verdict.eligible:
@@ -829,6 +848,29 @@ def claim_time_guard(
             return GuardVerdict(False, IDENTITY_CONFLICT)
         if not verdict.display_name:
             return GuardVerdict(False, TEMPLATE_PARAMETERS_UNPROVEN)
+        if expected.bookings is None or expected.booking_capture is None or verdict.source_attempted_at is None:
+            return GuardVerdict(False, BOOKING_CAPTURE_UNPROVEN)
+        item = await session.get(EasyWeekVoucherProductionBatchItem, int(source_item_id))
+        if item is None:
+            return GuardVerdict(False, IDENTITY_CONFLICT)
+        moment = now()
+        creations = await load_creation_evidence(
+            session,
+            items=[item],
+            now=moment,
+            unproven_reason=BOOKING_CAPTURE_UNPROVEN,
+            conflict_reason=IDENTITY_CONFLICT,
+            slot_bookings={int(item.slot): tuple(row.booking_uuid for row in expected.bookings.bookings)},
+            previous_capture=expected.booking_capture,
+        )
+        booking = booking_verdict(
+            expected.bookings,
+            creations=creations.for_slot(int(item.slot), reason=BOOKING_CAPTURE_UNPROVEN),
+            attempted_at=verdict.source_attempted_at,
+            now=moment,
+        )
+        if not booking.proven:
+            return GuardVerdict(False, booking.reason or BOOKING_CAPTURE_UNPROVEN)
         return GuardVerdict(True, None)
 
     return guard

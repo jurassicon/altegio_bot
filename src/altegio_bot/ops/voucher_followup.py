@@ -638,8 +638,10 @@ async def api_confirm_send(request: Request, batch_id: int, payload: ConfirmRequ
             confirmed_count=int(payload.confirmed_count),
         )
     except SQLAlchemyError:
-        return _refusal((DATABASE_UNAVAILABLE,), status_code=503)
+        return _uncertain_confirmation_response((DATABASE_UNAVAILABLE,))
 
+    if outcome.uncertain:
+        return _uncertain_confirmation_response(outcome.reasons or (DATABASE_UNAVAILABLE,))
     if not outcome.accepted or outcome.run is None:
         return _refusal(outcome.reasons or (send_ids.APPROVAL_UNKNOWN,))
     return JSONResponse(
@@ -649,6 +651,19 @@ async def api_confirm_send(request: Request, batch_id: int, payload: ConfirmRequ
             "planned": outcome.planned,
             "skipped": outcome.skipped,
             **outcome.run.as_safe_dict(),
+        },
+        headers=_PRIVATE_HEADERS,
+    )
+
+
+def _uncertain_confirmation_response(reasons: tuple[str, ...]) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "accepted": None,
+            "uncertain": True,
+            "reasons": list(reasons),
+            "detail": "Результат подтверждения неизвестен. Требуется проверка сохранённого состояния.",
         },
         headers=_PRIVATE_HEADERS,
     )
@@ -1290,6 +1305,11 @@ document.getElementById('followup-check')?.addEventListener('click', async (even
 // shows is the one the server counted. Nothing here assembles permission out of
 // fields — every value is compared server-side and discarded.
 let followupOffer = null;
+let followupConfirmPending = false;
+let followupUnknownApproval = null;
+const FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE = '<p class="alert alert-warning py-2" id="followup-confirmation-unknown">'
+  + 'Результат текущего подтверждения неизвестен. Ниже показана предыдущая отправка. '
+  + 'Для проверки текущей отправки обновите страницу.</p>';
 
 function followupSay(text) {{
   const out = document.getElementById('followup-send-result');
@@ -1301,7 +1321,18 @@ function followupHideConfirm() {{
   document.getElementById('followup-confirm-panel')?.classList.add('d-none');
 }}
 
+function followupSyncSendControls() {{
+  const blocked = followupConfirmPending || followupUnknownApproval !== null;
+  const prepare = document.getElementById('followup-prepare');
+  const confirm = document.getElementById('followup-confirm');
+  const cancel = document.getElementById('followup-cancel');
+  if (prepare !== null) {{ prepare.disabled = blocked; }}
+  if (confirm !== null) {{ confirm.disabled = blocked; }}
+  if (cancel !== null) {{ cancel.disabled = blocked || followupOffer === null; }}
+}}
+
 document.getElementById('followup-prepare')?.addEventListener('click', async (event) => {{
+  if (followupConfirmPending || followupUnknownApproval !== null) {{ return; }}
   const button = event.currentTarget;
   button.disabled = true;
   followupHideConfirm();
@@ -1333,33 +1364,35 @@ document.getElementById('followup-prepare')?.addEventListener('click', async (ev
   }} catch (error) {{
     followupSay('Подготовка не выполнена: запрос не удался.');
   }} finally {{
-    button.disabled = false;
+    followupSyncSendControls();
   }}
 }});
 
 document.getElementById('followup-cancel')?.addEventListener('click', () => {{
+  if (followupConfirmPending || followupUnknownApproval !== null || followupOffer === null) {{ return; }}
   followupHideConfirm();
+  followupSyncSendControls();
   followupSay('Подтверждение отменено. Ничего не отправлено и попытки не израсходованы.');
 }});
 
 document.getElementById('followup-confirm')?.addEventListener('click', async (event) => {{
-  const button = event.currentTarget;
+  if (followupConfirmPending || followupUnknownApproval !== null) {{ return; }}
   if (followupOffer === null) {{
     followupSay('Сначала подготовьте отправку.');
     return;
   }}
-  // Disabled for the whole request, so a double click cannot produce a second
-  // POST. The server would answer the same run anyway — the approval is
-  // single-use — and this only keeps the screen honest while it waits.
-  button.disabled = true;
+  // Preparing or cancelling another offer cannot cancel an in-flight confirmation.
+  const offer = followupOffer;
+  followupConfirmPending = true;
+  followupSyncSendControls();
   followupSay('Подтверждаем…');
   try {{
     const response = await fetch(window.location.pathname + '/confirm', {{
       method: 'POST',
       credentials: 'same-origin',
       headers: {{'Content-Type': 'application/json', [HEADER]: CSRF}},
-      body: JSON.stringify({{approval_id: followupOffer.id, plan_signature: followupOffer.signature,
-                             confirmed_count: followupOffer.count}}),
+      body: JSON.stringify({{approval_id: offer.id, plan_signature: offer.signature,
+                             confirmed_count: offer.count}}),
     }});
     // A PROVEN refusal and an UNKNOWN answer are different facts, and
     // collapsing them was a defect: an unreadable body — a proxy's 502 HTML, a
@@ -1373,14 +1406,17 @@ document.getElementById('followup-confirm')?.addEventListener('click', async (ev
     // this page does not retry it.
     let data = null;
     try {{ data = await response.json(); }} catch (parseError) {{ data = null; }}
-    if (data !== null && data.accepted === false) {{
+    if (data !== null && data.accepted === false && data.uncertain !== true) {{
       followupSay('Отправка не подтверждена. ' + (data.detail || '')
         + ' ' + ((data.reasons) || []).join(', '));
       return;
     }}
-    if (data === null || data.accepted !== true) {{
+    if (data === null || data.accepted !== true || data.uncertain === true) {{
+      followupUnknownApproval = offer.id;
       followupHideConfirm();
-      followupSay('Ответ сервера не удалось прочитать, поэтому результат подтверждения неизвестен. '
+      followupSay((data === null
+        ? 'Ответ сервера не удалось прочитать, поэтому результат подтверждения неизвестен. '
+        : 'Результат подтверждения неизвестен. ')
         + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
       await followupPoll();
       return;
@@ -1395,12 +1431,14 @@ document.getElementById('followup-confirm')?.addEventListener('click', async (ev
     // The request itself failed — aborted, offline, DNS. It may still have
     // reached the server and committed, so this is unknown too and is settled
     // the same way: by reading the durable state, never by confirming again.
+    followupUnknownApproval = offer.id;
     followupHideConfirm();
     followupSay('Ответ сервера не получен, результат подтверждения неизвестен. '
       + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
     await followupPoll();
   }} finally {{
-    button.disabled = false;
+    followupConfirmPending = false;
+    followupSyncSendControls();
   }}
 }});
 
@@ -1455,10 +1493,15 @@ function followupRenderRun(data) {{
   const host = document.getElementById('followup-run');
   if (host === null) {{ return; }}
   if (data.run === null) {{
-    host.innerHTML = '<p class="text-muted mb-0">Отправок по этой рассылке ещё не было.</p>';
+    host.innerHTML = followupUnknownApproval !== null
+      ? '<p class="text-muted mb-0" id="followup-run-unknown">'
+        + 'Результат подтверждения пока не установлен. Обновите страницу для проверки состояния.</p>'
+      : '<p class="text-muted mb-0">Отправок по этой рассылке ещё не было.</p>';
     return;
   }}
   const run = data.run;
+  const unresolvedNote = followupUnknownApproval !== null && run.approval_id !== followupUnknownApproval
+    ? FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE : '';
   const label = FOLLOWUP_RUN_LABELS[run.status] || run.status;
   const stopped = run.stop_requested === true;
   const stopControl = stopped
@@ -1496,9 +1539,10 @@ function followupRenderRun(data) {{
       + '<thead><tr><th>Позиция</th><th>Первое сообщение</th><th>Повторное сообщение</th>'
       + '<th>Попытка израсходована</th><th>Причина</th></tr></thead>'
       + '<tbody>' + rows + '</tbody></table></div>';
-  host.innerHTML =
+  host.innerHTML = unresolvedNote +
     '<div class="d-flex flex-wrap align-items-center gap-2 mb-2">'
-    + '<span class="badge bg-secondary" id="followup-run-status" data-followup-finished="'
+    + '<span class="badge bg-secondary" id="followup-run-status" data-approval-id="'
+    + String(run.approval_id) + '" data-followup-finished="'
     + (run.finished ? 'true' : 'false') + '">' + followupEscape(label) + '</span>'
     + '<span class="small text-muted">отправка №' + String(run.run_id)
     + ', подтверждено позиций: ' + String(run.planned_count) + '</span>'
@@ -1517,6 +1561,11 @@ async function followupPoll(options) {{
       method: 'GET', credentials: 'same-origin', cache: 'no-store',
     }});
     const data = await response.json();
+    // An older run of this mailing cannot settle the current confirmation.
+    if (data.run && data.run.approval_id === followupUnknownApproval) {{
+      followupUnknownApproval = null;
+      followupSyncSendControls();
+    }}
     followupRenderRun(data);
     // Keep asking only while the run can still change. A finished run is
     // final, and a page that kept asking would suggest otherwise. No reload is
@@ -1536,6 +1585,10 @@ async function followupPoll(options) {{
       host.innerHTML = '<p class="text-muted mb-0" id="followup-run-unknown">'
         + 'Состояние отправки сейчас прочитать не удалось. Это не значит, что отправки нет — '
         + 'обновите страницу.</p>';
+    }} else if (host !== null && followupUnknownApproval !== null
+               && document.getElementById('followup-run-status')?.dataset.approvalId !== String(followupUnknownApproval)
+               && document.getElementById('followup-confirmation-unknown') === null) {{
+      host.insertAdjacentHTML('afterbegin', FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE);
     }}
   }}
 }}

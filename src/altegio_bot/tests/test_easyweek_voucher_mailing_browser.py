@@ -4347,10 +4347,22 @@ async def test_followup_a_lost_confirm_answer_after_the_commit_still_shows_the_r
         runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
     assert int(runs) == 1, "a request that never arrived must not create a run"
     assert sender.count == 0
+    # This status belongs to the older stopped approval, not the lost request.
+    assert await page.is_disabled("#followup-prepare")
+    await page.wait_for_selector("#followup-confirmation-unknown", timeout=WAIT_MS)
+    unresolved = await page.inner_text("#followup-confirmation-unknown")
+    assert "текущего подтверждения неизвестен" in unresolved
+    assert "предыдущая отправка" in unresolved
+    assert "обновите страницу" in unresolved
+    await page.dispatch_event("#followup-prepare", "click")
+    assert "неизвестен" in await page.inner_text("#followup-send-result")
+    assert not await page.is_visible("#followup-confirm-panel")
 
     # A real, readable server refusal is different from both lost-answer cases.
     # Close the fence only after preparing the offer, so confirm reaches its
     # own guard and returns accepted:false without creating another run.
+    await page.reload(wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-prepare", timeout=WAIT_MS)
     await page.click("#followup-prepare")
     await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
     monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", False)
@@ -4368,3 +4380,271 @@ async def test_followup_a_lost_confirm_answer_after_the_commit_still_shows_the_r
         runs = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
     assert int(runs) == 1
     assert sender.count == 0
+
+
+async def _followup_offer_in_browser(page, monkeypatch, session_maker):
+    from altegio_bot.ops import voucher_followup as followup_ops
+    from altegio_bot.settings import settings
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import TemplateReader, location_map
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import seed_ready_batch
+    from altegio_bot.tests.test_easyweek_voucher_followup_preview import FakeHistoryReader
+
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key", SecretStr("k" * 48))
+    monkeypatch.setattr(settings, "easyweek_voucher_delivery_hmac_key_id", "test-key-1")
+    monkeypatch.setattr(settings, "easyweek_location_map", location_map())
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", True)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", True)
+    monkeypatch.setattr(settings, "easyweek_voucher_production_mailing_enabled", False)
+    batch_id = await seed_ready_batch(session_maker, slots=[{"state": "delivered"}, {"state": "delivered"}])
+    reader = FakeHistoryReader(batch_id=batch_id)
+    templates = TemplateReader()
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield reader
+
+    monkeypatch.setattr(followup_ops, "EasyWeekClient", lambda *a, **kw: fake_client())
+    original_proof = followup_ops.preview_module.prove_meta_followup_template
+
+    async def prove_template(given=None):
+        return await original_proof(templates)
+
+    monkeypatch.setattr(followup_ops.preview_module, "prove_meta_followup_template", prove_template)
+    await page.goto(f"/ops/voucher-mailings/{batch_id}/followup", wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-check", timeout=WAIT_MS)
+    await page.check("#group-delivered_unread")
+    await page.fill("#followup-interval", "14")
+    async with page.expect_navigation(wait_until="domcontentloaded", timeout=WAIT_MS):
+        await page.click("#followup-check")
+    await page.wait_for_selector("#followup-stored", timeout=WAIT_MS)
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    assert (await page.inner_text("#followup-confirm-count")).strip() == "2"
+    return batch_id, reader, templates
+
+
+async def _followup_stop_in_browser_before_execution(page, session_maker, *, batch_id, reader, templates):
+    from sqlalchemy import func as sql_func
+
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.models.models import EasyWeekVoucherFollowupRun
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import CountingSender, StubTransports, rows_of
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    await page.wait_for_selector("#followup-stop", timeout=WAIT_MS)
+    stored = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+    assert stored is not None and stored.status == "queued"
+    assert await page.get_attribute("#followup-stop", "data-run-id") == str(stored.id)
+    await page.click("#followup-stop")
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('остановлена окончательно')",
+        timeout=WAIT_MS,
+    )
+    stopped = await followup_ledger.load_run(session_maker, run_id=stored.id)
+    assert stopped is not None and stopped.stop_requested_at is not None
+    sender = CountingSender()
+    assert (
+        await followup_worker.run_once(
+            session_maker,
+            owner="browser-confirmation-recovery",
+            transports=StubTransports(reader=reader, sender=sender, templates=templates),
+            heartbeat_interval=60.0,
+        )
+        is None
+    )
+    assert sender.count == 0
+    rows = await rows_of(session_maker, run_id=stored.id)
+    assert len(rows) == 2
+    assert all(row.status == "stopped" and row.attempt_count == 0 for row in rows.values())
+    async with session_maker() as session:
+        count = (await session.execute(select(sql_func.count()).select_from(EasyWeekVoucherFollowupRun))).scalar_one()
+    assert count == 1
+    assert_no_page_errors(page)
+
+
+async def test_followup_cancellation_is_only_available_before_confirmation_starts(page, monkeypatch, session_maker):
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import CountingSender, StubTransports
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    batch_id, reader, templates = await _followup_offer_in_browser(page, monkeypatch, session_maker)
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    confirmations: list[int] = []
+
+    async def hold_committed_answer(route):
+        response = await route.fetch()
+        confirmations.append(response.status)
+        committed.set()
+        await release.wait()
+        await route.fulfill(response=response)
+
+    await page.route("**/followup/confirm", hold_committed_answer)
+    await page.click("#followup-cancel")
+    assert "Подтверждение отменено" in await page.inner_text("#followup-send-result")
+    assert confirmations == []
+    assert await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id) is None
+    sender = CountingSender()
+    assert (
+        await followup_worker.run_once(
+            session_maker,
+            owner="browser-cancel-before-confirm",
+            transports=StubTransports(reader=reader, sender=sender, templates=templates),
+            heartbeat_interval=60.0,
+        )
+        is None
+    )
+    assert sender.count == 0
+
+    await page.click("#followup-prepare")
+    await page.wait_for_selector("#followup-confirm-panel:not(.d-none)", timeout=WAIT_MS)
+    try:
+        await page.click("#followup-confirm")
+        await asyncio.wait_for(committed.wait(), timeout=WAIT_MS / 1000)
+        assert confirmations == [200]
+        run = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+        assert run is not None and run.status == "queued"
+        assert await page.is_disabled("#followup-cancel")
+        assert await page.is_disabled("#followup-prepare")
+        # A queued event must not turn an in-flight request into a local cancellation.
+        await page.dispatch_event("#followup-cancel", "click")
+        await page.dispatch_event("#followup-confirm", "click")
+        await page.dispatch_event("#followup-prepare", "click")
+        message = await page.inner_text("#followup-send-result")
+        assert message == "Подтверждаем…"
+        assert "Подтверждение отменено" not in message
+        assert "Ничего не отправлено" not in message
+        assert confirmations == [200]
+    finally:
+        release.set()
+    await page.wait_for_function(
+        "document.getElementById('followup-send-result').textContent.includes('Отправка подтверждена')",
+        timeout=WAIT_MS,
+    )
+    await _followup_stop_in_browser_before_execution(
+        page, session_maker, batch_id=batch_id, reader=reader, templates=templates
+    )
+    assert confirmations == [200]
+
+
+@pytest.mark.parametrize("reconciliation_unavailable", [False, True], ids=["recovered", "unknown-then-recovered"])
+async def test_followup_lost_commit_acknowledgement_is_reconciled_without_confirm_retry(
+    page, monkeypatch, session_maker, reconciliation_unavailable
+):
+    from asyncpg.exceptions import ConnectionDoesNotExistError
+    from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_connection
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+
+    batch_id, reader, templates = await _followup_offer_in_browser(page, monkeypatch, session_maker)
+    original_commit = AsyncAdapt_asyncpg_connection._commit_and_discard
+    lost_ack: list[bool] = []
+    confirmations: list[int] = []
+
+    async def lose_commit_ack(connection):
+        await original_commit(connection)
+        if not lost_ack:
+            lost_ack.append(True)
+            raise ConnectionDoesNotExistError("synthetic loss of COMMIT acknowledgement")
+
+    async def recovery_unavailable(*args, **kwargs):
+        assert lost_ack == [True]
+        raise SQLAlchemyError("synthetic unavailable confirmation reconciliation")
+
+    async def unavailable_status(route):
+        if not lost_ack:
+            await route.continue_()
+            return
+        await route.fulfill(status=503, content_type="text/html", body="<html>Status unavailable</html>")
+
+    async def count_confirm(route):
+        response = await route.fetch()
+        confirmations.append(response.status)
+        await route.fulfill(response=response)
+
+    monkeypatch.setattr(AsyncAdapt_asyncpg_connection, "_commit_and_discard", lose_commit_ack)
+    if reconciliation_unavailable:
+        monkeypatch.setattr(followup_ledger, "reconcile_confirmation", recovery_unavailable)
+        await page.route("**/followup/status", unavailable_status)
+    await page.route("**/followup/confirm", count_confirm)
+    async with page.expect_response(lambda response: response.url.endswith("/followup/confirm")) as confirmation:
+        await page.click("#followup-confirm")
+    response = await confirmation.value
+    payload = await response.json()
+    assert lost_ack == [True], "the failure must happen after a real database commit"
+    stored = await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id)
+    assert stored is not None and stored.status == "queued"
+    if reconciliation_unavailable:
+        assert response.status == 503
+        assert payload["accepted"] is None
+        assert payload["uncertain"] is True
+        await page.wait_for_function(
+            "document.getElementById('followup-send-result').textContent.includes('неизвестен')",
+            timeout=WAIT_MS,
+        )
+        message = await page.inner_text("#followup-send-result")
+        assert "Отправка не подтверждена" not in message
+        assert "Ничего не отправлено" not in message
+        await page.wait_for_selector("#followup-run-unknown", timeout=WAIT_MS)
+        assert "Отправок по этой рассылке ещё не было" not in await page.inner_text("#followup-run")
+        assert await page.query_selector("#followup-stop") is None
+        assert await page.is_disabled("#followup-prepare")
+        await page.dispatch_event("#followup-prepare", "click")
+        await page.dispatch_event("#followup-cancel", "click")
+        assert "неизвестен" in await page.inner_text("#followup-send-result")
+        assert confirmations == [503]
+        await page.unroute("**/followup/status")
+        await page.reload(wait_until="domcontentloaded")
+    else:
+        assert response.status == 200
+        assert payload["accepted"] is True
+        assert payload["created"] is False
+        assert payload["run_id"] == stored.id
+    await _followup_stop_in_browser_before_execution(
+        page, session_maker, batch_id=batch_id, reader=reader, templates=templates
+    )
+    assert confirmations == ([503] if reconciliation_unavailable else [200])
+
+
+async def test_followup_unknown_confirmation_without_a_run_does_not_enable_another_confirm(
+    page, monkeypatch, session_maker
+):
+    from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as followup_ledger
+    from altegio_bot.tests.easyweek_voucher_followup_send_fixtures import CountingSender, StubTransports
+    from altegio_bot.workers import easyweek_voucher_followup_worker as followup_worker
+
+    batch_id, reader, templates = await _followup_offer_in_browser(page, monkeypatch, session_maker)
+    requests: list[str] = []
+
+    async def lose_request(route):
+        requests.append(route.request.method)
+        await route.abort("failed")
+
+    await page.route("**/followup/confirm", lose_request)
+    await page.click("#followup-confirm")
+    await page.wait_for_selector("#followup-run-unknown", timeout=WAIT_MS)
+    assert "неизвестен" in await page.inner_text("#followup-send-result")
+    assert "Отправок по этой рассылке ещё не было" not in await page.inner_text("#followup-run")
+    assert await page.is_disabled("#followup-prepare")
+    await page.dispatch_event("#followup-prepare", "click")
+    await page.dispatch_event("#followup-confirm", "click")
+    await page.dispatch_event("#followup-cancel", "click")
+    assert requests == ["POST"]
+    assert "неизвестен" in await page.inner_text("#followup-send-result")
+    assert await followup_ledger.latest_run_for_batch(session_maker, source_batch_id=batch_id) is None
+    sender = CountingSender()
+    assert (
+        await followup_worker.run_once(
+            session_maker,
+            owner="browser-unknown-no-run",
+            transports=StubTransports(reader=reader, sender=sender, templates=templates),
+            heartbeat_interval=60.0,
+        )
+        is None
+    )
+    assert sender.count == 0
+    await page.reload(wait_until="domcontentloaded")
+    await page.wait_for_selector("#followup-prepare", timeout=WAIT_MS)
+    assert requests == ["POST"]
+    assert_no_page_errors(page)

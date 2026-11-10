@@ -78,6 +78,20 @@ selected groups or an identity reassigned while the claim was queued are all
 caught here, and the consent fingerprint is a version of CONSENT and of nothing
 else. Local reads only, so nothing external runs under the locks.
 
+The claim also re-reads captured booking evidence after the locks are granted,
+using the current time and the complete booking history proved before the claim.
+A new booking captured during the wait excludes the recipient without spending
+the attempt. A new fact that cannot be attributed safely leaves eligibility
+unproven; it is not treated as an empty booking history. A proven booking of
+another customer does not exclude this one.
+
+Freshness is compared using bounded sets of canonical delivery fingerprints
+kept only in memory. A reschedule of the same booking UUID invalidates its
+cached live state; an identical delivery does not. Newly visible events are
+checked even when their receipt time predates the external read. Unattributable
+changes remain unknown. These extra capture fields are not added to the booking
+report, approval, audit or stored preview.
+
 And:
 
 * takes the **original batch header's row lock** and reads that batch's terminal
@@ -186,6 +200,23 @@ also what later made a terminal stop abort.
 A second confirmation of the same offer returns **the existing run** with
 `created: false`. One offer becomes at most one run: the approval's single-use
 status under its row lock, plus `UNIQUE (approval_id)` on the run.
+
+For a pending offer, expiry is checked against fresh time after the required
+locks, immediately before consumption. Time spent checking the template or
+waiting for a lock does not extend the ten-minute permission. Returning an
+already consumed offer's existing run is a read of history, not a new permission.
+
+A database exception at COMMIT does not prove that the transaction rolled back.
+Confirmation distinguishes a proven refusal, a saved run and an unknown result.
+An uncertain write is reconciled by reading the corresponding approval and run,
+with the same operator and signature checks. It is never reconciled by repeating
+the confirmation. If the read is unavailable, the page reports uncertainty until
+the saved state can be read and its STOP control shown.
+
+Cancelling preparation is available only before the confirmation request starts.
+During confirmation, cancellation and preparation controls cannot dismiss or
+replace the pending confirmation. Once a run exists, its terminal STOP is the
+operation that cancels remaining work; hiding a panel does not cancel a run.
 
 ## 6. Execution
 
@@ -459,6 +490,13 @@ one `accepted`, one `unknown` and one terminal-stop tombstone shown as three
 different words, the original message's status shown beside the follow-up's, and
 a new preview plus a new run proven unable to reopen the stopped recipients.
 
+Additional boundary regressions cover bookings captured while the claim waits,
+including newly received and ambiguous facts; a real COMMIT whose acknowledgement
+is lost, with both available and unavailable reconciliation; cancellation during
+an outstanding confirmation; and expiry during external validation or a lock
+wait. Controls prove that unrelated bookings and still-live approvals continue
+to work, and that no recovery path repeats a confirmation or sends a message.
+
 Round 2 of review added these, each verified to fail on the previous commit:
 
 * a stop that waited for the batch header while an executor claimed the run —
@@ -511,7 +549,7 @@ stop:
 Migration: two additive revisions over the previous head; upgrade, downgrade and
 re-upgrade on an empty ledger; the destructive downgrade refusing **before any
 DDL** while a spent attempt or a terminal tombstone exists; the offer-identity
-column's own downgrade refusing while a PENDING offer carries one; the
+column's own downgrade refusing while an unexpired PENDING offer carries one; the
 historical tables untouched by the rollback.
 
 ## 13. Rollout prerequisites — NOT satisfied

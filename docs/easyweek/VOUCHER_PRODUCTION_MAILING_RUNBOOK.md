@@ -1992,8 +1992,9 @@ On the mailing's follow-up page, in order:
    already accounted for is left out here rather than discovered later. It still
    sends nothing and spends nothing, and it expires in ten minutes;
 4. read the panel: the count, the groups, the interval, the template and the
-   expiry. **«Подтвердить и отправить»** creates the run. **«Отмена»** spends
-   nothing;
+   expiry. **«Подтвердить и отправить»** creates the run. **«Отмена»** cancels
+   preparation only before confirmation starts and spends nothing. During
+   confirmation it is unavailable; use the run's STOP after its state is known;
 5. the dedicated executor does the work. Closing the tab, pressing twice,
    opening a second tab and reloading do not produce a second run or a second
    message.
@@ -2003,6 +2004,11 @@ version and its composition digest, the exact slots, the count, the groups, the
 interval, the full template identity and body digest, the policy version, the
 branch sender, the frozen composition and the source batch's stop generation.
 Change any of them and a new confirmation is required.
+
+The expiry remains the time shown in the panel. If it passes while the request
+checks prerequisites or waits, that pending offer cannot create a run; prepare
+again. A repeated request for an already confirmed offer still reads its
+existing run.
 
 ### 18.5 Operator: reading the result
 
@@ -2024,6 +2030,14 @@ configured never to send a read receipt, and the page says so next to the group.
 A follow-up outcome is never shown as a statistic of the original mailing.
 
 ### 18.6 Operator: stopping, and an unknown outcome
+
+**An unknown confirmation** means the application cannot yet prove whether the
+run was saved. A lost database acknowledgement can occur after it was saved,
+just as an HTTP answer can be lost. Do not treat this as cancellation or confirm
+again to recover it. The application reads the saved state; if that read is
+unavailable, follow the page's recovery instruction. Once the run is visible,
+its STOP can stop remaining work. This uncertainty does not by itself prove
+whether any message attempt has been spent.
 
 **Stopping** is available while the run is queued, running or finished, and with
 the fence closed. It is terminal: it tombstones every recipient the run has not
@@ -2106,7 +2120,8 @@ The operator-visible corrections are:
   UNKNOWN: the page says so, reads the saved state and shows the run and its
   stop button if one was created. It never confirms again by itself. If the
   status cannot be read at all, the page says it does not know rather than
-  claiming there is no send;
+  claiming there is no send. This also covers a lost acknowledgement after a
+  successful database commit;
 * **a stop of the ORIGINAL mailing now stops the follow-up atomically.** The
   claim takes that batch's header before it reads the stop, which is the same
   lock `request_stop` takes. A source stop committed before the attempt boundary
@@ -2122,7 +2137,9 @@ The operator-visible corrections are:
   the next recipient, with a readable reason, mid-run;
 * **what moved during the external checks is seen.** A read receipt, a customer
   reply, an identity change or an unsubscribe arriving while a recipient's
-  bookings were being read now excludes them;
+  bookings were being read now excludes them. Booking evidence is also checked
+  after waiting for the claim's locks: a newly captured booking excludes that
+  recipient before an attempt is spent;
 * **two prepared offers cannot both become runs.** The loser reads
   `followup_run_already_active`;
 * **a terminal stop can no longer be lost.** A recipient another run already
