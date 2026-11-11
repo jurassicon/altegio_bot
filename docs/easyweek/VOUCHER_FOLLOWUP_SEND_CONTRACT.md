@@ -418,11 +418,7 @@ The Karlsruhe German template has the following contract:
   before `Wenn` survive a copy. There is no trailing newline.
 
 ```python
-(
-    "Hallo {client_name}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt. "
-    "Termin buchen: {booking_link}. \n"
-    "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
-)
+"Hallo {client_name}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt. Termin buchen: {booking_link}. \nWenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
 ```
 
 The outgoing German instruction uses only Latin `STOP`. Inbound consent still
