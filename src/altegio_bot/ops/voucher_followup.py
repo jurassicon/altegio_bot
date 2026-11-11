@@ -923,7 +923,8 @@ def _template_block(proof: message.FollowupTemplateProof) -> str:
     Повторное сообщение не содержит кода ваучера: приложение хранит только криптографическую привязку
     кода и не может его восстановить, а новый ваучер, замена кода и продление срока здесь не создаются.
   </div>
-  <pre class="bg-light border rounded p-2 mt-2 mb-1 small text-wrap">{_esc(message.safe_example())}</pre>
+  <pre class="bg-light border rounded p-2 mt-2 mb-1 small"
+       style="white-space:pre-wrap">{_esc(message.safe_example())}</pre>
   <div class="small text-muted">
     Это текущий утверждённый текст. В квадратных скобках — подстановки;
     реальные имена, ссылки, номера и коды на этой странице не показываются.

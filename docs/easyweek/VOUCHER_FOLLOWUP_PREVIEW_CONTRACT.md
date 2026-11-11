@@ -856,18 +856,17 @@ The repeat message carries **no voucher code**, because this application does
 not have one: §45 stores a keyed MAC and never the code. A follow-up that printed
 a code would have to mint or look up a new one, which §46.4 forbids.
 
-The body states how to unsubscribe (`STOP` / `СТОП`). The preview shows the text
+The German body asks recipients to reply with Latin `STOP`. Inbound consent also recognises `стоп`. The preview shows the text
 with square-bracket placeholders only: no real name, link, number, code, body,
 provider identifier, uuid or secret appears in the interface, the logs or the
 error paths.
 
 ### Current prerequisite
 
-Neither the Meta template nor its local row exists yet. On a correctly
-configured deployment the preview therefore answers
-`followup_template_unproven`, and the Ops page says so. The owner must create
-the template and get it approved in Meta's own interface, and the local row must
-be added; this application will not do either.
+For Karlsruhe, the approved Meta BODY includes a space and LF before the final
+sentence. See the exact text in §10 of `VOUCHER_FOLLOWUP_SEND_CONTRACT.md` and
+the administrator's procedure in runbook §18.2. Until both the local row and
+the current Meta listing match, preview returns `followup_template_unproven`.
 
 ## 7. The stored snapshot
 
@@ -1398,8 +1397,8 @@ Before any production follow-up audience is used, independently of this stage:
    cannot be completed. Finishing the reconciliation is still required before a
    production audience is used — the per-preview check is a fail-closed
    precondition, not a substitute for the projection.
-2. **The follow-up Meta template does not exist.** It must be created and
-   approved by its owner, and its local row added (section 6).
+2. **Template proof requires a matching local row and live Meta approval**
+   (section 6). For the existing Karlsruhe row, see runbook §18.2.
 3. **There is no proven failure-admissibility policy** (section 3), so the third
    group yields zero until the owner decides one.
 4. **Positive statuses need their proof recorded going forward.** The

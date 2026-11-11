@@ -3400,7 +3400,10 @@ async def test_followup_preview_real_browser_operator_path(page, monkeypatch, se
 
     body = await opened.inner_text("body")
     assert "Четыре отдельных шага" in body
-    assert "[Vorname]" in body
+    example = opened.locator("pre").filter(has_text="[Vorname]")
+    booking, unsubscribe = (await example.inner_text()).splitlines()
+    assert booking.rstrip().endswith("Termin buchen: [Buchungslink].")
+    assert unsubscribe == "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
     # PR-22.3 added the send, and this environment opens neither fence — so the
     # page must SAY the send is closed rather than offer a control that fails,
     # and it must say that the primary mailing's permission is not this one.

@@ -1788,12 +1788,10 @@ Five things, none of them done by this stage:
    sitting there unprocessed, and reports «не установлено» for everybody if that
    scan cannot be completed. That is a fail-closed precondition, not a
    replacement for running the projection.
-2. **Create and approve the follow-up Meta template**
-   (`kitilash_ka_new_client_voucher_followup_v1`, `de`, MARKETING, one BODY,
-   positional parameters) in Meta's own interface, and add its local row. This
-   application does not create or modify Meta templates, and will not send free
-   text instead. Until both exist the preview answers
-   `followup_template_unproven`, which is the honest state of the prerequisite.
+2. **Verify the approved Karlsruhe template and its local row.** The
+   `kitilash_ka_new_client_voucher_followup_v1` German MARKETING template
+   has one positional BODY. Follow §18.2 to transition the previously
+   installed row or install it once. Preview requires a live exact match.
 3. **Decide the failure-admissibility policy.** The shipped
    `followup-failure-policy-v1` admits nothing, so the group «Подтверждённая
    ошибка» yields zero by design. A waiting time and a list of permitted Meta
@@ -1910,52 +1908,53 @@ What has to be true afterwards: exactly **one** row for
 must be `is_active`. An inactive duplicate is not ignored — it makes the contract
 unproven, which is what the application reports.
 
-The scope, the transaction and the refusal are therefore all explicit. Run it as
-one statement inside one transaction, in exactly this shape, and read the result
-before committing:
+For Karlsruhe (322579), run the following in Bash from the deployed checkout
+after the new application is up, before checking the audience. The default
+`transition` requires the single active row with its expected Meta name. It
+updates only the known previous BODY and accepts an already exact new row.
+If a read-only inspection confirms there is no scoped row, use the same block
+with `action=install` for first installation. Both operations refuse duplicates
+(including inactive ones), unexpected content and wrong identities. A conflict
+or lock timeout aborts the transaction. Inspect the cause before retrying.
 
 ```bash
-cd /opt/altegio_bot && docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+(
+  set -eu
+  cd /opt/altegio_bot
+  action=transition
+  compose() {
+    docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml "$@"
+  }
+  for service in altegio-api altegio-easyweek-voucher-followup-executor; do
+    compose exec -T -w /app "$service" /app/.venv/bin/python -B -c '
+from altegio_bot.settings import settings
+if settings.easyweek_voucher_followup_send_enabled or settings.easyweek_voucher_followup_executor_enabled:
+    raise SystemExit("STOP: a follow-up flag is enabled")
+'
+  done
+  compose exec -T -e "PGOPTIONS=-c lock_timeout=3s -c statement_timeout=10s -c easyweek.template_action=$action" \
+    postgres sh -c 'exec psql -X -1 -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' \
+    < docs/easyweek/karlsruhe_followup_template.sql
+)
 ```
+
+The SQL holds a table lock because the scope index is not unique. It verifies
+one exact active row before commit. The operation does not edit anything in Meta.
+In Ops open the original Karlsruhe batch → **Повторное сообщение: предпросмотр**,
+verify **Текст повторного сообщения: подтверждён**, select groups and an
+interval, and use only **Проверить состав**. The flags stay off. For batch 1,
+check the saved preview and the zero attempts in a read-only transaction:
 
 ```sql
-BEGIN;
-LOCK TABLE message_templates IN SHARE ROW EXCLUSIVE MODE;
-SELECT id, is_active, meta_template_name, md5(body)
-  FROM message_templates
- WHERE provider = 'easyweek'
-   AND company_id = :company_id
-   AND code = 'new_client_voucher_followup_v1'
-   AND language = 'de';
+BEGIN READ ONLY;
+SELECT version, template_meta_verified, included_count, excluded_count, unknown_count
+FROM easyweek_voucher_followup_previews WHERE batch_id = 1 AND company_id = 322579
+ORDER BY version DESC LIMIT 1;
+SELECT (SELECT count(*) FROM easyweek_voucher_followup_runs WHERE source_batch_id = 1) AS runs,
+       count(*) AS send_rows, coalesce(sum(attempt_count), 0) AS attempts
+FROM easyweek_voucher_followup_sends WHERE source_batch_id = 1;
+ROLLBACK;
 ```
-
-Read that result first:
-
-* **one active row that already matches** — commit nothing, `ROLLBACK`, and stop.
-  The step is done;
-* **any row that does not match**, active or not — `ROLLBACK` and stop. Do not
-  edit it in place and do not deactivate it blindly: the mismatch has to be
-  explained first, because the index on
-  `(provider, company_id, code, language)` is **not** unique and a wrong row may
-  be somebody's deliberate state;
-* **no row at all** — insert exactly one, with the body copied verbatim from
-  §10 of `VOUCHER_FOLLOWUP_SEND_CONTRACT.md`, then verify and commit:
-
-```sql
-INSERT INTO message_templates (provider, company_id, code, language, body, meta_template_name, is_active)
-VALUES ('easyweek', :company_id, 'new_client_voucher_followup_v1', 'de', :body,
-        'kitilash_ka_new_client_voucher_followup_v1', true);
-SELECT count(*) FROM message_templates
- WHERE provider = 'easyweek' AND company_id = :company_id
-   AND code = 'new_client_voucher_followup_v1' AND language = 'de';
-COMMIT;
-```
-
-The `LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE` is what protects against a
-concurrent duplicate: without it two administrators doing this at the same time
-each see no row and each insert one, and the result is the ambiguity the
-application then refuses on. The final `SELECT count(*)` must read exactly `1`
-before `COMMIT`; anything else is a `ROLLBACK`.
 
 A live Meta read still has to prove the exact APPROVED contract afterwards. The
 local row is one half; the application proves the other half in the evaluation

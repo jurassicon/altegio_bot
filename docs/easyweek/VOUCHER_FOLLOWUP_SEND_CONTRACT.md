@@ -406,7 +406,7 @@ transaction.
 
 ## 10. The message
 
-Unchanged from PR-22.2, and it is the contract:
+The Karlsruhe German template has the following contract:
 
 * local code `new_client_voucher_followup_v1`; Meta name
   `kitilash_ka_new_client_voucher_followup_v1`; language `de`; category
@@ -414,11 +414,20 @@ Unchanged from PR-22.2, and it is the contract:
   `booking_link` in that order;
 * local body carries `{client_name}` and `{booking_link}`; the Meta body carries
   `{{1}}` and `{{2}}`;
-* the text:
+* the exact local BODY below uses Python string notation so the space and LF
+  before `Wenn` survive a copy. There is no trailing newline.
 
-  > Hallo {client_name}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt.
-  > Termin buchen: {booking_link}. Wenn Sie keine Nachrichten mehr von uns
-  > möchten, antworten Sie mit STOP (СТОП).
+```python
+(
+    "Hallo {client_name}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt. "
+    "Termin buchen: {booking_link}. \n"
+    "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
+)
+```
+
+The outgoing German instruction uses only Latin `STOP`. Inbound consent still
+recognises both Latin and Cyrillic commands. Changing the BODY changes its
+digest, so an older preview or offer requires a fresh check.
 
 The local row must be the **only** one for this provider, company, code and
 language, and it must be active; an inactive duplicate is not ignored, it makes
