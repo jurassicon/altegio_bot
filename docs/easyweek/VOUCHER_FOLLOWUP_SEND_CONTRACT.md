@@ -90,9 +90,11 @@ visible local lifecycle delivery IDs, kept only in memory. A new lifecycle
 delivery can repeat a previous payload when a booking returns to an earlier
 holder; matching content does not prove it is the same occurrence. Newly visible
 deliveries are checked even when their IDs or receipt times precede the external
-read: a transaction may commit later than one with a higher ID. Unattributable
-changes remain unknown. An identical `booking-created` retry retains its
-existing deduplication semantics. These extra capture fields are not added to
+read: a transaction may commit later than one with a higher ID. An identical
+`booking-created` retry for an identified booking is deduplicated. When capture
+can neither identify the booking nor rule it out as foreign, each new receipt makes
+the cached history unproven: two different creations can both leave an empty
+JSON payload. These extra capture fields are not added to
 the booking report, approval, audit or stored preview, and receipt order is not
 used to infer the current business state.
 
@@ -100,9 +102,11 @@ Each new delivery's customer is checked in its own branch. A booking created by
 somebody else can since have been assigned to this recipient, so its creator
 does not prove the change unrelated. A new delivery naming this recipient or
 leaving its owner unproven invalidates the cached history, including when the
-creation itself is disputed. Changes proven to concern other people remain
-allowed. The check uses the new deliveries, not every historical holder, and
-does not change the report's attribution of the original creation.
+creation itself is disputed. If a recipient created a booking before the
+mailing and it has since left their live list, a reschedule by its proven
+new holder does not exclude the recipient. The original creator is checked
+again when the creation facts or the evidence for their chronology change.
+The report still attributes the original creation to its creator.
 
 And:
 

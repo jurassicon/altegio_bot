@@ -546,7 +546,7 @@ class CaptureScan:
     # A fresh lifecycle receipt can repeat an old state without being the same
     # occurrence. Keep every visible local ID, not a watermark: transactions
     # may commit out of ID order. None cannot be attributed or proven foreign.
-    # Creation retries still use the canonical fact identity above.
+    # Only an identified creation can be deduplicated by its canonical facts.
     lifecycle_deliveries: dict[int, tuple[uuid_module.UUID, int, int | None] | None] | None = field(
         default=None, repr=False
     )
@@ -1070,8 +1070,10 @@ async def scan_capture(
         if facts is None:
             if reason != REJECT_FOREIGN_LOCATION:
                 unattributed_fingerprints.add(fingerprint)
-                if event_hint != CREATED_HINT:
-                    lifecycle_deliveries[event_id] = None
+                # Distinct creations can share the empty payload left by capture
+                # when their bodies cannot be stored as JSON. Only the receipt
+                # ID proves that another unknown delivery has become visible.
+                lifecycle_deliveries[event_id] = None
             continue
 
         booking_uuid = facts["booking_uuid"]

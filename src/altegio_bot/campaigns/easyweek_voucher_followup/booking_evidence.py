@@ -613,6 +613,16 @@ def _chronology_contradicted(booking: ObservedBooking, *, now: datetime) -> bool
     return booking.booking_created_at > booking.first_observed_at
 
 
+def _creation_proof(booking: ObservedBooking, *, now: datetime) -> tuple[int, int, datetime, bool]:
+    """Facts that determine who created a booking, when, and whether that time is credible."""
+    return (
+        booking.company_id,
+        booking.customer_id,
+        booking.booking_created_at,
+        _chronology_contradicted(booking, now=now),
+    )
+
+
 def _dispute_chronology_contradicted(dispute: DisputedBooking, *, now: datetime) -> bool:
     """Do its own claimed instants fight what was already known about it?
 
@@ -837,7 +847,6 @@ async def load_creation_evidence(
     identities = await resolve_identities(session, items=items, registry=locations)
     grouped = scan.by_customer()
     by_uuid = scan.by_booking_uuid()
-    previous_bookings = previous_capture.by_booking_uuid() if previous_capture is not None else {}
     previous_deliveries = previous_capture.delivery_fingerprints or {} if previous_capture is not None else {}
     current_deliveries = scan.delivery_fingerprints or {}
     changed_ids = (
@@ -849,15 +858,19 @@ async def load_creation_evidence(
         if previous_capture is not None
         else set()
     )
-    changed_bookings = (
-        [
+    # Recheck the creator when new evidence establishes or changes the creation
+    # itself. A later edit of another holder's appointment can change the report's
+    # booking state while leaving its original creation fully established.
+    changed_creations: list[ObservedBooking] = []
+    if previous_capture is not None:
+        previous_creations = {
+            booking.booking_uuid: _creation_proof(booking, now=now) for booking in previous_capture.bookings
+        }
+        changed_creations = [
             booking
             for booking in scan.bookings
-            if booking.booking_uuid in changed_ids or previous_bookings.get(booking.booking_uuid) != booking
+            if previous_creations.get(booking.booking_uuid) != _creation_proof(booking, now=now)
         ]
-        if previous_capture is not None
-        else []
-    )
     # Creation attribution cannot settle who a new lifecycle delivery names.
     # Check the delta even for disputed creations, and do not reapply old
     # holders/ownerless facts the complete live read already covered.
@@ -872,8 +885,7 @@ async def load_creation_evidence(
     # Identical payloads can be separate lifecycle occurrences (for example,
     # returning to a previous holder). Compare every visible receipt ID, so a
     # lower-ID transaction committed after the live read is also detected.
-    # Keep these UUIDs apart from changed_bookings: a new receipt names its
-    # current holder and must not reapply the original creator's ownership.
+    # The receipt identifies the holder to check for this change.
     lifecycle_changed_ids: set[uuid_module.UUID] = set()
     if previous_capture is not None:
         previous_lifecycle = previous_capture.lifecycle_deliveries or {}
@@ -934,7 +946,7 @@ async def load_creation_evidence(
         for pair in changed_customers:
             if pair is not None and pair[1] is not None:
                 needed_owners.add((pair[0], pair[1]))
-        for booking in changed_bookings:
+        for booking in changed_creations:
             needed_owners.add((int(booking.company_id), int(booking.customer_id)))
         # And the bookings OUTSIDE anybody's list that a reassignment touched.
         # They are the reason a slot whose own list cannot show them is refused
@@ -1046,7 +1058,7 @@ async def load_creation_evidence(
         # establish ownership of a booking captured after that read started.
         # Resolve changed facts explicitly instead of treating the old list as
         # a current proof that none of them belong to this recipient.
-        for booking in changed_bookings:
+        for booking in changed_creations:
             if booking.booking_uuid in live:
                 continue
             owner = _owner_verdict(

@@ -2144,8 +2144,11 @@ The operator-visible corrections are:
   the cached history and excludes the row without spending an attempt. This
   includes a new lifecycle delivery with the same payload as an older one,
   and a delivery allocated a lower local ID but committed after the history
-  was read. An identical `booking-created` retry keeps its existing semantics. A
-  change proven to concern other customers does not exclude this recipient;
+  was read. An identical creation retry for an identified booking is harmless.
+  If two creation deliveries both leave empty JSON and the new one cannot be
+  ruled out as foreign, the recipient is skipped with no attempt spent.
+  Conversely, a reschedule by a proven new holder does not exclude the person
+  who created that booking before the mailing and no longer has it in their list;
 * **two prepared offers cannot both become runs.** The loser reads
   `followup_run_already_active`;
 * **a terminal stop can no longer be lost.** A recipient another run already
