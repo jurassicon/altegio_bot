@@ -1,4 +1,4 @@
-"""One screen: the follow-up PREVIEW for one original voucher mailing (§46.6).
+"""One screen: the follow-up for one original voucher mailing (§46.6, §46.8).
 
 What an operator does here
 --------------------------
@@ -8,23 +8,33 @@ attempt, read the exact text that would be sent, and press one button to check
 the composition. They get back how many people are eligible, who is excluded and
 who could not be established, each with a reason in words.
 
-What is deliberately NOT here
------------------------------
-There is no send. No confirmation of a send, no endpoint that could become one,
-no queue, no job, no stage. This page offers a proposal and the page says so in
-its own words, in a banner the operator cannot miss. The executor, its one-shot
-claim and its tombstones are PR-22.3, and nothing on this screen reaches the
-existing dispatch, the Outbox or the old follow-up worker: the only server-side
-action available is "compute and store a preview", which sends nothing.
+Then, and only as a SEPARATE step, they prepare a send — which states the exact
+number of messages pressing the next button can produce — confirm that number,
+watch the progress, and stop the run for good if they want to.
+
+The four steps are four different things on purpose
+---------------------------------------------------
+Looking at this page computes nothing. Checking the composition stores a
+proposal and spends nothing. Preparing a send stores an offer and spends
+nothing. Only the confirmation creates a durable run, and only the dedicated
+executor sends — so closing the tab, pressing twice, opening a second tab or
+reloading cannot produce a second message. Every GET here is a read.
 
 Where the authorisation is
 --------------------------
 Exactly where the rest of the section's is, reusing it rather than repeating it:
-the router carries ``require_ops_auth``, and the one POST resolves the operator
+the router carries ``require_ops_auth``, and every POST resolves the operator
 from the session cookie, requires this session's CSRF token in a header and
 requires a same-origin request. There is no second authorisation system, no API
-key and no shared secret. The GET renders and reads; it creates no operation and
-changes nothing.
+key and no shared secret. The send itself needs more than a session: a stored
+offer with its own TTL, its own keyed signature, the operator it was issued to
+and the exact count they confirmed.
+
+The fence
+---------
+The follow-up has its own, closed by default, and the primary mailing's
+permission does not open it. With it closed this page shows the whole scenario
+and every send action refuses by name.
 
 What is never on this page
 --------------------------
@@ -53,6 +63,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.campaigns.easyweek_voucher_followup import followup_template_contract as message
 from altegio_bot.campaigns.easyweek_voucher_followup import preview as preview_module
+from altegio_bot.campaigns.easyweek_voucher_followup import send_dispatch as send_module
+from altegio_bot.campaigns.easyweek_voucher_followup import send_identity as send_ids
+from altegio_bot.campaigns.easyweek_voucher_followup import send_ledger as send_ledger
 from altegio_bot.campaigns.easyweek_voucher_followup.failure_policy import CURRENT_FAILURE_POLICY
 from altegio_bot.campaigns.easyweek_voucher_followup.identity import (
     FOLLOWUP_GROUP_DELIVERED,
@@ -69,6 +82,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.identity import (
     OPS_ORIGIN_REJECTED,
     OPS_SESSION_REQUIRED,
 )
+from altegio_bot.campaigns.easyweek_voucher_production.operations import OpsPrincipal
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError
 from altegio_bot.ops.auth import (
@@ -206,6 +220,131 @@ _REASON_LABELS: Final[dict[str, str]] = {
         "Пока выполнялись внешние проверки, этот адресат перешёл в группу, которая не была выбрана. "
         "В состав он не включается, и его место никем не занимается."
     ),
+    # --- §46.8: the send's own refusals ----------------------------------
+    "followup_send_disabled": (
+        "Отправка повторных сообщений закрыта отдельным переключателем и по умолчанию выключена. "
+        "Разрешение первичной рассылки её не открывает."
+    ),
+    "followup_executor_unavailable": (
+        "В этой установке не запущен выделенный исполнитель повторной отправки, "
+        "поэтому подтверждать нечего: подтверждение не должно оставаться в очереди, которую никто не разбирает."
+    ),
+    "followup_preview_unknown": "Для этой рассылки ещё не сохранён предпросмотр состава.",
+    "followup_preview_not_current": (
+        "Сохранённый предпросмотр больше не актуален: истёк срок, изменился контракт текста или политика, "
+        "исходная рассылка была остановлена либо изменился её состав. Нужно пересчитать состав заново."
+    ),
+    "followup_approval_unknown": "Такого подтверждения нет.",
+    "followup_approval_expired": (
+        "Срок действия подготовленной отправки истёк. Подготовьте её заново: план, прочитанный давно, "
+        "описывает мир, у которого было время измениться."
+    ),
+    "followup_approval_already_consumed": (
+        "Эта подготовленная отправка уже подтверждена. Повторное нажатие, вторая вкладка и перезагрузка "
+        "дают ту же самую отправку, а не вторую."
+    ),
+    "followup_approval_principal_mismatch": "Эта подготовленная отправка принадлежит другой сессии оператора.",
+    "followup_approval_signature_invalid": "Подпись подготовленной отправки не совпадает с выданной сервером.",
+    "followup_approval_count_unconfirmed": (
+        "Подтверждённое количество не совпадает с количеством в подготовленной отправке."
+    ),
+    "followup_approval_contract_moved": (
+        "После подготовки отправки изменилось что-то из зафиксированного: шаблон, политика, отправитель, "
+        "состав исходной рассылки, её остановка или сам предложенный состав. Требуется новое подтверждение."
+    ),
+    "followup_approval_offer_unproven": (
+        "В подготовленной отправке не зафиксирован точный состав получателей, поэтому подтвердить её нельзя. "
+        "Подготовьте отправку заново."
+    ),
+    "followup_not_offered": (
+        "Этот получатель не входил в подготовленную отправку: на момент подготовки отправить ему было нельзя. "
+        "Подтверждение только сужает предложенный состав, поэтому он не добавляется — "
+        "чтобы включить его, подготовьте отправку заново."
+    ),
+    "followup_run_already_active": (
+        "По этой исходной рассылке уже есть отправка в очереди или в работе. Одновременно выполняется одна."
+    ),
+    "followup_run_stopped": "Отправка остановлена оператором. Остановка окончательная.",
+    "followup_run_interrupted": (
+        "Исполнитель прервался. Начатые попытки сохранены как «результат неизвестен»; повторная отправка запрещена."
+    ),
+    "followup_database_unavailable": "База данных недоступна.",
+    "followup_source_terminal_stop": (
+        "Исходная рассылка остановлена окончательно, поэтому её повторная отправка запрещена."
+    ),
+    "followup_attempt_already_used": (
+        "Дополнительная попытка по этому получателю исходной рассылки уже учтена: она была израсходована "
+        "или по нему сохранена окончательная остановка. Второго повторного сообщения не будет."
+    ),
+    "followup_terminally_stopped": (
+        "По этому получателю сохранена окончательная остановка. Новая партия, новый предпросмотр, "
+        "другая группа и другой шаблон её не обходят."
+    ),
+    "followup_consent_moved": (
+        "На финальной границе разрешения согласие изменилось: отказ, непросмотренное входящее сообщение "
+        "либо изменившийся набор адресов. Отправка по этой позиции не выполнена."
+    ),
+    "followup_claim_lease_lost": "Исполнитель потерял право на эту отправку, поэтому ничего не отправил.",
+    "followup_meta_accepted": "Провайдер принял сообщение. Это не доказательство доставки.",
+    "followup_meta_unknown": (
+        "Результат внешнего запроса неизвестен: таймаут, сбой связи, нечитаемый ответ или ответ без "
+        "идентификатора сообщения. Попытка израсходована, повторная отправка запрещена, нужна сверка фактов."
+    ),
+    "followup_meta_rejected": "Провайдер отказал в самом запросе. Попытка израсходована и не возобновляется.",
+    "followup_meta_callback_failed": "Пришёл подтверждённый отказ доставки именно по этому повторному сообщению.",
+    "followup_booking_link_unproven": "Для этого филиала не настроена ссылка на запись, поэтому текст не собрать.",
+    "followup_template_parameters_unproven": (
+        "Одну из двух подстановок утверждённого текста собрать не удалось, поэтому сообщение не отправлено."
+    ),
+}
+
+# What each follow-up row state says to a person, and how it is coloured.
+_SEND_STATUS_LABELS: Final[dict[str, str]] = {
+    send_ids.PLANNED: "запланировано",
+    send_ids.SKIPPED: "исключено",
+    send_ids.CLAIMED: "попытка начата",
+    send_ids.ACCEPTED: "принято провайдером",
+    send_ids.DELIVERED: "доставлено",
+    send_ids.READ: "прочитано",
+    send_ids.REJECTED: "отказ провайдера",
+    send_ids.FAILED: "ошибка доставки",
+    send_ids.UNKNOWN: "результат неизвестен",
+    send_ids.STOPPED: "остановлено",
+}
+
+_SEND_STATUS_BADGES: Final[dict[str, str]] = {
+    send_ids.PLANNED: "bg-light text-dark",
+    send_ids.SKIPPED: "bg-secondary",
+    send_ids.CLAIMED: "bg-info text-dark",
+    send_ids.ACCEPTED: "bg-primary",
+    send_ids.DELIVERED: "bg-success",
+    send_ids.READ: "bg-success",
+    send_ids.REJECTED: "bg-danger",
+    send_ids.FAILED: "bg-danger",
+    send_ids.UNKNOWN: "bg-warning text-dark",
+    send_ids.STOPPED: "bg-dark",
+}
+
+# The order the counters are shown in, declared once so the server-rendered
+# tiles and the ones the script repaints cannot disagree.
+_COUNTER_ORDER: Final[tuple[str, ...]] = (
+    send_ids.PLANNED,
+    send_ids.ACCEPTED,
+    send_ids.DELIVERED,
+    send_ids.READ,
+    send_ids.FAILED,
+    send_ids.UNKNOWN,
+    send_ids.SKIPPED,
+    send_ids.STOPPED,
+)
+
+_RUN_STATUS_LABELS: Final[dict[str, str]] = {
+    "queued": "в очереди",
+    "running": "выполняется",
+    "completed": "завершена",
+    "stopped": "остановлена оператором",
+    "interrupted": "прервана",
+    "refused": "отклонена",
 }
 
 
@@ -255,6 +394,23 @@ def _principal_or_error(request: Request) -> tuple[str | None, JSONResponse | No
     except OpsSessionError as exc:
         return None, _session_error(exc)
     return f"{account}:{fingerprint}"[:128], None
+
+
+def _ops_principal_or_error(request: Request) -> tuple[OpsPrincipal | None, JSONResponse | None]:
+    """The authenticated operator as the SERVER resolved them, or a refusal.
+
+    The same three checks in the same order and from the same module as the
+    preview's action: same origin, then the session, then the CSRF token. The
+    principal is built here and never from a request body — §46.8 is explicit
+    that a request may not name its own actor.
+    """
+    try:
+        require_same_origin(request)
+        account, fingerprint = resolve_ops_session(request)
+        require_csrf(request)
+    except OpsSessionError as exc:
+        return None, _session_error(exc)
+    return OpsPrincipal(account=account, session_fingerprint=fingerprint), None
 
 
 def _csrf_for(request: Request) -> str:
@@ -360,6 +516,218 @@ async def api_create_preview(request: Request, batch_id: int, payload: PreviewRe
 
 
 # ---------------------------------------------------------------------------
+# The send: prepare, confirm, stop, status
+# ---------------------------------------------------------------------------
+
+
+class PlanRequest(BaseModel):
+    """What a browser may choose when preparing a send: a version, or nothing.
+
+    ``extra="forbid"`` is the point of the model. A request that tries to name a
+    recipient list, a count, a digest, a template, an operator or a batch other
+    than the one in the path is refused by name rather than ignored — the
+    composition and the count are read from the stored preview by the server.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    preview_version: int | None = Field(default=None, ge=1)
+
+
+class ConfirmRequest(BaseModel):
+    """The confirmation: which offer, its signature, and the exact count.
+
+    All three are COMPARED against the stored approval and none of them is
+    used as a value, so a browser cannot widen anything by sending them. What
+    the count proves is that the human agreed to this many messages and not to
+    whatever the page last rendered.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: int = Field(ge=1)
+    plan_signature: str = Field(min_length=64, max_length=64)
+    confirmed_count: int = Field(ge=0)
+
+
+class StopRequest(BaseModel):
+    """Which run to stop. Terminal, and it takes nothing else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: int = Field(ge=1)
+
+
+def _refusal(reasons: tuple[str, ...], *, status_code: int = 409) -> JSONResponse:
+    """One refusal shape for every send action. Codes plus one readable sentence."""
+    primary = reasons[0] if reasons else "followup_send_unavailable"
+    return JSONResponse(
+        status_code=status_code,
+        content={"accepted": False, "reasons": list(reasons), "detail": _reason_sentence(primary)},
+        headers=_PRIVATE_HEADERS,
+    )
+
+
+@router.post("/{batch_id}/followup/plan")
+async def api_plan_send(request: Request, batch_id: int, payload: PlanRequest) -> JSONResponse:
+    """Prepare ONE send and store it as an immutable, single-use offer.
+
+    Still not a send. It reads the stored preview, re-proves the batch, the
+    message contract, the live Meta approval and the branch sender, counts how
+    many messages pressing the next button could produce, and writes one
+    approval row with its own expiry and its own signature. Nothing here claims
+    an attempt, queues a run or reaches Meta's message API.
+
+    The count it returns is the exact number the operator then confirms. It is
+    narrower than the preview's included count on purpose: a recipient whose one
+    extra attempt is already accounted for — spent in an earlier run, or stopped
+    for good — is left out here rather than discovered later.
+    """
+    principal, refusal = _ops_principal_or_error(request)
+    if refusal is not None:
+        return refusal
+    assert principal is not None
+
+    try:
+        offer = await send_module.offer_send(
+            SessionLocal,
+            principal=principal,
+            batch_id=int(batch_id),
+            preview_version=payload.preview_version,
+        )
+    except SQLAlchemyError:
+        return _refusal((DATABASE_UNAVAILABLE,), status_code=503)
+
+    if not offer.ready or offer.approval is None:
+        return _refusal(offer.reasons or (send_ids.PREVIEW_NOT_CURRENT,))
+    return JSONResponse(content={"accepted": True, **offer.as_safe_dict()}, headers=_PRIVATE_HEADERS)
+
+
+@router.post("/{batch_id}/followup/confirm")
+async def api_confirm_send(request: Request, batch_id: int, payload: ConfirmRequest) -> JSONResponse:
+    """Spend ONE offer and queue ONE durable run.
+
+    Returns as soon as the run is committed. Nothing has reached Meta yet and
+    nothing in this request will: the dedicated executor picks it up, which is
+    why closing the tab or losing this response changes nothing.
+
+    A second POST of the same click — a double-click, a retry after a lost
+    response, a refresh, the other tab — gets the SAME run back with
+    ``created: false``. What must never happen is two runs, and that is the
+    approval's single-use status plus a unique constraint, not a disabled
+    button.
+    """
+    principal, refusal = _ops_principal_or_error(request)
+    if refusal is not None:
+        return refusal
+    assert principal is not None
+
+    stored = await send_ledger.load_approval(SessionLocal, approval_id=int(payload.approval_id))
+    if stored is None or int(stored.source_batch_id) != int(batch_id):
+        # An approval of another mailing is not this page's to spend, and is
+        # refused by the same code as one that does not exist: a caller learns
+        # nothing about offers that are not theirs.
+        return _refusal((send_ids.APPROVAL_UNKNOWN,))
+
+    try:
+        outcome = await send_module.confirm_send(
+            SessionLocal,
+            approval_id=int(payload.approval_id),
+            presented_signature=payload.plan_signature,
+            principal=principal,
+            confirmed_count=int(payload.confirmed_count),
+        )
+    except SQLAlchemyError:
+        return _uncertain_confirmation_response((DATABASE_UNAVAILABLE,))
+
+    if outcome.uncertain:
+        return _uncertain_confirmation_response(outcome.reasons or (DATABASE_UNAVAILABLE,))
+    if not outcome.accepted or outcome.run is None:
+        return _refusal(outcome.reasons or (send_ids.APPROVAL_UNKNOWN,))
+    return JSONResponse(
+        content={
+            "accepted": True,
+            "created": outcome.created,
+            "planned": outcome.planned,
+            "skipped": outcome.skipped,
+            **outcome.run.as_safe_dict(),
+        },
+        headers=_PRIVATE_HEADERS,
+    )
+
+
+def _uncertain_confirmation_response(reasons: tuple[str, ...]) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "accepted": None,
+            "uncertain": True,
+            "reasons": list(reasons),
+            "detail": "Результат подтверждения неизвестен. Требуется проверка сохранённого состояния.",
+        },
+        headers=_PRIVATE_HEADERS,
+    )
+
+
+@router.post("/{batch_id}/followup/stop")
+async def api_stop_send(request: Request, batch_id: int, payload: StopRequest) -> JSONResponse:
+    """Stop this run for good and tombstone every recipient it has not started.
+
+    Terminal by contract, and deliberately available while the run is queued,
+    running or already finished, and with the fence closed — those are exactly
+    the moments an operator wants it. Pressing it twice is reported as such.
+
+    It does not promise to cancel a request that has already left the process:
+    nothing can. A row whose attempt was already claimed keeps its own state and
+    its own honest outcome.
+    """
+    principal, refusal = _ops_principal_or_error(request)
+    if refusal is not None:
+        return refusal
+    assert principal is not None
+
+    run = await send_ledger.load_run(SessionLocal, run_id=int(payload.run_id))
+    if run is None or int(run.source_batch_id) != int(batch_id):
+        return _refusal((send_ids.APPROVAL_UNKNOWN,))
+    try:
+        outcome = await send_ledger.request_terminal_stop(
+            SessionLocal,
+            run_id=int(payload.run_id),
+            requested_by=principal.account,
+        )
+    except SQLAlchemyError:
+        return _refusal((DATABASE_UNAVAILABLE,), status_code=503)
+    if not outcome.applied:
+        return _refusal((outcome.reason or send_ids.APPROVAL_UNKNOWN,))
+    return JSONResponse(content={"accepted": True, **outcome.as_safe_dict()}, headers=_PRIVATE_HEADERS)
+
+
+@router.get("/{batch_id}/followup/status")
+async def api_send_status(batch_id: int) -> JSONResponse:
+    """The newest run of this mailing and its rows. A READ; it starts nothing.
+
+    What the page polls while a run is in flight. It claims nothing, confirms
+    nothing and sends nothing — §46.8 requires a GET to be incapable of
+    starting execution, so this one reads two tables and returns labels.
+    """
+    run = await send_ledger.latest_run_for_batch(SessionLocal, source_batch_id=int(batch_id))
+    if run is None:
+        return JSONResponse(content={"run": None, "rows": [], "counters": {}}, headers=_PRIVATE_HEADERS)
+    rows = await send_ledger.send_rows(SessionLocal, run_id=run.id)
+    counters = await send_ledger.run_counters(SessionLocal, run_id=run.id)
+    return JSONResponse(
+        content={
+            "run": run.as_safe_dict(),
+            "rows": [row.as_safe_dict() for row in rows],
+            "counters": counters,
+            "send_enabled": send_module.send_allowed(),
+            "executor_enabled": send_module.executor_available(),
+        },
+        headers=_PRIVATE_HEADERS,
+    )
+
+
+# ---------------------------------------------------------------------------
 # The page
 # ---------------------------------------------------------------------------
 
@@ -407,7 +775,7 @@ def _rows_table(rows: tuple[preview_module.PreviewRowView, ...]) -> str:
             + "</td></tr>"
         )
     return (
-        "<div class='table-responsive'><table class='table table-sm align-middle'>"
+        "<div class='table-responsive' style='overflow-x:auto'><table class='table table-sm align-middle'>"
         "<thead><tr><th>Позиция</th><th>Группа</th><th>Решение</th><th>Причина</th></tr></thead>"
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
@@ -566,6 +934,168 @@ def _template_block(proof: message.FollowupTemplateProof) -> str:
 """
 
 
+def _send_rows_table(rows: tuple[send_ledger.SendRowView, ...]) -> str:
+    """The follow-up's own result, slot by slot, beside the ORIGINAL status.
+
+    Two separate columns on purpose (§46.8). The left one is what the FIRST
+    message did — the group this recipient was chosen from — and the right one is
+    what the repeat message did. Nothing on this screen mixes the two, and no
+    follow-up outcome is ever printed as a statistic of the original mailing.
+    """
+    if not rows:
+        return "<p class='text-muted'>В этой отправке нет позиций.</p>"
+    body = []
+    for row in rows:
+        sentence = _reason_sentence(row.reason)
+        body.append(
+            "<tr>"
+            f"<td class='text-nowrap'>{int(row.slot)}</td>"
+            f"<td class='small'>{_esc(_GROUP_LABELS.get(row.group, row.group))}</td>"
+            f"<td><span class='badge {_SEND_STATUS_BADGES.get(row.status, 'bg-light text-dark')}'>"
+            f"{_esc(_SEND_STATUS_LABELS.get(row.status, row.status))}</span></td>"
+            f"<td class='small'>{'да' if row.attempt_count else 'нет'}</td>"
+            f"<td class='small text-break'>{_esc(sentence)}"
+            + (f" <code class='text-break'>{_esc(row.reason)}</code>" if row.reason else "")
+            + (
+                f" <span class='badge bg-warning text-dark'>противоречий: {int(row.contradiction_count)}</span>"
+                if row.contradiction_count
+                else ""
+            )
+            + "</td></tr>"
+        )
+    return (
+        "<div class='table-responsive' style='overflow-x:auto'>"
+        "<table class='table table-sm align-middle' id='followup-send-table'>"
+        "<thead><tr><th>Позиция</th><th>Первое сообщение</th><th>Повторное сообщение</th>"
+        "<th>Попытка израсходована</th><th>Причина</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def _send_block(
+    *,
+    stored: preview_module.StoredPreview | None,
+    currency: preview_module.SnapshotCurrency | None,
+    run: send_ledger.StoredRun | None,
+    rows: tuple[send_ledger.SendRowView, ...],
+    counters: dict[str, int],
+    send_enabled: bool,
+    executor_enabled: bool,
+) -> str:
+    """Steps 4 and 5: the separate confirmation, then the run and its stop.
+
+    Rendered server-side AND owned by the page's script afterwards. Both halves
+    matter, and the second one is the fix for a real defect: the first
+    confirmation on a mailing that had never been sent produced a run with no
+    badge, no counters and no stop button, because the page had rendered none of
+    those and the poll only updated elements that already existed. The operator
+    was told the send was confirmed while the section below still said there had
+    never been one — with no way to stop it.
+
+    So ``#followup-run`` is a container the script fills from the status
+    endpoint, every time, whether or not the server rendered a run into it. The
+    server-rendered copy is what a reload shows and what a browser with no
+    script would see; the script replaces it with the same shape built from
+    durable state.
+
+    The confirmation panel stays hidden until an offer has been prepared: §46.8
+    forbids a hidden selection, and an operator may not confirm a number they
+    have not been shown.
+    """
+    fence = ""
+    if not send_enabled:
+        fence = (
+            "<div class='alert alert-warning'><b>Отправка закрыта отдельным переключателем.</b> "
+            "Весь сценарий ниже доступен для просмотра, но подготовка и подтверждение отправки "
+            "сейчас отказывают по имени. Разрешение первичной рассылки этот переключатель не открывает.</div>"
+        )
+    elif not executor_enabled:
+        fence = (
+            "<div class='alert alert-warning'><b>Выделенный исполнитель не запущен.</b> "
+            "Подтверждение сейчас отказывает: оно не должно оставаться в очереди, которую никто не разбирает.</div>"
+        )
+
+    ready = stored is not None and currency is not None and currency.current
+    prepare_note = (
+        "Подготовка отправки ничего не отправляет и не расходует попытку. "
+        "Она пересчитывает разрешения и называет точное число сообщений, которое может дать следующая кнопка."
+        if ready
+        else "Сначала пересчитайте состав: подтверждать можно только актуальный предпросмотр."
+    )
+
+    run_block = "<p class='text-muted mb-0'>Отправок по этой рассылке ещё не было.</p>"
+    if run is not None:
+        status_label = _RUN_STATUS_LABELS.get(run.status, run.status)
+        stop_note = (
+            "<div class='small text-danger mt-1'>Остановлена оператором. Остановка окончательная: "
+            "новая партия, новый предпросмотр, другая группа и другой шаблон её не обходят.</div>"
+            if run.stopped
+            else ""
+        )
+        stop_button = (
+            f"<button class='btn btn-outline-danger btn-sm' id='followup-stop' data-run-id='{int(run.id)}'>"
+            "Остановить окончательно</button>"
+            if not run.stopped
+            else "<button class='btn btn-outline-secondary btn-sm' disabled>Уже остановлена</button>"
+        )
+        tiles = "".join(
+            "<div class='col'><div class='card'><div class='card-body py-2'>"
+            f"<div class='h5 mb-0'>{int(counters.get(state, 0))}</div>"
+            f"<div class='small text-muted'>{_esc(_SEND_STATUS_LABELS[state])}</div>"
+            "</div></div></div>"
+            for state in _COUNTER_ORDER
+        )
+        # ``flex-wrap`` is load-bearing, not decoration: at phone width the
+        # badge, the sentence and the stop button do not fit on one line, and a
+        # flex row that cannot wrap pushes the whole page sideways. §46.8 asks
+        # for this screen to be readable on mobile, and a page that scrolls
+        # horizontally is how a stop button ends up off-screen.
+        run_block = f"""
+<div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+  <span class="badge bg-secondary" id="followup-run-status"
+        data-followup-finished="{"true" if run.finished else "false"}">{_esc(status_label)}</span>
+  <span class="small text-muted">отправка №{int(run.id)}, подтверждено позиций: {int(run.planned_count)}</span>
+  <span class="ms-sm-auto">{stop_button}</span>
+</div>
+{stop_note}
+<div class="row row-cols-2 row-cols-md-4 g-2 mb-3" id="followup-send-counters">{tiles}</div>
+{_send_rows_table(rows)}
+"""
+
+    return f"""
+{fence}
+<div class="card mb-3"><div class="card-body">
+  <h2 class="h6">4. Подтверждение отправки</h2>
+  <p class="small text-muted">{_esc(prepare_note)}</p>
+  <button class="btn btn-outline-primary" id="followup-prepare" {"" if ready else "disabled"}>
+    Подготовить отправку
+  </button>
+  <div class="alert alert-light border mt-3 d-none" id="followup-confirm-panel">
+    <div><b>Будет отправлено сообщений: <span id="followup-confirm-count">—</span>.</b></div>
+    <div class="small text-muted mt-1" id="followup-confirm-detail"></div>
+    <div class="small text-muted mt-1">
+      Это отдельное подтверждение именно этого состава и этого текста. Оно не создаёт новый ваучер,
+      не продлевает срок и не меняет финансовую историю. Каждому получателю исходной рассылки
+      разрешена не более одной дополнительной попытки.
+    </div>
+    <button class="btn btn-danger mt-2" id="followup-confirm">Подтвердить и отправить</button>
+    <button class="btn btn-link mt-2" id="followup-cancel">Отмена</button>
+  </div>
+  <div class="small text-muted mt-2" id="followup-send-result"></div>
+</div></div>
+<div class="card mb-3"><div class="card-body">
+  <h2 class="h6">5. Исполнение, статус и остановка</h2>
+  <p class="small text-muted">
+    Исполнение продолжается независимо от этой вкладки: его ведёт выделенный исполнитель,
+    а не этот запрос. Повторное нажатие, вторая вкладка и перезагрузка не создают вторую отправку.
+    «Принято провайдером» — это не доставка. «Результат неизвестен» означает израсходованную попытку
+    без доказанного результата: повторная отправка запрещена, допускается только сверка фактов.
+  </p>
+  <div id="followup-run">{run_block}</div>
+</div></div>
+"""
+
+
 @router.get("/{batch_id}/followup", response_class=HTMLResponse)
 async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
     """The follow-up preview screen. A read; it creates and changes nothing.
@@ -581,6 +1111,11 @@ async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
         local_template = bool(gate.company_id) and await preview_module.local_template_row_proven(
             session, company_id=int(gate.company_id or 0)
         )
+    # The newest run of this mailing, read with its own session. A read: opening
+    # this page claims nothing, confirms nothing and sends nothing.
+    run = await send_ledger.latest_run_for_batch(SessionLocal, source_batch_id=int(batch_id))
+    send_rows = await send_ledger.send_rows(SessionLocal, run_id=run.id) if run is not None else ()
+    send_counters = await send_ledger.run_counters(SessionLocal, run_id=run.id) if run is not None else {}
     # The live Meta read happens with the session closed. This page holds no
     # lock, but the rule is the rule: nothing external runs while this phase has
     # a database handle open.
@@ -665,6 +1200,17 @@ async def page_followup(request: Request, batch_id: int) -> HTMLResponse:
   <div class="small text-muted mt-2" id="followup-result"></div>
 </div></div>
 {_stored_block(stored, currency=currency)}
+{
+        _send_block(
+            stored=stored,
+            currency=currency,
+            run=run,
+            rows=send_rows,
+            counters=send_counters,
+            send_enabled=send_module.send_allowed(),
+            executor_enabled=send_module.executor_available(),
+        )
+    }
 <div class="card"><div class="card-body small text-muted">
   <b>Что означают результаты.</b>
   Отсутствие отметки о прочтении не доказывает, что человек не прочитал сообщение.
@@ -752,18 +1298,324 @@ document.getElementById('followup-check')?.addEventListener('click', async (even
     button.disabled = false;
   }}
 }});
+
+// --- steps 4 and 5: prepare, confirm, poll, stop -------------------------
+// The prepared offer lives in this page only. It is the approval id and the
+// signature the SERVER issued; the page cannot compute either, and the count it
+// shows is the one the server counted. Nothing here assembles permission out of
+// fields — every value is compared server-side and discarded.
+let followupOffer = null;
+let followupConfirmPending = false;
+let followupUnknownApproval = null;
+const FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE = '<p class="alert alert-warning py-2" id="followup-confirmation-unknown">'
+  + 'Результат текущего подтверждения неизвестен. Ниже показана предыдущая отправка. '
+  + 'Для проверки текущей отправки обновите страницу.</p>';
+
+function followupSay(text) {{
+  const out = document.getElementById('followup-send-result');
+  if (out !== null) {{ out.textContent = text; }}
+}}
+
+function followupHideConfirm() {{
+  followupOffer = null;
+  document.getElementById('followup-confirm-panel')?.classList.add('d-none');
+}}
+
+function followupSyncSendControls() {{
+  const blocked = followupConfirmPending || followupUnknownApproval !== null;
+  const prepare = document.getElementById('followup-prepare');
+  const confirm = document.getElementById('followup-confirm');
+  const cancel = document.getElementById('followup-cancel');
+  if (prepare !== null) {{ prepare.disabled = blocked; }}
+  if (confirm !== null) {{ confirm.disabled = blocked; }}
+  if (cancel !== null) {{ cancel.disabled = blocked || followupOffer === null; }}
+}}
+
+document.getElementById('followup-prepare')?.addEventListener('click', async (event) => {{
+  if (followupConfirmPending || followupUnknownApproval !== null) {{ return; }}
+  const button = event.currentTarget;
+  button.disabled = true;
+  followupHideConfirm();
+  followupSay('Подготавливаем отправку…');
+  try {{
+    const response = await fetch(window.location.pathname + '/plan', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{'Content-Type': 'application/json', [HEADER]: CSRF}},
+      body: JSON.stringify({{}}),
+    }});
+    let data = null;
+    try {{ data = await response.json(); }} catch (parseError) {{ data = null; }}
+    if (data === null || !data.accepted) {{
+      followupSay('Подготовка не выполнена. ' + ((data && data.detail) || '')
+        + ' ' + ((data && data.reasons) || []).join(', '));
+      return;
+    }}
+    followupOffer = {{id: data.approval.approval_id, signature: data.plan_signature,
+                      count: data.approval.approved_recipient_count}};
+    document.getElementById('followup-confirm-count').textContent = String(followupOffer.count);
+    document.getElementById('followup-confirm-detail').textContent =
+      'Группы: ' + (data.approval.selected_groups || []).join(', ')
+      + '. Интервал: ' + Math.round((data.approval.min_interval_seconds || 0) / 86400) + ' дн.'
+      + ' Текст: ' + data.approval.meta_template_name + ' (' + data.approval.template_language + ').'
+      + ' Подтверждение действует до ' + data.approval.expires_at + '.';
+    document.getElementById('followup-confirm-panel').classList.remove('d-none');
+    followupSay('');
+  }} catch (error) {{
+    followupSay('Подготовка не выполнена: запрос не удался.');
+  }} finally {{
+    followupSyncSendControls();
+  }}
+}});
+
+document.getElementById('followup-cancel')?.addEventListener('click', () => {{
+  if (followupConfirmPending || followupUnknownApproval !== null || followupOffer === null) {{ return; }}
+  followupHideConfirm();
+  followupSyncSendControls();
+  followupSay('Подтверждение отменено. Ничего не отправлено и попытки не израсходованы.');
+}});
+
+document.getElementById('followup-confirm')?.addEventListener('click', async (event) => {{
+  if (followupConfirmPending || followupUnknownApproval !== null) {{ return; }}
+  if (followupOffer === null) {{
+    followupSay('Сначала подготовьте отправку.');
+    return;
+  }}
+  // Preparing or cancelling another offer cannot cancel an in-flight confirmation.
+  const offer = followupOffer;
+  followupConfirmPending = true;
+  followupSyncSendControls();
+  followupSay('Подтверждаем…');
+  try {{
+    const response = await fetch(window.location.pathname + '/confirm', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{'Content-Type': 'application/json', [HEADER]: CSRF}},
+      body: JSON.stringify({{approval_id: offer.id, plan_signature: offer.signature,
+                             confirmed_count: offer.count}}),
+    }});
+    // A PROVEN refusal and an UNKNOWN answer are different facts, and
+    // collapsing them was a defect: an unreadable body — a proxy's 502 HTML, a
+    // truncated response — was reported as «Отправка не подтверждена» and the
+    // page returned without reconciling, while the confirmation had actually
+    // committed and a run was queued with no stop button on screen.
+    //
+    // So the only thing that counts as a refusal is a readable answer that says
+    // so. Everything else is unknown, and unknown means: go and read the
+    // durable state. Never a second confirm — the approval is single-use and
+    // this page does not retry it.
+    let data = null;
+    try {{ data = await response.json(); }} catch (parseError) {{ data = null; }}
+    if (data !== null && data.accepted === false && data.uncertain !== true) {{
+      followupSay('Отправка не подтверждена. ' + (data.detail || '')
+        + ' ' + ((data.reasons) || []).join(', '));
+      return;
+    }}
+    if (data === null || data.accepted !== true || data.uncertain === true) {{
+      followupUnknownApproval = offer.id;
+      followupHideConfirm();
+      followupSay((data === null
+        ? 'Ответ сервера не удалось прочитать, поэтому результат подтверждения неизвестен. '
+        : 'Результат подтверждения неизвестен. ')
+        + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
+      await followupPoll();
+      return;
+    }}
+    followupHideConfirm();
+    followupSay(data.created
+      ? ('Отправка подтверждена: позиций ' + data.planned + ', исключено ' + data.skipped
+         + '. Исполняет выделенный исполнитель.')
+      : 'Эта отправка уже была подтверждена ранее. Второй отправки не создано.');
+    await followupPoll();
+  }} catch (error) {{
+    // The request itself failed — aborted, offline, DNS. It may still have
+    // reached the server and committed, so this is unknown too and is settled
+    // the same way: by reading the durable state, never by confirming again.
+    followupUnknownApproval = offer.id;
+    followupHideConfirm();
+    followupSay('Ответ сервера не получен, результат подтверждения неизвестен. '
+      + 'Повторное подтверждение не отправляется. Ниже — сохранённое состояние отправки.');
+    await followupPoll();
+  }} finally {{
+    followupConfirmPending = false;
+    followupSyncSendControls();
+  }}
+}});
+
+document.addEventListener('click', async (event) => {{
+  const button = event.target.closest('#followup-stop');
+  if (button === null) {{ return; }}
+  button.disabled = true;
+  followupSay('Останавливаем…');
+  try {{
+    const response = await fetch(window.location.pathname + '/stop', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{'Content-Type': 'application/json', [HEADER]: CSRF}},
+      body: JSON.stringify({{run_id: Number(button.dataset.runId)}}),
+    }});
+    let data = null;
+    try {{ data = await response.json(); }} catch (parseError) {{ data = null; }}
+    if (data === null || !data.accepted) {{
+      followupSay('Остановить не удалось. ' + ((data && data.detail) || ''));
+      button.disabled = false;
+      return;
+    }}
+    followupSay(data.already_stopped
+      ? 'Отправка уже была остановлена. Повторное нажатие ничего не изменило.'
+      : ('Отправка остановлена окончательно. Отложено навсегда позиций: ' + data.tombstoned + '.'));
+    followupPoll();
+  }} catch (error) {{
+    followupSay('Остановить не удалось: запрос не выполнен.');
+    button.disabled = false;
+  }}
+}});
+
+const FOLLOWUP_STATUS_LABELS = {_json_object(_SEND_STATUS_LABELS)};
+const FOLLOWUP_RUN_LABELS = {_json_object(_RUN_STATUS_LABELS)};
+const FOLLOWUP_GROUP_LABELS = {_json_object(_GROUP_LABELS)};
+const FOLLOWUP_REASON_LABELS = {_json_object(_REASON_LABELS)};
+const FOLLOWUP_STATUS_BADGES = {_json_object(_SEND_STATUS_BADGES)};
+const FOLLOWUP_COUNTER_ORDER = {_json_literal_list(_COUNTER_ORDER)};
+
+function followupEscape(value) {{
+  const box = document.createElement('div');
+  box.textContent = value === null || value === undefined ? '' : String(value);
+  return box.innerHTML;
+}}
+
+// The whole run block, built from DURABLE state rather than patched into
+// whatever the server happened to render. That is what makes the first
+// confirmation on a mailing with no previous send show its status, its counters
+// and its stop button without a reload — and it is the same shape the server
+// renders, so a reload and a repaint agree.
+function followupRenderRun(data) {{
+  const host = document.getElementById('followup-run');
+  if (host === null) {{ return; }}
+  if (data.run === null) {{
+    host.innerHTML = followupUnknownApproval !== null
+      ? '<p class="text-muted mb-0" id="followup-run-unknown">'
+        + 'Результат подтверждения пока не установлен. Обновите страницу для проверки состояния.</p>'
+      : '<p class="text-muted mb-0">Отправок по этой рассылке ещё не было.</p>';
+    return;
+  }}
+  const run = data.run;
+  const unresolvedNote = followupUnknownApproval !== null && run.approval_id !== followupUnknownApproval
+    ? FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE : '';
+  const label = FOLLOWUP_RUN_LABELS[run.status] || run.status;
+  const stopped = run.stop_requested === true;
+  const stopControl = stopped
+    ? '<button class="btn btn-outline-secondary btn-sm" disabled>Уже остановлена</button>'
+    : '<button class="btn btn-outline-danger btn-sm" id="followup-stop" data-run-id="'
+      + String(run.run_id) + '">Остановить окончательно</button>';
+  const stopNote = stopped
+    ? '<div class="small text-danger mt-1">Остановлена оператором. Остановка окончательная: '
+      + 'новая партия, новый предпросмотр, другая группа и другой шаблон её не обходят.</div>'
+    : '';
+  const tiles = FOLLOWUP_COUNTER_ORDER.map((state) =>
+    '<div class="col"><div class="card"><div class="card-body py-2">'
+    + '<div class="h5 mb-0">' + ((data.counters || {{}})[state] || 0) + '</div>'
+    + '<div class="small text-muted">' + followupEscape(FOLLOWUP_STATUS_LABELS[state] || state)
+    + '</div></div></div></div>').join('');
+  const rows = (data.rows || []).map((row) => {{
+    const reason = row.reason
+      ? followupEscape(FOLLOWUP_REASON_LABELS[row.reason] || '')
+        + ' <code class="text-break">' + followupEscape(row.reason) + '</code>'
+      : '';
+    const contradictions = row.contradictions
+      ? ' <span class="badge bg-warning text-dark">противоречий: ' + String(row.contradictions) + '</span>'
+      : '';
+    return '<tr><td class="text-nowrap">' + String(row.slot) + '</td>'
+      + '<td class="small">' + followupEscape(FOLLOWUP_GROUP_LABELS[row.group] || row.group) + '</td>'
+      + '<td><span class="badge ' + (FOLLOWUP_STATUS_BADGES[row.status] || 'bg-light text-dark') + '">'
+      + followupEscape(FOLLOWUP_STATUS_LABELS[row.status] || row.status) + '</span></td>'
+      + '<td class="small">' + (row.attempt_spent ? 'да' : 'нет') + '</td>'
+      + '<td class="small text-break">' + reason + contradictions + '</td></tr>';
+  }}).join('');
+  const table = rows === ''
+    ? '<p class="text-muted">В этой отправке нет позиций.</p>'
+    : '<div class="table-responsive" style="overflow-x:auto">'
+      + '<table class="table table-sm align-middle" id="followup-send-table">'
+      + '<thead><tr><th>Позиция</th><th>Первое сообщение</th><th>Повторное сообщение</th>'
+      + '<th>Попытка израсходована</th><th>Причина</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>';
+  host.innerHTML = unresolvedNote +
+    '<div class="d-flex flex-wrap align-items-center gap-2 mb-2">'
+    + '<span class="badge bg-secondary" id="followup-run-status" data-approval-id="'
+    + String(run.approval_id) + '" data-followup-finished="'
+    + (run.finished ? 'true' : 'false') + '">' + followupEscape(label) + '</span>'
+    + '<span class="small text-muted">отправка №' + String(run.run_id)
+    + ', подтверждено позиций: ' + String(run.planned_count) + '</span>'
+    + '<span class="ms-sm-auto">' + stopControl + '</span>'
+    + '</div>' + stopNote
+    + '<div class="row row-cols-2 row-cols-md-4 g-2 mb-3" id="followup-send-counters">' + tiles + '</div>'
+    + table;
+}}
+
+let followupPollTimer = null;
+
+async function followupPoll(options) {{
+  const keepPolling = !(options && options.once === true);
+  try {{
+    const response = await fetch(window.location.pathname + '/status', {{
+      method: 'GET', credentials: 'same-origin', cache: 'no-store',
+    }});
+    const data = await response.json();
+    // An older run of this mailing cannot settle the current confirmation.
+    if (data.run && data.run.approval_id === followupUnknownApproval) {{
+      followupUnknownApproval = null;
+      followupSyncSendControls();
+    }}
+    followupRenderRun(data);
+    // Keep asking only while the run can still change. A finished run is
+    // final, and a page that kept asking would suggest otherwise. No reload is
+    // involved either way: the block above is built from the same durable state
+    // a reload would read.
+    if (keepPolling && data.run !== null && !data.run.finished) {{
+      if (followupPollTimer !== null) {{ window.clearTimeout(followupPollTimer); }}
+      followupPollTimer = window.setTimeout(followupPoll, 2000);
+    }}
+  }} catch (error) {{
+    // A failed poll says nothing about the run, so the page must not say
+    // «Отправок по этой рассылке ещё не было» — that is a claim about durable
+    // state this request could not read. It says it does not know instead, and
+    // keeps whatever it was already showing.
+    const host = document.getElementById('followup-run');
+    if (host !== null && document.getElementById('followup-run-status') === null) {{
+      host.innerHTML = '<p class="text-muted mb-0" id="followup-run-unknown">'
+        + 'Состояние отправки сейчас прочитать не удалось. Это не значит, что отправки нет — '
+        + 'обновите страницу.</p>';
+    }} else if (host !== null && followupUnknownApproval !== null
+               && document.getElementById('followup-run-status')?.dataset.approvalId !== String(followupUnknownApproval)
+               && document.getElementById('followup-confirmation-unknown') === null) {{
+      host.insertAdjacentHTML('afterbegin', FOLLOWUP_CONFIRMATION_UNKNOWN_NOTE);
+    }}
+  }}
+}}
+
+// Always, on every load. The status endpoint is a read and answers `null` when
+// this mailing has never been sent, so this costs one request and removes the
+// class of defect where the page could only update what it had already drawn.
+followupPoll();
 </script>
 """
     return HTMLResponse(content=_page("Повторное сообщение", body), headers=_PRIVATE_HEADERS)
 
 
 def _page_banner() -> str:
-    """The sentence §46.6 requires, where it cannot be missed."""
+    """The sentences §46.6 and §46.8 require, where they cannot be missed.
+
+    Four separate steps, named as four, because the operator's whole protection
+    is that none of them does the next one's work: a preview is not permission,
+    a prepared send is not a send, and only the confirmation creates a run.
+    """
     return (
         "<div class='alert alert-info'>"
-        "<b>Доступен только предпросмотр.</b> Отправки повторного сообщения в этой версии нет: "
-        "нет кнопки отправки, нет подтверждения отправки и нет серверного пути, который мог бы её выполнить. "
-        "Предпросмотр ничего не отправляет, не расходует попытку отправки и не является разрешением на отправку."
+        "<b>Четыре отдельных шага.</b> Предпросмотр состава ничего не отправляет и не расходует попытку. "
+        "Подготовка отправки тоже ничего не отправляет — она называет точное число сообщений. "
+        "Только отдельное подтверждение создаёт отправку, и выполняет её выделенный исполнитель, "
+        "а не эта страница. Каждому получателю исходной рассылки разрешена не более одной "
+        "дополнительной попытки; новые ваучеры и финансовые операции здесь не создаются."
         "</div>"
     )
 
@@ -773,3 +1625,27 @@ def _json_literal(value: Any) -> str:
     import json
 
     return json.dumps(str(value)).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _json_literal_list(value: tuple[str, ...]) -> str:
+    """One JSON array literal for the page's script, escaped the same way."""
+    import json
+
+    return (
+        json.dumps(list(value), ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def _json_object(value: dict[str, str]) -> str:
+    """One JSON object literal for the page's script, escaped the same way.
+
+    Used for the two label maps, so the words the polling script prints are the
+    same words the server-rendered table prints. A second copy in JavaScript is
+    exactly how the two end up disagreeing.
+    """
+    import json
+
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")

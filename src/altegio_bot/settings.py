@@ -968,6 +968,33 @@ class Settings(BaseSettings):
     # the validator below, like every other worker interval.
     easyweek_voucher_production_executor_poll_sec: float = 2.0
 
+    # --- §46.8: the voucher FOLLOW-UP send, and its own fence (PR-22.3) ------
+    # The follow-up's own send fence, closed by default and separate on purpose.
+    # `..._MAILING_ENABLED` above permits the PRIMARY mailing's create, pay and
+    # deliver; it does not permit a repeat message, and nothing in the follow-up
+    # code reads it. So a deployment running the production mailing still
+    # refuses every follow-up plan, every confirmation and every claim until
+    # this one is turned on deliberately.
+    #
+    # What it does NOT fence is the truth arriving about a follow-up that was
+    # already sent: a delivered/read/failed callback about one of its messages
+    # is recorded whatever this says, because dropping it would corrupt the
+    # record of a send that really happened.
+    easyweek_voucher_followup_send_enabled: bool = False
+
+    # Does this deployment RUN the dedicated follow-up executor? A weak claim —
+    # "one is deployed", never "it is alive this second" — which is what lets a
+    # confirmation refuse up front instead of parking in a queue nobody drains.
+    #
+    # It is not a second fence and it authorises nothing: with it true and
+    # `..._FOLLOWUP_SEND_ENABLED` false, every offer and every confirmation
+    # still refuses.
+    easyweek_voucher_followup_executor_enabled: bool = False
+
+    # How long that executor sleeps when the run queue is empty. Bounded in the
+    # validator below, like every other worker interval.
+    easyweek_voucher_followup_executor_poll_sec: float = 2.0
+
     # ---------------------------------------------------------------------------
     # Worker polling intervals
     # ---------------------------------------------------------------------------
@@ -986,6 +1013,7 @@ class Settings(BaseSettings):
         "whatsapp_inbox_worker_poll_sec",
         "easyweek_inbox_worker_poll_sec",
         "easyweek_voucher_production_executor_poll_sec",
+        "easyweek_voucher_followup_executor_poll_sec",
     )
     @classmethod
     def validate_worker_poll_sec(cls, v: float) -> float:

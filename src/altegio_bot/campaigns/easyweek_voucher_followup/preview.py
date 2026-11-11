@@ -162,6 +162,7 @@ __all__ = [
     "SnapshotCurrency",
     "assess_snapshot",
     "batch_gate",
+    "configured_binding_key_id",
     "create_preview",
     "latest_preview",
     "local_template_row_proven",
@@ -1560,6 +1561,12 @@ def _configured_binding_key_id() -> str | None:
     except VoucherBindingKeyError:
         return None
     return identifier
+
+
+# The same question, under a public name, for the PR-22.3 send path: it has to
+# re-prove the very same binding before an attempt and must not reach for a
+# private helper to do it.
+configured_binding_key_id = _configured_binding_key_id
 
 
 # ---------------------------------------------------------------------------

@@ -171,7 +171,11 @@ BROWSER_ACCEPT: Final = "text/html,application/xhtml+xml"
 # One sentence the page cannot be read without. Asserted absent from every
 # refusal: a 401 or a 302 that nevertheless carried the page would be the
 # defect this section is about.
-PAGE_MARKER: Final = "Доступен только предпросмотр"
+#
+# PR-22.3 replaced the preview-only banner with the four-step one, because the
+# page now carries a send — behind its own fence, its own offer and its own
+# confirmation. The marker follows the contract rather than outliving it.
+PAGE_MARKER: Final = "Четыре отдельных шага"
 
 
 def _carries_no_credentials(client: AsyncClient) -> None:
@@ -476,8 +480,16 @@ async def test_an_unknown_group_name_is_refused_not_widened(session_maker, ops_c
     await _no_effects(session_maker)
 
 
-async def test_there_is_no_send_endpoint_anywhere_in_this_section(session_maker) -> None:
-    """§46.6: no send, no confirmation of a send, no path that becomes one."""
+async def test_the_section_exposes_exactly_the_five_followup_routes(session_maker) -> None:
+    """§46.8: these five and nothing else, each with exactly its own method.
+
+    An exact inventory rather than a list of forbidden words, which is what
+    makes it useful in both directions: a sixth endpoint, a GET that gained a
+    POST, or a path that quietly started executing something fails here. The
+    preview-only inventory this replaced was the PR-22.2 contract; PR-22.3 adds
+    the plan, the confirmation, the stop and the read-only status, and nothing
+    more.
+    """
     from altegio_bot.main import app
 
     followup_routes = {
@@ -488,9 +500,17 @@ async def test_there_is_no_send_endpoint_anywhere_in_this_section(session_maker)
     assert followup_routes == {
         "/ops/voucher-mailings/{batch_id}/followup": ["GET"],
         "/ops/voucher-mailings/{batch_id}/followup/preview": ["POST"],
+        "/ops/voucher-mailings/{batch_id}/followup/plan": ["POST"],
+        "/ops/voucher-mailings/{batch_id}/followup/confirm": ["POST"],
+        "/ops/voucher-mailings/{batch_id}/followup/stop": ["POST"],
+        "/ops/voucher-mailings/{batch_id}/followup/status": ["GET"],
     }
-    for forbidden in ("send", "confirm", "dispatch", "claim", "execute"):
-        assert not any(forbidden in path for path in followup_routes)
+    # Everything that can start work is a POST, and the two reads are reads.
+    for path, methods in followup_routes.items():
+        if path.endswith(("/plan", "/confirm", "/stop", "/preview")):
+            assert methods == ["POST"], path
+        else:
+            assert methods == ["GET"], path
 
 
 # ---------------------------------------------------------------------------
@@ -506,13 +526,23 @@ async def test_the_page_creates_nothing(session_maker, ops_client, no_network, s
     await _no_effects(session_maker)
 
 
-async def test_the_page_says_only_a_preview_is_available(
+async def test_the_page_keeps_the_four_steps_apart_and_names_the_closed_fence(
     session_maker, ops_client, no_network, seams, binding_key
 ) -> None:
+    """§46.8: four steps, and the default state of the send said in words.
+
+    The fence is closed in this test's environment — no setting is patched —
+    which is the deployed default, so the page has to say so rather than offer a
+    button that would fail. And it must keep the three harmless steps separate
+    from the one that is not: a preview spends nothing, a prepared send spends
+    nothing, and only the confirmation creates a run.
+    """
     batch_id = await _batch(session_maker)
     body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
-    assert "Доступен только предпросмотр" in body
-    assert "не расходует попытку отправки" in body
+    assert "Четыре отдельных шага" in body
+    assert "не расходует попытку" in body
+    assert "Отправка закрыта отдельным переключателем" in body
+    assert "Разрешение первичной рассылки этот переключатель не открывает" in body
 
 
 async def test_the_page_explains_that_no_read_receipt_proves_nothing(

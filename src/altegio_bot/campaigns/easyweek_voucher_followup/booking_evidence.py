@@ -180,6 +180,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.booking_attribution impor
     BOOKING_CANCELLED,
     IDENTITY_NUMERIC_MISSING,
     IDENTITY_PROVEN,
+    CaptureScan,
     DisputedBooking,
     ObservedBooking,
     resolve_identities,
@@ -612,6 +613,16 @@ def _chronology_contradicted(booking: ObservedBooking, *, now: datetime) -> bool
     return booking.booking_created_at > booking.first_observed_at
 
 
+def _creation_proof(booking: ObservedBooking, *, now: datetime) -> tuple[int, int, datetime, bool]:
+    """Facts that determine who created a booking, when, and whether that time is credible."""
+    return (
+        booking.company_id,
+        booking.customer_id,
+        booking.booking_created_at,
+        _chronology_contradicted(booking, now=now),
+    )
+
+
 def _dispute_chronology_contradicted(dispute: DisputedBooking, *, now: datetime) -> bool:
     """Do its own claimed instants fight what was already known about it?
 
@@ -758,6 +769,7 @@ async def load_creation_evidence(
     conflict_reason: str | None = None,
     slot_bookings: Mapping[int, Collection[uuid_module.UUID]] | None = None,
     registry: EasyWeekLocationRegistry | None = None,
+    previous_capture: CaptureScan | None = None,
 ) -> CapturedCreations:
     """One bounded local pass: which bookings each slot's person created, when.
 
@@ -779,6 +791,10 @@ async def load_creation_evidence(
     The branch scope comes from the configured location registry, so a creation
     at any configured branch of the same workspace counts, which is what §46.5
     asks of the booking question.
+
+    ``previous_capture`` is the send executor's snapshot taken before its live
+    read. Changed bookings outside that read's list must be proven unrelated;
+    otherwise the live negative proof is stale. Preview leaves this unset.
     """
     locations = registry if registry is not None else configured_easyweek_locations()
     anchors = [item.send_attempted_at for item in items if item.send_attempted_at is not None]
@@ -795,7 +811,20 @@ async def load_creation_evidence(
     # MADE, which may be long before the mailing. Bounded newest-first by the
     # report's own row cap, which reports truncation.
     scan = await scan_capture(session, anchors=list(anchors), now=now, registry=locations, lookback=None)
-    if scan.truncated:
+    if scan.truncated or (
+        previous_capture is not None
+        and (
+            previous_capture.truncated
+            or previous_capture.delivery_fingerprints is None
+            or scan.delivery_fingerprints is None
+            or previous_capture.unattributed_fingerprints is None
+            or scan.unattributed_fingerprints is None
+            or previous_capture.delivery_customers is None
+            or scan.delivery_customers is None
+            or previous_capture.lifecycle_deliveries is None
+            or scan.lifecycle_deliveries is None
+        )
+    ):
         # A partial pass is not an answer about anybody, so nothing below has
         # anything left to decide — and with a capture large enough to
         # truncate, the per-pair owner lookup was also the query that failed
@@ -818,6 +847,58 @@ async def load_creation_evidence(
     identities = await resolve_identities(session, items=items, registry=locations)
     grouped = scan.by_customer()
     by_uuid = scan.by_booking_uuid()
+    previous_deliveries = previous_capture.delivery_fingerprints or {} if previous_capture is not None else {}
+    current_deliveries = scan.delivery_fingerprints or {}
+    changed_ids = (
+        {
+            booking_uuid
+            for booking_uuid in previous_deliveries.keys() | current_deliveries.keys()
+            if previous_deliveries.get(booking_uuid) != current_deliveries.get(booking_uuid)
+        }
+        if previous_capture is not None
+        else set()
+    )
+    # Recheck the creator when new evidence establishes or changes the creation
+    # itself. A later edit of another holder's appointment can change the report's
+    # booking state while leaving its original creation fully established.
+    changed_creations: list[ObservedBooking] = []
+    if previous_capture is not None:
+        previous_creations = {
+            booking.booking_uuid: _creation_proof(booking, now=now) for booking in previous_capture.bookings
+        }
+        changed_creations = [
+            booking
+            for booking in scan.bookings
+            if previous_creations.get(booking.booking_uuid) != _creation_proof(booking, now=now)
+        ]
+    # Creation attribution cannot settle who a new lifecycle delivery names.
+    # Check the delta even for disputed creations, and do not reapply old
+    # holders/ownerless facts the complete live read already covered.
+    changed_customers: set[tuple[int, int | None] | None] = set()
+    removed_delivery = False
+    for booking_uuid in changed_ids:
+        before = previous_deliveries.get(booking_uuid, frozenset())
+        after = current_deliveries.get(booking_uuid, frozenset())
+        removed_delivery = removed_delivery or bool(before - after)
+        customers = (scan.delivery_customers or {}).get(booking_uuid, {})
+        changed_customers.update(customers.get(fingerprint) for fingerprint in after - before)
+    # Identical payloads can be separate lifecycle occurrences (for example,
+    # returning to a previous holder). Compare every visible receipt ID, so a
+    # lower-ID transaction committed after the live read is also detected.
+    # The receipt identifies the holder to check for this change.
+    lifecycle_changed_ids: set[uuid_module.UUID] = set()
+    if previous_capture is not None:
+        previous_lifecycle = previous_capture.lifecycle_deliveries or {}
+        current_lifecycle = scan.lifecycle_deliveries or {}
+        removed_delivery = removed_delivery or bool(previous_lifecycle.keys() - current_lifecycle.keys())
+        for event_id in current_lifecycle.keys() - previous_lifecycle.keys():
+            delivery = current_lifecycle[event_id]
+            if delivery is None:
+                changed_customers.add(None)
+            else:
+                booking_uuid, company_id, customer_id = delivery
+                lifecycle_changed_ids.add(booking_uuid)
+                changed_customers.add((company_id, customer_id))
     # Bookings that may have left somebody's list. Two shapes, and the second
     # one used to be invisible: a delivery naming a DIFFERENT customer record,
     # and a delivery from another branch naming no customer at all. The second
@@ -862,6 +943,11 @@ async def load_creation_evidence(
             if booking is not None:
                 needed_owners.add((int(booking.company_id), int(booking.customer_id)))
     if judged:
+        for pair in changed_customers:
+            if pair is not None and pair[1] is not None:
+                needed_owners.add((pair[0], pair[1]))
+        for booking in changed_creations:
+            needed_owners.add((int(booking.company_id), int(booking.customer_id)))
         # And the bookings OUTSIDE anybody's list that a reassignment touched.
         # They are the reason a slot whose own list cannot show them is refused
         # at all, so they are precisely where a proven creator is worth asking
@@ -904,6 +990,32 @@ async def load_creation_evidence(
         # they appeared. Kept out of the creations and reported, because the
         # half this phase would otherwise act on is the one that excludes.
         contradicted: set[uuid_module.UUID] = set()
+        # A changed booking in the cached live list invalidates its live state
+        # even when the creation/owner summary stayed the same (rescheduling).
+        live_proof_moved = bool(live & (changed_ids | lifecycle_changed_ids)) or (
+            previous_capture is not None
+            and previous_capture.unattributed_fingerprints != scan.unattributed_fingerprints
+        )
+        if removed_delivery or any(
+            pair is None
+            or pair[1] is None
+            or _owner_verdict(
+                company_id=pair[0],
+                customer_id=pair[1],
+                numeric_id=numeric_id,
+                numeric_branches=numeric_branches,
+                slot_uuid=item.easyweek_customer_uuid,
+                owners=owners,
+            )
+            != ATTRIBUTION_ANOTHERS
+            for pair in changed_customers
+        ):
+            live_proof_moved = True
+        represented = set(by_uuid) | {dispute.booking_uuid for dispute in scan.disputed}
+        if changed_ids - represented:
+            # An ownerless/removed candidate cannot be proven unrelated to the
+            # live proof. Do not turn missing evidence into a permission.
+            live_proof_moved = True
 
         def _credit(booking: ObservedBooking) -> None:
             if _chronology_contradicted(booking, now=now):
@@ -942,6 +1054,26 @@ async def load_creation_evidence(
             ):
                 _credit(booking)
 
+        # A UUID-only card may have no numeric bridge. Its live list cannot
+        # establish ownership of a booking captured after that read started.
+        # Resolve changed facts explicitly instead of treating the old list as
+        # a current proof that none of them belong to this recipient.
+        for booking in changed_creations:
+            if booking.booking_uuid in live:
+                continue
+            owner = _owner_verdict(
+                company_id=int(booking.company_id),
+                customer_id=int(booking.customer_id),
+                numeric_id=numeric_id,
+                numeric_branches=numeric_branches,
+                slot_uuid=item.easyweek_customer_uuid,
+                owners=owners,
+            )
+            if owner == ATTRIBUTION_THEIRS:
+                _credit(booking)
+            if owner != ATTRIBUTION_ANOTHERS:
+                live_proof_moved = True
+
         # Bookings of theirs the capture cannot date and had provably already
         # heard of when the attempt was made. No creation date is taken from
         # the sighting; all it answers is that nothing NEW is hiding here.
@@ -966,7 +1098,7 @@ async def load_creation_evidence(
         # theirs. Reported rather than dropped, because an empty live history
         # plus a forgotten dispute reads as "nothing happened since the
         # mailing" — and that is exactly what it is not.
-        if contradicted:
+        if contradicted or live_proof_moved:
             # Two captured facts about one booking that cannot both hold. The
             # answer is not the harsher of them.
             proven = False
