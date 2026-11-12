@@ -289,7 +289,17 @@ def approved_meta_templates() -> list[dict[str, Any]]:
             "status": "APPROVED",
             "category": message.FOLLOWUP_TEMPLATE_CATEGORY,
             "parameter_format": message.FOLLOWUP_TEMPLATE_PARAMETER_FORMAT,
-            "components": [{"type": "BODY", "text": message.positional_body()}],
+            # Verbatim positional BODY from the approved Karlsruhe Meta template.
+            "components": [
+                {
+                    "type": "BODY",
+                    "text": (
+                        "Hallo {{1}}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt. "
+                        "Termin buchen: {{2}}. \n"
+                        "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
+                    ),
+                }
+            ],
         }
     ]
 

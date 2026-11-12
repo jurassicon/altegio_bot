@@ -37,10 +37,8 @@ original entitlement and at the booking link, and nothing else.
 
 Unsubscribing is part of the text
 ---------------------------------
-The body states STOP/СТОП, in the language the first mailing's audience was
-written in plus the Cyrillic spelling the inbound path has always accepted. A
-marketing follow-up that did not say how to stop it would be the one message in
-this phase that makes the consent ledger harder to use rather than easier.
+The outgoing German message asks recipients to reply with Latin STOP.
+Inbound consent recognises both Latin and Cyrillic commands.
 
 Nothing here creates or changes a Meta template
 -----------------------------------------------
@@ -104,8 +102,8 @@ FOLLOWUP_TEMPLATE_ARITY: Final = len(FOLLOWUP_TEMPLATE_FIELDS)
 # about the first message, and deliberately carrying the opt-out sentence.
 FOLLOWUP_TEMPLATE_BODY: Final = (
     "Hallo {client_name}, für Sie ist bei uns ein Gutschein über 10 € hinterlegt. "
-    "Termin buchen: {booking_link}. "
-    "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP (СТОП)."
+    "Termin buchen: {booking_link}. \n"
+    "Wenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
 )
 
 # The explicit group mapping §46.4 asks for. All three names are present, so a

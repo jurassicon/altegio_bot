@@ -547,8 +547,19 @@ def test_the_text_is_safe_for_the_failure_group() -> None:
 
 
 def test_the_text_explains_how_to_unsubscribe() -> None:
-    assert "STOP" in message.FOLLOWUP_TEMPLATE_BODY
-    assert "СТОП" in message.FOLLOWUP_TEMPLATE_BODY
+    assert message.FOLLOWUP_TEMPLATE_BODY.endswith("antworten Sie mit STOP.")
+    assert not any("\u0400" <= ch <= "\u04ff" for ch in message.FOLLOWUP_TEMPLATE_BODY)
+
+
+@pytest.mark.parametrize("separator, ending", [(" ", "STOP (СТОП)."), (" ", "STOP."), ("\n", "STOP.")])
+def test_followup_rejects_unapproved_spacing_and_previous_body(separator, ending) -> None:
+    from altegio_bot.tests.easyweek_voucher_followup_fixtures import approved_meta_templates
+
+    listing = approved_meta_templates()
+    assert message.prove_meta_templates(listing).proven
+    component = listing[0]["components"][0]
+    component["text"] = component["text"].replace(" \n", separator).removesuffix("STOP.") + ending
+    assert not message.prove_meta_templates(listing).proven
 
 
 def test_the_safe_example_leaks_nothing() -> None:

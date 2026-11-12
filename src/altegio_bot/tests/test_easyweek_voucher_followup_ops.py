@@ -42,6 +42,8 @@ from altegio_bot.campaigns.easyweek_voucher_followup import followup_template_co
 from altegio_bot.models.models import (
     EasyWeekVoucherFollowupPreview,
     EasyWeekVoucherFollowupPreviewRow,
+    EasyWeekVoucherFollowupRun,
+    EasyWeekVoucherFollowupSend,
     EasyWeekVoucherProductionBatchItem,
     MessageJob,
     OutboxMessage,
@@ -567,7 +569,10 @@ async def test_the_page_shows_the_text_with_placeholders_only(
     batch_id = await _batch(session_maker)
     body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
     assert "[Vorname]" in body
-    assert "STOP" in body and "СТОП" in body
+    assert (
+        "Termin buchen: [Buchungslink]. \nWenn Sie keine Nachrichten mehr von uns möchten, antworten Sie mit STOP."
+        in body
+    )
     # And nothing personal: no number, no card name, no uuid, no digest, no id.
     for forbidden in ("+4915100", "Person 1", "00000001-1111", "wamid.", "test-key-1", "f" * 64):
         assert forbidden not in body, forbidden
@@ -603,8 +608,10 @@ async def test_a_batch_that_may_not_have_a_preview_says_so_on_the_page(
 
 
 async def test_an_authenticated_operator_can_store_a_preview(
-    session_maker, ops_client, no_network, seams, binding_key
+    session_maker, ops_client, no_network, seams, binding_key, monkeypatch
 ) -> None:
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_send_enabled", False)
+    monkeypatch.setattr(settings, "easyweek_voucher_followup_executor_enabled", False)
     batch_id = await _batch(session_maker)
     response = await ops_client.post(ACTION.format(batch_id=batch_id), json=GOOD_BODY)
     assert response.status_code == 200, response.text
@@ -625,7 +632,16 @@ async def test_an_authenticated_operator_can_store_a_preview(
         spent = (
             await session.execute(select(func.sum(EasyWeekVoucherProductionBatchItem.send_attempt_count)))
         ).scalar_one()
+        runs = await session.scalar(select(func.count()).select_from(EasyWeekVoucherFollowupRun))
+        sends, attempts = (
+            await session.execute(
+                select(func.count(), func.coalesce(func.sum(EasyWeekVoucherFollowupSend.attempt_count), 0)).select_from(
+                    EasyWeekVoucherFollowupSend
+                )
+            )
+        ).one()
     assert (jobs, outbox, int(spent)) == (0, 0, 1)
+    assert (runs, sends, attempts) == (0, 0, 0)
 
 
 async def test_an_unproven_template_is_reported_with_a_sentence(
@@ -791,7 +807,8 @@ async def test_a_changed_body_hides_the_old_text_rather_than_substituting(
             stored = (await session.execute(select(EasyWeekVoucherFollowupPreview))).scalar_one()
             # The snapshot is immutable; this stands in for the contract having
             # moved underneath it, which is what the page must notice.
-            stored.template_body_digest = "0" * 64
+            # Digest recorded with the previous Karlsruhe BODY, before the Meta text correction.
+            stored.template_body_digest = "d8fcc3ec0e3d0a7e01ba40b5ca234d4727bdc8b5c07aad7df10092ccfcd42d2d"
 
     body = (await ops_client.get(PAGE.format(batch_id=batch_id))).text
     assert "текст повторного сообщения изменился" in body
