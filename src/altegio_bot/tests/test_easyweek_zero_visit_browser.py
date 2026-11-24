@@ -304,3 +304,77 @@ async def test_a_stale_tab_does_not_claim_the_person_is_still_excluded(
     assert "исключённой" not in text
     assert_no_page_errors(page)
     assert_no_page_errors(second)
+
+
+async def test_a_permanent_refusal_is_not_rendered_as_retryable(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2, item 5: a 403 must never be rendered as "try again later".
+
+    The three families say three different things to do next, and the one thing
+    an operator must not be told after a permanent refusal is to come back and
+    press the button again.
+    """
+    from altegio_bot.easyweek_client import EasyWeekAuthError
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserEasyWeek(person=person, rows=[], failure=EasyWeekAuthError("403", status_code=403)))
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "EasyWeek отказал в запросе" in text
+    assert "Можно повторить проверку позже." not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert "визитов по истории API" not in text
+    assert_no_page_errors(page)
+
+
+async def test_a_malformed_answer_is_rendered_as_a_format_problem(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 200 of the wrong shape is its own answer, not an outage."""
+    from altegio_bot.easyweek_client import EasyWeekProtocolError
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserEasyWeek(person=person, rows=[], failure=EasyWeekProtocolError("shape")))
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "ответ неожидаемого формата" in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert_no_page_errors(page)
+
+
+async def test_a_deadline_before_the_first_api_call_does_not_blame_easyweek(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2, item 5: the local deadline, as an operator actually reads it.
+
+    The check's one deadline covers reading our own rows as well as the network.
+    When it expires in the first half, EasyWeek was never asked — and the
+    sentence on the screen must not say EasyWeek failed to answer.
+    """
+    import asyncio
+
+    from altegio_bot.campaigns import easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserEasyWeek(person=person, rows=[]))
+    real_local = history_module._local_facts
+
+    async def slow_local(*args: Any, **kwargs: Any):
+        await asyncio.sleep(5)
+        return await real_local(*args, **kwargs)
+
+    monkeypatch.setattr(history_module, "_local_facts", slow_local)
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.05)
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "на нашей стороне" in text
+    assert "EasyWeek не запрашивался" in text
+    assert "EasyWeek не ответил" not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)

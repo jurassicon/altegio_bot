@@ -40,6 +40,37 @@ async def lock_workspace_identity(session: AsyncSession) -> None:
     await session.execute(text("SELECT pg_advisory_xact_lock(724410210071::bigint)"))
 
 
+async def known_numeric_uuid_binding(session: AsyncSession, customer_id: int) -> tuple[uuid.UUID | None, bool]:
+    """The stored numeric↔UUID correspondence for one EasyWeek customer id.
+
+    ``(uuid, conflict)``. Deliberately workspace-wide and NOT branch-scoped:
+    §44.2 says one customer UUID may legitimately hold cards in several proven
+    branches, so the correspondence a webhook once proved on a Durlach card is
+    the same person's correspondence in Karlsruhe. Reading only the branch card
+    would treat a known person as unknown and send an identity question down a
+    path that guesses.
+
+    ``conflict`` is true when two different UUIDs are stored against one numeric
+    id. That cannot be resolved by reading harder — it means the workspace holds
+    contradictory bindings — and every caller refuses on it.
+
+    The single implementation of this rule, shared by the webhook bridge and by
+    the read-only diagnostic, so the two cannot drift apart.
+    """
+    values = set(
+        (
+            await session.scalars(
+                select(Client.easyweek_customer_uuid).where(
+                    Client.provider == "easyweek",
+                    Client.altegio_client_id == customer_id,
+                    Client.easyweek_customer_uuid.is_not(None),
+                )
+            )
+        ).all()
+    )
+    return (next(iter(values)) if len(values) == 1 else None, len(values) > 1)
+
+
 async def lock_identity(session: AsyncSession, *, phone: str, customer_uuid: str) -> None:
     """Serialize cross-preview creation, including absent-row races.
 

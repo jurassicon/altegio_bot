@@ -704,3 +704,54 @@ async def test_an_excluded_ordinary_row_carries_no_binding(session_maker, monkey
     assert rows[0].excluded_reason == OPTED_OUT
     assert read_zero_visit_source_meta(rows[0].meta) is None
     assert rows[0].meta == {}
+
+
+# ===========================================================================
+# 9. The contact source, recorded apart from the counter — review round 2
+# ===========================================================================
+
+
+async def test_the_binding_records_the_contact_source_separately(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which delivery carried the counter and which carried the contact.
+
+    Two different questions, so two different fields. The number itself is not
+    one of them: a preview snapshot is not a contact store, and the check can
+    read it back from the delivery the binding names.
+    """
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.event_id == person.event_ids[0]
+    assert stored.contact_sources == 1
+    # The zero-counter delivery carried it itself, so no pointer is needed.
+    assert stored.contact_event_id is None
+    assert person.phone not in json.dumps(rows[0].meta or {})
+
+
+async def test_a_booking_with_no_captured_contact_records_none(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero contacts is a recorded fact, not an absent field to be guessed at."""
+    await seed_person(session_maker, 1, customer_uuid=None, capture_phone=False)
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.contact_sources == 0
+    assert stored.contact_event_id is None
+
+
+async def test_the_period_count_follows_records_not_deliveries(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three deliveries of one booking are one record in the period."""
+    await seed_person(session_maker, 1, deliveries=3)
+    result = await _segment(session_maker, monkeypatch)
+
+    candidate = result.candidates[0].candidate
+    assert candidate.total_records_in_period == 1
+    assert candidate.confirmed_records_in_period == 0

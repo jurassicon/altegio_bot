@@ -102,6 +102,12 @@ service category either, because none was ever checked for it. A person the
 segmenter already proved, or already excluded for a reason of its own, keeps
 that verdict: this row only exists for somebody who would otherwise have no row.
 
+`total_records_in_period` on that row is the count the field's name promises —
+this client's distinct, non-deleted records starting inside the campaign's
+half-open period, counted in SQL. Two different bookings in the period read as
+2; one booking delivered twice reads as 1. It is never a count of zero-counter
+deliveries.
+
 **Which delivery the row is about.** The preview records it when it creates the
 row: the event id, the record id and the booking's identity, stored in the
 recipient's own snapshot and deliberately **not** in the five source-proof
@@ -113,17 +119,59 @@ ambiguous rather than picking one. A row from before this path existed has no
 binding, and the check says «источник не установлен» instead of guessing. The
 binding is never written onto an existing, manual or frozen row afterwards.
 
+**Which delivery the contact comes from.** Recorded in the same snapshot, as its
+own two fields, because "which delivery carried the counter" and "which delivery
+carried the contact" are different questions. A zero-counter delivery often
+carries no phone at all, so the preview also looks at the other processed
+deliveries of that same booking — a repeat of it, or its `booking-created` /
+`booking-updated` — and takes a contact only from one that proves the same
+branch, the same booking UUID, the same numeric booking id and the same numeric
+customer id. It stores how many different contacts those deliveries carried and,
+when the one contact came from a sibling delivery, which delivery that was. The
+number itself is **not** stored. One contact is usable; none means the identity
+cannot come from this route; more than one means the deliveries contradict each
+other about who this is, and the check refuses rather than choosing. A delivery
+that arrives after the preview supplies nothing, because the binding was already
+decided.
+
 **How to check the history.** Press **🔎 Проверить историю** on that row. The
 server takes the run id and the recipient id only, and re-derives the branch,
 the period, the client and the originating booking from its own rows; a customer
 UUID or phone number sent by the browser is refused. One operator gets one check
 at a time. The identity comes from one of the two routes §44.2 allows: the
-stored numeric-to-UUID correspondence on the local card, or — when the card has
-none — the contact **that delivery itself captured**, resolved across the whole
+stored numeric-to-UUID correspondence, or — when there is none — the contact
+**one of that booking's deliveries captured**, resolved across the whole
 workspace to exactly one customer and then read back directly. The current
-owner of the booking is never used to supply a missing identity. It then reads
-the source booking and that customer's complete booking history, read-only,
-within one deadline that covers the local checks and the network together.
+owner of the booking is never used to supply a missing identity.
+
+The correspondence is read **workspace-wide**, through the same rule the webhook
+bridge uses: one customer UUID may legitimately hold cards in several proven
+branches, so a correspondence stored on another branch's card identifies the same
+person here. That case is checked and works. Two different UUIDs stored against
+one numeric customer id is a conflict and stops the check. So is a live answer
+naming a different customer than the stored correspondence does — which is the
+case where the Karlsruhe card has no UUID, another branch says `N → A`, and the
+phone and the current booking both point at `B`.
+
+Because the lookup is a network call and the webhook bridge writes during it, the
+local identity facts — the Karlsruhe card included — are read a second time
+afterwards. A correspondence that appeared mid-lookup and names somebody else, a
+second card that has taken the proven UUID, or a card whose contact has changed
+all stop the check there. In every one of these cases nobody's booking history is
+read at all.
+
+The diagnostic's phone lookup is also stricter than the migration one about
+coverage: page parameters and metadata must be consistent, `per_page` stable,
+every page before the last one full, the rows handed over must add up to the
+declared total, and every row must be a distinct customer. A listing declaring
+`total: 2` that repeats one UUID is indeterminate here — the row never shown may
+be a second person on that number — and the check stops without reading a
+history. The migration lookup and the manual Add keep their own contract, in
+which one UUID listed twice is one customer, unchanged.
+
+It then reads the source booking and that customer's complete booking history,
+read-only, within one deadline that covers the local checks and the network
+together.
 
 A successful answer states the counter the delivery carried (0), the number of
 completed non-canceled visits in the full API history, what became of the exact
@@ -134,15 +182,25 @@ completed visit" are two different facts: it is either completed and not
 canceled (counted), found but canceled, found but not finished, or not in the
 history at all.
 
-Three kinds of refusal, and they mean different things:
+Kinds of refusal, and they mean different things:
 
 - «не удалось подтвердить» — we will not say whose history this is. The source
   event no longer attributes to this person, the booking has been reassigned,
   the identity is unproven, or one contact resolves to more than one card.
-- «не удалось проверить» — the history itself could not be trusted: incomplete
-  pagination, a malformed body, a 404.
-- «временно не удалось проверить» — a 429, a 5xx or a timeout. Nothing is wrong
-  with the data and only this one is worth repeating.
+- «конфликт идентификаторов клиента» — the workspace or the API contradicts
+  itself about who this numeric customer is. Repeating the check cannot settle
+  it; the cards have to be looked at.
+- «не удалось проверить историю» — the history itself could not be trusted:
+  incomplete pagination, or a listing whose coverage could not be proven.
+- «EasyWeek отказал в запросе» — a permanent 4xx (401, 403, 404, 422) or an
+  unusable API configuration. **Not** offered as a retry: retrying cannot work.
+- «EasyWeek вернул ответ неожидаемого формата» — a 200 whose body is not the
+  promised shape. Also not a retry.
+- «временно не удалось проверить историю» — a 429, a 5xx or a timeout. Nothing
+  is wrong with the data and only this one is worth repeating.
+- «проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался» —
+  the one deadline expired while reading our own rows. EasyWeek was never asked,
+  so the message does not say EasyWeek failed to answer.
 
 An unavailable history is never shown as zero visits, and no count appears for
 an answer that was not read.

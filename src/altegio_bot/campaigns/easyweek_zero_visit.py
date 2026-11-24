@@ -47,9 +47,17 @@ from typing import Any, Final, Mapping
 from altegio_bot.easyweek_locations import EasyWeekLocation
 from altegio_bot.easyweek_normalizer import (
     NormalizationError,
+    captured_customer_phone,
+    normalize_event,
     normalize_succeeded_customer_id,
     normalize_succeeded_event,
 )
+
+# Which triggers may carry the contact that proves WHO a delivery was about.
+# A repeat of the same ``booking-succeeded`` and the create/update deliveries of
+# the same booking, and nothing else: a cancellation says the booking ended, and
+# a reschedule is an update of times rather than of the person.
+CONTACT_EVENT_HINTS: Final = ("booking-created", "booking-succeeded", "booking-updated")
 
 # The excluded row's stable reason. Fits `campaign_recipients.excluded_reason`
 # (and `auto_excluded_reason`, where it is kept as audit after an operator
@@ -189,11 +197,29 @@ class ZeroVisitSourceBinding:
     # Always literally 0. Stored so the row states the number the delivery
     # carried instead of the screen asserting it.
     reported_visits_total: int = 0
+    # -- the captured contact, recorded SEPARATELY from the zero counter -----
+    # §44.2's second identity route needs a contact this workspace captured for
+    # this very booking. The zero-counter delivery does not always carry one: a
+    # repeat of the same booking, or its `booking-created`/`booking-updated`
+    # delivery, may. So which delivery the contact comes from is its own field,
+    # never conflated with `event_id`, which is the delivery whose COUNTER was
+    # zero. Set only when that is a different delivery; the source delivery's
+    # own contact needs no pointer.
+    #
+    # The number itself is deliberately NOT stored. A preview snapshot is not a
+    # contact store, and the check can read it back from the delivery it names.
+    contact_event_id: int | None = None
+    # How many DIFFERENT captured contacts the deliveries of this booking
+    # carried, as the preview saw them. 1 is usable. 0 means none did. More than
+    # one means the deliveries contradict each other about who this is, and that
+    # is recorded rather than resolved: choosing between them would choose a
+    # person. ``None`` for a row written before this was recorded.
+    contact_sources: int | None = None
 
 
 def zero_visit_source_meta(binding: ZeroVisitSourceBinding) -> dict[str, Any]:
     """The binding as it is stored: ids and a version, never a payload."""
-    return {
+    stored: dict[str, Any] = {
         "version": ZERO_VISIT_SOURCE_VERSION,
         "event_id": binding.event_id,
         "record_id": binding.record_id,
@@ -203,10 +229,77 @@ def zero_visit_source_meta(binding: ZeroVisitSourceBinding) -> dict[str, Any]:
         "distinct_sources": binding.distinct_sources,
         "reported_visits_total": binding.reported_visits_total,
     }
+    if binding.contact_sources is not None:
+        stored["contact_sources"] = binding.contact_sources
+    if binding.contact_event_id is not None:
+        stored["contact_event_id"] = binding.contact_event_id
+    return stored
 
 
 def _positive_int(value: object) -> int | None:
     return value if type(value) is int and value > 0 else None
+
+
+def _count_int(value: object) -> int | None:
+    """A stored count: an exact non-negative integer, or ``None``."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def captured_contact_phone(
+    *,
+    event_hint: str | None,
+    payload: object,
+    body_truncated: bool,
+    location_registry: Mapping[int, EasyWeekLocation],
+    company_id: int,
+    booking_uuid: uuid.UUID,
+    booking_id: int,
+    customer_id: int,
+) -> str | None:
+    """The contact one delivery captured, if that delivery is provably this one.
+
+    One rule, used by the preview when it records which delivery carries the
+    contact and by the check when it reads that delivery back, so the two can
+    never disagree. Everything must line up before the number is returned at
+    all: the branch (through the registry's ``location_id``/``location_uuid``
+    pair), the canonical booking UUID, the numeric booking id and the numeric
+    customer id. A delivery for somebody else's booking, for another branch, or
+    one that renames the customer, proves nothing about this person — §44.2 is
+    explicit that a booking's current details may not stand in for an older
+    event's missing ones.
+
+    ``None`` means "no usable contact here", never "no contact exists".
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        if event_hint == "booking-succeeded":
+            succeeded = normalize_succeeded_event(
+                event_hint=event_hint,
+                payload=payload,
+                body_truncated=body_truncated,
+                location_registry=location_registry,
+            )
+            identity = (succeeded.company_id, succeeded.booking_uuid, succeeded.booking_id)
+            captured_customer = normalize_succeeded_customer_id(payload)
+            phone = captured_customer_phone(payload)
+        else:
+            booking = normalize_event(
+                event_hint=event_hint,
+                payload=payload,
+                body_truncated=body_truncated,
+                location_registry=location_registry,
+            )
+            if booking is None or not booking.carries("phone_e164") or booking.customer_id is None:
+                return None
+            identity = (booking.company_id, booking.booking_uuid, booking.booking_id)
+            captured_customer = booking.customer_id
+            phone = booking.phone_e164
+    except NormalizationError:
+        return None
+    if identity != (company_id, booking_uuid, booking_id) or captured_customer != customer_id:
+        return None
+    return phone
 
 
 def read_zero_visit_source_meta(meta: object) -> ZeroVisitSourceBinding | None:
@@ -243,16 +336,33 @@ def read_zero_visit_source_meta(meta: object) -> ZeroVisitSourceBinding | None:
         return None
     if str(booking_uuid) != raw_uuid:
         return None
-    return ZeroVisitSourceBinding(booking_uuid=booking_uuid, **ids)
+    # The two contact fields are optional, because a row written before they
+    # existed is still a valid binding: it simply says nothing about a sibling
+    # delivery's contact, and the check then uses the source delivery's own.
+    # Present but unreadable is a different matter — a hand-edited or truncated
+    # blob — and refuses the whole binding rather than silently dropping it.
+    optional: dict[str, int | None] = {}
+    for field_name, reader in (("contact_event_id", _positive_int), ("contact_sources", _count_int)):
+        raw = stored.get(field_name)
+        if raw is None:
+            optional[field_name] = None
+            continue
+        value = reader(raw)
+        if value is None:
+            return None
+        optional[field_name] = value
+    return ZeroVisitSourceBinding(booking_uuid=booking_uuid, **ids, **optional)
 
 
 __all__ = [
+    "CONTACT_EVENT_HINTS",
     "ZERO_VISITS_REPORTED",
     "ZERO_VISITS_REPORTED_TEXT",
     "ZERO_VISIT_SOURCE_META_KEY",
     "ZERO_VISIT_SOURCE_VERSION",
     "ZeroVisitReport",
     "ZeroVisitSourceBinding",
+    "captured_contact_phone",
     "normalize_zero_visit_event",
     "payload_reports_zero_visits_total",
     "read_zero_visit_source_meta",

@@ -208,6 +208,11 @@ async def seed_person(
                 event = EasyWeekEvent(
                     status=event_status,
                     event_hint="booking-succeeded",
+                    # Capture fills this from the payload's `uid` (and the
+                    # reconciler backfills what it missed), so a synthetic
+                    # delivery that left it NULL would be a delivery production
+                    # never produces — and the contact lookup is keyed on it.
+                    booking_uuid=person.booking_uuid,
                     body_truncated=truncated,
                     payload=succeeded_payload(
                         booking_uuid=person.booking_uuid,

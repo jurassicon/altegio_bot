@@ -15,6 +15,7 @@ from altegio_bot.campaigns.easyweek_manual_identity import (
     KARLSRUHE_COMPANY_ID as KARLSRUHE_COMPANY_ID,
 )
 from altegio_bot.campaigns.easyweek_manual_identity import (
+    known_numeric_uuid_binding,
     lock_workspace_identity,
 )
 from altegio_bot.campaigns.easyweek_manual_recipient import prove_customer
@@ -61,18 +62,9 @@ async def needs_uuid_resolution(session, booking: NormalizedBooking, *, existing
 
 
 async def _known_binding(session, customer_id: int) -> tuple[uuid.UUID | None, bool]:
-    values = set(
-        (
-            await session.scalars(
-                select(Client.easyweek_customer_uuid).where(
-                    Client.provider == "easyweek",
-                    Client.altegio_client_id == customer_id,
-                    Client.easyweek_customer_uuid.is_not(None),
-                )
-            )
-        ).all()
-    )
-    return (next(iter(values)) if len(values) == 1 else None, len(values) > 1)
+    # One implementation of the workspace-wide correspondence, shared with the
+    # read-only diagnostic so neither can drift from the other.
+    return await known_numeric_uuid_binding(session, customer_id)
 
 
 def _customer_body(payload):

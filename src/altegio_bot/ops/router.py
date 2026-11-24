@@ -7358,12 +7358,24 @@ const ZERO_VISIT_REASONS = {
     "Не удалось подтвердить: личность клиента в EasyWeek не доказана.",
   "zero_visit_check_customer_identity_ambiguous":
     "Не удалось подтвердить: по этому контакту больше одной карточки.",
+  "zero_visit_check_identity_uuid_conflict":
+    "Не удалось подтвердить: конфликт идентификаторов клиента в EasyWeek.",
   "zero_visit_check_booking_reassigned":
     "Не удалось подтвердить: бронирование переназначено другому клиенту.",
   "zero_visit_check_history_unverified":
     "Не удалось проверить историю: ответ API неполный или некорректный.",
   "zero_visit_check_temporarily_unavailable":
     "Временно не удалось проверить историю: EasyWeek не ответил.",
+  // A permanent 4xx. Deliberately NOT in the temporary family: an operator
+  // told to retry a 403 would retry it forever.
+  "zero_visit_check_api_refused":
+    "Не удалось проверить историю: EasyWeek отказал в запросе.",
+  "zero_visit_check_api_response_malformed":
+    "Не удалось проверить историю: EasyWeek вернул ответ неожидаемого формата.",
+  // The deadline expired on OUR rows, before EasyWeek was asked at all. Saying
+  // "EasyWeek did not answer" here would send somebody to the wrong system.
+  "zero_visit_check_local_deadline":
+    "Проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался.",
   "manual_batch_rate_limit": "Предыдущая проверка ещё выполняется.",
   "manual_batch_input_invalid": "Некорректный запрос.",
   "manual_batch_provider_unavailable":

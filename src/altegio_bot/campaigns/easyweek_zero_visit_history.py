@@ -46,14 +46,27 @@ CURRENT card of the booking proves nothing on its own.
 
 The two identity branches §44.2 allows, and only those
 ------------------------------------------------------
-1. The stored numeric-to-UUID correspondence on the local card, when there is
-   one. The live booking must still name that same customer.
-2. Otherwise the contact **this delivery itself captured**, proven the long way:
-   a complete workspace-wide lookup of that number, exactly one customer on it,
-   a direct read of that customer's card, and agreement with the source record.
-   The captured number must be the one ingestion stored on the source client, so
-   it is historical evidence rather than the current owner's details, and a
-   number shared with a second local card refuses outright.
+1. The stored numeric-to-UUID correspondence, read **workspace-wide** through
+   the same rule the webhook bridge uses. One customer UUID may legitimately
+   hold cards in several proven branches, so a correspondence stored on another
+   branch's card identifies this person here as well; reading only the branch
+   card treated a known person as unknown. Two different UUIDs against one
+   numeric id is a conflict and stops here, and the live booking must still name
+   the same customer.
+2. Otherwise the contact **one of this booking's deliveries captured**, proven
+   the long way: a complete workspace-wide lookup of that number under this
+   module's stricter coverage contract, exactly one customer on it, a direct
+   read of that customer's card, and agreement with the source record. Which
+   delivery supplies the contact was decided by the preview and recorded on the
+   row; the captured number must still be the one ingestion stored on the source
+   client, so it is historical evidence rather than the current owner's details,
+   and a number shared with a second local card refuses outright.
+
+Because that lookup is a network call and the webhook bridge writes during it,
+the local identity facts — this branch's card included — are read a second time
+afterwards. A correspondence that appeared mid-lookup and names somebody else, a
+second card that has taken the proven UUID, and a card whose contact has since
+changed all stop the check before a single page of anybody's history is read.
 
 Nothing in the report, and nothing logged by it, contains a name, a phone, a
 UUID, a URL or a raw API body.
@@ -72,6 +85,7 @@ from sqlalchemy import select
 from altegio_bot.campaigns.easyweek_customer_history import (
     API_RETRYABLE_UNCERTAINTY,
     CUSTOMER_RESPONSE_MALFORMED,
+    CUSTOMER_UUID_MISMATCH,
     SOURCE_BOOKING_MALFORMED,
     CustomerHistoryReader,
     LiveProofDisposition,
@@ -80,16 +94,20 @@ from altegio_bot.campaigns.easyweek_customer_history import (
     read_customer_bookings,
 )
 from altegio_bot.campaigns.easyweek_eligibility import prove_event_record_client_link
+from altegio_bot.campaigns.easyweek_manual_identity import known_numeric_uuid_binding
 from altegio_bot.campaigns.easyweek_manual_recipient import CUSTOMER_AMBIGUOUS, prove_customer_identity
 from altegio_bot.campaigns.easyweek_zero_visit import (
     ZERO_VISITS_REPORTED,
     ZeroVisitSourceBinding,
+    captured_contact_phone,
     normalize_zero_visit_event,
     payload_reports_zero_visits_total,
     read_zero_visit_source_meta,
 )
+from altegio_bot.campaigns.easyweek_zero_visit_lookup import DiagnosticReader
+from altegio_bot.easyweek_client import EasyWeekError, EasyWeekProtocolError
 from altegio_bot.easyweek_locations import EasyWeekLocationRegistry, configured_easyweek_locations
-from altegio_bot.easyweek_normalizer import NormalizationError, captured_customer_phone
+from altegio_bot.easyweek_normalizer import NormalizationError
 from altegio_bot.models.models import (
     PROVIDER_EASYWEEK,
     RECIPIENT_BASIS_EARNED,
@@ -129,9 +147,29 @@ SOURCE_EVENT_UNPROVEN: Final = "zero_visit_check_source_event_unproven"
 SOURCE_EVENT_AMBIGUOUS: Final = "zero_visit_check_source_event_ambiguous"
 CUSTOMER_IDENTITY_UNPROVEN: Final = "zero_visit_check_customer_identity_unproven"
 CUSTOMER_IDENTITY_AMBIGUOUS: Final = "zero_visit_check_customer_identity_ambiguous"
+# The workspace itself disagrees about who this numeric customer is, or a second
+# card already owns the UUID the lookup proved. Its own code because it is the
+# one identity refusal that is neither "we could not read enough" nor "two
+# people share a number": the stored correspondence and the live answer point at
+# different customers, and no retry and no further read can settle it.
+IDENTITY_UUID_CONFLICT: Final = "zero_visit_check_identity_uuid_conflict"
 BOOKING_REASSIGNED: Final = "zero_visit_check_booking_reassigned"
 HISTORY_UNVERIFIED: Final = "zero_visit_check_history_unverified"
 TEMPORARILY_UNAVAILABLE: Final = "zero_visit_check_temporarily_unavailable"
+# A permanent 4xx from EasyWeek — 401, 403, 404, 422 — or an unusable API
+# configuration. The data may be fine; the call is not allowed or the resource
+# is not there. Kept apart from the temporary family precisely so the screen
+# never offers a retry that cannot work.
+API_REFUSED: Final = "zero_visit_check_api_refused"
+# A 2xx whose body is not the shape the endpoint promises. Also not temporary:
+# repeating a well-formed wrong answer returns the same wrong answer.
+API_RESPONSE_MALFORMED: Final = "zero_visit_check_api_response_malformed"
+# The deadline expired while the check was still reading our OWN rows, before a
+# single external call was attempted. Its own code because reporting it as
+# "EasyWeek did not answer" blames a branch that was never asked, and an
+# operator would go looking at the wrong system.
+LOCAL_DEADLINE: Final = "zero_visit_check_local_deadline"
+LOCAL_DEADLINE_DETAIL: Final = "zero_visit_check_local_phase_timeout"
 
 # Which of the two §44.2 branches produced the customer, reported so an operator
 # knows whether they are looking at a stored correspondence or at one proven
@@ -242,7 +280,8 @@ class _LocalFacts:
     client_id: int
     location_uuid: str
     # Exactly one of the two is set: the stored correspondence, or the contact
-    # this delivery captured and that ingestion stored on the source client.
+    # one of this booking's deliveries captured and that ingestion stored on the
+    # source client.
     stored_customer_uuid: uuid.UUID | None
     captured_phone: str | None
     company_id: int
@@ -250,6 +289,52 @@ class _LocalFacts:
 
 def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+async def _captured_contact(
+    session: Any,
+    *,
+    event: EasyWeekEvent,
+    binding: ZeroVisitSourceBinding,
+    company_id: int,
+    registry: EasyWeekLocationRegistry,
+) -> tuple[str | None, str]:
+    """The contact a delivery of THIS booking captured, or why there is none.
+
+    Which delivery is not decided here. The preview decided it, while it still
+    had the archive in front of it, and recorded two things: how many different
+    contacts the booking's deliveries carried, and — when the one contact came
+    from a sibling delivery rather than from the zero-counter one — which
+    delivery that was. Re-deciding now would let a delivery that arrived AFTER
+    the preview supply the contact, which is exactly the kind of substitution
+    §44.2 forbids.
+
+    ``contact_sources`` of anything but one is refused rather than resolved:
+    zero means nothing captured a contact for this booking, and more than one
+    means the deliveries contradict each other about who it was. A row written
+    before the count existed falls back to the zero-counter delivery's own
+    captured contact — the delivery the binding already names, which is not a
+    guess about anything.
+    """
+    if binding.contact_sources is not None and binding.contact_sources != 1:
+        return None, CUSTOMER_IDENTITY_UNPROVEN
+    contact_event = event
+    if binding.contact_event_id is not None and binding.contact_event_id != binding.event_id:
+        found = await session.get(EasyWeekEvent, binding.contact_event_id)
+        if found is None or found.status != "processed":
+            return None, CUSTOMER_IDENTITY_UNPROVEN
+        contact_event = found
+    phone = captured_contact_phone(
+        event_hint=contact_event.event_hint,
+        payload=contact_event.payload,
+        body_truncated=bool(contact_event.body_truncated),
+        location_registry=registry.locations,
+        company_id=company_id,
+        booking_uuid=binding.booking_uuid,
+        booking_id=binding.booking_id,
+        customer_id=binding.customer_id,
+    )
+    return (phone, CUSTOMER_IDENTITY_UNPROVEN)
 
 
 async def _local_facts(
@@ -385,15 +470,39 @@ async def _local_facts(
         ):
             return None, SOURCE_EVENT_UNPROVEN
 
-        stored_uuid = client.easyweek_customer_uuid
+        # §44.2 branch one, read the way the webhook bridge reads it: the
+        # numeric↔UUID correspondence is a property of the WORKSPACE, not of one
+        # branch's card. One customer UUID may hold cards in several proven
+        # branches, so a correspondence already stored on another branch's card
+        # identifies this person here too — treating them as unknown would send
+        # a known identity down the path that has to prove one from a contact.
+        known_uuid, workspace_conflict = await known_numeric_uuid_binding(session, binding.customer_id)
+        if workspace_conflict:
+            # Two different UUIDs stored against one numeric customer id. The
+            # webhook refuses this outright and so does this: the workspace
+            # holds contradictory bindings and neither can be preferred.
+            return None, IDENTITY_UUID_CONFLICT
+        branch_uuid = client.easyweek_customer_uuid
+        if branch_uuid is not None and known_uuid is not None and branch_uuid != known_uuid:
+            return None, IDENTITY_UUID_CONFLICT
+        stored_uuid = branch_uuid or known_uuid
         captured_phone: str | None = None
         if stored_uuid is None:
-            # §44.2 branch two. The contact must be the one THIS delivery
-            # captured and the one ingestion stored on this card: a number that
-            # does not match the card is not evidence about this client, and the
-            # current owner's details are explicitly not a substitute.
-            captured_phone = captured_customer_phone(event.payload)
-            if captured_phone is None or client.phone_e164 != captured_phone:
+            # §44.2 branch two. The contact must be one THIS BOOKING's
+            # deliveries captured and the one ingestion stored on this card: a
+            # number that does not match the card is not evidence about this
+            # client, and the current owner's details are explicitly not a
+            # substitute.
+            captured_phone, contact_reason = await _captured_contact(
+                session,
+                event=event,
+                binding=binding,
+                company_id=company_id,
+                registry=registry,
+            )
+            if captured_phone is None:
+                return None, contact_reason
+            if client.phone_e164 != captured_phone:
                 return None, CUSTOMER_IDENTITY_UNPROVEN
             shared = await session.scalar(
                 select(Client.id)
@@ -420,68 +529,164 @@ async def _local_facts(
         )
 
 
-async def _uuid_is_shared_locally(
+async def _recheck_local_identity(
     session_maker: Any,
     *,
-    company_id: int,
-    client_id: int,
+    facts: _LocalFacts,
     customer_uuid: uuid.UUID,
-) -> bool:
-    """Does another local card in this branch already hold this UUID?
+) -> str | None:
+    """Read the local identity facts again, after the external lookup.
 
-    Asked after the live proof, in a session of its own, so no lock is held
-    across a network call. A number proving out to a customer another card
-    already owns is an identity conflict: the two cards are either the same
-    person recorded twice or two people sharing a number, and neither licenses
-    showing one of them the other's history.
+    Why again
+    ---------
+    The lookup is a network call, and the webhook bridge writes while it is in
+    flight. A real sequence: the check starts with no correspondence stored
+    anywhere, so it goes looking for the person by the contact this booking
+    captured; mid-lookup an ingesting delivery proves and stores ``N → A`` on
+    this very card; the lookup comes back with ``B``. Every fact the check read
+    at the start was true when it read it, and the answer it is about to act on
+    is now wrong. Checking the card a second time is the only thing that
+    catches it, and it has to include the branch card itself — a recheck that
+    only looked at other branches would miss the write that landed here.
+
+    Still no lock held across the network: this is a short session of its own,
+    after the reads, exactly like the first one.
+
+    Four ways it can fail, none of them retryable:
+    * the workspace now holds contradictory correspondences for this numeric id;
+    * a correspondence now exists and names somebody other than the customer the
+      lookup proved;
+    * another card in this branch already owns that customer, so the two cards
+      are either one person twice or two people sharing a number; or
+    * the card no longer carries the contact the proof was built on, which means
+      the historical evidence this check used is no longer this card's.
     """
     async with session_maker() as session:
-        found = await session.scalar(
+        client = await session.get(Client, facts.client_id)
+        if client is None or client.provider != PROVIDER_EASYWEEK or client.company_id != facts.company_id:
+            return RECIPIENT_NOT_FOUND
+        known_uuid, workspace_conflict = await known_numeric_uuid_binding(session, facts.binding.customer_id)
+        if workspace_conflict:
+            return IDENTITY_UUID_CONFLICT
+        for candidate in (client.easyweek_customer_uuid, known_uuid):
+            if candidate is not None and candidate != customer_uuid:
+                return IDENTITY_UUID_CONFLICT
+        if facts.captured_phone is not None and client.phone_e164 != facts.captured_phone:
+            return CUSTOMER_IDENTITY_UNPROVEN
+        shared = await session.scalar(
             select(Client.id)
             .where(Client.provider == PROVIDER_EASYWEEK)
-            .where(Client.company_id == company_id)
+            .where(Client.company_id == facts.company_id)
             .where(Client.easyweek_customer_uuid == customer_uuid)
-            .where(Client.id != client_id)
+            .where(Client.id != facts.client_id)
             .limit(1)
         )
-    return found is not None
+    return CUSTOMER_IDENTITY_AMBIGUOUS if shared is not None else None
+
+
+def _api_family(exc: Exception, *, stage: str) -> tuple[str, str | None, bool]:
+    """``(reason, detail, retryable)`` for one failed EasyWeek read.
+
+    Four families, never collapsed, because each one tells an operator to do
+    something different:
+
+    * a 429, a 5xx, a timeout or an exhausted retry chain — temporary, retry;
+    * a permanent 4xx (401/403/404/422) or an unusable API configuration — the
+      call is refused or the resource is not there, and retrying cannot help;
+    * a 2xx whose body is not the promised shape — a contract problem; and
+    * anything our own strictness refused, which is handled by the caller.
+
+    The stable code comes from the shared classifier, so the detail an operator
+    can quote is the same one the PR-15 proof reports for the same failure.
+    """
+    detail, disposition = classify_read_failure(exc, stage=stage)
+    if disposition is LiveProofDisposition.RETRYABLE_UNCERTAINTY:
+        return TEMPORARILY_UNAVAILABLE, detail, True
+    if isinstance(exc, EasyWeekProtocolError):
+        return API_RESPONSE_MALFORMED, detail, False
+    if isinstance(exc, EasyWeekError):
+        return API_REFUSED, detail, False
+    return API_RESPONSE_MALFORMED, detail, False
+
+
+def _lookup_refusal(reader: DiagnosticReader, outcome_reason: str | None) -> tuple[str, str | None, bool]:
+    """Why the phone lookup produced no identity, in the operator's terms.
+
+    The shared proof deliberately answers with one refusal for every unreadable
+    lookup, which is right for a path that only needs "no". A diagnostic has to
+    say WHICH, so the typed exception the wrapper kept and the coverage refusal
+    it recorded are consulted here. Our own strictness is never reported as an
+    EasyWeek failure: a listing we would not trust is an unproven identity, not
+    an outage.
+    """
+    if outcome_reason == CUSTOMER_AMBIGUOUS:
+        return CUSTOMER_IDENTITY_AMBIGUOUS, None, False
+    if reader.refusal is not None:
+        return CUSTOMER_IDENTITY_UNPROVEN, reader.refusal, False
+    exc = reader.failure
+    if isinstance(exc, EasyWeekError):
+        return _api_family(exc, stage="customer")
+    return CUSTOMER_IDENTITY_UNPROVEN, None, False
 
 
 async def _prove_live_customer(
     facts: _LocalFacts,
     *,
-    reader: Any,
+    reader: DiagnosticReader,
     session_maker: Any,
-) -> tuple[uuid.UUID | None, str, str | None, bool]:
-    """``(customer_uuid, identity_source, refusal, retryable)``.
+) -> tuple[uuid.UUID | None, str, str | None, str | None, bool]:
+    """``(customer_uuid, identity_source, refusal, detail, retryable)``.
 
     Branch one is already proven locally and needs no read. Branch two is the
     full §44.2 proof, reusing the existing workspace lookup and direct card read
-    rather than restating either: complete pagination, exactly one customer on
-    the number, and the card read back at that number.
+    rather than restating either — complete pagination, exactly one customer on
+    the number, and the card read back at that number — under the diagnostic's
+    stricter coverage contract, and then rechecking the local identity facts the
+    lookup may have raced.
     """
     if facts.stored_customer_uuid is not None:
-        return facts.stored_customer_uuid, IDENTITY_VIA_STORED_UUID, None, False
-    assert facts.captured_phone is not None  # noqa: S101 - the local phase set exactly one
-    outcome = await prove_customer_identity(reader, phone=facts.captured_phone, require_name=False)
+        return facts.stored_customer_uuid, IDENTITY_VIA_STORED_UUID, None, None, False
+    phone = facts.captured_phone
+    if phone is None:  # pragma: no cover - the local phase sets exactly one
+        return None, IDENTITY_VIA_CAPTURED_CONTACT, CUSTOMER_IDENTITY_UNPROVEN, None, False
+    reader.expect_phone(phone)
+    outcome = await prove_customer_identity(reader, phone=phone, require_name=False)
     if outcome.customer is None:
-        if outcome.retryable:
-            return None, IDENTITY_VIA_CAPTURED_CONTACT, TEMPORARILY_UNAVAILABLE, True
-        if outcome.reason == CUSTOMER_AMBIGUOUS:
-            return None, IDENTITY_VIA_CAPTURED_CONTACT, CUSTOMER_IDENTITY_AMBIGUOUS, False
-        return None, IDENTITY_VIA_CAPTURED_CONTACT, CUSTOMER_IDENTITY_UNPROVEN, False
+        reason, detail, retryable = _lookup_refusal(reader, outcome.reason)
+        return None, IDENTITY_VIA_CAPTURED_CONTACT, reason, detail, retryable
     try:
         proven = uuid.UUID(outcome.customer.uuid)
     except (ValueError, AttributeError, TypeError):
-        return None, IDENTITY_VIA_CAPTURED_CONTACT, CUSTOMER_IDENTITY_UNPROVEN, False
-    if await _uuid_is_shared_locally(
-        session_maker,
-        company_id=facts.company_id,
-        client_id=facts.client_id,
-        customer_uuid=proven,
-    ):
-        return None, IDENTITY_VIA_CAPTURED_CONTACT, CUSTOMER_IDENTITY_AMBIGUOUS, False
-    return proven, IDENTITY_VIA_CAPTURED_CONTACT, None, False
+        return None, IDENTITY_VIA_CAPTURED_CONTACT, API_RESPONSE_MALFORMED, None, False
+    conflict = await _recheck_local_identity(session_maker, facts=facts, customer_uuid=proven)
+    if conflict is not None:
+        return None, IDENTITY_VIA_CAPTURED_CONTACT, conflict, None, False
+    return proven, IDENTITY_VIA_CAPTURED_CONTACT, None, None, False
+
+
+def _history_refusal(
+    reader: DiagnosticReader,
+    *,
+    bookings: Any,
+    fallback: str,
+) -> tuple[str, str | None, bool]:
+    """Why the history read produced no trustworthy set.
+
+    The shared reader reports WHAT could not be trusted and whether retrying
+    could help; it folds a permanent 4xx and a malformed body into one
+    "unreadable" code, because for its own purpose they are the same answer.
+    Here they are not, so the typed exception the wrapper kept decides the
+    family and ``fallback`` covers the cases that never involved an exception at
+    all — incomplete pagination, an inconsistent total, a row that did not
+    belong to this customer.
+    """
+    if bookings.retryable_uncertainty:
+        return TEMPORARILY_UNAVAILABLE, bookings.reason, True
+    exc = reader.failure
+    if isinstance(exc, EasyWeekError):
+        reason, detail, temporary = _api_family(exc, stage="history")
+        return reason, bookings.reason or detail, temporary
+    return fallback, bookings.reason, False
 
 
 def _source_state(bookings: tuple[Any, ...], *, booking_uuid: uuid.UUID) -> tuple[bool, str]:
@@ -502,7 +707,7 @@ async def _check(
     *,
     run_id: int,
     recipient_id: int,
-    reader: CustomerHistoryReader,
+    reader: DiagnosticReader,
     clock: datetime,
     registry: EasyWeekLocationRegistry,
     pause: Callable[[float], Awaitable[None]] | None,
@@ -525,13 +730,14 @@ async def _check(
     }
 
     # Everything below is network, and every database session above is closed.
-    customer_uuid, identity_source, refusal, retryable = await _prove_live_customer(
+    customer_uuid, identity_source, refusal, refusal_detail, retryable = await _prove_live_customer(
         facts, reader=reader, session_maker=session_maker
     )
     if customer_uuid is None:
         return ZeroVisitHistoryReport(
             False,
             reason=refusal,
+            detail_reason=refusal_detail,
             retryable=retryable,
             identity_source=identity_source,
             **base,
@@ -540,11 +746,10 @@ async def _check(
     try:
         booking_payload = await reader.get_booking(str(facts.binding.booking_uuid))
     except Exception as exc:  # noqa: BLE001 - a failed read is never a fact
-        detail, disposition = classify_read_failure(exc, stage="source")
-        temporary = disposition is LiveProofDisposition.RETRYABLE_UNCERTAINTY
+        reason, detail, temporary = _api_family(exc, stage="source")
         return ZeroVisitHistoryReport(
             False,
-            reason=TEMPORARILY_UNAVAILABLE if temporary else HISTORY_UNVERIFIED,
+            reason=reason,
             detail_reason=detail,
             retryable=temporary,
             identity_source=identity_source,
@@ -558,10 +763,10 @@ async def _check(
     ):
         # Not the booking we asked about, not this branch, or a body that does
         # not name a customer at all. None of them is a reassignment and none of
-        # them is a confirmation.
+        # them is a confirmation: it is a body that does not keep its contract.
         return ZeroVisitHistoryReport(
             False,
-            reason=HISTORY_UNVERIFIED,
+            reason=API_RESPONSE_MALFORMED,
             detail_reason=SOURCE_BOOKING_MALFORMED,
             identity_source=identity_source,
             **base,
@@ -579,11 +784,17 @@ async def _check(
         pause_sec=pause_sec,
     )
     if not bookings.identity_current:
-        temporary = bookings.retryable_uncertainty
+        reason, detail, temporary = _history_refusal(
+            reader,
+            bookings=bookings,
+            fallback=(
+                IDENTITY_UUID_CONFLICT if bookings.reason == CUSTOMER_UUID_MISMATCH else CUSTOMER_IDENTITY_UNPROVEN
+            ),
+        )
         return ZeroVisitHistoryReport(
             False,
-            reason=TEMPORARILY_UNAVAILABLE if temporary else CUSTOMER_IDENTITY_UNPROVEN,
-            detail_reason=bookings.reason or CUSTOMER_RESPONSE_MALFORMED,
+            reason=reason,
+            detail_reason=detail or CUSTOMER_RESPONSE_MALFORMED,
             retryable=temporary,
             identity_source=identity_source,
             pages_read=bookings.pages_read,
@@ -592,11 +803,11 @@ async def _check(
     if not bookings.complete:
         # Incomplete pagination, a timeout, a 429, a 5xx, a malformed row. The
         # counts stay None: an unread history is unknown, never zero.
-        temporary = bookings.retryable_uncertainty
+        reason, detail, temporary = _history_refusal(reader, bookings=bookings, fallback=HISTORY_UNVERIFIED)
         return ZeroVisitHistoryReport(
             False,
-            reason=TEMPORARILY_UNAVAILABLE if temporary else HISTORY_UNVERIFIED,
-            detail_reason=bookings.reason,
+            reason=reason,
+            detail_reason=detail,
             retryable=temporary,
             identity_source=identity_source,
             identity_confirmed=True,
@@ -641,31 +852,39 @@ async def check_zero_visit_history(
     """
     locations = registry or configured_easyweek_locations()
     clock = _as_utc(now or utcnow())
+    tracked = DiagnosticReader(reader)
     try:
         async with asyncio.timeout(CHECK_TIMEOUT_SEC):
             return await _check(
                 session_maker,
                 run_id=run_id,
                 recipient_id=recipient_id,
-                reader=reader,
+                reader=tracked,
                 clock=clock,
                 registry=locations,
                 pause=pause,
                 pause_sec=pause_sec,
             )
     except TimeoutError:
+        # Which half ran out of time decides what the operator is told. With no
+        # external call attempted, the deadline expired on our own rows and
+        # EasyWeek was never asked — reporting "EasyWeek did not answer" would
+        # send somebody to look at a branch that had nothing to do with it.
+        local_only = tracked.external_calls == 0
         return ZeroVisitHistoryReport(
             False,
             run_id,
             recipient_id,
-            reason=TEMPORARILY_UNAVAILABLE,
-            detail_reason=API_RETRYABLE_UNCERTAINTY,
+            reason=LOCAL_DEADLINE if local_only else TEMPORARILY_UNAVAILABLE,
+            detail_reason=LOCAL_DEADLINE_DETAIL if local_only else API_RETRYABLE_UNCERTAINTY,
             retryable=True,
             checked_at=clock.isoformat(),
         )
 
 
 __all__ = [
+    "API_REFUSED",
+    "API_RESPONSE_MALFORMED",
     "BOOKING_REASSIGNED",
     "BRANCH_UNKNOWN",
     "CHECK_PAUSE_SEC",
@@ -673,8 +892,11 @@ __all__ = [
     "CUSTOMER_IDENTITY_AMBIGUOUS",
     "CUSTOMER_IDENTITY_UNPROVEN",
     "HISTORY_UNVERIFIED",
+    "IDENTITY_UUID_CONFLICT",
     "IDENTITY_VIA_CAPTURED_CONTACT",
     "IDENTITY_VIA_STORED_UUID",
+    "LOCAL_DEADLINE",
+    "LOCAL_DEADLINE_DETAIL",
     "RECIPIENT_NOT_FOUND",
     "ROW_ALREADY_DECIDED",
     "ROW_NOT_ZERO_DIAGNOSTIC",
