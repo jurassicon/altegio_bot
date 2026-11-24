@@ -39,7 +39,7 @@ a fourth, step-only job:
 | `required-tests-heavy` | Required Tests (heavy shard) | exactly the 16 heaviest general modules, listed explicitly |
 | `required-tests-rest` | Required Tests (rest shard) | the whole test root **minus** the dedicated suites **minus** heavy **minus** the browser suite |
 | `required-tests-dedicated` | Required Tests (dedicated gates) | the four mandatory gates, under their env flags |
-| `required-tests-browser` | Required Tests (browser acceptance) | the §43 operator-UI acceptance suite, in a real Chromium |
+| `required-tests-browser` | Required Tests (browser acceptance) | the §43 operator-UI acceptance suite and the zero-counter operator messages, in a real Chromium |
 | `tests` | **Run Tests** | nothing — it aggregates the four above |
 
 The browser job is separate because it is the only suite that needs a browser
@@ -95,7 +95,7 @@ uv run pytest -q -m "not legacy_altegio" src/altegio_bot/tests/test_easyweek_inb
 Rest shard, exactly as `required-tests-rest` runs it:
 
 ```bash
-uv run pytest -q -m "not legacy_altegio" --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py --ignore=src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py --ignore=src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py --ignore=src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py --ignore=src/altegio_bot/tests/test_easyweek_migration_live_proof.py --ignore=src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py --ignore=src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py --ignore=src/altegio_bot/tests/test_easyweek_pr4_migration.py --ignore=src/altegio_bot/tests/test_easyweek_migration_apply.py --ignore=src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py --ignore=src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py --ignore=src/altegio_bot/tests/test_easyweek_manual_recipient.py --ignore=src/altegio_bot/tests/test_easyweek_visit_counter.py --ignore=src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py --ignore=src/altegio_bot/tests/test_easyweek_post_booking_handover.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_durability.py
+uv run pytest -q -m "not legacy_altegio" --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_db.py --ignore=src/altegio_bot/tests/test_easyweek_reminder_handover_safety.py --ignore=src/altegio_bot/tests/test_easyweek_migration_integration.py --ignore=src/altegio_bot/tests/test_nginx_webhook_logging_integration.py --ignore=src/altegio_bot/tests/test_easyweek_inbox_worker_integration.py --ignore=src/altegio_bot/tests/test_easyweek_outbox_pr5_integration.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_delivery_runner.py --ignore=src/altegio_bot/tests/test_easyweek_manual_voucher_canary.py --ignore=src/altegio_bot/tests/test_easyweek_migration_live_proof.py --ignore=src/altegio_bot/tests/test_easyweek_migration_rollback_recovery.py --ignore=src/altegio_bot/tests/test_chatwoot_branch_compose_contract.py --ignore=src/altegio_bot/tests/test_easyweek_pr4_migration.py --ignore=src/altegio_bot/tests/test_easyweek_migration_apply.py --ignore=src/altegio_bot/tests/test_easyweek_multi_service_snapshot_recovery.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_canary_runner.py --ignore=src/altegio_bot/tests/test_chatwoot_webhook_sanitization.py --ignore=src/altegio_bot/tests/test_easyweek_manual_recipient.py --ignore=src/altegio_bot/tests/test_easyweek_visit_counter.py --ignore=src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py --ignore=src/altegio_bot/tests/test_easyweek_post_booking_handover.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py --ignore=src/altegio_bot/tests/test_easyweek_zero_visit_browser.py --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_durability.py
 ```
 
 Legacy tier:
@@ -163,7 +163,9 @@ Browser acceptance gate, exactly as `required-tests-browser` runs it. The browse
 installed with `uv run playwright install chromium` first:
 
 ```bash
-ALTEGIO_REQUIRE_BROWSER_TESTS=1 uv run pytest -q src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py
+ALTEGIO_REQUIRE_BROWSER_TESTS=1 uv run pytest -q \
+  src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py \
+  src/altegio_bot/tests/test_easyweek_zero_visit_browser.py
 ```
 
 ## The `legacy_altegio` criterion

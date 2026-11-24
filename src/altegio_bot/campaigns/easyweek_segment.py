@@ -38,8 +38,10 @@ from altegio_bot.campaigns.easyweek_eligibility import (
 from altegio_bot.campaigns.easyweek_zero_visit import (
     ZERO_VISITS_REPORTED,
     ZeroVisitReport,
+    ZeroVisitSourceBinding,
     normalize_zero_visit_event,
     payload_reports_zero_visits_total,
+    zero_visit_source_meta,
 )
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_locations import (
@@ -108,6 +110,11 @@ class EasyWeekSourceProof:
 class EasyWeekCandidate:
     candidate: ClientCandidate
     proof: EasyWeekSourceProof | None = None
+    # The zero-counter diagnostic's binding, serialised, for the one kind of row
+    # that has one. Separate from ``proof`` because it is the opposite claim:
+    # ``proof`` says a first visit was proven, this says which delivery an
+    # operator has to go and look at.
+    zero_source: dict[str, object] | None = None
 
 
 @dataclass
@@ -137,7 +144,7 @@ class _Evidence:
 
 
 @dataclass(frozen=True)
-class ZeroVisitRow:
+class _ZeroVisitRow:
     """One delivery that reported the integer zero, with its proven chain."""
 
     event_id: int
@@ -150,7 +157,27 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _candidate(client: Client, *, phone: str | None, reason: str | None) -> ClientCandidate:
+def _candidate(
+    client: Client,
+    *,
+    phone: str | None,
+    reason: str | None,
+    evaluated: bool = True,
+) -> ClientCandidate:
+    """One row's snapshot counters.
+
+    ``evaluated`` says whether this row went through the proven-subset
+    evaluation — the service category, the counter and the whole local evidence
+    rule. Only then may the row claim a confirmed in-category visit, because
+    only then was one checked.
+
+    The zero-counter diagnostic never reaches that evaluation: it is attributed
+    and then stopped. Its record IS proven to exist inside the period, so
+    ``total_records_in_period`` stays 1, and every counter that would otherwise
+    assert a confirmed first visit in an allowed service category stays 0. A row
+    the operator is being asked to investigate must not also be a row the screen
+    describes as already proven.
+    """
     return ClientCandidate(
         client=ClientSnapshot(
             id=client.id,
@@ -162,9 +189,9 @@ def _candidate(client: Client, *, phone: str | None, reason: str | None) -> Clie
             wa_opted_out=client.wa_opted_out,
         ),
         total_records_in_period=1,
-        confirmed_records_in_period=1,
-        lash_records_in_period=1,
-        confirmed_lash_records_in_period=1,
+        confirmed_records_in_period=1 if evaluated else 0,
+        lash_records_in_period=1 if evaluated else 0,
+        confirmed_lash_records_in_period=1 if evaluated else 0,
         service_titles_in_period=[],
         records_before_period=0,
         records_after_period=0,
@@ -262,7 +289,7 @@ async def _resolve_record(
     return (None, BOOKING_IDENTITY_MISMATCH if numeric_collision is not None else MISSING_RECORD)
 
 
-async def resolve_zero_visit_row(
+async def _resolve_zero_visit_row(
     session: AsyncSession,
     *,
     event: EasyWeekEvent,
@@ -271,7 +298,7 @@ async def resolve_zero_visit_row(
     locations: Mapping[int, EasyWeekLocation],
     period_start: datetime,
     period_end: datetime,
-) -> ZeroVisitRow | None:
+) -> _ZeroVisitRow | None:
     """Can this zero-counter delivery be attributed to a person, or not at all?
 
     ``None`` means it cannot, and then nothing is shown: a truncated payload, a
@@ -322,7 +349,7 @@ async def resolve_zero_visit_row(
     # is proven, so it does not take over a case the segmenter can already name.
     if record.is_deleted is not False:
         return None
-    return ZeroVisitRow(event_id=event.id, report=report, record=record, client=client)
+    return _ZeroVisitRow(event_id=event.id, report=report, record=record, client=client)
 
 
 async def build_easyweek_segment(
@@ -348,7 +375,7 @@ async def build_easyweek_segment(
 
     result = EasyWeekSegmentResult(candidates=[])
     evidence_by_client: dict[tuple[str, int, int], list[_Evidence]] = defaultdict(list)
-    zero_by_client: dict[tuple[str, int, int], list[ZeroVisitRow]] = defaultdict(list)
+    zero_by_client: dict[tuple[str, int, int], list[_ZeroVisitRow]] = defaultdict(list)
     clock = now or utcnow()
 
     async with SessionLocal() as session:
@@ -388,7 +415,7 @@ async def build_easyweek_segment(
                 if exc.code == NormalizationError.VISITS_TOTAL_OUT_OF_RANGE and payload_reports_zero_visits_total(
                     payload
                 ):
-                    zero_row = await resolve_zero_visit_row(
+                    zero_row = await _resolve_zero_visit_row(
                         session,
                         event=event,
                         payload=payload,
@@ -497,6 +524,21 @@ async def build_easyweek_segment(
             continue
         rows = sorted(zero_by_client[key], key=lambda row: (row.event_id, str(row.report.booking_uuid)))
         representative = rows[0]
+        # Deliveries are not people and bookings are not deliveries. A replayed
+        # webhook repeats one booking and must change neither the row nor the
+        # count; two DIFFERENT zero-counter bookings for one card mean the
+        # question "which visit is this about?" has no single answer, and that
+        # fact is recorded now rather than rediscovered — or guessed at — when
+        # the row is opened.
+        distinct = {row.report.booking_uuid for row in rows}
+        binding = ZeroVisitSourceBinding(
+            event_id=representative.event_id,
+            record_id=representative.record.id,
+            booking_uuid=representative.report.booking_uuid,
+            booking_id=representative.report.booking_id,
+            customer_id=representative.report.customer_id,
+            distinct_sources=len(distinct),
+        )
         # Once per person, not once per delivery: a replayed webhook must not
         # produce a second row or a second reason in the recipient breakdown.
         _record_failure(result, ZERO_VISITS_REPORTED)
@@ -506,10 +548,13 @@ async def build_easyweek_segment(
                     representative.client,
                     phone=normalize_phone_candidate(representative.client.phone_e164),
                     reason=ZERO_VISITS_REPORTED,
+                    # Not evaluated: attributed and stopped. See `_candidate`.
+                    evaluated=False,
                 ),
                 # No source proof, ever. The delivery proved no first visit, and
                 # a proof here would be a number nobody reported.
                 proof=None,
+                zero_source=zero_visit_source_meta(binding),
             )
         )
 
@@ -528,7 +573,5 @@ __all__ = [
     "EasyWeekSegmentResult",
     "EasyWeekSegmentUnavailable",
     "SEGMENT_SOURCE",
-    "ZeroVisitRow",
     "build_easyweek_segment",
-    "resolve_zero_visit_row",
 ]

@@ -94,29 +94,67 @@ counts them twice: `zero_visits_total_reported_events` is deliveries and
 inflate the number of cards to review.
 
 The row is reviewed and excluded. It is not in the active audience, it does not
-change the voucher nominal, and it carries no source proof. A person the
+change the voucher nominal, and it carries no source proof. Its basis reads
+`auto` because that is the default for every non-manual row, so the screens show
+«первый визит не доказан» beside it and the recipients JSON answers
+`first_visit_proof_recorded: false`. It claims no confirmed visit in an allowed
+service category either, because none was ever checked for it. A person the
 segmenter already proved, or already excluded for a reason of its own, keeps
 that verdict: this row only exists for somebody who would otherwise have no row.
+
+**Which delivery the row is about.** The preview records it when it creates the
+row: the event id, the record id and the booking's identity, stored in the
+recipient's own snapshot and deliberately **not** in the five source-proof
+columns. Opening the row re-proves that chain and nothing else, so a
+zero-counter delivery that arrives later cannot become the source of a row that
+was written about a different visit. If the preview saw two different
+zero-counter bookings for one card, it records that too and the check refuses as
+ambiguous rather than picking one. A row from before this path existed has no
+binding, and the check says «источник не установлен» instead of guessing. The
+binding is never written onto an existing, manual or frozen row afterwards.
 
 **How to check the history.** Press **🔎 Проверить историю** on that row. The
 server takes the run id and the recipient id only, and re-derives the branch,
 the period, the client and the originating booking from its own rows; a customer
-UUID or phone number sent by the browser is refused. It then reads the source
-booking and that customer's complete booking history, read-only, with bounded
-time and bounded pagination.
+UUID or phone number sent by the browser is refused. One operator gets one check
+at a time. The identity comes from one of the two routes §44.2 allows: the
+stored numeric-to-UUID correspondence on the local card, or — when the card has
+none — the contact **that delivery itself captured**, resolved across the whole
+workspace to exactly one customer and then read back directly. The current
+owner of the booking is never used to supply a missing identity. It then reads
+the source booking and that customer's complete booking history, read-only,
+within one deadline that covers the local checks and the network together.
 
 A successful answer states the counter the delivery carried (0), the number of
-completed non-canceled visits in the full API history, whether the exact source
-booking is among them, whether anything is booked ahead, and the moment it was
-read. Otherwise it says «не удалось подтвердить» (the identity is not provable,
-or the booking has been reassigned to another customer) or «не удалось
-проверить» (incomplete pagination, a timeout, a 429/5xx, an API error). An
-unavailable history is never shown as zero visits.
+completed non-canceled visits in the full API history, what became of the exact
+source booking, whether anything is booked ahead, the moment it was read, and
+the state of the row as the server saw it while checking. The source booking's
+state is reported in its own words, because "in the history" and "counted as a
+completed visit" are two different facts: it is either completed and not
+canceled (counted), found but canceled, found but not finished, or not in the
+history at all.
 
-The check writes nothing: no status, no reason, no counter, no consent, no
-entitlement. Having looked at the row grants nothing — automatic eligibility
-still requires a source and current `visits_total` of exactly 1 with a paired
-timestamp, and reading the API produces neither.
+Three kinds of refusal, and they mean different things:
+
+- «не удалось подтвердить» — we will not say whose history this is. The source
+  event no longer attributes to this person, the booking has been reassigned,
+  the identity is unproven, or one contact resolves to more than one card.
+- «не удалось проверить» — the history itself could not be trusted: incomplete
+  pagination, a malformed body, a 404.
+- «временно не удалось проверить» — a 429, a 5xx or a timeout. Nothing is wrong
+  with the data and only this one is worth repeating.
+
+An unavailable history is never shown as zero visits, and no count appears for
+an answer that was not read.
+
+The check writes nothing: no status, no reason, no counter, no consent, no UUID,
+no phone, no entitlement. It holds no database lock while the API is read.
+Having looked at the row grants nothing — automatic eligibility still requires a
+source and current `visits_total` of exactly 1 with a paired timestamp, and
+reading the API produces neither. The screen says so on every answer, and a
+refusal says only that this check changed nothing: if another tab has already
+included the person, the refusal reports that decision instead of claiming the
+row is still excluded.
 
 **What a manual decision means.** If an operator decides to include the person,
 use the existing single **Add recipient** with their phone number. The same row

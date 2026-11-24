@@ -31,6 +31,7 @@ from altegio_bot.campaigns.easyweek_segment import build_easyweek_segment
 from altegio_bot.campaigns.easyweek_zero_visit import (
     ZERO_VISITS_REPORTED,
     payload_reports_zero_visits_total,
+    read_zero_visit_source_meta,
 )
 from altegio_bot.campaigns.runner import RunParams
 from altegio_bot.models.models import (
@@ -569,3 +570,137 @@ async def test_two_people_one_zero_one_proven_are_both_reported(session_maker, m
     assert by_client[zero.client_id].candidate.excluded_reason == ZERO_VISITS_REPORTED
     assert result.coverage["eligible_unique_clients"] == 1
     assert result.coverage["zero_visits_total_unique_clients"] == 1
+
+
+# ===========================================================================
+# 8. The preview records which delivery the row came from — review round 1
+# ===========================================================================
+
+
+async def test_the_row_carries_the_binding_of_the_delivery_it_came_from(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ids and a version, stored apart from the five earned-proof columns.
+
+    The binding exists so that opening the row re-proves the chain the preview
+    decided on, instead of re-deriving a new one that a later delivery could
+    have changed.
+    """
+    person = await seed_person(session_maker, 1)
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.event_id == person.event_ids[0]
+    assert stored.record_id == person.record_id
+    assert stored.booking_uuid == person.booking_uuid
+    assert stored.booking_id == person.booking_id
+    assert stored.customer_id == person.customer_id
+    assert stored.distinct_sources == 1
+    assert stored.reported_visits_total == 0
+    # Separate from the proof, and the row still has none of it.
+    assert rows[0].source_easyweek_event_id is None
+
+
+async def test_a_replayed_delivery_is_still_one_source(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three deliveries of ONE booking are one source, not three."""
+    person = await seed_person(session_maker, 1, deliveries=3)
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    assert len(rows) == 1
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.distinct_sources == 1
+    # The earliest delivery of that booking is the one recorded.
+    assert stored.event_id == min(person.event_ids)
+
+
+async def test_two_zero_counter_bookings_record_the_ambiguity(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two different zero-counter visits for one card: recorded, not resolved."""
+    person = await seed_person(session_maker, 1)
+    second_booking = uuid.UUID(int=0x7100_0001, version=4)
+    async with session_maker() as session:
+        async with session.begin():
+            session.add(
+                Record(
+                    provider=PROVIDER_EASYWEEK,
+                    company_id=COMPANY_ID,
+                    altegio_record_id=person.booking_id + 1,
+                    easyweek_booking_uuid=second_booking,
+                    client_id=person.client_id,
+                    altegio_client_id=person.customer_id,
+                    starts_at=START + timedelta(days=2),
+                    is_deleted=False,
+                    raw=record_raw(),
+                )
+            )
+            session.add(
+                EasyWeekEvent(
+                    status="processed",
+                    event_hint="booking-succeeded",
+                    body_truncated=False,
+                    payload=succeeded_payload(
+                        booking_uuid=second_booking,
+                        booking_id=person.booking_id + 1,
+                        customer_id=person.customer_id,
+                        visits_total=0,
+                    ),
+                    payload_hash=f"event-{uuid.uuid4()}",
+                )
+            )
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    # Still one person, one row, one reason.
+    assert len(rows) == 1
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.distinct_sources == 2
+
+
+async def test_the_diagnostic_row_claims_no_confirmed_in_category_visit(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It never went through the evaluation, so it asserts nothing about it."""
+    await seed_person(session_maker, 1)
+    result = await _segment(session_maker, monkeypatch)
+
+    candidate = result.candidates[0].candidate
+    # The source record IS proven to exist inside the period.
+    assert candidate.total_records_in_period == 1
+    # Nothing else was checked, so nothing else is claimed.
+    assert candidate.confirmed_records_in_period == 0
+    assert candidate.lash_records_in_period == 0
+    assert candidate.confirmed_lash_records_in_period == 0
+    assert candidate.service_titles_in_period == []
+
+
+async def test_a_proven_candidate_keeps_its_evaluated_counters(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ordinary earned row is untouched by the diagnostic's own shape."""
+    await seed_person(session_maker, 1, visits_total=1, local_counter=1, local_stamp=STAMP)
+    result = await _segment(session_maker, monkeypatch)
+
+    candidate = result.candidates[0].candidate
+    assert result.candidates[0].proof is not None
+    assert result.candidates[0].zero_source is None
+    assert candidate.confirmed_records_in_period == 1
+    assert candidate.lash_records_in_period == 1
+    assert candidate.confirmed_lash_records_in_period == 1
+
+
+async def test_an_excluded_ordinary_row_carries_no_binding(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the zero-counter diagnostic gets one."""
+    await seed_person(session_maker, 1, visits_total=1, local_counter=1, local_stamp=STAMP, opted_out=True)
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    assert len(rows) == 1
+    assert rows[0].excluded_reason == OPTED_OUT
+    assert read_zero_visit_source_meta(rows[0].meta) is None
+    assert rows[0].meta == {}

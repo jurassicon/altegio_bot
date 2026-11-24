@@ -157,6 +157,19 @@ def _api_refusal(exc: Exception, *, stage: str, pages_read: int = 0) -> Customer
     return _refusal(SOURCE_BOOKING_MALFORMED, pages_read=pages_read)
 
 
+def classify_read_failure(exc: Exception, *, stage: str) -> tuple[str, LiveProofDisposition]:
+    """One read's failure as a stable code plus whether retrying could help.
+
+    The same classification the PR-15 proof uses, exposed for callers that need
+    the DISPOSITION rather than the whole verdict. A 429, a 5xx, a timeout and
+    an exhausted retry chain are a temporary inability to check; a 404, an auth
+    refusal and a malformed body are not, and telling an operator "try again"
+    for one of those would be advice that can never work.
+    """
+    result = _api_refusal(exc, stage=stage)
+    return result.reason or SOURCE_BOOKING_MALFORMED, result.disposition
+
+
 def _source_booking(
     payload: object,
     *,

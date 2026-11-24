@@ -137,10 +137,124 @@ def normalize_zero_visit_event(
     )
 
 
+# ---------------------------------------------------------------------------
+# The durable diagnostic binding
+# ---------------------------------------------------------------------------
+# Why this exists at all
+# ----------------------
+# The row is written when the preview is built; it is opened days later. In
+# between, a replay, a reassignment or a second zero-counter delivery can change
+# what "the delivery behind this row" resolves to. Re-deriving the source at
+# open time therefore answered a different question than the one the row was
+# created from, and a LATER booking B could become the source of row A.
+#
+# So the preview records which delivery and which record it attributed, once, at
+# the moment it decided. Opening the row re-proves exactly that chain and
+# nothing else.
+#
+# Why `meta` and not new columns
+# ------------------------------
+# This is a diagnostic link, not proof. The five `source_*` columns are the
+# earned-first-visit proof and carry database CHECK constraints that forbid them
+# on anything but an eligible row; putting the diagnostic there — or beside them
+# in a shape those constraints treat the same way — is exactly the confusion the
+# whole path exists to avoid. `meta` is the existing per-recipient snapshot
+# store, it needs no migration, and nothing in the voucher, basis or entitlement
+# rules reads it. The separation is the point: a row can have this binding and
+# still be unable to hold a proof.
+ZERO_VISIT_SOURCE_META_KEY: Final = "easyweek_zero_visit_source"
+
+# Bumped only if the stored shape changes meaning. An unknown version reads as
+# "no binding", which refuses rather than guesses.
+ZERO_VISIT_SOURCE_VERSION: Final = 1
+
+
+@dataclass(frozen=True)
+class ZeroVisitSourceBinding:
+    """Which delivery and which record this diagnostic row was attributed to.
+
+    ``distinct_sources`` is how many different zero-counter bookings the
+    segmenter could have attributed to this person when it built the row. One is
+    the ordinary case. More than one is recorded rather than resolved: picking
+    the lowest id would answer "which visit is this about?" by coin toss, and an
+    operator has to be told that the question itself is ambiguous.
+    """
+
+    event_id: int
+    record_id: int
+    booking_uuid: uuid.UUID
+    booking_id: int
+    customer_id: int
+    distinct_sources: int = 1
+    # Always literally 0. Stored so the row states the number the delivery
+    # carried instead of the screen asserting it.
+    reported_visits_total: int = 0
+
+
+def zero_visit_source_meta(binding: ZeroVisitSourceBinding) -> dict[str, Any]:
+    """The binding as it is stored: ids and a version, never a payload."""
+    return {
+        "version": ZERO_VISIT_SOURCE_VERSION,
+        "event_id": binding.event_id,
+        "record_id": binding.record_id,
+        "booking_uuid": str(binding.booking_uuid),
+        "booking_id": binding.booking_id,
+        "customer_id": binding.customer_id,
+        "distinct_sources": binding.distinct_sources,
+        "reported_visits_total": binding.reported_visits_total,
+    }
+
+
+def _positive_int(value: object) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def read_zero_visit_source_meta(meta: object) -> ZeroVisitSourceBinding | None:
+    """Read a stored binding back, or ``None`` for "source not established".
+
+    Strict on purpose, and ``None`` for every doubt: a row written before this
+    path existed, a row an operator's decision rewrote, a truncated or
+    hand-edited blob, an unknown version, a non-canonical uuid, or a counter
+    that is not the integer zero. Every one of them means we cannot say which
+    delivery the row came from, and saying so is the only safe answer — a
+    guessed source would read one person's history against another's row.
+    """
+    if not isinstance(meta, dict):
+        return None
+    stored = meta.get(ZERO_VISIT_SOURCE_META_KEY)
+    if not isinstance(stored, dict) or stored.get("version") != ZERO_VISIT_SOURCE_VERSION:
+        return None
+    ids: dict[str, int] = {}
+    for field_name in ("event_id", "record_id", "booking_id", "customer_id", "distinct_sources"):
+        value = _positive_int(stored.get(field_name))
+        if value is None:
+            return None
+        ids[field_name] = value
+    counter = stored.get("reported_visits_total")
+    # `False == 0` in Python, so the type is checked as well as the value.
+    if type(counter) is not int or counter != 0:
+        return None
+    raw_uuid = stored.get("booking_uuid")
+    if not isinstance(raw_uuid, str):
+        return None
+    try:
+        booking_uuid = uuid.UUID(raw_uuid)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if str(booking_uuid) != raw_uuid:
+        return None
+    return ZeroVisitSourceBinding(booking_uuid=booking_uuid, **ids)
+
+
 __all__ = [
     "ZERO_VISITS_REPORTED",
     "ZERO_VISITS_REPORTED_TEXT",
+    "ZERO_VISIT_SOURCE_META_KEY",
+    "ZERO_VISIT_SOURCE_VERSION",
     "ZeroVisitReport",
+    "ZeroVisitSourceBinding",
     "normalize_zero_visit_event",
     "payload_reports_zero_visits_total",
+    "read_zero_visit_source_meta",
+    "zero_visit_source_meta",
 ]

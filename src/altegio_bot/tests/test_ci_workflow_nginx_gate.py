@@ -58,6 +58,12 @@ DEDICATED_JOB = "required-tests-dedicated"
 BROWSER_JOB = "required-tests-browser"
 BROWSER_GATE_ENV = "ALTEGIO_REQUIRE_BROWSER_TESTS"
 BROWSER_SUITE = "src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py"
+# The zero-counter row's operator messages are assembled in the page's own
+# JavaScript, so the only place they can be proven is a browser. It joins the
+# browser job rather than growing a marker, and the rest shard subtracts it for
+# the same reason it subtracts the suite above.
+ZERO_VISIT_BROWSER_SUITE = "src/altegio_bot/tests/test_easyweek_zero_visit_browser.py"
+BROWSER_SUITES = (BROWSER_SUITE, ZERO_VISIT_BROWSER_SUITE)
 # §43's migration cycle, under its own mandatory flag in the dedicated job.
 VOUCHER_MIGRATION_GATE_ENV = "ALTEGIO_REQUIRE_VOUCHER_MAILING_MIGTEST"
 VOUCHER_MIGRATION_SUITE = "src/altegio_bot/tests/test_easyweek_voucher_mailing_durability.py"

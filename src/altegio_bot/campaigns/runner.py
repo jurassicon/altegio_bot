@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.altegio_loyalty import AltegioLoyaltyClient
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
+from altegio_bot.campaigns.easyweek_zero_visit import ZERO_VISIT_SOURCE_META_KEY
 from altegio_bot.campaigns.loyalty_cleanup import (
     cleanup_campaign_cards,
     make_card_number,
@@ -250,6 +251,15 @@ def _build_recipient(
         source_booking_uuid=candidate.source_booking_uuid,
         source_visits_total=candidate.source_visits_total,
         source_visits_total_updated_at=candidate.source_visits_total_updated_at,
+        # Only the zero-counter diagnostic has one, and only on the preview that
+        # created the row: it says which delivery and which record this row was
+        # attributed to, so opening it later re-proves that chain instead of
+        # re-deriving a new one. Ids only — never a payload, a phone or a UUID.
+        meta=(
+            {ZERO_VISIT_SOURCE_META_KEY: candidate.easyweek_zero_visit_source}
+            if candidate.easyweek_zero_visit_source is not None
+            else {}
+        ),
     )
     return recipient
 
@@ -359,6 +369,7 @@ async def run_preview(params: RunParams) -> CampaignRun:
                 candidate.source_booking_uuid = item.proof.booking_uuid
                 candidate.source_visits_total = item.proof.visits_total
                 candidate.source_visits_total_updated_at = item.proof.visits_total_updated_at
+            candidate.easyweek_zero_visit_source = item.zero_source
             candidates.append(candidate)
         source_meta = segment.safe_meta()
     else:

@@ -615,6 +615,24 @@ async def _recipient_request(request: Request, schema: type[BaseModel]) -> BaseM
 _MANUAL_BATCH_IN_FLIGHT: set[str] = set()
 
 
+def _claim_manual_slot(account: str) -> bool:
+    """Take this operator's single slot, or report that it is taken.
+
+    The check and the take are one step with no ``await`` between them, which on
+    a single event loop is what makes them atomic. Splitting them around a body
+    read is how two concurrent requests both passed the check and both ran: the
+    first one to finish then released the slot the second was still holding, so
+    a third request could join as well.
+
+    Only the request that took the slot may release it — see the callers, which
+    enter their ``try``/``finally`` only after this returns ``True``.
+    """
+    if account in _MANUAL_BATCH_IN_FLIGHT:
+        return False
+    _MANUAL_BATCH_IN_FLIGHT.add(account)
+    return True
+
+
 async def _manual_batch_action(request: Request, *, confirm: bool) -> JSONResponse:
     principal, refusal = _principal_or_error(request)
     if refusal is not None or principal is None:
@@ -630,9 +648,8 @@ async def _manual_batch_action(request: Request, *, confirm: bool) -> JSONRespon
         payload = None
     if payload is None:
         return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
-    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+    if not _claim_manual_slot(principal.account):
         return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
-    _MANUAL_BATCH_IN_FLIGHT.add(principal.account)
     redact_easyweek_url_logging()
     try:
         async with EasyWeekClient() as reader:
@@ -700,7 +717,11 @@ async def api_zero_visit_history(request: Request) -> JSONResponse:
         payload = None
     if not isinstance(payload, ZeroVisitHistoryRequest):
         return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
-    _MANUAL_BATCH_IN_FLIGHT.add(principal.account)
+    # Taken AFTER the body read and in the same step as the check, so two
+    # concurrent clicks cannot both get through, and released below only by the
+    # request that took it.
+    if not _claim_manual_slot(principal.account):
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
     redact_easyweek_url_logging()
     try:
         async with EasyWeekClient() as reader:

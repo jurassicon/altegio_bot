@@ -56,6 +56,7 @@ from altegio_bot.campaigns.easyweek_manual_identity import (
 )
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_migration.customer_api import (
+    DETAIL_TRANSPORT,
     LOOKUP_ABSENT,
     LOOKUP_AMBIGUOUS,
     LOOKUP_FIRST_NAME_MISSING,
@@ -215,9 +216,33 @@ class _CompleteCustomerLookup:
         return payload
 
 
+@dataclass(frozen=True)
+class CustomerProofOutcome:
+    """The identity proof plus whether a failure was temporary.
+
+    ``retryable`` is true only for a 429, a 5xx, a timeout or an exhausted retry
+    chain. Incomplete pagination, a malformed body, an auth refusal, an absence
+    and an ambiguity are all answers rather than outages: repeating the call
+    would return the same thing. A screen that says "try again later" for one of
+    those is telling an operator to wait for something that will not change.
+    """
+
+    customer: ProvenCustomer | None
+    reason: str | None = None
+    retryable: bool = False
+
+
 async def prove_customer(
     reader: CustomerReader, *, phone: str, require_name: bool = True
 ) -> tuple[ProvenCustomer | None, str | None]:
+    """The historical two-value contract. See :func:`prove_customer_identity`."""
+    outcome = await prove_customer_identity(reader, phone=phone, require_name=require_name)
+    return outcome.customer, outcome.reason
+
+
+async def prove_customer_identity(
+    reader: CustomerReader, *, phone: str, require_name: bool = True
+) -> CustomerProofOutcome:
     """Resolve a number to exactly one customer, then read that customer back.
 
     Two reads, deliberately. The listing answers "who has this number?" across
@@ -233,48 +258,49 @@ async def prove_customer(
     """
     try:
         lookup = await lookup_customer_by_phone(_CompleteCustomerLookup(reader), phone)
-    except Exception:  # noqa: BLE001 - unavailable lookup is never an absence
-        return None, CUSTOMER_UNPROVEN
+    except Exception as exc:  # noqa: BLE001 - unavailable lookup is never an absence
+        return CustomerProofOutcome(None, CUSTOMER_UNPROVEN, retryable=bool(getattr(exc, "retryable", False)))
     if lookup.outcome == LOOKUP_PHONE_UNUSABLE:
-        return None, PHONE_UNUSABLE
+        return CustomerProofOutcome(None, PHONE_UNUSABLE)
     if lookup.outcome == LOOKUP_ABSENT:
         # No customer, and this path does not create one: a POST here would
         # invent a person in a production workspace on the strength of a typo.
-        return None, CUSTOMER_ABSENT
+        return CustomerProofOutcome(None, CUSTOMER_ABSENT)
     if lookup.outcome == LOOKUP_AMBIGUOUS:
         # One number, two customers — a couple, a family phone, a duplicated
         # import. Picking the first would pick a person.
-        return None, CUSTOMER_AMBIGUOUS
+        return CustomerProofOutcome(None, CUSTOMER_AMBIGUOUS)
     if lookup.outcome == LOOKUP_FIRST_NAME_MISSING and require_name:
-        return None, CUSTOMER_NAME_MISSING
+        return CustomerProofOutcome(None, CUSTOMER_NAME_MISSING)
     if lookup.outcome not in (LOOKUP_FOUND, LOOKUP_FIRST_NAME_MISSING) or lookup.uuid is None or lookup.phone is None:
         # Undetermined: transport, auth, malformed, incomplete pagination. The
-        # workspace was not read, so nothing about it is known.
-        return None, CUSTOMER_UNPROVEN
+        # workspace was not read, so nothing about it is known. Only the
+        # transport detail is worth retrying; the rest would come back the same.
+        return CustomerProofOutcome(None, CUSTOMER_UNPROVEN, retryable=lookup.detail == DETAIL_TRANSPORT)
 
     try:
         payload = await reader.get_customer(lookup.uuid)
         if not isinstance(payload, dict):
-            return None, CUSTOMER_UNPROVEN
+            return CustomerProofOutcome(None, CUSTOMER_UNPROVEN)
         if "data" in payload and not isinstance(payload["data"], dict):
-            return None, CUSTOMER_UNPROVEN
+            return CustomerProofOutcome(None, CUSTOMER_UNPROVEN)
         body = payload["data"] if "data" in payload else payload
         card = read_customer_card(body, expected_phone=lookup.phone)
-    except Exception:  # noqa: BLE001 - every read failure is the same refusal
-        return None, CUSTOMER_UNPROVEN
+    except Exception as exc:  # noqa: BLE001 - every read failure is the same refusal
+        return CustomerProofOutcome(None, CUSTOMER_UNPROVEN, retryable=bool(getattr(exc, "retryable", False)))
 
     if card.uuid != lookup.uuid or card.phone != lookup.phone:
-        return None, CUSTOMER_UNPROVEN
+        return CustomerProofOutcome(None, CUSTOMER_UNPROVEN)
     first_name = (card.first_name or "").strip()
     if require_name and (not first_name or len(first_name) > 256):
         # The delivery template has a name slot. An empty one either fails at
         # Meta or reaches a customer as a blank.
-        return None, CUSTOMER_NAME_MISSING
+        return CustomerProofOutcome(None, CUSTOMER_NAME_MISSING)
     # Real booking ingestion only needs UUID/phone identity; the normalizer
     # already owns its display name. Voucher paths keep requiring a usable name.
     if not require_name and len(first_name) > 256:
         first_name = ""
-    return ProvenCustomer(uuid=card.uuid, phone=card.phone, first_name=first_name), None
+    return CustomerProofOutcome(ProvenCustomer(uuid=card.uuid, phone=card.phone, first_name=first_name))
 
 
 async def _one_local_client(session: AsyncSession, *, company_id: int, phone: str) -> tuple[Client | None, str | None]:

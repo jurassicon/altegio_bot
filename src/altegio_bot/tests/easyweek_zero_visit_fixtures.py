@@ -94,6 +94,7 @@ def succeeded_payload(
     location_id: int = COMPANY_ID,
     location_uuid: str = LOCATION_UUID,
     omit_visits_total: bool = False,
+    customer_phone: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "uid": str(booking_uuid),
@@ -102,6 +103,11 @@ def succeeded_payload(
         "location_uuid": location_uuid,
         "customer_id": customer_id,
     }
+    if customer_phone is not None:
+        # The contact the delivery itself captured. §44.2 allows an identity to
+        # be proven from it when no numeric-to-UUID correspondence was stored;
+        # off by default so a test says explicitly which world it is in.
+        payload["customer_phone"] = customer_phone
     if not omit_visits_total:
         payload["visits_total"] = visits_total
     return payload
@@ -146,6 +152,8 @@ async def seed_person(
     payload_location_id: int = COMPANY_ID,
     payload_location_uuid: str = LOCATION_UUID,
     customer_uuid: uuid.UUID | None = None,
+    capture_phone: bool = False,
+    card_phone: str | None = None,
 ) -> Person:
     person = Person(index)
     async with session_maker() as session:
@@ -158,7 +166,7 @@ async def seed_person(
                 easyweek_identity_assigned_at=(
                     NOW if customer_uuid is not None and client_provider == PROVIDER_EASYWEEK else None
                 ),
-                phone_e164=person.phone,
+                phone_e164=person.phone if card_phone is None else card_phone,
                 display_name=person.name,
                 raw={},
                 wa_opted_out=opted_out,
@@ -209,6 +217,7 @@ async def seed_person(
                         location_id=payload_location_id,
                         location_uuid=payload_location_uuid,
                         omit_visits_total=omit_visits_total,
+                        customer_phone=person.phone if capture_phone else None,
                     ),
                     payload_hash=f"event-{uuid.uuid4()}",
                 )
