@@ -69,6 +69,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     APPROVED_ISSUER_DISPLAY_NAME,
     APPROVED_ISSUER_DISPLAY_NAME_GENITIVE,
 )
+from altegio_bot.campaigns.easyweek_zero_visit_history import check_zero_visit_history
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
@@ -141,6 +142,21 @@ class CompositionRequest(BaseModel):
 
 
 class ExcludeRecipientRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_run_id: int = Field(gt=0)
+    campaign_recipient_id: int = Field(gt=0)
+
+
+class ZeroVisitHistoryRequest(BaseModel):
+    """Two ids and nothing else.
+
+    ``extra="forbid"`` is load bearing. A request that tried to supply a customer
+    UUID, a phone number or a booking UUID is refused by name rather than having
+    the extra field ignored, because "ignored" is indistinguishable from
+    "accepted" to whoever reads this next.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     preview_run_id: int = Field(gt=0)
@@ -661,6 +677,51 @@ async def api_check_recipients(request: Request) -> JSONResponse:
 async def api_confirm_recipients(request: Request) -> JSONResponse:
     """Apply the exact server-owned subset after live revalidation, atomically."""
     return await _manual_batch_action(request, confirm=True)
+
+
+@router.post("/api/recipients/zero-visit-history")
+async def api_zero_visit_history(request: Request) -> JSONResponse:
+    """Read what EasyWeek says now about one zero-counter row. Writes nothing.
+
+    Same door as every other action here — session, CSRF, same origin — because
+    it spends somebody else's API budget even though it changes nothing locally.
+    The answer is facts and a timestamp; it is never an authorisation, and the
+    row, its reason, its basis and the audience are untouched by it.
+    """
+    principal, refusal = _principal_or_error(request)
+    if refusal is not None or principal is None:
+        return refusal or _session_error(OpsSessionError("ops_session_invalid"))
+    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
+    try:
+        async with asyncio.timeout(10):
+            payload = await _recipient_request(request, ZeroVisitHistoryRequest)
+    except TimeoutError:
+        payload = None
+    if not isinstance(payload, ZeroVisitHistoryRequest):
+        return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
+    _MANUAL_BATCH_IN_FLIGHT.add(principal.account)
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as reader:
+            report = await check_zero_visit_history(
+                SessionLocal,
+                run_id=payload.preview_run_id,
+                recipient_id=payload.campaign_recipient_id,
+                reader=reader,
+            )
+        result = report.as_safe_dict()
+    except (EasyWeekError, TimeoutError):
+        result = {"ok": False, "reason": "manual_batch_provider_unavailable"}
+    except SQLAlchemyError:
+        result = {"ok": False, "reason": "manual_batch_database_unavailable"}
+    finally:
+        _MANUAL_BATCH_IN_FLIGHT.discard(principal.account)
+    return JSONResponse(
+        status_code=200 if result.get("ok") else 409,
+        content=result,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/api/recipients")

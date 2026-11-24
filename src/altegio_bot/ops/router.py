@@ -28,6 +28,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.ledger import (
     preview_is_locked_by_voucher_production,
     production_batch_id_for_preview,
 )
+from altegio_bot.campaigns.easyweek_zero_visit import ZERO_VISITS_REPORTED, ZERO_VISITS_REPORTED_TEXT
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
@@ -137,6 +138,21 @@ def _error_cell(error: str | None) -> str:
         badge = '<span class="badge bg-info text-dark me-1">suppressed 131026</span>'
         cell = badge + cell
     return cell
+
+
+def _excluded_reason_cell(reason: str | None) -> str:
+    """The reason an operator reads, with the stable code still available.
+
+    Only the zero-counter reason gets a sentence so far, because it is the only
+    exclusion whose next step is an operator action rather than a fact: every
+    other code says "this person is not in the audience", and this one says
+    "somebody has to look at this card".
+    """
+    if not reason:
+        return "&mdash;"
+    if reason == ZERO_VISITS_REPORTED:
+        return f'<span class="text-warning-emphasis" title="{_esc(reason)}">{_esc(ZERO_VISITS_REPORTED_TEXT)}</span>'
+    return _esc(reason)
 
 
 def _basis_badge(recipient: CampaignRecipient, *, with_audit_column: bool = False) -> str:
@@ -7026,6 +7042,8 @@ async function recomputeStats(runId) {{
 @router.get("/campaigns/{run_id}/recipients", response_class=HTMLResponse)
 async def ops_campaign_recipients(request: Request, run_id: int) -> str:
     tz = _local_tz()
+    session_token = request.cookies.get(SESSION_COOKIE, "")
+    page_csrf = csrf_token_for(session_token) if session_token else ""
     status_filter = request.query_params.get("status", "")
     excluded_reason_filter = request.query_params.get("excluded_reason", "")
     limit_str = request.query_params.get("limit", "100")
@@ -7141,7 +7159,13 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             "Booked",
             "Followup",
         ]
+    # The zero-counter rows are the only ones an operator has to go and
+    # check somewhere else, so the check lives on the row rather than in a form
+    # that would need the person identified by hand all over again.
+    show_zero_visit_check = is_easyweek_run and run.mode == "preview" and run.status == "completed"
     extra_cols: list[str] = []
+    if show_zero_visit_check:
+        extra_cols.append("Сверка истории")
     if is_editable_preview:
         extra_cols.append("")
     if is_send_real:
@@ -7158,8 +7182,8 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 _esc(r.phone_e164 or ""),
                 _status_badge(r.status),
                 _basis_badge(r, with_audit_column=True),
-                _esc(r.excluded_reason or "—"),
-                _esc(r.auto_excluded_reason or "—"),
+                _excluded_reason_cell(r.excluded_reason),
+                _excluded_reason_cell(r.auto_excluded_reason),
                 # Presence only: the customer UUID is never rendered.
                 "✓" if r.easyweek_customer_uuid is not None else "—",
                 "✓" if r.local_client_found else "—",
@@ -7181,6 +7205,16 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 _esc(_fmt_dt(r.booked_after_at, tz)),
                 _esc(r.followup_status or ""),
             ]
+        if show_zero_visit_check:
+            if r.excluded_reason == ZERO_VISITS_REPORTED:
+                row.append(
+                    f'<button class="btn btn-sm btn-outline-info" '
+                    f'onclick="checkZeroVisitHistory({run_id},{r.id})">'
+                    f"&#x1F50E; Проверить историю</button>"
+                    f'<div class="small mt-1" id="zero-visit-{r.id}" role="status"></div>'
+                )
+            else:
+                row.append('<span class="text-muted small">—</span>')
         if is_editable_preview:
             # Remove is for ACTIVE candidates. A row the segmenter already
             # excluded has nothing to remove, and offering the button would
@@ -7269,6 +7303,86 @@ async function retryRecipient(runId, recipientId) {
 }
 </script>"""
 
+    zero_visit_js = ""
+    if show_zero_visit_check:
+        zero_visit_js = (
+            """
+<script>
+const ZERO_VISIT_CSRF = """
+            + json.dumps(page_csrf)
+            + """;
+
+// Stable codes turned into sentences. "Не удалось подтвердить" and "не удалось
+// проверить" are deliberately different answers: the first says we will not
+// claim whose history this is, the second says the history itself could not be
+// trusted. An unread history is never shown as 0 visits.
+const ZERO_VISIT_REASONS = {
+  "zero_visit_check_run_not_found": "Preview не найден.",
+  "zero_visit_check_run_not_completed_easyweek_preview":
+    "Это не завершённый EasyWeek preview.",
+  "zero_visit_check_branch_unknown": "Филиал не настроен на сервере.",
+  "zero_visit_check_recipient_not_found": "Строка не найдена в этом preview.",
+  "zero_visit_check_row_not_zero_diagnostic":
+    "Эта строка не является строкой со счётчиком 0.",
+  "zero_visit_check_source_event_unproven":
+    "Не удалось подтвердить: исходное событие больше не относится к этому клиенту.",
+  "zero_visit_check_source_event_ambiguous":
+    "Не удалось подтвердить: для карточки несколько разных событий со счётчиком 0.",
+  "zero_visit_check_customer_identity_unproven":
+    "Не удалось подтвердить: личность клиента в EasyWeek не доказана.",
+  "zero_visit_check_booking_reassigned":
+    "Не удалось подтвердить: бронирование переназначено другому клиенту.",
+  "zero_visit_check_history_unverified":
+    "Не удалось проверить историю: ответ API неполный или недоступен.",
+  "manual_batch_rate_limit": "Предыдущая проверка ещё выполняется.",
+  "manual_batch_input_invalid": "Некорректный запрос.",
+  "manual_batch_provider_unavailable":
+    "Не удалось проверить историю: EasyWeek не ответил.",
+  "manual_batch_database_unavailable": "База недоступна: результат не подтверждён.",
+};
+
+function zeroVisitReason(data) {
+  const code = data.reason || (data.reasons || [])[0] || "";
+  return ZERO_VISIT_REASONS[code] || code || "Не удалось проверить историю.";
+}
+
+async function checkZeroVisitHistory(runId, recipientId) {
+  const box = document.getElementById("zero-visit-" + recipientId);
+  box.textContent = "Читаем историю EasyWeek. Состав preview не меняется…";
+  let data;
+  try {
+    const resp = await fetch("/ops/voucher-mailings/api/recipients/zero-visit-history", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {"Content-Type": "application/json", "X-Ops-CSRF": ZERO_VISIT_CSRF},
+      // Two ids. The server re-derives the client, the branch, the period and
+      // the source booking itself; this page never names a customer.
+      body: JSON.stringify({preview_run_id: runId, campaign_recipient_id: recipientId})
+    });
+    data = await resp.json();
+  } catch (err) {
+    box.textContent = "Сетевая ошибка: не удалось проверить историю.";
+    return;
+  }
+  if (!data.ok) {
+    box.textContent = zeroVisitReason(data) +
+      " Строка осталась исключённой, ничего не изменено.";
+    return;
+  }
+  const parts = [
+    "Счётчик из события: " + data.event_visits_total + ".",
+    "Завершённых неотменённых визитов по истории API: " + data.completed_visit_count + ".",
+    "Исходная запись в истории: " +
+      (data.source_booking_completed_in_history ? "найдена" : "не найдена") + ".",
+    "Активная будущая запись: " + (data.active_future_booking ? "есть" : "нет") + ".",
+    "Проверено: " + data.checked_at + ".",
+    "Клиент остаётся исключённым: просмотр не даёт права на выдачу ваучера."
+  ];
+  box.textContent = parts.join(" ");
+}
+</script>"""
+        )
+
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h4>👥 Recipients — Run #{run_id}</h4>
@@ -7281,6 +7395,7 @@ async function retryRecipient(runId, recipientId) {
 {table_html}
 {remove_js}
 {retry_js}
+{zero_visit_js}
 """
     return _page(f"Recipients — Run {run_id}", body)
 

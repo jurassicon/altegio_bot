@@ -218,3 +218,9 @@ from altegio_bot.tests.easyweek_voucher_mailing_ui_fixtures import (  # noqa: E4
 from altegio_bot.tests.easyweek_voucher_production_fixtures import (  # noqa: E402,F401
     production_configuration,
 )
+
+# Zero-counter diagnostic. Same reason again: the suites take it as an
+# argument, so importing it in a test module would shadow the parameter name.
+from altegio_bot.tests.easyweek_zero_visit_fixtures import (  # noqa: E402,F401
+    easyweek_zero_visit_configuration,
+)

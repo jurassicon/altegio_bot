@@ -77,6 +77,57 @@ belongs to the same EasyWeek customer card. It requires exactly one completed,
 non-canceled visit and no active future booking. This is not an import or
 reconstruction of historical Altegio visits.
 
+## Zero counter reported by a delivery
+
+A processed `booking-succeeded` may carry the JSON integer `0` in
+`visits_total`. The counter is still refused — `Client.easyweek_visits_total`
+stays NULL and the normalizer keeps rejecting the value — but the preview no
+longer loses the person.
+
+**Where the row is.** Open the preview, then **Recipients**
+(`/ops/campaigns/<run_id>/recipients`). The row is `skipped`, its basis is
+`auto`, and its reason reads: «EasyWeek подтвердил завершение визита, но передал
+счётчик 0. Первый визит требует проверки». Filter by the stable code
+`easyweek_campaign_source_visits_total_zero` to list only these. The run meta
+counts them twice: `zero_visits_total_reported_events` is deliveries and
+`zero_visits_total_unique_clients` is people, so a replayed webhook does not
+inflate the number of cards to review.
+
+The row is reviewed and excluded. It is not in the active audience, it does not
+change the voucher nominal, and it carries no source proof. A person the
+segmenter already proved, or already excluded for a reason of its own, keeps
+that verdict: this row only exists for somebody who would otherwise have no row.
+
+**How to check the history.** Press **🔎 Проверить историю** on that row. The
+server takes the run id and the recipient id only, and re-derives the branch,
+the period, the client and the originating booking from its own rows; a customer
+UUID or phone number sent by the browser is refused. It then reads the source
+booking and that customer's complete booking history, read-only, with bounded
+time and bounded pagination.
+
+A successful answer states the counter the delivery carried (0), the number of
+completed non-canceled visits in the full API history, whether the exact source
+booking is among them, whether anything is booked ahead, and the moment it was
+read. Otherwise it says «не удалось подтвердить» (the identity is not provable,
+or the booking has been reassigned to another customer) or «не удалось
+проверить» (incomplete pagination, a timeout, a 429/5xx, an API error). An
+unavailable history is never shown as zero visits.
+
+The check writes nothing: no status, no reason, no counter, no consent, no
+entitlement. Having looked at the row grants nothing — automatic eligibility
+still requires a source and current `visits_total` of exactly 1 with a paired
+timestamp, and reading the API produces neither.
+
+**What a manual decision means.** If an operator decides to include the person,
+use the existing single **Add recipient** with their phone number. The same row
+becomes `operator_manual_selection`, its original verdict is kept in
+`auto_excluded_reason`, and no second row is created. It is recorded as a
+person's decision, not as a proven first visit: the source-proof columns stay
+NULL and a database CHECK keeps them that way. A matching opt-out still blocks
+the addition, and a frozen or already-used preview still refuses it. The §44
+list mode «предыдущий визит в Altegio / ноль записей EasyWeek» does not apply to
+this case.
+
 ## Read-only voucher evidence
 
 The only confirmed Public API voucher-template identity is UUID

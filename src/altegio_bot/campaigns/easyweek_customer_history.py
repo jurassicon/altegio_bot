@@ -193,6 +193,35 @@ def _source_booking(
     return _Booking(booking_uuid, customer_uuid, canceled, completed, start_time), None, LiveProofDisposition.READY
 
 
+@dataclass(frozen=True)
+class BookingBinding:
+    """Only the identity a booking response carries. Canonical text or nothing.
+
+    Deliberately NOT a verdict. :func:`_source_booking` answers PR-15's question
+    and refuses a booking that is not a completed single-service visit, which is
+    eligibility policy. A caller that has to decide whether an OLD delivery and a
+    CURRENT booking are about the same customer needs the identity and must not
+    inherit that policy, so the projection is shared and the judgement is not.
+    """
+
+    booking_uuid: uuid.UUID | None
+    customer_uuid: uuid.UUID | None
+    location_uuid: str | None
+
+
+def read_booking_binding(payload: object) -> BookingBinding:
+    """Project one booking response's booking/customer/location identity."""
+    if not isinstance(payload, dict):
+        return BookingBinding(None, None, None)
+    customer = payload.get("customer")
+    location_uuid = payload.get("location_uuid")
+    return BookingBinding(
+        booking_uuid=_canonical_uuid(payload.get("uuid")),
+        customer_uuid=_canonical_uuid(customer.get("uuid")) if isinstance(customer, dict) else None,
+        location_uuid=location_uuid if isinstance(location_uuid, str) else None,
+    )
+
+
 def _customer_uuid(payload: object) -> uuid.UUID | None:
     if isinstance(payload, dict) and "data" in payload:
         payload = payload.get("data")
