@@ -183,15 +183,33 @@ stops before the number is sent anywhere. Two cards on the number inside the
 branch remain «по этому контакту больше одной карточки».
 
 Every network call is a window, and the webhook bridge writes while they are
-open, so the local identity facts — the Karlsruhe card included — are read again
-after the lookup, **after the source booking read**, and **after the history
-read**. A correspondence that appeared mid-call and names somebody else, a UUID
-since bound to another numeric customer, a second card that has taken the proven
-UUID, a local card that now claims the number, or a card whose contact has
-changed all stop the check. The first two rechecks stop it before anybody's
-booking history is read at all; the last one stops a confirmation that was
-already known to be out of date from reaching the operator — the count is not
-shown, and the row stays as it was.
+open, so the local facts are read again after the lookup, **after the source
+booking read**, **before every page of the history** and **after the history
+read**. The page guard matters because the history reader proves the card with a
+`GET` of its own before the first page: a conflict written during that read must
+not be followed by a page request, and one that becomes visible between pages
+ends the walk there. A correspondence that appeared mid-call and names somebody
+else, a UUID since bound to another numeric customer, a second card that has
+taken the proven UUID, a local card that now claims the number, or a card whose
+contact has changed all stop the check.
+
+So does a change to the **source record itself**. Each recheck re-proves the
+exact record the preview bound the row to — read by its id, never replaced by
+another record that happens to fit — through the segmenter's own rule: provider,
+branch, booking UUID and numeric id, the customer id on both the record and the
+card, not deleted, and a start inside the campaign's half-open period. A webhook
+that moves the booking to another client leaves both cards and both UUIDs
+untouched, so this is the only check that sees it, and the refusal reads «исходное
+событие больше не относится к этому клиенту» with the stable detail
+`zero_visit_check_source_record_changed`.
+
+A conflict found before the pages stops the check before anybody's booking
+history is read at all; one found during the last page is caught by the check
+after the read, which stops a confirmation already known to be out of date from
+reaching the operator — the count is not shown, and the row stays as it was. All
+of these are short reads of our own rows: no transaction and no lock is held
+across an HTTP call. Other consumers of the shared history module pass no guard
+and read exactly as they did before.
 
 The diagnostic's phone lookup is also stricter than the migration one about
 coverage. Page parameters and metadata must be consistent, `per_page` stable,
@@ -208,9 +226,10 @@ person on that number — and so is an empty first page followed by one card at
 simply absent. The client never sends a page size, so a `per_page` that is not
 an integer — a string `"100"` — is treated as unknown rather than refused, and
 the structural rules still have to hold. The direct card read is checked too, and
-its two failures are kept apart: a 200 whose body is not a readable card is a
-format problem, while a readable card for a different customer is an identity
-conflict. The migration lookup and the manual Add keep their own contract — one
+its two failures are kept apart: a 200 whose body is not a readable card — `{}`
+included — is a format problem, while a readable card for a different customer
+is an identity conflict. That holds for both of the direct card reads: the one
+the lookup makes and the one the history reader repeats before the first page. The migration lookup and the manual Add keep their own contract — one
 UUID listed twice is one customer, and that listing above still resolves for
 them — unchanged.
 
@@ -230,8 +249,10 @@ history at all.
 Kinds of refusal, and they mean different things:
 
 - «не удалось подтвердить» — we will not say whose history this is. The source
-  event no longer attributes to this person, the booking has been reassigned,
-  the identity is unproven, or one contact resolves to more than one card.
+  event or its record no longer attributes to this person (detail
+  `zero_visit_check_source_record_changed` when the record itself moved,
+  was deleted or left the period), the booking has been reassigned, the
+  identity is unproven, or one contact resolves to more than one card.
 - «конфликт идентификаторов клиента» — the workspace or the API contradicts
   itself about who this numeric customer is: two UUIDs on one numeric id, one
   UUID on two numeric ids, a local card claiming the number for somebody else,
@@ -249,8 +270,9 @@ Kinds of refusal, and they mean different things:
   not a branch's; no retry helps until the server is configured.
 - «EasyWeek вернул ответ неожидаемого формата» — a 200 whose body is not the
   promised shape. Also not a retry.
-- «временно не удалось проверить историю» — a 429, a 5xx or a timeout. Nothing
-  is wrong with the data and only this one is worth repeating.
+- «временно не удалось проверить историю» — a 429, a 5xx or a timeout, the
+  workspace listing included: a request that was made and not answered in time
+  is EasyWeek's side, and this is the one family worth repeating.
 - «проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался» —
   the one deadline expired while reading our own rows. EasyWeek was never asked,
   so the message does not say EasyWeek failed to answer.

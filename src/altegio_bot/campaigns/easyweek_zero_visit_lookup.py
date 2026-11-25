@@ -248,12 +248,12 @@ class DiagnosticReader:
             # customer, and both look like a complete read from the outside.
             raise self._refuse(LOOKUP_PAGE_OUT_OF_SEQUENCE)
         self._page = page
-        self.external_calls += 1
-        try:
-            payload = await self._reader.list_customers(params=params)
-        except Exception as exc:
-            self._note(exc)
-            raise
+        # Through the same wrapper as every other read, and therefore counted
+        # once and marked in flight. Its own counter did neither: a deadline
+        # that expired while the workspace listing was unanswered looked like
+        # our own phase running out of time after an answer, and an operator was
+        # told so.
+        payload = await self._read(self._reader.list_customers(params=params))
         self._verify(payload, page=page)
         return payload
 

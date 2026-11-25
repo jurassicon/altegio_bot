@@ -111,6 +111,7 @@ from altegio_bot.campaigns.easyweek_manual_identity import (
 from altegio_bot.campaigns.easyweek_manual_recipient import CUSTOMER_AMBIGUOUS, prove_customer_identity
 from altegio_bot.campaigns.easyweek_zero_visit import (
     ZERO_VISITS_REPORTED,
+    ZeroVisitReport,
     ZeroVisitSourceBinding,
     captured_contact_phone,
     normalize_zero_visit_event,
@@ -161,6 +162,12 @@ ROW_ALREADY_DECIDED: Final = "zero_visit_check_row_already_decided"
 # one whose stored binding cannot be read. "Источник не установлен".
 SOURCE_NOT_ESTABLISHED: Final = "zero_visit_check_source_not_established"
 SOURCE_EVENT_UNPROVEN: Final = "zero_visit_check_source_event_unproven"
+# The exact record the preview bound this row to is no longer the one the row
+# was written about: reassigned to another client, deleted, or moved out of the
+# campaign's period. A quotable detail rather than a reason of its own, because
+# an operator reads the same thing either way — the source no longer attributes
+# to this person — and the stable code says which half of it changed.
+SOURCE_RECORD_CHANGED: Final = "zero_visit_check_source_record_changed"
 SOURCE_EVENT_AMBIGUOUS: Final = "zero_visit_check_source_event_ambiguous"
 CUSTOMER_IDENTITY_UNPROVEN: Final = "zero_visit_check_customer_identity_unproven"
 CUSTOMER_IDENTITY_AMBIGUOUS: Final = "zero_visit_check_customer_identity_ambiguous"
@@ -325,6 +332,13 @@ class _LocalFacts:
     stored_customer_uuid: uuid.UUID | None
     captured_phone: str | None
     company_id: int
+    # The normalized source delivery and the run's period, carried so the
+    # rechecks can re-prove the Event -> Record -> Client chain against the
+    # EXACT record the preview bound the row to, through the same rule the
+    # segmenter used. Plain values: nothing here is attached to a session.
+    report: ZeroVisitReport
+    period_start: datetime
+    period_end: datetime
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -597,6 +611,9 @@ async def _local_facts(
                 stored_customer_uuid=stored_uuid,
                 captured_phone=captured_phone,
                 company_id=company_id,
+                report=report,
+                period_start=run.period_start,
+                period_end=run.period_end,
             ),
             None,
             None,
@@ -633,7 +650,11 @@ async def _recheck_local_identity(
     Still no lock held across the network: a short session of its own each
     time, after the reads, exactly like the first one.
 
-    Six ways it can fail, none of them retryable:
+    Seven ways it can fail, none of them retryable:
+    * the source RECORD is no longer the row's source — reassigned to another
+      client, deleted, or moved out of the campaign's period. The cards and
+      their UUIDs can be untouched while this happens, which is exactly how a
+      recheck that only read cards let it through;
     * the workspace now holds contradictory correspondences for this numeric id;
     * a correspondence now exists and names somebody other than the customer the
       lookup proved;
@@ -648,6 +669,27 @@ async def _recheck_local_identity(
         client = await session.get(Client, facts.client_id)
         if client is None or client.provider != PROVIDER_EASYWEEK or client.company_id != facts.company_id:
             return RECIPIENT_NOT_FOUND, None
+        # The EXACT record the preview bound this row to, re-proven through the
+        # segmenter's own rule: provider, branch, booking uuid and numeric id,
+        # the customer id on both the record and the card, and a start inside
+        # the campaign's half-open period. Read by primary key and never
+        # searched for: if this record is no longer the row's source, the answer
+        # is a refusal, not a different record that happens to fit.
+        record = await session.get(Record, facts.binding.record_id)
+        if (
+            record is None
+            or record.is_deleted is not False
+            or prove_event_record_client_link(
+                booking=facts.report,
+                record=record,
+                client=client,
+                company_id=facts.company_id,
+                period_start=facts.period_start,
+                period_end=facts.period_end,
+            )
+            is not None
+        ):
+            return SOURCE_EVENT_UNPROVEN, SOURCE_RECORD_CHANGED
         known_uuid, workspace_conflict = await known_numeric_uuid_binding(session, facts.binding.customer_id)
         if workspace_conflict:
             return IDENTITY_UUID_CONFLICT, NUMERIC_OWNER_CONFLICT
@@ -796,6 +838,17 @@ async def _prove_live_customer(
     return proven, IDENTITY_VIA_CAPTURED_CONTACT, None, None, False
 
 
+# What the shared reader's card-proof refusals mean in the operator's terms.
+# Both come from the one direct ``GET /customers/{uuid}`` the history read makes
+# of its own, and they are not the same thing to report: a body this card cannot
+# be read from is a format problem, while a readable card for another customer
+# is a statement about identity. Anything else there is an unproven identity.
+_CARD_REFUSALS: Final = {
+    CUSTOMER_RESPONSE_MALFORMED: API_RESPONSE_MALFORMED,
+    CUSTOMER_UUID_MISMATCH: IDENTITY_UUID_CONFLICT,
+}
+
+
 def _history_refusal(
     reader: DiagnosticReader,
     *,
@@ -932,19 +985,50 @@ async def _check(
             **base,
         )
 
+    # The shared reader proves the card with a GET of its own before the first
+    # page, and a webhook can write during THAT read as easily as during any
+    # other. So the same recheck is handed to it as a guard: it runs before
+    # every page request, the first one included, and a conflict already visible
+    # means the page is never asked for. What it found is kept here, because the
+    # shared reader reports one refusal for every unreadable history and this
+    # one is not about the history at all.
+    guarded: dict[str, str | None] = {"reason": None, "detail": None}
+
+    async def guard() -> str | None:
+        conflict, conflict_detail = await _recheck_local_identity(
+            session_maker, facts=facts, customer_uuid=customer_uuid
+        )
+        if conflict is not None:
+            guarded["reason"], guarded["detail"] = conflict, conflict_detail
+        return conflict
+
     bookings = await read_customer_bookings(
         reader,
         customer_uuid=customer_uuid,
         pause=pause if pause is not None else asyncio.sleep,
         pause_sec=pause_sec,
+        guard=guard,
     )
+    if guarded["reason"] is not None:
+        return ZeroVisitHistoryReport(
+            False,
+            reason=guarded["reason"],
+            detail_reason=guarded["detail"],
+            identity_source=identity_source,
+            pages_read=bookings.pages_read,
+            **base,
+        )
     if not bookings.identity_current:
+        # The card read itself failed, and its two failures are different
+        # facts. A 200 carrying `{}` — or any body this card cannot be read
+        # from — is the endpoint not keeping its contract, and reporting it as
+        # "личность не доказана" said something about the person instead of
+        # about the answer. A readable card for a DIFFERENT customer is the
+        # identity answer. Everything else stays an unproven identity.
         reason, detail, temporary = _history_refusal(
             reader,
             bookings=bookings,
-            fallback=(
-                IDENTITY_UUID_CONFLICT if bookings.reason == CUSTOMER_UUID_MISMATCH else CUSTOMER_IDENTITY_UNPROVEN
-            ),
+            fallback=_CARD_REFUSALS.get(bookings.reason or "", CUSTOMER_IDENTITY_UNPROVEN),
         )
         return ZeroVisitHistoryReport(
             False,
@@ -1098,6 +1182,7 @@ __all__ = [
     "SOURCE_EVENT_AMBIGUOUS",
     "SOURCE_EVENT_UNPROVEN",
     "SOURCE_NOT_ESTABLISHED",
+    "SOURCE_RECORD_CHANGED",
     "SOURCE_STATE_ABSENT",
     "SOURCE_STATE_CANCELED",
     "SOURCE_STATE_COMPLETED",

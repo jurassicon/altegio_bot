@@ -494,3 +494,118 @@ async def test_a_row_without_the_contact_proof_reads_as_its_own_reason(
     assert "визитов по истории API" not in text
     assert "Эта проверка ничего не изменила." in text
     assert_no_page_errors(page)
+
+
+class BrowserDirectory(BrowserEasyWeek):
+    """The same reader, with the card body and the listing's pace steerable."""
+
+    def __init__(self, *, card: Any = None, listing_delay: float = 0.0, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.card = card
+        self.listing_delay = listing_delay
+
+    async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        if self.card is not None:
+            if isinstance(self.card, Exception):
+                raise self.card
+            return self.card  # type: ignore[return-value]
+        return await super().get_customer(customer_uuid)
+
+    async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+        if self.listing_delay:
+            import asyncio
+
+            await asyncio.sleep(self.listing_delay)
+        return await super().list_customers(params=params)
+
+
+async def _preview_without_stored_uuid(session_maker, monkeypatch: pytest.MonkeyPatch) -> tuple[int, int, Person]:
+    """A row whose identity has to come from the contact a delivery captured."""
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+    monkeypatch.setattr(segment_module, "SessionLocal", session_maker)
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+    run = await runner_module.run_preview(
+        RunParams(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COMPANY_ID,
+            location_id=COMPANY_ID,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+            mode="preview",
+            campaign_code="new_clients_monthly",
+        )
+    )
+    async with session_maker() as session:
+        from sqlalchemy import select
+
+        row = (
+            await session.execute(select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id))
+        ).scalar_one()
+        assert row.excluded_reason == ZERO_VISITS_REPORTED
+        return run.id, int(row.id), person
+
+
+async def test_a_directory_that_never_answers_reads_as_easyweek_not_answering(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4, item 3: the deadline expired inside the workspace listing.
+
+    EasyWeek was asked and did not answer in time, so this is the one family
+    where "можно повторить позже" is honest advice — and it must not read as our
+    own side running late after an answer that never came.
+    """
+    from altegio_bot.campaigns import easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserDirectory(person=person, rows=[], listing_delay=5))
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.3)
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "EasyWeek не ответил" in text
+    assert "Можно повторить проверку позже." in text
+    assert "на нашей стороне" not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)
+
+
+async def test_an_empty_card_body_reads_as_a_format_problem(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4, item 4: HTTP 200 with ``{}`` is about the answer, not the person."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserDirectory(person=person, rows=[], card={}))
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "ответ неожидаемого формата" in text
+    assert "личность клиента в EasyWeek не доказана" not in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)
+
+
+async def test_a_card_for_another_customer_reads_as_an_identity_conflict(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4, item 4: a readable card for somebody else is the other sentence."""
+    other = uuid.UUID("deadbeef-5555-4666-8777-888888888888")
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(
+        monkeypatch,
+        BrowserDirectory(
+            person=person,
+            rows=[],
+            card={"uuid": str(other), "phone": person.phone, "first_name": "Synthetic"},
+        ),
+    )
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "конфликт идентификаторов клиента" in text
+    assert "ответ неожидаемого формата" not in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert_no_page_errors(page)

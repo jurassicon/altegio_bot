@@ -269,6 +269,7 @@ async def _collect_customer_history(
     *,
     customer_uuid: uuid.UUID,
     paced: Callable[[], Awaitable[None]],
+    guard: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[dict[uuid.UUID, _Booking] | None, str | None, LiveProofDisposition, int]:
     """Every booking of one customer card, or why the set could not be trusted.
 
@@ -283,6 +284,13 @@ async def _collect_customer_history(
 
     ``None`` is NEVER "this customer has no bookings". An empty history is an
     empty dict, behind a complete and structurally valid zero-row response.
+
+    ``guard`` is an optional question asked before EVERY page request: "is what
+    we are about to read still about the right person?" A caller that holds
+    local evidence a concurrent writer can invalidate — the zero-counter
+    diagnostic does — passes one, and its refusal code is returned instead of a
+    page being requested. Callers that pass none behave exactly as before: no
+    extra call, no database read, and no early stop.
     """
     rows: dict[uuid.UUID, _Booking] = {}
     expected_total: int | None = None
@@ -290,6 +298,13 @@ async def _collect_customer_history(
     pages_read = 0
     page = 1
     while True:
+        if guard is not None:
+            refused = await guard()
+            if refused is not None:
+                # Asked before the request, so the page is not fetched at all:
+                # an answer already known to be about somebody else is not
+                # worth somebody's rate budget, let alone an operator's screen.
+                return None, refused, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
         await paced()
         try:
             payload = await reader.list_customer_bookings(
@@ -379,6 +394,7 @@ async def read_customer_bookings(
     customer_uuid: uuid.UUID,
     pause: Callable[[float], Awaitable[None]] | None = None,
     pause_sec: float = 0.0,
+    guard: Callable[[], Awaitable[str | None]] | None = None,
 ) -> CustomerBookingSet:
     """Prove one customer card's identity, then read every booking it has.
 
@@ -406,6 +422,15 @@ async def read_customer_bookings(
     Strictly read-only — ``get_customer`` and ``list_customer_bookings``, no
     mutation, no database access and no lock. The caller must not hold a row
     lock or an advisory lock across this call.
+
+    ``guard`` is optional and, when given, is asked before every page request —
+    including the first, which is the moment after this function's own card
+    proof. That gap matters to a caller whose local evidence a concurrent
+    writer can invalidate: the card read is a network call like any other, and
+    a conflict written during it must not be followed by a page request. The
+    guard's own refusal code comes back as ``reason``; it may read a database,
+    and it must not hold a lock either. Without it nothing changes for the
+    callers that have no such evidence to lose.
     """
 
     async def paced() -> None:
@@ -431,7 +456,7 @@ async def read_customer_bookings(
         return CustomerBookingSet(complete=False, identity_current=False, reason=CUSTOMER_UUID_MISMATCH)
 
     rows, reason, disposition, pages_read = await _collect_customer_history(
-        reader, customer_uuid=customer_uuid, paced=paced
+        reader, customer_uuid=customer_uuid, paced=paced, guard=guard
     )
     if rows is None:
         return CustomerBookingSet(
