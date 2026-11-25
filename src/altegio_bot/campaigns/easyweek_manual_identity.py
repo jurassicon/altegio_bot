@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select, text, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.models.models import Client
@@ -69,6 +69,112 @@ async def known_numeric_uuid_binding(session: AsyncSession, customer_id: int) ->
         ).all()
     )
     return (next(iter(values)) if len(values) == 1 else None, len(values) > 1)
+
+
+def uuid_bound_elsewhere(
+    *,
+    row_customer_uuid: uuid.UUID | None,
+    row_customer_id: int | None,
+    customer_uuid: uuid.UUID,
+    customer_id: int,
+) -> bool:
+    """Does this card bind that UUID to a DIFFERENT numeric customer?
+
+    The other direction of :func:`known_numeric_uuid_binding`, and the same
+    contradiction read the other way round. §44.2 allows one UUID to hold cards
+    in several proven branches, and those cards all carry the same numeric id;
+    two different numeric ids on one UUID means the workspace is describing two
+    people as one, and nothing can prefer either of them.
+
+    A card with no numeric id yet binds nothing and contradicts nothing: it is
+    the ordinary state of an identity the webhook has not reached.
+
+    One predicate, applied by the webhook bridge to the rows it has locked and
+    by the read-only diagnostic to the workspace, so the two cannot drift.
+    """
+    return row_customer_uuid == customer_uuid and row_customer_id not in (None, customer_id)
+
+
+def phone_owner_conflict(
+    *,
+    row_customer_uuid: uuid.UUID | None,
+    row_customer_id: int | None,
+    customer_uuid: uuid.UUID | None,
+    customer_id: int,
+) -> bool:
+    """Does this card, carrying the number in question, claim another owner?
+
+    The webhook bridge's rule for a card found by phone: a number is evidence
+    about one person only while every local card on it is unbound or bound to
+    exactly this person. ``customer_uuid`` is ``None`` for a caller that has not
+    proven one yet, and then only the numeric side can disagree — which is still
+    worth refusing, because a number two numeric customers share identifies
+    neither of them.
+    """
+    if customer_uuid is not None and row_customer_uuid not in (None, customer_uuid):
+        return True
+    return row_customer_id not in (None, customer_id)
+
+
+async def uuid_numeric_conflict(session: AsyncSession, *, customer_uuid: uuid.UUID, customer_id: int) -> bool:
+    """Is that UUID already bound to another numeric customer anywhere here?
+
+    Workspace-wide, for the same reason the correspondence itself is read
+    workspace-wide. Reads two columns of the cards holding this UUID — a handful
+    of rows under the existing identity index, never the archive.
+    """
+    rows = (
+        await session.execute(
+            select(Client.easyweek_customer_uuid, Client.altegio_client_id).where(
+                Client.provider == "easyweek",
+                Client.easyweek_customer_uuid == customer_uuid,
+            )
+        )
+    ).all()
+    return any(
+        uuid_bound_elsewhere(
+            row_customer_uuid=row_uuid,
+            row_customer_id=row_numeric,
+            customer_uuid=customer_uuid,
+            customer_id=customer_id,
+        )
+        for row_uuid, row_numeric in rows
+    )
+
+
+async def phone_identity_conflict(
+    session: AsyncSession,
+    *,
+    phone: str,
+    customer_id: int,
+    customer_uuid: uuid.UUID | None = None,
+    exclude_client_id: int | None = None,
+) -> bool:
+    """Does any local card on this number claim an owner other than this one?
+
+    The local half of §44.2's contact route. A workspace lookup answers who the
+    number reaches in EasyWeek; this answers whether our own records already
+    disagree about whose number it is — and if they do, the lookup's answer
+    cannot be attached to this person whatever it says.
+    """
+    rows = (
+        await session.execute(
+            select(Client.easyweek_customer_uuid, Client.altegio_client_id).where(
+                Client.provider == "easyweek",
+                Client.phone_e164 == phone,
+                Client.id != exclude_client_id if exclude_client_id is not None else true(),
+            )
+        )
+    ).all()
+    return any(
+        phone_owner_conflict(
+            row_customer_uuid=row_uuid,
+            row_customer_id=row_numeric,
+            customer_uuid=customer_uuid,
+            customer_id=customer_id,
+        )
+        for row_uuid, row_numeric in rows
+    )
 
 
 async def lock_identity(session: AsyncSession, *, phone: str, customer_uuid: str) -> None:

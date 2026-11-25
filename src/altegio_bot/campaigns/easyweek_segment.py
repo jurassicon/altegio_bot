@@ -419,10 +419,63 @@ async def _records_in_period(
     return int(total or 0)
 
 
-async def _contact_evidence(
+async def _contact_deliveries(
     session: AsyncSession,
     *,
+    booking_uuids: set[uuid.UUID],
+) -> dict[uuid.UUID, list[_Delivery]]:
+    """Every delivery that could carry a contact, for ALL of these bookings.
+
+    One query for the whole preview, not one per recipient. The predicate —
+    ``booking_uuid`` plus ``status = 'processed'`` plus a contact-carrying
+    trigger — is not served by any index this schema has: the only index on
+    ``booking_uuid`` is ``ix_easyweek_events_pending_booking``, which is partial
+    on the two NON-terminal statuses and therefore cannot answer a question
+    about processed rows at all. So the read costs one pass over the deliveries
+    whatever is asked of it, and asking once per preview instead of once per
+    recipient is the whole difference; a branch's archive is scanned a single
+    time however many zero-counter rows the preview holds.
+
+    Only the five fields the contact rule needs are selected, so a large archive
+    does not arrive as ORM rows nobody reads, and nothing here is attached to a
+    session: the values outlive it, as :class:`_Delivery` exists to allow.
+    """
+    if not booking_uuids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                EasyWeekEvent.id,
+                EasyWeekEvent.booking_uuid,
+                EasyWeekEvent.event_hint,
+                EasyWeekEvent.payload,
+                EasyWeekEvent.body_truncated,
+            )
+            .where(EasyWeekEvent.booking_uuid.in_(sorted(booking_uuids)))
+            .where(EasyWeekEvent.status == "processed")
+            .where(EasyWeekEvent.event_hint.in_(CONTACT_EVENT_HINTS))
+            .order_by(EasyWeekEvent.id.asc())
+        )
+    ).all()
+    grouped: dict[uuid.UUID, list[_Delivery]] = defaultdict(list)
+    for event_id, booking_uuid, event_hint, payload, truncated in rows:
+        if booking_uuid is None:
+            continue
+        grouped[booking_uuid].append(
+            _Delivery(
+                event_id=int(event_id),
+                event_hint=event_hint,
+                payload=payload,
+                body_truncated=bool(truncated),
+            )
+        )
+    return grouped
+
+
+def _contact_evidence(
+    *,
     source: _Delivery,
+    deliveries: list[_Delivery],
     report: ZeroVisitReport,
     company_id: int,
     locations: Mapping[int, EasyWeekLocation],
@@ -452,37 +505,16 @@ async def _contact_evidence(
     * ``distinct_contacts > 1`` — the deliveries contradict each other about who
       this is. Recorded, never resolved: picking one would pick a person.
 
-    Bounded by the deliveries of ONE booking, keyed on the indexed booking uuid,
-    and the phone itself is never stored.
+    Decided in memory from the deliveries :func:`_contact_deliveries` already
+    read for the whole preview, and bounded by the deliveries of ONE booking.
+    The phone itself is never stored.
     """
-    siblings = list(
-        (
-            await session.execute(
-                select(EasyWeekEvent)
-                .where(EasyWeekEvent.booking_uuid == report.booking_uuid)
-                .where(EasyWeekEvent.status == "processed")
-                .where(EasyWeekEvent.event_hint.in_(CONTACT_EVENT_HINTS))
-                .where(EasyWeekEvent.id != source.event_id)
-                .order_by(EasyWeekEvent.id.asc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    # The source delivery is always a candidate, whatever the index says about
-    # it: it is the delivery this row was written from and it is already in
-    # hand, so its own captured contact never depends on a lookup succeeding.
-    deliveries = [source] + [
-        _Delivery(
-            event_id=row.id,
-            event_hint=row.event_hint,
-            payload=row.payload,
-            body_truncated=bool(row.body_truncated),
-        )
-        for row in siblings
-    ]
+    # The source delivery is always a candidate, whatever the read returned
+    # about it: it is the delivery this row was written from and it is already
+    # in hand, so its own captured contact never depends on a query succeeding.
+    candidates = [source] + [row for row in deliveries if row.event_id != source.event_id]
     carriers: dict[str, list[int]] = defaultdict(list)
-    for delivery in deliveries:
+    for delivery in candidates:
         phone = captured_contact_phone(
             event_hint=delivery.event_hint,
             payload=delivery.payload,
@@ -672,11 +704,21 @@ async def build_easyweek_segment(
     # zero-counter row exists to stop somebody DISAPPEARING, never to override a
     # verdict or to open a way around an exclusion. Keyed on the client, so the
     # outcome is the same whichever order the deliveries arrived in.
+    diagnostic_keys = [key for key in sorted(zero_by_client) if key not in evidence_by_client]
+    representatives = {
+        key: sorted(zero_by_client[key], key=lambda row: (row.event_id, str(row.report.booking_uuid)))
+        for key in diagnostic_keys
+    }
     async with SessionLocal() as session:
-        for key in sorted(zero_by_client):
-            if key in evidence_by_client:
-                continue
-            rows = sorted(zero_by_client[key], key=lambda row: (row.event_id, str(row.report.booking_uuid)))
+        # One read of the deliveries for every booking this phase is about,
+        # before the loop. Asking per recipient scanned the archive once per
+        # person, because no index serves this predicate.
+        contact_deliveries = await _contact_deliveries(
+            session,
+            booking_uuids={rows[0].report.booking_uuid for rows in representatives.values()},
+        )
+        for key in diagnostic_keys:
+            rows = representatives[key]
             representative = rows[0]
             # Deliveries are not people and bookings are not deliveries. A
             # replayed webhook repeats one booking and must change neither the
@@ -685,9 +727,9 @@ async def build_easyweek_segment(
             # answer, and that fact is recorded now rather than rediscovered —
             # or guessed at — when the row is opened.
             distinct = {row.report.booking_uuid for row in rows}
-            contact_event_id, contact_sources = await _contact_evidence(
-                session,
+            contact_event_id, contact_sources = _contact_evidence(
                 source=representative.delivery,
+                deliveries=contact_deliveries.get(representative.report.booking_uuid, []),
                 report=representative.report,
                 company_id=company_id,
                 locations=locations.locations,

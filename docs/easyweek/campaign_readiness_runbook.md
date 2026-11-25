@@ -134,6 +134,25 @@ other about who this is, and the check refuses rather than choosing. A delivery
 that arrives after the preview supplies nothing, because the binding was already
 decided.
 
+Those sibling deliveries are read **once per preview**, for every zero-counter
+booking in it together, and only the fields the rule needs. The predicate —
+this booking's UUID plus `status = 'processed'` — is served by no index the
+schema has: the only index on `booking_uuid` is
+`ix_easyweek_events_pending_booking`, which is partial on the two non-terminal
+statuses. So the read costs one pass over the deliveries whatever is asked of
+it, and asking once instead of once per person is the whole difference. A plan
+on 20 000 synthetic deliveries reads 606 shared buffers for 40 bookings at once,
+and the same 606 for one booking alone.
+
+A row that does **not** carry the contact count — one created before that field
+existed — is refused with its own reason: «в строке нет доказательства
+единственности контакта». The number on the card cannot distinguish a booking
+whose single delivery captured one contact from one whose deliveries disagreed,
+so it does not authorise a lookup. Such a row is still checked normally when a
+stored numeric-to-UUID correspondence identifies the person: that basis needs no
+contact at all. Old rows are never rewritten, and the count is never re-derived
+from deliveries that arrived afterwards.
+
 **How to check the history.** Press **🔎 Проверить историю** on that row. The
 server takes the run id and the recipient id only, and re-derives the branch,
 the period, the client and the originating booking from its own rows; a customer
@@ -147,27 +166,53 @@ owner of the booking is never used to supply a missing identity.
 The correspondence is read **workspace-wide**, through the same rule the webhook
 bridge uses: one customer UUID may legitimately hold cards in several proven
 branches, so a correspondence stored on another branch's card identifies the same
-person here. That case is checked and works. Two different UUIDs stored against
-one numeric customer id is a conflict and stops the check. So is a live answer
-naming a different customer than the stored correspondence does — which is the
-case where the Karlsruhe card has no UUID, another branch says `N → A`, and the
-phone and the current booking both point at `B`.
+person here. That case is checked and works, and the same numeric id with the
+same UUID in two branches stays allowed. The correspondence is checked in **both
+directions**: two different UUIDs against one numeric customer id is a conflict,
+and so is one UUID carrying two different numeric customer ids — the second is
+the same contradiction read the other way round, and the webhook bridge has
+always refused it. So is a live answer naming a different customer than the
+stored correspondence does — the case where the Karlsruhe card has no UUID,
+another branch says `N → A`, and the phone and the current booking both point at
+`B`.
 
-Because the lookup is a network call and the webhook bridge writes during it, the
-local identity facts — the Karlsruhe card included — are read a second time
-afterwards. A correspondence that appeared mid-lookup and names somebody else, a
-second card that has taken the proven UUID, or a card whose contact has changed
-all stop the check there. In every one of these cases nobody's booking history is
-read at all.
+For the contact route, local cards are consulted as well as the workspace: a
+card anywhere here that carries the same number for a different numeric customer
+means our own records already disagree about whose number it is, and the check
+stops before the number is sent anywhere. Two cards on the number inside the
+branch remain «по этому контакту больше одной карточки».
+
+Every network call is a window, and the webhook bridge writes while they are
+open, so the local identity facts — the Karlsruhe card included — are read again
+after the lookup, **after the source booking read**, and **after the history
+read**. A correspondence that appeared mid-call and names somebody else, a UUID
+since bound to another numeric customer, a second card that has taken the proven
+UUID, a local card that now claims the number, or a card whose contact has
+changed all stop the check. The first two rechecks stop it before anybody's
+booking history is read at all; the last one stops a confirmation that was
+already known to be out of date from reaching the operator — the count is not
+shown, and the row stays as it was.
 
 The diagnostic's phone lookup is also stricter than the migration one about
-coverage: page parameters and metadata must be consistent, `per_page` stable,
-every page before the last one full, the rows handed over must add up to the
-declared total, and every row must be a distinct customer. A listing declaring
-`total: 2` that repeats one UUID is indeterminate here — the row never shown may
-be a second person on that number — and the check stops without reading a
-history. The migration lookup and the manual Add keep their own contract, in
-which one UUID listed twice is one customer, unchanged.
+coverage. Page parameters and metadata must be consistent, `per_page` stable,
+every page before the last one full, the rows must add up to the declared total,
+and every row must be a distinct customer. On top of that the declared size,
+page count and total must describe a listing that can exist: with `per_page` 100
+and `total` 1 there is exactly one page, no page may hold more rows than its
+size allows, no page may be empty while the total says something is left, and no
+page may arrive after the rows have already added up. A `total: 2` listing that
+repeats one UUID is indeterminate here — the row never shown may be a second
+person on that number — and so is an empty first page followed by one card at
+`total: 1`, or an extra empty page after the only card. A correct empty answer
+(`total: 0`) is a complete answer, not a coverage complaint: the customer is
+simply absent. The client never sends a page size, so a `per_page` that is not
+an integer — a string `"100"` — is treated as unknown rather than refused, and
+the structural rules still have to hold. The direct card read is checked too, and
+its two failures are kept apart: a 200 whose body is not a readable card is a
+format problem, while a readable card for a different customer is an identity
+conflict. The migration lookup and the manual Add keep their own contract — one
+UUID listed twice is one customer, and that listing above still resolves for
+them — unchanged.
 
 It then reads the source booking and that customer's complete booking history,
 read-only, within one deadline that covers the local checks and the network
@@ -188,12 +233,20 @@ Kinds of refusal, and they mean different things:
   event no longer attributes to this person, the booking has been reassigned,
   the identity is unproven, or one contact resolves to more than one card.
 - «конфликт идентификаторов клиента» — the workspace or the API contradicts
-  itself about who this numeric customer is. Repeating the check cannot settle
-  it; the cards have to be looked at.
+  itself about who this numeric customer is: two UUIDs on one numeric id, one
+  UUID on two numeric ids, a local card claiming the number for somebody else,
+  or a card read answering about a different customer. Repeating the check
+  cannot settle it; the cards have to be looked at.
+- «в строке нет доказательства единственности контакта» — the row predates the
+  contact count and has no stored correspondence either. Only a new preview can
+  give that row a basis; the check never guesses one.
 - «не удалось проверить историю» — the history itself could not be trusted:
   incomplete pagination, or a listing whose coverage could not be proven.
-- «EasyWeek отказал в запросе» — a permanent 4xx (401, 403, 404, 422) or an
-  unusable API configuration. **Not** offered as a retry: retrying cannot work.
+- «EasyWeek отказал в запросе» — a permanent 4xx (401, 403, 404, 422). **Not**
+  offered as a retry: retrying cannot work.
+- «интеграция с EasyWeek не настроена на сервере» — no API key, no workspace
+  slug, or an unusable base URL. Nobody was asked anything, so this is ours and
+  not a branch's; no retry helps until the server is configured.
 - «EasyWeek вернул ответ неожидаемого формата» — a 200 whose body is not the
   promised shape. Also not a retry.
 - «временно не удалось проверить историю» — a 429, a 5xx or a timeout. Nothing
@@ -201,6 +254,10 @@ Kinds of refusal, and they mean different things:
 - «проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался» —
   the one deadline expired while reading our own rows. EasyWeek was never asked,
   so the message does not say EasyWeek failed to answer.
+- «проверка не успела завершиться на нашей стороне после ответа EasyWeek» — the
+  deadline expired between calls, after EasyWeek had answered: a slow database
+  during an identity recheck, say. Neutral on purpose — EasyWeek did answer, and
+  the check still did not finish, so no count is shown.
 
 An unavailable history is never shown as zero visits, and no count appears for
 an answer that was not read.

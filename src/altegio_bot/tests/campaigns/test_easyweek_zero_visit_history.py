@@ -55,17 +55,23 @@ from altegio_bot.campaigns.easyweek_zero_visit import (
     ZERO_VISITS_REPORTED_TEXT,
 )
 from altegio_bot.campaigns.easyweek_zero_visit_history import (
+    API_NOT_CONFIGURED,
     API_REFUSED,
     API_RESPONSE_MALFORMED,
     BOOKING_REASSIGNED,
+    CONTACT_EVIDENCE_MISSING,
+    CONTACT_OWNER_CONFLICT,
     CUSTOMER_IDENTITY_AMBIGUOUS,
     CUSTOMER_IDENTITY_UNPROVEN,
+    DEADLINE_AFTER_READ,
+    DEADLINE_AFTER_READ_DETAIL,
     HISTORY_UNVERIFIED,
     IDENTITY_UUID_CONFLICT,
     IDENTITY_VIA_CAPTURED_CONTACT,
     IDENTITY_VIA_STORED_UUID,
     LOCAL_DEADLINE,
     LOCAL_DEADLINE_DETAIL,
+    NUMERIC_OWNER_CONFLICT,
     RECIPIENT_NOT_FOUND,
     ROW_ALREADY_DECIDED,
     ROW_NOT_ZERO_DIAGNOSTIC,
@@ -82,13 +88,20 @@ from altegio_bot.campaigns.easyweek_zero_visit_history import (
     check_zero_visit_history,
 )
 from altegio_bot.campaigns.easyweek_zero_visit_lookup import (
+    LOOKUP_CARD_MALFORMED,
+    LOOKUP_CARD_UUID_MISMATCH,
+    LOOKUP_PAGE_COUNT_UNEXPECTED,
+    LOOKUP_PAGE_EMPTY,
+    LOOKUP_PAGE_OVERFILLED,
     LOOKUP_PAGE_SIZE_UNSTABLE,
     LOOKUP_PAGE_UNDERFILLED,
     LOOKUP_ROWS_NOT_DISTINCT,
+    LOOKUP_TOTAL_REACHED_EARLY,
 )
 from altegio_bot.campaigns.runner import RunParams
 from altegio_bot.easyweek_client import (
     EasyWeekAuthError,
+    EasyWeekConfigError,
     EasyWeekNotFoundError,
     EasyWeekPermanentError,
     EasyWeekProtocolError,
@@ -2949,3 +2962,848 @@ async def test_a_proven_candidate_keeps_its_own_period_count(session_maker, monk
     assert rows[0].excluded_reason is None
     assert rows[0].total_records_in_period == 1
     assert rows[0].confirmed_records_in_period == 1
+
+
+# ===========================================================================
+# 20. The correspondence is checked in BOTH directions — round 3, item 1
+# ===========================================================================
+# One numeric customer with two UUIDs was already refused. The other direction
+# was not: one UUID carrying two different numeric customer ids is the same
+# contradiction read the other way round, and the webhook bridge has always
+# refused it. The diagnostic now asks the same question, workspace-wide, on both
+# §44.2 branches — and, for the branch that proves an identity from a contact,
+# also asks whether a local card claims that number for somebody else.
+
+
+async def _card_in_branch(
+    session_maker,
+    *,
+    company_id: int,
+    customer_id: int | None,
+    customer_uuid: uuid.UUID | None,
+    phone: str,
+) -> int:
+    """One more EasyWeek card, exactly as an import or a webhook would leave it."""
+    async with session_maker() as session:
+        async with session.begin():
+            client = Client(
+                provider=PROVIDER_EASYWEEK,
+                company_id=company_id,
+                altegio_client_id=customer_id,
+                easyweek_customer_uuid=customer_uuid,
+                easyweek_identity_assigned_at=NOW if customer_uuid is not None else None,
+                phone_e164=phone,
+                display_name="Synthetic other card",
+                raw={},
+                wa_opted_out=False,
+            )
+            session.add(client)
+            await session.flush()
+            return int(client.id)
+
+
+async def test_one_uuid_carrying_two_numeric_customers_is_a_conflict(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 1: the stored branch, read the other way round.
+
+    The Karlsruhe card says ``N -> U``. Another branch's card says ``M -> U``
+    for a different numeric customer. One UUID may hold cards in several proven
+    branches, but not two numeric identities: the webhook bridge refuses exactly
+    this, and reading one of the two people's history against the other's row is
+    the mistake this path exists to prevent.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    await _card_in_branch(
+        session_maker,
+        company_id=OTHER_COMPANY_ID,
+        customer_id=person.customer_id + 501,
+        customer_uuid=CUSTOMER_UUID,
+        phone=f"{person.phone}3",
+    )
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.detail_reason == NUMERIC_OWNER_CONFLICT
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+    # Refused before anything was asked of EasyWeek.
+    assert reader.calls == []
+
+
+async def test_a_uuid_owned_elsewhere_refuses_the_contact_branch_too(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same question on the branch that proves the identity from a contact."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    await _card_in_branch(
+        session_maker,
+        company_id=OTHER_COMPANY_ID,
+        customer_id=person.customer_id + 502,
+        customer_uuid=CUSTOMER_UUID,
+        phone=f"{person.phone}4",
+    )
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.identity_source == IDENTITY_VIA_CAPTURED_CONTACT
+    assert report.retryable is False
+    assert not any(call.startswith("history") for call in reader.calls)
+    assert report.completed_visit_count is None
+
+
+async def test_a_card_claiming_this_number_for_another_customer_refuses(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 1: a local card proves the number's owner is in doubt.
+
+    Another branch holds a card on this very number for a DIFFERENT numeric
+    customer. The contact the delivery captured therefore does not identify one
+    person, and a workspace lookup on it answers a question nobody can act on.
+    """
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    await _card_in_branch(
+        session_maker,
+        company_id=OTHER_COMPANY_ID,
+        customer_id=person.customer_id + 503,
+        customer_uuid=None,
+        phone=person.phone,
+    )
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.detail_reason == CONTACT_OWNER_CONFLICT
+    # Refused locally: the number is never sent anywhere.
+    assert reader.calls == []
+
+
+async def test_the_same_numeric_and_uuid_in_two_branches_stays_allowed(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§44.2's positive case: one person, one UUID, one numeric id, two branches."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    await _card_in_branch(
+        session_maker,
+        company_id=OTHER_COMPANY_ID,
+        customer_id=person.customer_id,
+        customer_uuid=CUSTOMER_UUID,
+        phone=person.phone,
+    )
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.identity_source == IDENTITY_VIA_STORED_UUID
+    assert report.completed_visit_count == 1
+    assert "customers" not in reader.calls
+
+
+async def test_a_numeric_only_card_in_another_branch_is_not_a_conflict(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card with no UUID yet binds nothing, so it contradicts nothing."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    await _card_in_branch(
+        session_maker,
+        company_id=OTHER_COMPANY_ID,
+        customer_id=person.customer_id,
+        customer_uuid=None,
+        phone=person.phone,
+    )
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.completed_visit_count == 1
+
+
+async def test_a_recipient_of_another_branch_is_not_this_preview_s_row(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row and its source record must belong to the preview's own branch."""
+    run_id, recipient_id, _person = await _preview_with_zero_row(session_maker, monkeypatch)
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(CampaignRecipient, recipient_id)
+            assert row is not None
+            row.company_id = OTHER_COMPANY_ID
+    reader = FakeEasyWeek(booking=_booking_response(booking_uuid=uuid.uuid4()))
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, RECIPIENT_NOT_FOUND)
+    assert reader.calls == []
+
+
+# ===========================================================================
+# 21. The owner can still change after the lookup — round 3, item 2
+# ===========================================================================
+# The identity recheck closed the race against the lookup. It did not close the
+# window after it: the source booking read is another network call, and a
+# webhook storing a different UUID for this client while it is in flight leaves
+# the check about to read one person's history for another's row. And a conflict
+# that appears during the history read itself must not be served as a
+# confirmation that was already known to be out of date.
+
+
+class _WritingDuringHistory(FakeEasyWeek):
+    """A reader that lets a webhook's write land during one chosen read."""
+
+    def __init__(self, *, on_history: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.on_history = on_history
+
+    async def list_customer_bookings(self, customer_uuid: str, page: int, per_page: int = 100) -> dict[str, Any]:
+        await self.on_history()
+        return await super().list_customer_bookings(customer_uuid, page=page, per_page=per_page)
+
+
+async def _store_uuid_on_card(session_maker, *, client_id: int, customer_uuid: uuid.UUID) -> None:
+    """Exactly what the webhook bridge's transaction leaves behind."""
+    async with session_maker() as session:
+        async with session.begin():
+            client = await session.get(Client, client_id)
+            assert client is not None
+            client.easyweek_customer_uuid = customer_uuid
+            client.easyweek_identity_assigned_at = NOW
+
+
+async def test_a_conflict_written_during_the_booking_read_stops_the_history(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 2: the lookup proved U, then the webhook stored another UUID.
+
+    The barrier is the booking read itself: the write lands while that call is in
+    flight, so every local fact the lookup was checked against is already stale
+    by the time the history would be asked for. The history must not be asked
+    for at all.
+    """
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+
+    async def race() -> None:
+        await _store_uuid_on_card(session_maker, client_id=person.client_id or 0, customer_uuid=OTHER_CUSTOMER_UUID)
+
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+        on_booking=race,
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+    # The booking was read; the history was not.
+    assert "booking" in reader.calls
+    assert not any(call.startswith("history") for call in reader.calls)
+
+
+async def test_a_conflict_written_during_the_booking_read_stops_the_stored_branch(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same window on the branch that needed no lookup at all."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+
+    async def race() -> None:
+        await _card_in_branch(
+            session_maker,
+            company_id=OTHER_COMPANY_ID,
+            customer_id=person.customer_id,
+            customer_uuid=OTHER_CUSTOMER_UUID,
+            phone=f"{person.phone}6",
+        )
+
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+        on_booking=race,
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert not any(call.startswith("history") for call in reader.calls)
+
+
+async def test_a_conflict_during_the_history_read_is_not_served_as_a_confirmation(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 2: an answer already known to be out of date is not shown.
+
+    The history read is the last network call, and a webhook can prove a
+    different UUID for this client while its pages are being walked. The pages
+    were read for a customer this card no longer belongs to, so the count must
+    not be reported — neither as a confirmation nor as a number.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+
+    async def race() -> None:
+        await _card_in_branch(
+            session_maker,
+            company_id=OTHER_COMPANY_ID,
+            customer_id=person.customer_id,
+            customer_uuid=OTHER_CUSTOMER_UUID,
+            phone=f"{person.phone}7",
+        )
+
+    reader = _WritingDuringHistory(
+        on_history=race,
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.completed_visit_count is None
+    assert report.history_verified is False
+    # It did read the history — and then refused to present it.
+    assert "history:1" in reader.calls
+
+
+async def test_an_undisturbed_check_rechecks_and_still_confirms(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The extra rechecks must not cost a correct answer."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.completed_visit_count) == (True, 1)
+    assert report.history_verified is True
+
+
+async def test_the_rechecks_hold_no_lock_through_the_api(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Short reads, no transaction and no row lock across a network call."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    probe: dict[str, Any] = {"ok": False, "error": None}
+
+    async def check_lock() -> None:
+        try:
+            async with session_maker() as session:
+                async with session.begin():
+                    await session.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                    await session.execute(
+                        select(Client).where(Client.id == person.client_id).with_for_update(nowait=True)
+                    )
+            probe["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - the failure IS the finding
+            probe["error"] = repr(exc)
+
+    reader = _WritingDuringHistory(
+        on_history=check_lock,
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert (probe["ok"], probe["error"]) == (True, None)
+
+
+# ===========================================================================
+# 22. The listing must add up, page by page — round 3, item 3
+# ===========================================================================
+# The coverage contract checked stability and distinctness. It did not check
+# that the declared page size, page count and total describe a listing that can
+# exist: an empty first page followed by one card at ``total: 1`` was accepted,
+# and so was an extra empty page after the rows had already added up. Both are
+# answers whose completeness cannot be proven, and the card never shown may be a
+# second person on that number.
+
+
+def _loose_page(
+    rows: list[dict[str, Any]],
+    *,
+    page: int,
+    last: int,
+    total: int,
+    per_page: object = None,
+) -> dict[str, Any]:
+    """A page whose declared size is a string, or absent altogether."""
+    meta: dict[str, Any] = {"current_page": page, "last_page": last, "total": total}
+    if per_page is not None:
+        meta["per_page"] = per_page
+    return {"data": rows, "meta": meta}
+
+
+@pytest.mark.parametrize("per_page", [pytest.param("100", id="string-size"), pytest.param(None, id="no-size")])
+async def test_an_empty_first_page_before_a_single_card_is_indeterminate(
+    session_maker, monkeypatch: pytest.MonkeyPatch, per_page: object
+) -> None:
+    """Round 3, item 3: nothing on page one, one card on page two, total 1."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    row = _customer_row(phone=person.phone)
+    reader = PagedDirectory(
+        listing={
+            1: _loose_page([], page=1, last=2, total=1, per_page=per_page),
+            2: _loose_page([row], page=2, last=2, total=1, per_page=per_page),
+        },
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=row,
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_UNPROVEN)
+    assert report.detail_reason == LOOKUP_PAGE_EMPTY
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+    # Refused on the first page: no card read, no booking read, no history read.
+    assert reader.calls == ["customers:1"]
+
+
+async def test_an_extra_empty_last_page_is_indeterminate(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 3, item 3: one card, total 1, and a second page that cannot exist."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    row = _customer_row(phone=person.phone)
+    reader = PagedDirectory(
+        listing={
+            1: _page([row], page=1, last=2, total=1, per_page=100),
+            2: _page([], page=2, last=2, total=1, per_page=100),
+        },
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=row,
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_UNPROVEN)
+    assert report.detail_reason == LOOKUP_PAGE_COUNT_UNEXPECTED
+    assert reader.calls == ["customers:1"]
+
+
+async def test_an_extra_page_after_the_total_was_reached_is_indeterminate(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same shape with no declared size: the rows added up too early."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    row = _customer_row(phone=person.phone)
+    reader = PagedDirectory(
+        listing={
+            1: _loose_page([row], page=1, last=2, total=1),
+            2: _loose_page([], page=2, last=2, total=1),
+        },
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=row,
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_UNPROVEN)
+    assert report.detail_reason == LOOKUP_TOTAL_REACHED_EARLY
+    assert reader.calls == ["customers:1"]
+
+
+async def test_a_page_holding_more_rows_than_its_size_is_indeterminate(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two rows on a page that declares room for one describes no listing."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    row = _customer_row(phone=person.phone)
+    other = _customer_row(phone=person.phone, customer_uuid=OTHER_CUSTOMER_UUID)
+    reader = PagedDirectory(
+        listing={1: _page([row, other], page=1, last=2, total=2, per_page=1)},
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=row,
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_UNPROVEN)
+    assert report.detail_reason == LOOKUP_PAGE_OVERFILLED
+    assert reader.calls == ["customers:1"]
+
+
+async def test_a_correct_empty_listing_is_an_answer_not_a_refusal(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 3: nobody on that number, read completely, is a fact.
+
+    The stricter contract must not turn a legitimately empty workspace answer
+    into a coverage complaint: the listing is complete, the customer is absent,
+    and the check refuses for that reason and not for ours.
+    """
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = PagedDirectory(
+        listing={1: _page([], page=1, last=1, total=0, per_page=100)},
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_UNPROVEN)
+    # Not one of OUR coverage refusals: the listing was fine.
+    assert report.detail_reason is None
+    assert reader.calls == ["customers:1"]
+    assert report.completed_visit_count is None
+
+
+async def test_the_migration_lookup_still_accepts_the_empty_first_page() -> None:
+    """The shared contracts keep their own answer to the same listing.
+
+    The migration read and the manual Add resolve this listing exactly as they
+    did before; the stricter coverage rule lives in the diagnostic alone.
+    """
+    row = {"uuid": str(CUSTOMER_UUID), "phone": "+4915100012345", "first_name": "Synthetic"}
+
+    class Directory:
+        async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
+            page = int(params["page"])
+            rows = [] if page == 1 else [row]
+            return {
+                "data": rows,
+                "meta": {"current_page": page, "last_page": 2, "per_page": "100", "total": 1},
+            }
+
+        async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+            return row
+
+    lookup = await lookup_customer_by_phone(Directory(), "+4915100012345")
+
+    assert lookup.outcome == LOOKUP_FOUND
+    assert lookup.uuid == str(CUSTOMER_UUID)
+
+
+# ===========================================================================
+# 23. A row written before the contact count — round 3, item 5
+# ===========================================================================
+# Rows created by the previous revision hold a binding without the proof that
+# exactly one contact was captured for the booking. The card's number alone does
+# not make up for it: it may be the one number a single delivery captured, or
+# one of several the deliveries disagreed about, and the row cannot say which.
+# Such a row is refused with a reason of its own — unless a stored numeric↔UUID
+# correspondence identifies the person without any contact at all. Old rows are
+# never rewritten and never rebuilt from a later delivery.
+
+
+async def _strip_contact_proof(session_maker, recipient_id: int) -> dict[str, Any]:
+    """Rewrite the row's binding into the exact shape commit c3cb4f1 stored."""
+    async with session_maker() as session:
+        async with session.begin():
+            row = await session.get(CampaignRecipient, recipient_id)
+            assert row is not None
+            meta = dict(row.meta or {})
+            stored = dict(meta[ZERO_VISIT_SOURCE_META_KEY])
+            stored.pop("contact_sources", None)
+            stored.pop("contact_event_id", None)
+            meta[ZERO_VISIT_SOURCE_META_KEY] = stored
+            row.meta = meta
+            return stored
+
+
+async def test_a_row_without_the_contact_proof_is_refused_with_its_own_reason(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 5: two contradictory contacts, and an old row that cannot tell.
+
+    The archive holds two deliveries of this booking carrying two different
+    numbers, so no contact identifies the customer. A row from before the count
+    existed looks exactly like a row from a booking with one contact, so it is
+    refused rather than resolved — and the lookup is never spent on it.
+    """
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+    await _sibling_delivery(session_maker, person, phone="+4915100077777")
+    run_id, recipient_id = await _run_preview(session_maker, monkeypatch)
+    stored = await _strip_contact_proof(session_maker, recipient_id)
+    assert "contact_sources" not in stored
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CONTACT_EVIDENCE_MISSING)
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+    assert reader.calls == []
+    # The stored row is left exactly as it was found.
+    row = await _row(session_maker, recipient_id)
+    assert ZERO_VISIT_SOURCE_META_KEY in (row.meta or {})
+    assert "contact_sources" not in (row.meta or {})[ZERO_VISIT_SOURCE_META_KEY]
+
+
+async def test_an_old_row_with_a_stored_correspondence_is_still_checked(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 5: a consistent stored UUID remains a basis of its own."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    await _strip_contact_proof(session_maker, recipient_id)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.identity_source == IDENTITY_VIA_STORED_UUID
+    assert report.completed_visit_count == 1
+    assert "customers" not in reader.calls
+
+
+async def test_an_old_row_is_not_rebuilt_from_a_later_delivery(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A delivery that arrived after the preview supplies nothing, as before."""
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=False)
+    run_id, recipient_id = await _run_preview(session_maker, monkeypatch)
+    await _strip_contact_proof(session_maker, recipient_id)
+    # Only now does a delivery carrying the number arrive.
+    await _sibling_delivery(session_maker, person, phone=person.phone)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CONTACT_EVIDENCE_MISSING)
+    assert reader.calls == []
+
+
+# ===========================================================================
+# 24. Which failure the operator is told about — round 3, item 6
+# ===========================================================================
+# Four more distinctions an operator has to be able to act on: our own database
+# running out of time after EasyWeek had already answered is not EasyWeek
+# failing; an unusable integration is not an unreachable branch; and on the
+# direct card read, a body that is not a card is not the same as a card for
+# somebody else.
+
+
+async def test_a_database_timeout_after_the_api_answered_is_not_blamed_on_easyweek(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 6: EasyWeek answered, our own phase ran out of time."""
+    import altegio_bot.campaigns.easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    real_recheck = history_module._recheck_local_identity
+
+    async def slow_recheck(*args: Any, **kwargs: Any):
+        await asyncio.sleep(5)
+        return await real_recheck(*args, **kwargs)
+
+    monkeypatch.setattr(history_module, "_recheck_local_identity", slow_recheck)
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.2)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is False
+    # Neutral: our side. Never "EasyWeek did not answer" — it did.
+    assert report.reason == DEADLINE_AFTER_READ
+    assert report.detail_reason == DEADLINE_AFTER_READ_DETAIL
+    assert report.retryable is True
+    assert report.completed_visit_count is None
+    # It had already answered the lookup and the card read.
+    assert "customers" in reader.calls
+    assert not any(call.startswith("history") for call in reader.calls)
+
+
+async def test_a_deadline_inside_an_api_call_still_says_easyweek_did_not_answer(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The temporary family is untouched where it is the right answer."""
+    import altegio_bot.campaigns.easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+
+    async def hang() -> None:
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.2)
+    reader = FakeEasyWeek(booking=_booking_response(booking_uuid=person.booking_uuid), on_booking=hang)
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, TEMPORARILY_UNAVAILABLE)
+    assert report.detail_reason == API_RETRYABLE_UNCERTAINTY
+    assert report.retryable is True
+
+
+async def test_an_unusable_integration_is_not_an_unreachable_branch(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 6: a configuration error has its own answer."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=EasyWeekConfigError("EASYWEEK_API_KEY is not configured"),
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, API_NOT_CONFIGURED)
+    # Not temporary: no retry can configure a workspace slug.
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+
+
+async def test_the_ops_api_says_the_integration_is_not_configured(
+    session_maker, monkeypatch: pytest.MonkeyPatch, ui_client
+) -> None:
+    """The same distinction where the client is built, before any request."""
+    run_id, recipient_id, _person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+
+    class Unconfigured:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise EasyWeekConfigError("EASYWEEK_WORKSPACE_SLUG is not configured")
+
+    monkeypatch.setattr(voucher_mailing_module, "EasyWeekClient", Unconfigured)
+    response = await ui_client.post(
+        HISTORY_URL,
+        json={"preview_run_id": run_id, "campaign_recipient_id": recipient_id},
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == API_NOT_CONFIGURED
+    assert body.get("completed_visit_count") is None
+
+
+async def test_a_card_body_that_is_not_a_card_is_a_format_problem(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 6: a 200 that is not a readable card."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer={"unexpected": "shape"},
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, API_RESPONSE_MALFORMED)
+    assert report.detail_reason == LOOKUP_CARD_MALFORMED
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+
+
+async def test_a_card_read_answering_about_another_customer_is_a_conflict(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A well-formed card for a different UUID is an identity answer, not a format one."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone, customer_uuid=OTHER_CUSTOMER_UUID),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.detail_reason == LOOKUP_CARD_UUID_MISMATCH
+    assert report.retryable is False
+    assert not any(call.startswith("history") for call in reader.calls)
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason", "retryable"),
+    [
+        pytest.param(EasyWeekRetryableError("429"), TEMPORARILY_UNAVAILABLE, True, id="429"),
+        pytest.param(EasyWeekRetryableError("503"), TEMPORARILY_UNAVAILABLE, True, id="503"),
+        pytest.param(EasyWeekPermanentError("422"), API_REFUSED, False, id="422"),
+    ],
+)
+async def test_the_three_preserved_families_still_answer_as_before(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    reason: str,
+    retryable: bool,
+) -> None:
+    """429, 503 and a permanent 422 keep exactly the answers they had."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: failure},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason, report.retryable) == (False, reason, retryable)
+    assert report.completed_visit_count is None
+
+
+async def test_a_second_card_on_the_number_appearing_mid_check_stops_it(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 2: the recheck applies the rule the first read applied.
+
+    A second local card on the proof's number, created while the booking read
+    was in flight, is exactly what the first read refuses as ambiguous. The
+    window must not be a way past it.
+    """
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+
+    async def race() -> None:
+        await _card_in_branch(
+            session_maker,
+            company_id=COMPANY_ID,
+            customer_id=person.customer_id + 777,
+            customer_uuid=None,
+            phone=person.phone,
+        )
+
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer=_customer_row(phone=person.phone),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+        on_booking=race,
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CUSTOMER_IDENTITY_AMBIGUOUS)
+    assert report.completed_visit_count is None
+    assert not any(call.startswith("history") for call in reader.calls)

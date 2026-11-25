@@ -69,9 +69,12 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     APPROVED_ISSUER_DISPLAY_NAME,
     APPROVED_ISSUER_DISPLAY_NAME_GENITIVE,
 )
+from altegio_bot.campaigns.easyweek_zero_visit_history import (
+    API_NOT_CONFIGURED as ZERO_VISIT_API_NOT_CONFIGURED,
+)
 from altegio_bot.campaigns.easyweek_zero_visit_history import check_zero_visit_history
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.easyweek_voucher_production_contract import (
@@ -732,6 +735,12 @@ async def api_zero_visit_history(request: Request) -> JSONResponse:
                 reader=reader,
             )
         result = report.as_safe_dict()
+    except EasyWeekConfigError:
+        # The client could not even be built: no API key, no workspace slug, a
+        # base URL that is not the EasyWeek API. Nothing was asked of anybody,
+        # so "EasyWeek did not answer" would send an operator to look at a
+        # branch — and no retry can configure a workspace.
+        result = {"ok": False, "reason": ZERO_VISIT_API_NOT_CONFIGURED, "retryable": False}
     except (EasyWeekError, TimeoutError):
         result = {"ok": False, "reason": "manual_batch_provider_unavailable"}
     except SQLAlchemyError:

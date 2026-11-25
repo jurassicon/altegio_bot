@@ -378,3 +378,119 @@ async def test_a_deadline_before_the_first_api_call_does_not_blame_easyweek(
     assert "визитов по истории API" not in text
     assert "Эта проверка ничего не изменила." in text
     assert_no_page_errors(page)
+
+
+async def test_an_unconfigured_integration_does_not_read_as_an_outage(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 6: ours, not theirs, in the sentence on the screen.
+
+    No API key means nobody was asked anything. "EasyWeek не ответил" would send
+    an operator to look at a branch, and "можно повторить позже" would have them
+    pressing a button that cannot start working.
+    """
+    from altegio_bot.easyweek_client import EasyWeekConfigError
+
+    run_id, recipient_id, _person = await _preview_with_zero_row(session_maker, monkeypatch)
+
+    class Unconfigured:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise EasyWeekConfigError("EASYWEEK_API_KEY is not configured")
+
+    monkeypatch.setattr(voucher_mailing_module, "EasyWeekClient", Unconfigured)
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "интеграция с EasyWeek не настроена" in text
+    assert "EasyWeek не ответил" not in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)
+
+
+async def test_a_deadline_after_the_api_answered_does_not_blame_easyweek(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 6: EasyWeek answered, and then our own phase ran out.
+
+    The operator must read neither "EasyWeek не ответил", which is false, nor a
+    visit count, which was never confirmed.
+    """
+    import asyncio
+
+    from altegio_bot.campaigns import easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    _install(monkeypatch, BrowserEasyWeek(person=person, rows=[_history_row(booking_uuid=person.booking_uuid)]))
+    real_recheck = history_module._recheck_local_identity
+
+    async def slow_recheck(*args: Any, **kwargs: Any):
+        await asyncio.sleep(5)
+        return await real_recheck(*args, **kwargs)
+
+    monkeypatch.setattr(history_module, "_recheck_local_identity", slow_recheck)
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.3)
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "на нашей стороне после ответа EasyWeek" in text
+    assert "EasyWeek не ответил" not in text
+    assert "EasyWeek не запрашивался" not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)
+
+
+async def test_a_row_without_the_contact_proof_reads_as_its_own_reason(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 5: what an old row's operator actually reads.
+
+    Not "личность не доказана", which reads as a statement about the person, and
+    not a retry suggestion: the row simply does not carry the proof, and only a
+    new preview can give it one.
+    """
+    from altegio_bot.campaigns.easyweek_zero_visit import ZERO_VISIT_SOURCE_META_KEY
+
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+    monkeypatch.setattr(segment_module, "SessionLocal", session_maker)
+    monkeypatch.setattr(runner_module, "SessionLocal", session_maker)
+    run = await runner_module.run_preview(
+        RunParams(
+            provider=PROVIDER_EASYWEEK,
+            company_id=COMPANY_ID,
+            location_id=COMPANY_ID,
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+            mode="preview",
+            campaign_code="new_clients_monthly",
+        )
+    )
+    async with session_maker() as session:
+        from sqlalchemy import select
+
+        row = (
+            await session.execute(select(CampaignRecipient).where(CampaignRecipient.campaign_run_id == run.id))
+        ).scalar_one()
+        recipient_id = int(row.id)
+    # The exact shape the previous revision stored: no contact proof.
+    async with session_maker() as session:
+        async with session.begin():
+            stored_row = await session.get(CampaignRecipient, recipient_id)
+            assert stored_row is not None
+            meta = dict(stored_row.meta or {})
+            binding = dict(meta[ZERO_VISIT_SOURCE_META_KEY])
+            binding.pop("contact_sources", None)
+            binding.pop("contact_event_id", None)
+            meta[ZERO_VISIT_SOURCE_META_KEY] = binding
+            stored_row.meta = meta
+    _install(monkeypatch, BrowserEasyWeek(person=person, rows=[_history_row(booking_uuid=person.booking_uuid)]))
+
+    text = await _press_check(page, run_id=run.id, recipient_id=recipient_id)
+
+    assert "нет доказательства единственности контакта" in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    assert_no_page_errors(page)

@@ -48,6 +48,7 @@ from altegio_bot.models.models import (
 from altegio_bot.tests.easyweek_zero_visit_fixtures import (
     CATEGORY,
     COMPANY_ID,
+    LOCATION_UUID,
     NOW,
     OTHER_COMPANY_ID,
     OTHER_LOCATION_UUID,
@@ -755,3 +756,182 @@ async def test_the_period_count_follows_records_not_deliveries(session_maker, mo
     candidate = result.candidates[0].candidate
     assert candidate.total_records_in_period == 1
     assert candidate.confirmed_records_in_period == 0
+
+
+# ===========================================================================
+# 10. The archive is read once per preview — review round 3, item 4
+# ===========================================================================
+# The contact rule asks which of a booking's deliveries carried a contact. That
+# question used to be asked per recipient, and its predicate — this booking uuid
+# plus ``status = 'processed'`` — is served by no index this schema has: the one
+# index on ``booking_uuid`` is partial on the two NON-terminal statuses. So the
+# preview scanned the delivery archive once for every zero-counter person in it.
+# It is now one read for the whole phase; what the rule itself accepts and
+# refuses is unchanged and covered above.
+
+
+async def _contact_sibling(
+    session_maker,
+    person: Person,
+    *,
+    phone: str,
+    booking_uuid: uuid.UUID | None = None,
+    status: str = "processed",
+    location_id: int = COMPANY_ID,
+    location_uuid: str = LOCATION_UUID,
+    event_hint: str = "booking-created",
+) -> int:
+    """One more processed delivery of (nominally) the same booking."""
+    identity = booking_uuid or person.booking_uuid
+    async with session_maker() as session:
+        async with session.begin():
+            event = EasyWeekEvent(
+                status=status,
+                event_hint=event_hint,
+                booking_uuid=identity,
+                body_truncated=False,
+                payload={
+                    "uid": str(identity),
+                    "id": person.booking_id,
+                    "location_id": location_id,
+                    "location_uuid": location_uuid,
+                    "customer_id": person.customer_id,
+                    "customer_phone": phone,
+                },
+                payload_hash=f"sibling-{uuid.uuid4()}",
+            )
+            session.add(event)
+            await session.flush()
+            return int(event.id)
+
+
+def _statement_counter(engine, needle: str) -> tuple[dict[str, int], Any]:
+    """Count the statements that touch one table, with their own listener."""
+    from sqlalchemy import event as sa_event
+
+    counted = {"statements": 0}
+
+    def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if needle in statement.lower():
+            counted["statements"] += 1
+
+    sa_event.listen(engine.sync_engine, "after_cursor_execute", after_cursor_execute)
+    return counted, after_cursor_execute
+
+
+async def _contact_reads_during_preview(session_maker, engine, monkeypatch: pytest.MonkeyPatch) -> tuple[int, int]:
+    """``(reads of the delivery archive, rows the preview produced)``."""
+    from sqlalchemy import event as sa_event
+
+    counted, listener = _statement_counter(engine, "from easyweek_events")
+    try:
+        result = await _segment(session_maker, monkeypatch)
+    finally:
+        sa_event.remove(engine.sync_engine, "after_cursor_execute", listener)
+    diagnostic = [item for item in result.candidates if item.candidate.excluded_reason == ZERO_VISITS_REPORTED]
+    return counted["statements"], len(diagnostic)
+
+
+async def test_the_delivery_archive_is_not_read_once_per_recipient(
+    session_maker, engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3, item 4: three diagnostic rows must not cost three archive reads.
+
+    A count of statements, not a stopwatch: the point is that the number of
+    reads does not follow the number of recipients, and a timing threshold
+    would say nothing about that on a machine of a different speed.
+    """
+    await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+    one_reads, one_rows = await _contact_reads_during_preview(session_maker, engine, monkeypatch)
+
+    for index in (2, 3):
+        await seed_person(session_maker, index, customer_uuid=None, capture_phone=True)
+    three_reads, three_rows = await _contact_reads_during_preview(session_maker, engine, monkeypatch)
+
+    assert (one_rows, three_rows) == (1, 3)
+    assert one_reads > 0
+    assert three_reads == one_reads
+
+
+async def test_the_batched_read_still_finds_each_booking_s_own_contact(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One read for several bookings must not mix their deliveries up.
+
+    Two people, each with a sibling delivery carrying their own number, and a
+    third sibling carrying a number for a booking nobody in this preview owns.
+    Each row must record its own contact, and neither may borrow the other's.
+    """
+    first = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=False)
+    second = await seed_person(session_maker, 2, customer_uuid=None, capture_phone=False)
+    first_contact = await _contact_sibling(session_maker, first, phone=first.phone)
+    second_contact = await _contact_sibling(session_maker, second, phone=second.phone)
+    # A delivery of a booking this preview knows nothing about.
+    await _contact_sibling(
+        session_maker,
+        first,
+        phone="+4915100088888",
+        booking_uuid=uuid.UUID(int=0x5150_0001, version=4),
+    )
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    bindings = {row.client_id: read_zero_visit_source_meta(row.meta) for row in rows}
+    assert len(bindings) == 2
+    assert bindings[first.client_id] is not None
+    assert bindings[second.client_id] is not None
+    assert bindings[first.client_id].contact_event_id == first_contact
+    assert bindings[second.client_id].contact_event_id == second_contact
+    assert {binding.contact_sources for binding in bindings.values()} == {1}
+
+
+async def test_a_delivery_of_another_branch_is_still_no_contact(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every check the per-recipient read made is still made: the branch."""
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=False)
+    await _contact_sibling(
+        session_maker,
+        person,
+        phone=person.phone,
+        location_id=OTHER_COMPANY_ID,
+        location_uuid=OTHER_LOCATION_UUID,
+    )
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.contact_sources == 0
+    assert stored.contact_event_id is None
+
+
+async def test_an_unprocessed_sibling_delivery_is_still_no_contact(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the status: a delivery that was never processed proves nothing."""
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=False)
+    await _contact_sibling(session_maker, person, phone=person.phone, status="captured")
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.contact_sources == 0
+
+
+async def test_contradictory_contacts_are_still_recorded_as_such(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the contradiction: two numbers for one booking choose nobody."""
+    person = await seed_person(session_maker, 1, customer_uuid=None, capture_phone=True)
+    await _contact_sibling(session_maker, person, phone="+4915100066666")
+
+    run_id = await _preview(session_maker, monkeypatch)
+    rows = await _rows(session_maker, run_id)
+
+    stored = read_zero_visit_source_meta(rows[0].meta)
+    assert stored is not None
+    assert stored.contact_sources == 2
+    assert stored.contact_event_id is None

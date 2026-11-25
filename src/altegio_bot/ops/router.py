@@ -7372,10 +7372,23 @@ const ZERO_VISIT_REASONS = {
     "Не удалось проверить историю: EasyWeek отказал в запросе.",
   "zero_visit_check_api_response_malformed":
     "Не удалось проверить историю: EasyWeek вернул ответ неожидаемого формата.",
+  // Ours, not theirs: no key, no workspace, an unusable base URL. Nobody was
+  // asked anything, so a retry changes nothing until the server is configured.
+  "zero_visit_check_api_not_configured":
+    "Проверка недоступна: интеграция с EasyWeek не настроена на сервере.",
+  // The row holds no proof that exactly one contact was captured for this
+  // booking — a row created before that proof existed. Its own sentence,
+  // because an operator must not read it as "this person is unknown".
+  "zero_visit_check_contact_evidence_missing":
+    "Не удалось подтвердить: в строке нет доказательства единственности контакта.",
   // The deadline expired on OUR rows, before EasyWeek was asked at all. Saying
   // "EasyWeek did not answer" here would send somebody to the wrong system.
   "zero_visit_check_local_deadline":
     "Проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался.",
+  // EasyWeek answered, and then our own phase ran out of time. Neutral on
+  // purpose: blaming EasyWeek would be wrong, and so would a confirmation.
+  "zero_visit_check_deadline_after_api_read":
+    "Проверка не успела завершиться на нашей стороне после ответа EasyWeek.",
   "manual_batch_rate_limit": "Предыдущая проверка ещё выполняется.",
   "manual_batch_input_invalid": "Некорректный запрос.",
   "manual_batch_provider_unavailable":
