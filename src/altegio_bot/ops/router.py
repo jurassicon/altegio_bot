@@ -7381,6 +7381,10 @@ const ZERO_VISIT_REASONS = {
   // because an operator must not read it as "this person is unknown".
   "zero_visit_check_contact_evidence_missing":
     "Не удалось подтвердить: в строке нет доказательства единственности контакта.",
+  // The identity rested on the number the delivery captured, and the card has
+  // since said that number is not its own. No number and no UUID in the text.
+  "zero_visit_check_contact_proof_stale":
+    "Не удалось подтвердить: контакт клиента в EasyWeek изменился, прежнее совпадение больше не доказывает личность.",
   // The deadline expired on OUR rows, before EasyWeek was asked at all. Saying
   // "EasyWeek did not answer" here would send somebody to the wrong system.
   "zero_visit_check_local_deadline":

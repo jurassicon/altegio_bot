@@ -499,12 +499,25 @@ async def test_a_row_without_the_contact_proof_reads_as_its_own_reason(
 class BrowserDirectory(BrowserEasyWeek):
     """The same reader, with the card body and the listing's pace steerable."""
 
-    def __init__(self, *, card: Any = None, listing_delay: float = 0.0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        card: Any = None,
+        cards_in_sequence: list[Any] | None = None,
+        listing_delay: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.card = card
+        self.cards_in_sequence = list(cards_in_sequence or [])
         self.listing_delay = listing_delay
 
     async def get_customer(self, customer_uuid: str) -> dict[str, Any]:
+        if self.cards_in_sequence:
+            value = self.cards_in_sequence.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value  # type: ignore[return-value]
         if self.card is not None:
             if isinstance(self.card, Exception):
                 raise self.card
@@ -608,4 +621,40 @@ async def test_a_card_for_another_customer_reads_as_an_identity_conflict(
     assert "ответ неожидаемого формата" not in text
     assert "Можно повторить проверку позже." not in text
     assert "визитов по истории API" not in text
+    assert_no_page_errors(page)
+
+
+async def test_a_number_that_changed_under_the_proof_reads_as_its_own_reason(
+    page, session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 2: the sentence an operator reads for a stale contact.
+
+    Not "личность не доказана", which says the wrong thing about a person who
+    may well be the same, and not a retry suggestion: the number the proof
+    rested on is simply not this card's any more. No number and no UUID appear
+    in the text.
+    """
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    moved = "+4915100055555"
+    _install(
+        monkeypatch,
+        BrowserDirectory(
+            person=person,
+            rows=[_history_row(booking_uuid=person.booking_uuid)],
+            cards_in_sequence=[
+                {"uuid": str(CUSTOMER_UUID), "phone": person.phone, "first_name": "Synthetic"},
+                {"uuid": str(CUSTOMER_UUID), "phone": moved, "first_name": "Synthetic"},
+            ],
+        ),
+    )
+
+    text = await _press_check(page, run_id=run_id, recipient_id=recipient_id)
+
+    assert "контакт клиента в EasyWeek изменился" in text
+    assert "больше не доказывает личность" in text
+    assert "Можно повторить проверку позже." not in text
+    assert "визитов по истории API" not in text
+    assert "Эта проверка ничего не изменила." in text
+    for secret in (person.phone, moved, str(CUSTOMER_UUID)):
+        assert secret not in text
     assert_no_page_errors(page)

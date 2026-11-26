@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import func, select, text
 
@@ -63,6 +64,7 @@ from altegio_bot.campaigns.easyweek_zero_visit_history import (
     BOOKING_REASSIGNED,
     CONTACT_EVIDENCE_MISSING,
     CONTACT_OWNER_CONFLICT,
+    CONTACT_PROOF_STALE,
     CUSTOMER_IDENTITY_AMBIGUOUS,
     CUSTOMER_IDENTITY_UNPROVEN,
     DEADLINE_AFTER_READ,
@@ -91,6 +93,7 @@ from altegio_bot.campaigns.easyweek_zero_visit_history import (
     check_zero_visit_history,
 )
 from altegio_bot.campaigns.easyweek_zero_visit_lookup import (
+    LOOKUP_CARD_CONTACT_CHANGED,
     LOOKUP_CARD_MALFORMED,
     LOOKUP_CARD_UUID_MISMATCH,
     LOOKUP_PAGE_COUNT_UNEXPECTED,
@@ -104,7 +107,9 @@ from altegio_bot.campaigns.easyweek_zero_visit_lookup import (
 )
 from altegio_bot.campaigns.runner import RunParams
 from altegio_bot.easyweek_client import (
+    CANONICAL_API_BASE_URL,
     EasyWeekAuthError,
+    EasyWeekClient,
     EasyWeekConfigError,
     EasyWeekNotFoundError,
     EasyWeekPermanentError,
@@ -4404,4 +4409,469 @@ async def test_the_card_read_keeps_the_other_families_too(
     report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
 
     assert (report.ok, report.reason, report.retryable) == (False, reason, retryable)
+    assert report.completed_visit_count is None
+
+
+# ===========================================================================
+# 29. The guard must close on the actual request — round 5, item 1
+# ===========================================================================
+# The guard ran BEFORE the pace delay, and a delay is exactly where a
+# concurrent writer gets its time: by the moment the page was actually asked
+# for, the answer could already be about somebody else. The client's retry
+# delay is the same window one level down — a ``Retry-After`` the server chose
+# can be seconds long, and the repeat request is a second GET of the same page.
+#
+# These tests drive the REAL client over a local transport and watch the
+# requests it actually issues. The race is deterministic: the write happens
+# inside the pause, not after a sleep somebody hopes is long enough.
+
+
+def _card_body(person: Person, *, customer_uuid: uuid.UUID = CUSTOMER_UUID, phone: str | None = None) -> dict[str, Any]:
+    return {
+        "uuid": str(customer_uuid),
+        "phone": person.phone if phone is None else phone,
+        "first_name": "Synthetic",
+    }
+
+
+class RecordingTransport:
+    """A local EasyWeek, recording what the client actually asked for.
+
+    Not a reader double: the real :class:`EasyWeekClient` runs on top of this,
+    so the retry loop, the ``Retry-After`` handling and the URL building are the
+    production ones. ``requests`` is the evidence — "no second GET of that page"
+    is a statement about HTTP, and only HTTP can answer it.
+    """
+
+    def __init__(
+        self,
+        person: Person,
+        *,
+        pages: dict[int, dict[str, Any]],
+        card: dict[str, Any] | None = None,
+        throttle_page: int | None = None,
+    ) -> None:
+        self.person = person
+        self.pages = pages
+        self.card = card
+        self.throttle_page = throttle_page
+        self.requests: list[str] = []
+        self.throttled = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/bookings/{self.person.booking_uuid}"):
+            self.requests.append("booking")
+            return httpx.Response(200, json=_booking_response(booking_uuid=self.person.booking_uuid))
+        if "/customers/" in path:
+            self.requests.append("customer")
+            return httpx.Response(200, json=self.card or _card_body(self.person))
+        if path.endswith("/bookings"):
+            page = int(request.url.params["page"])
+            self.requests.append(f"history:{page}")
+            if self.throttle_page == page and self.throttled == 0:
+                self.throttled += 1
+                # A server-chosen delay, which is where the owner can change.
+                return httpx.Response(429, json={}, headers={"Retry-After": "1"})
+            return httpx.Response(200, json=self.pages[page])
+        raise AssertionError(f"unexpected request path: {path}")
+
+
+class _PauseWriting:
+    """A controllable pause: on chosen invocations it performs one write."""
+
+    def __init__(self, writes: dict[int, Any]) -> None:
+        self.writes = writes
+        self.calls = 0
+
+    async def __call__(self, _seconds: float = 0.0) -> None:
+        self.calls += 1
+        write = self.writes.get(self.calls)
+        if write is not None:
+            await write()
+
+
+async def _live_check(
+    session_maker,
+    *,
+    run_id: int,
+    recipient_id: int,
+    transport: RecordingTransport,
+    pause: Any,
+    sleep: Any = None,
+):
+    """Run the shipped check against the real client over a local transport."""
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    client = EasyWeekClient(
+        api_key="synthetic-key",
+        workspace_slug="synthetic-slug",
+        base_url=CANONICAL_API_BASE_URL,
+        transport=httpx.MockTransport(transport.handler),
+        sleep=sleep or _no_sleep,
+    )
+    async with client:
+        return await check_zero_visit_history(
+            session_maker,
+            run_id=run_id,
+            recipient_id=recipient_id,
+            reader=client,
+            now=NOW,
+            registry=registry(),
+            pause=pause,
+            pause_sec=0.0,
+        )
+
+
+def _owner_change(session_maker, person: Person, *, suffix: str = "1") -> Any:
+    """One write that makes this row's identity contradictory, and nothing else."""
+
+    async def write() -> None:
+        await _card_in_branch(
+            session_maker,
+            company_id=OTHER_COMPANY_ID,
+            customer_id=person.customer_id,
+            customer_uuid=OTHER_CUSTOMER_UUID,
+            phone=f"{person.phone}{suffix}",
+        )
+
+    return write
+
+
+async def test_an_owner_change_during_the_pause_stops_the_first_page(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 1: the change lands while the check is waiting to ask.
+
+    The guard used to be asked before the wait, so the first page was fetched
+    on the strength of a fact that was true a moment earlier. Not one page
+    request may be made now.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(person, pages=_two_page_history(person))
+    pause = _PauseWriting({1: _owner_change(session_maker, person)})
+
+    report = await _live_check(
+        session_maker, run_id=run_id, recipient_id=recipient_id, transport=transport, pause=pause
+    )
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.completed_visit_count is None
+    assert report.pages_read == 0
+    assert transport.requests == ["booking", "customer"]
+
+
+async def test_an_owner_change_before_the_second_page_leaves_only_the_first_read(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 1: the same window between two pages."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(person, pages=_two_page_history(person))
+    pause = _PauseWriting({2: _owner_change(session_maker, person, suffix="2")})
+
+    report = await _live_check(
+        session_maker, run_id=run_id, recipient_id=recipient_id, transport=transport, pause=pause
+    )
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.completed_visit_count is None
+    assert transport.requests == ["booking", "customer", "history:1"]
+
+
+async def test_an_owner_change_during_retry_after_cancels_the_repeat_request(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 1: a 429, a server-chosen delay, and a second GET that must not happen.
+
+    The retry lives inside the client, so this is the one window the page guard
+    cannot see: the first request was made, the answer said "come back later",
+    and by the time it would have come back the row's identity had changed.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(person, pages=_two_page_history(person), throttle_page=1)
+    change = _owner_change(session_maker, person, suffix="3")
+
+    async def sleeping(_delay: float) -> None:
+        # The Retry-After wait, with the webhook's write landing inside it.
+        await change()
+
+    report = await _live_check(
+        session_maker,
+        run_id=run_id,
+        recipient_id=recipient_id,
+        transport=transport,
+        pause=_PauseWriting({}),
+        sleep=sleeping,
+    )
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.completed_visit_count is None
+    # One GET of page one, and no second attempt at it.
+    assert transport.requests == ["booking", "customer", "history:1"]
+    assert transport.throttled == 1
+
+
+async def test_a_stable_owner_still_confirms_a_two_page_history(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 5, item 1: nothing changed, so both pages are read and confirmed."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(person, pages=_two_page_history(person))
+    pause = _PauseWriting({})
+
+    report = await _live_check(
+        session_maker, run_id=run_id, recipient_id=recipient_id, transport=transport, pause=pause
+    )
+
+    assert report.ok is True
+    assert report.completed_visit_count == 1
+    assert report.source_booking_state == SOURCE_STATE_COMPLETED
+    assert report.pages_read == 2
+    assert transport.requests == ["booking", "customer", "history:1", "history:2"]
+    # The barrier left the shared client exactly as it found it.
+    assert pause.calls == 2
+
+
+async def test_the_retry_barrier_is_removed_after_the_check(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing of one request's guard may survive into the next caller's reads."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(person, pages=_two_page_history(person))
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    client = EasyWeekClient(
+        api_key="synthetic-key",
+        workspace_slug="synthetic-slug",
+        base_url=CANONICAL_API_BASE_URL,
+        transport=httpx.MockTransport(transport.handler),
+        sleep=_no_sleep,
+    )
+    async with client:
+        report = await check_zero_visit_history(
+            session_maker,
+            run_id=run_id,
+            recipient_id=recipient_id,
+            reader=client,
+            now=NOW,
+            registry=registry(),
+            pause=_PauseWriting({}),
+            pause_sec=0.0,
+        )
+        assert report.ok is True
+        assert client._before_retry is None
+
+
+# ===========================================================================
+# 30. A number that changed under the proof — round 5, item 2
+# ===========================================================================
+# Where there is no stored numeric-to-UUID correspondence, the identity is
+# proven from the contact a delivery captured: the lookup resolves that number
+# to one customer and the card is read back at it. The history reader then reads
+# that card AGAIN, and that answer can carry a different number — or none. The
+# UUID still matches, so nothing contradicted anything, and the check went on to
+# show a confirmed visit count for a card whose only link to the delivery had
+# just disappeared. §44.2 allows an identity's number to change; it does not
+# allow a changed number to go on proving an identity.
+
+
+async def test_a_changed_number_on_the_repeat_card_refuses_before_the_history(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 2: same UUID, explicitly different number."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[
+            _customer_row(phone=person.phone),
+            _customer_row(phone="+4915100099999"),
+        ],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CONTACT_PROOF_STALE)
+    assert report.detail_reason == LOOKUP_CARD_CONTACT_CHANGED
+    assert report.retryable is False
+    assert report.completed_visit_count is None
+    assert report.history_verified is False
+    # Decided from the answer already in hand: no page, and no extra card read.
+    assert [call for call in reader.calls if call.startswith("history")] == []
+    assert reader.calls.count("customer") == 2
+
+
+async def test_an_explicitly_cleared_number_on_the_repeat_card_refuses(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 2: ``phone: null`` is a clearing, and it says so."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[
+            _customer_row(phone=person.phone),
+            {"uuid": str(CUSTOMER_UUID), "phone": None, "first_name": "Synthetic"},
+        ],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, CONTACT_PROOF_STALE)
+    assert report.completed_visit_count is None
+    assert [call for call in reader.calls if call.startswith("history")] == []
+
+
+async def test_a_missing_phone_key_is_not_a_clearing(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 5, item 2: silence about the number is not a statement about it."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[
+            _customer_row(phone=person.phone),
+            {"uuid": str(CUSTOMER_UUID), "first_name": "Synthetic"},
+        ],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.completed_visit_count == 1
+
+
+async def test_an_equivalent_spelling_of_the_same_number_is_no_contradiction(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 2: compared after the project's own normalisation."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    spaced = f"{person.phone[:3]} {person.phone[3:6]} {person.phone[6:]}"
+    assert spaced != person.phone
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[_customer_row(phone=person.phone), _customer_row(phone=spaced)],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.completed_visit_count == 1
+
+
+async def test_a_stored_correspondence_tolerates_a_changed_number(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, item 2: where the UUID is the proof, the number may change.
+
+    §44.2 is explicit about this: a proven change or clearing of the same
+    identity's contact is allowed. Nothing about this row rests on the number,
+    so nothing about it is in doubt.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    reader = FakeEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customer={"uuid": str(CUSTOMER_UUID), "phone": "+4915100088888", "first_name": "Synthetic"},
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert report.ok is True
+    assert report.identity_source == IDENTITY_VIA_STORED_UUID
+    assert report.completed_visit_count == 1
+
+
+async def test_the_stale_contact_refusal_names_nothing_contactable(
+    session_maker, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """Round 5, item 2: no number, no UUID, no response body — anywhere."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    moved = "+4915100077777"
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[_customer_row(phone=person.phone), _customer_row(phone=moved)],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    with caplog.at_level("DEBUG"):
+        report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    served = json.dumps(report.as_safe_dict())
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    for secret in (person.phone, moved, str(CUSTOMER_UUID), str(person.booking_uuid)):
+        assert secret not in served
+        assert secret not in logged
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason", "retryable"),
+    [
+        pytest.param(EasyWeekAuthError("403"), API_REFUSED, False, id="403"),
+        pytest.param(EasyWeekRetryableError("503"), TEMPORARILY_UNAVAILABLE, True, id="503"),
+    ],
+)
+async def test_the_repeat_card_read_keeps_its_other_reasons(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    reason: str,
+    retryable: bool,
+) -> None:
+    """Round 5, item 2: the new refusal must not swallow the existing ones."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[_customer_row(phone=person.phone), failure],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason, report.retryable) == (False, reason, retryable)
+    assert report.completed_visit_count is None
+
+
+async def test_an_empty_repeat_card_is_still_a_format_error(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """And an empty body stays the format refusal it became in round 4."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[_customer_row(phone=person.phone), {}],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, API_RESPONSE_MALFORMED)
+    assert report.detail_reason == CUSTOMER_RESPONSE_MALFORMED
+    assert report.completed_visit_count is None
+
+
+async def test_a_repeat_card_for_another_customer_is_still_a_conflict(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And a card for somebody else stays the identity refusal."""
+    run_id, recipient_id, person = await _preview_without_stored_uuid(session_maker, monkeypatch)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        customers=_customers_page([_customer_row(phone=person.phone)]),
+        customers_in_sequence=[
+            _customer_row(phone=person.phone),
+            _customer_row(phone=person.phone, customer_uuid=OTHER_CUSTOMER_UUID),
+        ],
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
+    assert report.detail_reason == CUSTOMER_UUID_MISMATCH
     assert report.completed_visit_count is None

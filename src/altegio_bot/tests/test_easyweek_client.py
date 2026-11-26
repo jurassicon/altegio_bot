@@ -790,6 +790,74 @@ async def test_retry_after_header_is_honoured_and_capped() -> None:
     assert sleeps.delays == [10.0]  # _RETRY_AFTER_MAX_SEC
 
 
+async def test_the_retry_barrier_is_asked_after_the_delay_and_before_the_repeat() -> None:
+    """A caller may stop a retry between the wait and the second request.
+
+    The delay is the window: a ``Retry-After`` the server chose can be seconds
+    long, and a caller whose evidence a concurrent writer can invalidate must be
+    able to decide not to ask again. Order matters, so the order is asserted.
+    """
+    events: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append("request")
+        if len([item for item in events if item == "request"]) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={"ping": "pong"})
+
+    async def sleep(_delay: float) -> None:
+        events.append("sleep")
+
+    async def barrier() -> None:
+        events.append("barrier")
+
+    async with _client(handler, sleep=sleep) as client:
+        with client.retry_barrier(barrier):
+            assert await client.ping() == {"ping": "pong"}
+        # Removed again, so it cannot reach into the next caller's reads.
+        assert client._before_retry is None
+
+    assert events == ["request", "sleep", "barrier", "request"]
+
+
+async def test_a_raising_retry_barrier_prevents_the_repeat_request() -> None:
+    """Its refusal is how a caller says "do not ask again"."""
+    requests = {"n": 0}
+
+    class Refused(Exception):
+        pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    async def barrier() -> None:
+        raise Refused()
+
+    async with _client(handler, sleep=_Sleeps()) as client:
+        with client.retry_barrier(barrier):
+            with pytest.raises(Refused):
+                await client.ping()
+
+    assert requests["n"] == 1
+
+
+async def test_without_a_barrier_the_retry_path_is_unchanged() -> None:
+    """Every other consumer of this client installs none and retries as before."""
+    requests = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        if requests["n"] == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"ping": "pong"})
+
+    async with _client(handler, sleep=_Sleeps()) as client:
+        assert await client.ping() == {"ping": "pong"}
+
+    assert requests["n"] == 2
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [

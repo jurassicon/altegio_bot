@@ -58,9 +58,11 @@ body appears in one, nor in anything this module raises or records.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Final, Protocol
+from contextlib import contextmanager
+from typing import Any, Awaitable, Callable, Final, Iterator, Protocol
 
 from altegio_bot.campaigns.easyweek_customer_history import CUSTOMER_BOOKINGS_PER_PAGE
+from altegio_bot.easyweek_migration.customers import normalized_international_phone
 from altegio_bot.easyweek_migration.manifest import canonical_uuid
 
 # -- stable, PII-free refusal details --------------------------------------
@@ -89,6 +91,11 @@ LOOKUP_TOTAL_REACHED_EARLY: Final = "zero_visit_lookup_total_reached_early"
 # different facts and only one of them is about an identity.
 LOOKUP_CARD_MALFORMED: Final = "zero_visit_lookup_card_malformed"
 LOOKUP_CARD_UUID_MISMATCH: Final = "zero_visit_lookup_card_uuid_mismatch"
+# The repeat card read answered with the SAME customer and an explicitly
+# different contact. Only meaningful where the identity rests on the historical
+# contact: the proof was "this card is the person that number belonged to", and
+# the card has just said that number is no longer its own.
+LOOKUP_CARD_CONTACT_CHANGED: Final = "zero_visit_lookup_card_contact_changed"
 
 
 class DiagnosticLookupRefused(Exception):
@@ -152,11 +159,35 @@ class DiagnosticReader:
         self.awaiting = False
         self.failure: Exception | None = None
         self.refusal: str | None = None
+        # Set when a card read answered with this customer and an explicitly
+        # different number. Kept apart from ``refusal`` because it is not a
+        # statement about the listing's coverage and because the caller decides
+        # whether it matters: it does when the identity was proven FROM that
+        # number, and it does not when a stored correspondence proved it, where
+        # §44.2 explicitly allows the same identity's number to change.
+        self.card_contact_changed = False
         self._page = 0
         self._per_page: int | None = None
         self._expected: tuple[int, int] | None = None
         self._rows = 0
         self._seen: set[str] = set()
+
+    @contextmanager
+    def retry_barrier(self, barrier: Callable[[], Awaitable[None]] | None) -> Iterator[None]:
+        """Install the caller's retry barrier on the reader underneath, if it has one.
+
+        The retry loop lives in the EasyWeek client, so a caller that must not
+        spend a second request on a stale answer has to reach it through here.
+        A reader without the hook — a test double, another transport — simply
+        gets nothing installed, which is also the behaviour every other consumer
+        of that client keeps.
+        """
+        install = getattr(self._reader, "retry_barrier", None)
+        if install is None:
+            yield
+            return
+        with install(barrier):
+            yield
 
     def expect_phone(self, phone: str) -> None:
         """Bind the number this lookup is allowed to ask about.
@@ -233,6 +264,17 @@ class DiagnosticReader:
             return
         if identity != canonical_uuid(customer_uuid):
             self._refuse(LOOKUP_CARD_UUID_MISMATCH)
+            return
+        # The same customer, and the contact this proof was built on. Only an
+        # EXPLICIT contradiction counts: the key has to be there, and it has to
+        # normalise to something else — a cleared number included. A body that
+        # simply does not mention ``phone`` says nothing about the number, and
+        # treating silence as a clearing would refuse a perfectly good answer.
+        # Normalisation is the project's own, so "+49 151 0000 0001" and
+        # "+4915100000001" are the same number and not a contradiction.
+        if self._phone is not None and "phone" in body:
+            if normalized_international_phone(body.get("phone")) != self._phone:
+                self.card_contact_changed = True
 
     # -- the strict part ---------------------------------------------------
     async def list_customers(self, *, params: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +379,7 @@ class DiagnosticReader:
 
 
 __all__ = [
+    "LOOKUP_CARD_CONTACT_CHANGED",
     "LOOKUP_CARD_MALFORMED",
     "LOOKUP_CARD_UUID_MISMATCH",
     "LOOKUP_COVERAGE_INCOMPLETE",

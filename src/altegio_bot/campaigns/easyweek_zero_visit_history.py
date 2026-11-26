@@ -119,6 +119,7 @@ from altegio_bot.campaigns.easyweek_zero_visit import (
     read_zero_visit_source_meta,
 )
 from altegio_bot.campaigns.easyweek_zero_visit_lookup import (
+    LOOKUP_CARD_CONTACT_CHANGED,
     LOOKUP_CARD_MALFORMED,
     LOOKUP_CARD_UUID_MISMATCH,
     DiagnosticReader,
@@ -189,6 +190,13 @@ CONTACT_OWNER_CONFLICT: Final = "zero_visit_check_contact_owner_conflict"
 # several the deliveries disagreed about, and the row cannot tell us which. A
 # stored numeric↔UUID correspondence is still a valid basis; a bare phone is not.
 CONTACT_EVIDENCE_MISSING: Final = "zero_visit_check_contact_evidence_missing"
+# The identity rested on the contact a delivery captured, and the card has since
+# said that number is not its own any more. Its own reason: nothing is wrong
+# with the answer, nobody contradicts anybody about UUIDs, and the person may
+# well be the same — what is gone is the one thing that tied this card to the
+# historical delivery. §44.2 allows an identity's number to change; it does not
+# allow a changed number to go on proving an identity it no longer matches.
+CONTACT_PROOF_STALE: Final = "zero_visit_check_contact_proof_stale"
 BOOKING_REASSIGNED: Final = "zero_visit_check_booking_reassigned"
 HISTORY_UNVERIFIED: Final = "zero_visit_check_history_unverified"
 TEMPORARILY_UNAVAILABLE: Final = "zero_visit_check_temporarily_unavailable"
@@ -317,6 +325,18 @@ class ZeroVisitHistoryReport:
             "voucher_entitlement_granted": False,
             "campaign_send_authorized": False,
         }
+
+
+class _IdentityMovedOn(Exception):
+    """Raised out of the client's retry loop when the row's identity changed.
+
+    Never retryable and never shown: the refusal an operator reads is the one
+    the guard recorded. This exists only because a retry can be stopped in one
+    way — by raising — and the loop that would otherwise repeat the request is
+    inside the shared client.
+    """
+
+    retryable = False
 
 
 @dataclass(frozen=True)
@@ -995,6 +1015,14 @@ async def _check(
     guarded: dict[str, str | None] = {"reason": None, "detail": None}
 
     async def guard() -> str | None:
+        # The repeat card read is answered through this wrapper, so the body it
+        # returned is already in hand — no second request is made to ask about
+        # it. Only the branch that proved the identity FROM the captured contact
+        # cares: there the number is the proof, and a card that has explicitly
+        # stopped carrying it no longer connects this row to that delivery.
+        if facts.captured_phone is not None and reader.card_contact_changed:
+            guarded["reason"], guarded["detail"] = CONTACT_PROOF_STALE, LOOKUP_CARD_CONTACT_CHANGED
+            return CONTACT_PROOF_STALE
         conflict, conflict_detail = await _recheck_local_identity(
             session_maker, facts=facts, customer_uuid=customer_uuid
         )
@@ -1002,13 +1030,22 @@ async def _check(
             guarded["reason"], guarded["detail"] = conflict, conflict_detail
         return conflict
 
-    bookings = await read_customer_bookings(
-        reader,
-        customer_uuid=customer_uuid,
-        pause=pause if pause is not None else asyncio.sleep,
-        pause_sec=pause_sec,
-        guard=guard,
-    )
+    async def retry_barrier() -> None:
+        # The same question between a retry delay and the repeat request. It has
+        # to raise, because that is the only way out of the client's retry loop;
+        # the refusal itself is already recorded in `guarded`, which is what the
+        # caller reports.
+        if await guard() is not None:
+            raise _IdentityMovedOn(guarded["reason"] or CUSTOMER_IDENTITY_UNPROVEN)
+
+    with reader.retry_barrier(retry_barrier):
+        bookings = await read_customer_bookings(
+            reader,
+            customer_uuid=customer_uuid,
+            pause=pause if pause is not None else asyncio.sleep,
+            pause_sec=pause_sec,
+            guard=guard,
+        )
     if guarded["reason"] is not None:
         return ZeroVisitHistoryReport(
             False,
@@ -1162,6 +1199,7 @@ __all__ = [
     "CHECK_TIMEOUT_SEC",
     "CONTACT_EVIDENCE_MISSING",
     "CONTACT_OWNER_CONFLICT",
+    "CONTACT_PROOF_STALE",
     "CUSTOMER_IDENTITY_AMBIGUOUS",
     "CUSTOMER_IDENTITY_UNPROVEN",
     "DEADLINE_AFTER_READ",

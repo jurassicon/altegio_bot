@@ -188,7 +188,17 @@ booking read**, **before every page of the history** and **after the history
 read**. The page guard matters because the history reader proves the card with a
 `GET` of its own before the first page: a conflict written during that read must
 not be followed by a page request, and one that becomes visible between pages
-ends the walk there. A correspondence that appeared mid-call and names somebody
+ends the walk there.
+
+Each page guard runs **after** the pace delay, immediately before the request,
+because the delay is where a concurrent writer gets its time: asking first and
+waiting afterwards proved something about a moment that had passed. The client's
+retry delay is the same window one level down — a `Retry-After` the server chose
+can be seconds long, and the repeat is a second `GET` of the same page — so the
+check installs a barrier the client asks after that delay and before the repeat
+request. A change already saved by then means the repeat never goes out. The
+barrier is installed for the duration of this one read and removed again, and a
+caller that installs none sees no change at all. A correspondence that appeared mid-call and names somebody
 else, a UUID since bound to another numeric customer, a second card that has
 taken the proven UUID, a local card that now claims the number, or a card whose
 contact has changed all stop the check.
@@ -229,7 +239,20 @@ the structural rules still have to hold. The direct card read is checked too, an
 its two failures are kept apart: a 200 whose body is not a readable card — `{}`
 included — is a format problem, while a readable card for a different customer
 is an identity conflict. That holds for both of the direct card reads: the one
-the lookup makes and the one the history reader repeats before the first page. The migration lookup and the manual Add keep their own contract — one
+the lookup makes and the one the history reader repeats before the first page.
+
+That repeat read can also answer with the same customer and a **different
+number**, and where the identity was proven from the contact a delivery
+captured, the number is the proof: the refusal is «контакт клиента в EasyWeek
+изменился, прежнее совпадение больше не доказывает личность», no history is
+read, and no count is shown. Only an explicit contradiction counts — the `phone`
+key present and normalising to something else, a cleared `phone: null`
+included — and the comparison uses the project's own normalizer, so a different
+spelling of the same number is not a contradiction. A body that does not mention
+`phone` says nothing about it. Where a stored numeric↔UUID correspondence proved
+the identity, a changed number is allowed on its own, exactly as §44.2 says. The
+decision is made from the answer already in hand: no extra request, and no
+number, UUID or response body reaches Ops or a log. The migration lookup and the manual Add keep their own contract — one
 UUID listed twice is one customer, and that listing above still resolves for
 them — unchanged.
 
@@ -261,6 +284,10 @@ Kinds of refusal, and they mean different things:
 - «в строке нет доказательства единственности контакта» — the row predates the
   contact count and has no stored correspondence either. Only a new preview can
   give that row a basis; the check never guesses one.
+- «контакт клиента в EasyWeek изменился» — the identity rested on the contact a
+  delivery captured, and the card has since explicitly stopped carrying that
+  number. Not a retry: the number is not coming back, and a stored
+  correspondence is what would make the person identifiable without it.
 - «не удалось проверить историю» — the history itself could not be trusted:
   incomplete pagination, or a listing whose coverage could not be proven.
 - «EasyWeek отказал в запросе» — a permanent 4xx (401, 403, 404, 422). **Not**

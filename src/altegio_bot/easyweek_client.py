@@ -43,8 +43,9 @@ import logging
 import random
 import time
 import uuid as uuid_module
+from contextlib import contextmanager
 from types import TracebackType
-from typing import Any, Awaitable, Callable, Final, Mapping
+from typing import Any, Awaitable, Callable, Final, Iterator, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -414,6 +415,10 @@ class EasyWeekClient:
         self._base_url = _normalize_base_url(base_url if base_url is not None else settings.easyweek_api_base_url)
         self._max_attempts = max(1, int(max_attempts))
         self._sleep = sleep or asyncio.sleep
+        # Asked after a retry delay, immediately before the repeat request. See
+        # `retry_barrier`. None for every caller that does not install one, and
+        # the request path is then exactly what it always was.
+        self._before_retry: Callable[[], Awaitable[None]] | None = None
 
         if http_client is not None:
             self._client = http_client
@@ -426,6 +431,32 @@ class EasyWeekClient:
                 transport=transport,
             )
             self._owns_client = True
+
+    # -- retry barrier -----------------------------------------------------
+
+    @contextmanager
+    def retry_barrier(self, barrier: Callable[[], Awaitable[None]] | None) -> Iterator[None]:
+        """Ask *barrier* after each retry delay, before the repeat request.
+
+        A retry is a second request, and the delay before it can be long: a
+        ``Retry-After`` the server chose, or this client's own backoff. A caller
+        whose evidence a concurrent writer can invalidate — the read-only
+        zero-counter diagnostic, which must not read one person's history for
+        another person's row — needs the chance to stop between the wait and the
+        repeat, and it has no other way in: the retry loop is here.
+
+        The barrier is expected to raise when it refuses; an exception from it
+        propagates as that request's failure, and no further attempt is made.
+        Installed for the duration of a ``with`` block and always removed again,
+        so it cannot leak into the next caller's reads. No barrier means no
+        behaviour change at all: nothing is called and nothing is awaited.
+        """
+        previous = self._before_retry
+        self._before_retry = barrier
+        try:
+            yield
+        finally:
+            self._before_retry = previous
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -477,6 +508,11 @@ class EasyWeekClient:
         last_error: EasyWeekError | None = None
 
         for attempt in range(1, self._max_attempts + 1):
+            if attempt > 1 and self._before_retry is not None:
+                # After the delay and before the repeat request, so a caller
+                # whose evidence changed while this waited never spends a second
+                # request on an answer it already knows it cannot use.
+                await self._before_retry()
             started = time.monotonic()
             try:
                 response = await self._client.get(url, headers=self._headers(), params=params)

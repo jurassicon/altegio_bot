@@ -285,12 +285,14 @@ async def _collect_customer_history(
     ``None`` is NEVER "this customer has no bookings". An empty history is an
     empty dict, behind a complete and structurally valid zero-row response.
 
-    ``guard`` is an optional question asked before EVERY page request: "is what
-    we are about to read still about the right person?" A caller that holds
-    local evidence a concurrent writer can invalidate — the zero-counter
-    diagnostic does — passes one, and its refusal code is returned instead of a
-    page being requested. Callers that pass none behave exactly as before: no
-    extra call, no database read, and no early stop.
+    ``guard`` is an optional question asked before EVERY page request, after the
+    pace delay: "is what we are about to read still about the right person?" A
+    caller that holds local evidence a concurrent writer can invalidate — the
+    zero-counter diagnostic does — passes one, and its refusal code is returned
+    instead of a page being requested. The order matters: the delay is where a
+    writer gets its time, so asking before sleeping would prove something about
+    a moment that has passed. Callers that pass none behave exactly as before:
+    no extra call, no database read, and no early stop.
     """
     rows: dict[uuid.UUID, _Booking] = {}
     expected_total: int | None = None
@@ -298,14 +300,18 @@ async def _collect_customer_history(
     pages_read = 0
     page = 1
     while True:
+        await paced()
         if guard is not None:
             refused = await guard()
             if refused is not None:
-                # Asked before the request, so the page is not fetched at all:
-                # an answer already known to be about somebody else is not
-                # worth somebody's rate budget, let alone an operator's screen.
+                # Asked AFTER the pace delay and immediately before the request,
+                # because the delay is exactly where a concurrent writer gets
+                # time to act: asking first and sleeping afterwards left a
+                # window in which the answer became stale before it was asked
+                # for. The page is then not fetched at all — an answer already
+                # known to be about somebody else is not worth somebody's rate
+                # budget, let alone an operator's screen.
                 return None, refused, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
-        await paced()
         try:
             payload = await reader.list_customer_bookings(
                 str(customer_uuid), page=page, per_page=CUSTOMER_BOOKINGS_PER_PAGE
