@@ -198,7 +198,18 @@ can be seconds long, and the repeat is a second `GET` of the same page — so th
 check installs a barrier the client asks after that delay and before the repeat
 request. A change already saved by then means the repeat never goes out. The
 barrier is installed for the duration of this one read and removed again, and a
-caller that installs none sees no change at all. A correspondence that appeared mid-call and names somebody
+caller that installs none sees no change at all.
+
+That barrier reads our own rows from inside an HTTP call, so its failures are
+reported as ours and not as EasyWeek's. A database error there gives the
+route's standing answer «База недоступна: результат не подтверждён»
+(`manual_batch_database_unavailable`) instead of a card-format or
+incomplete-history reason, and a deadline that expires over that SQL gives
+«проверка не успела завершиться на нашей стороне после ответа EasyWeek» — the
+branch had answered, with a 429, and was waiting to be asked again. In both
+cases the repeat request is not sent and no visit count is shown. A deadline
+that expires while an answer is genuinely being waited for still reads as
+EasyWeek not answering. A correspondence that appeared mid-call and names somebody
 else, a UUID since bound to another numeric customer, a second card that has
 taken the proven UUID, a local card that now claims the number, or a card whose
 contact has changed all stop the check.

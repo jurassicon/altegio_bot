@@ -4450,13 +4450,27 @@ class RecordingTransport:
         pages: dict[int, dict[str, Any]],
         card: dict[str, Any] | None = None,
         throttle_page: int | None = None,
+        throttle_card: bool = False,
+        on_throttle: Any = None,
     ) -> None:
         self.person = person
         self.pages = pages
         self.card = card
         self.throttle_page = throttle_page
+        self.throttle_card = throttle_card
+        # Called the moment a 429 is served, so a test can arm whatever has to
+        # happen during the retry delay without counting anything.
+        self.on_throttle = on_throttle
         self.requests: list[str] = []
         self.throttled = 0
+        self.throttled_card = 0
+
+    def _throttle(self, label: str) -> httpx.Response:
+        self.throttled += 1
+        if self.on_throttle is not None:
+            self.on_throttle(label)
+        # A server-chosen delay, which is where the owner can change.
+        return httpx.Response(429, json={}, headers={"Retry-After": "1"})
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -4465,14 +4479,15 @@ class RecordingTransport:
             return httpx.Response(200, json=_booking_response(booking_uuid=self.person.booking_uuid))
         if "/customers/" in path:
             self.requests.append("customer")
+            if self.throttle_card and self.throttled_card == 0:
+                self.throttled_card += 1
+                return self._throttle("customer")
             return httpx.Response(200, json=self.card or _card_body(self.person))
         if path.endswith("/bookings"):
             page = int(request.url.params["page"])
             self.requests.append(f"history:{page}")
-            if self.throttle_page == page and self.throttled == 0:
-                self.throttled += 1
-                # A server-chosen delay, which is where the owner can change.
-                return httpx.Response(429, json={}, headers={"Retry-After": "1"})
+            if self.throttle_page == page and self.throttled == self.throttled_card:
+                return self._throttle(f"history:{page}")
             return httpx.Response(200, json=self.pages[page])
         raise AssertionError(f"unexpected request path: {path}")
 
@@ -4875,3 +4890,379 @@ async def test_a_repeat_card_for_another_customer_is_still_a_conflict(
     assert (report.ok, report.reason) == (False, IDENTITY_UUID_CONFLICT)
     assert report.detail_reason == CUSTOMER_UUID_MISMATCH
     assert report.completed_visit_count is None
+
+
+# ===========================================================================
+# 31. The owner check before a retry is OUR phase — round 6
+# ===========================================================================
+# After a 429, the owner is checked again before the repeat request — and that
+# check runs inside the HTTP client, which is where two things went wrong. The
+# shared reader turns every exception out of a read into an answer about
+# EasyWeek, so a database failure surfaced as "the card could not be read" or
+# "the history is incomplete". And the deadline covering the whole check saw a
+# call in flight, so time spent in that local SQL was reported as "EasyWeek did
+# not answer" — about a branch that had answered, with a 429, and was waiting to
+# be asked again.
+#
+# The local read is now marked as ours for the duration, and a database failure
+# is handed out as itself so the Ops route answers with the standing
+# "база недоступна" reason.
+
+
+class _PoisonedProxy:
+    """A real session whose first read fails, or never finishes."""
+
+    def __init__(self, session: Any, *, mode: str) -> None:
+        self._session = session
+        self._mode = mode
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    async def get(self, *args: Any, **kwargs: Any) -> Any:
+        if self._mode == "hang":
+            await asyncio.sleep(5)
+        else:
+            # A real failure, from the database itself.
+            await self._session.execute(text("SELECT 1 / 0"))
+        return await self._session.get(*args, **kwargs)
+
+
+class _PoisonedSession:
+    def __init__(self, context: Any, *, mode: str) -> None:
+        self._context = context
+        self._mode = mode
+
+    async def __aenter__(self) -> Any:
+        session = await self._context.__aenter__()
+        return _PoisonedProxy(session, mode=self._mode)
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        return await self._context.__aexit__(*exc_info)
+
+
+class _GuardSessions:
+    """The real session maker, poisoning exactly the session the barrier opens.
+
+    Armed by the transport the moment it answers 429, so the poisoned session is
+    the one the retry barrier opens between the delay and the repeat request —
+    no counting of opens, and no sleeping and hoping.
+    """
+
+    def __init__(self, maker: Any, *, mode: str) -> None:
+        self._maker = maker
+        self.mode = mode
+        self.armed = False
+        self.poisoned = 0
+
+    def arm(self, _label: str) -> None:
+        self.armed = True
+
+    def __call__(self) -> Any:
+        if not self.armed:
+            return self._maker()
+        self.armed = False
+        self.poisoned += 1
+        return _PoisonedSession(self._maker(), mode=self.mode)
+
+
+def _install_live_client(monkeypatch: pytest.MonkeyPatch, transport: RecordingTransport, *, sleep: Any) -> Any:
+    """Put the REAL client, over a local transport, behind the Ops route."""
+    client = EasyWeekClient(
+        api_key="synthetic-key",
+        workspace_slug="synthetic-slug",
+        base_url=CANONICAL_API_BASE_URL,
+        transport=httpx.MockTransport(transport.handler),
+        sleep=sleep,
+    )
+    _install_reader(monkeypatch, client)
+    return client
+
+
+async def _ops_zero_visit(ui_client, *, run_id: int, recipient_id: int) -> Any:
+    return await ui_client.post(HISTORY_URL, json={"preview_run_id": run_id, "campaign_recipient_id": recipient_id})
+
+
+async def _no_sleep(_delay: float) -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("throttle", "expected_requests"),
+    [
+        pytest.param("card", ["booking", "customer"], id="card-retry"),
+        pytest.param("page", ["booking", "customer", "history:1"], id="page-retry"),
+    ],
+)
+async def test_a_database_failure_before_a_retry_is_a_database_answer(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    ui_client,
+    throttle: str,
+    expected_requests: list[str],
+) -> None:
+    """Round 6: the owner check failed, so neither EasyWeek nor the row is at fault.
+
+    The shipped route already has one answer for this, and it is the one an
+    operator can act on: the database is unavailable, nothing was concluded,
+    try again. What it must not say is that the card could not be read or that
+    the history was incomplete — EasyWeek answered both times it was asked.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    sessions = _GuardSessions(session_maker, mode="sql")
+    monkeypatch.setattr(voucher_mailing_module, "SessionLocal", sessions)
+    transport = RecordingTransport(
+        person,
+        pages=_two_page_history(person),
+        throttle_card=throttle == "card",
+        throttle_page=1 if throttle == "page" else None,
+        on_throttle=sessions.arm,
+    )
+    client = _install_live_client(monkeypatch, transport, sleep=_no_sleep)
+
+    try:
+        response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "manual_batch_database_unavailable"
+    assert body.get("completed_visit_count") is None
+    # The poisoned read happened, and the repeat request did not.
+    assert sessions.poisoned == 1
+    assert transport.requests == expected_requests
+
+
+@pytest.mark.parametrize(
+    ("throttle", "expected_requests"),
+    [
+        pytest.param("card", ["booking", "customer"], id="card-retry"),
+        pytest.param("page", ["booking", "customer", "history:1"], id="page-retry"),
+    ],
+)
+async def test_a_deadline_inside_the_retry_owner_check_is_our_own(
+    session_maker,
+    monkeypatch: pytest.MonkeyPatch,
+    ui_client,
+    throttle: str,
+    expected_requests: list[str],
+) -> None:
+    """Round 6: the deadline expired over our SQL, after EasyWeek had answered.
+
+    EasyWeek answered with a 429 and was waiting to be asked again, so the one
+    thing this must not say is that EasyWeek did not answer.
+    """
+    import altegio_bot.campaigns.easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    sessions = _GuardSessions(session_maker, mode="hang")
+    monkeypatch.setattr(voucher_mailing_module, "SessionLocal", sessions)
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.3)
+    transport = RecordingTransport(
+        person,
+        pages=_two_page_history(person),
+        throttle_card=throttle == "card",
+        throttle_page=1 if throttle == "page" else None,
+        on_throttle=sessions.arm,
+    )
+    client = _install_live_client(monkeypatch, transport, sleep=_no_sleep)
+
+    try:
+        response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == DEADLINE_AFTER_READ
+    assert body["detail_reason"] == DEADLINE_AFTER_READ_DETAIL
+    assert body["retryable"] is True
+    assert body.get("completed_visit_count") is None
+    assert transport.requests == expected_requests
+
+
+async def test_a_healthy_database_still_retries_after_a_429(
+    session_maker, monkeypatch: pytest.MonkeyPatch, ui_client
+) -> None:
+    """Round 6: the positive case, on both retry points at once.
+
+    A 429 on the card read and a 429 on the first page, a stable owner and a
+    database that answers: both requests are repeated and the history is
+    confirmed.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    transport = RecordingTransport(
+        person,
+        pages=_two_page_history(person),
+        throttle_card=True,
+        throttle_page=1,
+    )
+    client = _install_live_client(monkeypatch, transport, sleep=_no_sleep)
+
+    try:
+        response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["completed_visit_count"] == 1
+    assert body["event_visits_total"] == 0
+    assert transport.requests == [
+        "booking",
+        "customer",
+        "customer",
+        "history:1",
+        "history:1",
+        "history:2",
+    ]
+
+
+async def test_an_owner_change_during_the_retry_delay_still_stops_the_repeat(
+    session_maker, monkeypatch: pytest.MonkeyPatch, ui_client
+) -> None:
+    """Round 6: and the refusal the barrier exists for is unaffected."""
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    change = _owner_change(session_maker, person, suffix="6")
+
+    async def sleeping(_delay: float) -> None:
+        await change()
+
+    transport = RecordingTransport(person, pages=_two_page_history(person), throttle_page=1)
+    client = _install_live_client(monkeypatch, transport, sleep=sleeping)
+
+    try:
+        response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason"] == IDENTITY_UUID_CONFLICT
+    assert body.get("completed_visit_count") is None
+    assert transport.requests == ["booking", "customer", "history:1"]
+
+
+async def test_nothing_is_locked_while_the_retry_delay_passes(session_maker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 6: no transaction and no row lock across the HTTP wait.
+
+    Probed from outside, on both rows the owner check reads, while the client is
+    sitting in its ``Retry-After`` delay.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    probe: dict[str, Any] = {"client": None, "record": None}
+
+    async def sleeping(_delay: float) -> None:
+        for label, statement in (
+            ("client", select(Client).where(Client.id == person.client_id)),
+            ("record", select(Record).where(Record.id == person.record_id)),
+        ):
+            try:
+                async with session_maker() as session:
+                    async with session.begin():
+                        await session.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                        await session.execute(statement.with_for_update(nowait=True))
+                probe[label] = "free"
+            except Exception as exc:  # noqa: BLE001 - the failure IS the finding
+                probe[label] = repr(exc)
+
+    transport = RecordingTransport(person, pages=_two_page_history(person), throttle_page=1)
+
+    client = EasyWeekClient(
+        api_key="synthetic-key",
+        workspace_slug="synthetic-slug",
+        base_url=CANONICAL_API_BASE_URL,
+        transport=httpx.MockTransport(transport.handler),
+        sleep=sleeping,
+    )
+    async with client:
+        report = await check_zero_visit_history(
+            session_maker,
+            run_id=run_id,
+            recipient_id=recipient_id,
+            reader=client,
+            now=NOW,
+            registry=registry(),
+            pause=_PauseWriting({}),
+            pause_sec=0.0,
+        )
+
+    assert report.ok is True
+    assert probe == {"client": "free", "record": "free"}
+
+
+async def test_a_real_wait_for_a_page_is_still_easyweek_not_answering(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 6: the timeout classification for an actual HTTP wait is kept.
+
+    Nothing local is slow here: the page read itself never comes back, and that
+    is the one case where "EasyWeek не ответил" is exactly right.
+    """
+    import altegio_bot.campaigns.easyweek_zero_visit_history as history_module
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+
+    async def hang() -> None:
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.2)
+    reader = HookedEasyWeek(
+        booking=_booking_response(booking_uuid=person.booking_uuid),
+        pages={1: _history_page([_history_row(booking_uuid=person.booking_uuid)])},
+        on_history_page={1: hang},
+    )
+
+    report = await _check(session_maker, run_id=run_id, recipient_id=recipient_id, reader=reader)
+
+    assert (report.ok, report.reason) == (False, TEMPORARILY_UNAVAILABLE)
+    assert report.detail_reason == API_RETRYABLE_UNCERTAINTY
+    assert report.retryable is True
+    assert report.completed_visit_count is None
+
+
+async def test_a_database_failure_before_a_page_is_not_classified_as_a_read(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 6: the same failure, seen at the function boundary.
+
+    The guard before a page already ran outside the shared reader's error
+    handling; the barrier did not. Both now leave the database's own failure
+    intact for the route to answer, and this asserts it where the Ops layer is
+    not involved at all.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    sessions = _GuardSessions(session_maker, mode="sql")
+    transport = RecordingTransport(
+        person,
+        pages=_two_page_history(person),
+        throttle_page=1,
+        on_throttle=sessions.arm,
+    )
+
+    client = EasyWeekClient(
+        api_key="synthetic-key",
+        workspace_slug="synthetic-slug",
+        base_url=CANONICAL_API_BASE_URL,
+        transport=httpx.MockTransport(transport.handler),
+        sleep=_no_sleep,
+    )
+    async with client:
+        with pytest.raises(SQLAlchemyError):
+            await check_zero_visit_history(
+                sessions,
+                run_id=run_id,
+                recipient_id=recipient_id,
+                reader=client,
+                now=NOW,
+                registry=registry(),
+                pause=_PauseWriting({}),
+                pause_sec=0.0,
+            )
+
+    assert transport.requests == ["booking", "customer", "history:1"]

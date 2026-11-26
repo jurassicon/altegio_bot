@@ -173,6 +173,33 @@ class DiagnosticReader:
         self._seen: set[str] = set()
 
     @contextmanager
+    def local_phase(self) -> Iterator[None]:
+        """Our own rows, read from inside a call that is already in flight.
+
+        The retry barrier runs there: the client asks it between a retry delay
+        and the repeat request, so from the deadline's point of view the check
+        is inside ``list_customer_bookings`` while it is in fact reading a
+        database. Left as it was, a deadline expiring over that SQL was reported
+        as "EasyWeek did not answer" — about a branch that had already answered,
+        with a 429, and was waiting to be asked again.
+
+        So the flag comes down for the duration and goes back up afterwards,
+        except on cancellation: that is precisely the case the flag exists to
+        describe, and leaving it down is what tells the caller the deadline
+        expired on our side.
+        """
+        previous = self.awaiting
+        self.awaiting = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            self.awaiting = previous
+            raise
+        self.awaiting = previous
+
+    @contextmanager
     def retry_barrier(self, barrier: Callable[[], Awaitable[None]] | None) -> Iterator[None]:
         """Install the caller's retry barrier on the reader underneath, if it has one.
 

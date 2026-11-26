@@ -90,6 +90,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Final
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from altegio_bot.campaigns.easyweek_customer_history import (
     API_RETRYABLE_UNCERTAINTY,
@@ -97,6 +98,7 @@ from altegio_bot.campaigns.easyweek_customer_history import (
     CUSTOMER_UUID_MISMATCH,
     SOURCE_BOOKING_MALFORMED,
     CustomerHistoryReader,
+    GuardFailed,
     LiveProofDisposition,
     classify_read_failure,
     read_booking_binding,
@@ -1035,17 +1037,37 @@ async def _check(
         # to raise, because that is the only way out of the client's retry loop;
         # the refusal itself is already recorded in `guarded`, which is what the
         # caller reports.
-        if await guard() is not None:
+        #
+        # Two things make this different from the guard before a page. It runs
+        # INSIDE a call the reader counts as in flight, so the deadline would
+        # otherwise read a slow database as EasyWeek not answering — hence the
+        # local phase. And it runs inside the shared reader's own error
+        # handling, which turns every exception into an answer about EasyWeek —
+        # so a database failure is handed out as itself instead, for the caller
+        # to report as the database being unavailable.
+        with reader.local_phase():
+            try:
+                refused = await guard()
+            except SQLAlchemyError as exc:
+                raise GuardFailed(exc) from exc
+        if refused is not None:
             raise _IdentityMovedOn(guarded["reason"] or CUSTOMER_IDENTITY_UNPROVEN)
 
-    with reader.retry_barrier(retry_barrier):
-        bookings = await read_customer_bookings(
-            reader,
-            customer_uuid=customer_uuid,
-            pause=pause if pause is not None else asyncio.sleep,
-            pause_sec=pause_sec,
-            guard=guard,
-        )
+    try:
+        with reader.retry_barrier(retry_barrier):
+            bookings = await read_customer_bookings(
+                reader,
+                customer_uuid=customer_uuid,
+                pause=pause if pause is not None else asyncio.sleep,
+                pause_sec=pause_sec,
+                guard=guard,
+            )
+    except GuardFailed as failed:
+        # The database, not EasyWeek. Raised onward as the failure it is, so the
+        # Ops route answers with the standing "база недоступна" reason it
+        # already has for exactly this — and so that nothing here invents a
+        # verdict out of a read that never happened.
+        raise failed.cause
     if guarded["reason"] is not None:
         return ZeroVisitHistoryReport(
             False,

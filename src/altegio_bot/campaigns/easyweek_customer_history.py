@@ -316,6 +316,12 @@ async def _collect_customer_history(
             payload = await reader.list_customer_bookings(
                 str(customer_uuid), page=page, per_page=CUSTOMER_BOOKINGS_PER_PAGE
             )
+        except GuardFailed:
+            # The caller's guard ran inside this read — the client asks it
+            # between a retry delay and the repeat request — and could not
+            # answer. That is not EasyWeek failing to answer, so it is not
+            # classified here as though it were.
+            raise
         except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
             result = _api_refusal(exc, stage="history", pages_read=pages_read)
             return None, result.reason, result.disposition, pages_read
@@ -370,6 +376,26 @@ async def _collect_customer_history(
     if expected_total is None or len(rows) != expected_total:
         return None, HISTORY_PAGINATION_INCOMPLETE, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
     return rows, None, LiveProofDisposition.READY, pages_read
+
+
+class GuardFailed(Exception):
+    """A caller's guard could not answer, and its failure is the caller's to report.
+
+    Not an API failure, and deliberately not classified as one. Every other
+    exception out of a read here is EasyWeek's answer — a timeout, a 4xx, a body
+    that does not keep its contract — and is turned into a stable reason that
+    says so. A guard, however, may read a database, and a database that is
+    unavailable has nothing to do with EasyWeek: reporting it as "incomplete
+    history" or "the card could not be read" sends an operator to look at the
+    wrong system entirely.
+
+    So the read sites re-raise this unchanged and let the caller unwrap
+    :attr:`cause`, which is the failure that actually happened.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__("history read guard failed")
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -445,6 +471,11 @@ async def read_customer_bookings(
 
     try:
         customer_payload = await reader.get_customer(str(customer_uuid))
+    except GuardFailed:
+        # The card read retries too, so the guard runs inside this call as well.
+        # Its own failure is the caller's to report, not a card that could not
+        # be read.
+        raise
     except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
         result = _api_refusal(exc, stage="customer")
         return CustomerBookingSet(
