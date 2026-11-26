@@ -209,10 +209,22 @@ incomplete-history reason, and a deadline that expires over that SQL gives
 branch had answered, with a 429, and was waiting to be asked again. In both
 cases the repeat request is not sent and no visit count is shown. A deadline
 that expires while an answer is genuinely being waited for still reads as
-EasyWeek not answering. A correspondence that appeared mid-call and names somebody
-else, a UUID since bound to another numeric customer, a second card that has
-taken the proven UUID, a local card that now claims the number, or a card whose
-contact has changed all stop the check.
+EasyWeek not answering.
+
+A connection that cannot be **opened** reads the same way, and it is the more
+likely failure in production: the server refusing one client too many, the
+database endpoint not listening after a restart, or a connect that never
+completes. None of those arrives as a database error of the kind an open session
+raises, so each used to be reported as a card that could not be read, an
+incomplete history, or — for the connect that timed out — as EasyWeek not
+answering. All three now give the same «База недоступна» answer, with no repeat
+request and no visit count, because that is what happened: nothing was
+concluded, and nobody needs to look at a branch for it.
+
+A correspondence that appeared mid-call and names somebody else, a UUID since
+bound to another numeric customer, a second card that has taken the proven
+UUID, a local card that now claims the number, or a card whose contact has
+changed all stop the check.
 
 So does a change to the **source record itself**. Each recheck re-proves the
 exact record the preview bound the row to — read by its id, never replaced by

@@ -72,7 +72,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
 from altegio_bot.campaigns.easyweek_zero_visit_history import (
     API_NOT_CONFIGURED as ZERO_VISIT_API_NOT_CONFIGURED,
 )
-from altegio_bot.campaigns.easyweek_zero_visit_history import check_zero_visit_history
+from altegio_bot.campaigns.easyweek_zero_visit_history import LocalDatabaseUnavailable, check_zero_visit_history
 from altegio_bot.db import SessionLocal
 from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
@@ -743,7 +743,12 @@ async def api_zero_visit_history(request: Request) -> JSONResponse:
         result = {"ok": False, "reason": ZERO_VISIT_API_NOT_CONFIGURED, "retryable": False}
     except (EasyWeekError, TimeoutError):
         result = {"ok": False, "reason": "manual_batch_provider_unavailable"}
-    except SQLAlchemyError:
+    except (LocalDatabaseUnavailable, SQLAlchemyError):
+        # OUR database, not EasyWeek's. The typed one carries the failures that
+        # never become a SQLAlchemyError, because they happen while a connection
+        # is being opened: a refused endpoint, a connect that timed out, a server
+        # answering "too many clients". One answer for all of them — nothing was
+        # concluded, and nobody is sent to look at a branch for it.
         result = {"ok": False, "reason": "manual_batch_database_unavailable"}
     finally:
         _MANUAL_BATCH_IN_FLIGHT.discard(principal.account)

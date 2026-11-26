@@ -23,13 +23,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import socket
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
+from asyncpg.exceptions import TooManyConnectionsError
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 import altegio_bot.campaigns.easyweek_segment as segment
 import altegio_bot.campaigns.runner as runner
@@ -89,6 +95,7 @@ from altegio_bot.campaigns.easyweek_zero_visit_history import (
     SOURCE_STATE_COMPLETED,
     SOURCE_STATE_NOT_COMPLETED,
     TEMPORARILY_UNAVAILABLE,
+    LocalDatabaseUnavailable,
     ZeroVisitHistoryReport,
     check_zero_visit_history,
 )
@@ -4910,18 +4917,33 @@ async def test_a_repeat_card_for_another_customer_is_still_a_conflict(
 
 
 class _PoisonedProxy:
-    """A real session whose first read fails, or never finishes."""
+    """A real session whose first read fails, parks, or merely takes its time.
 
-    def __init__(self, session: Any, *, mode: str) -> None:
+    ``sql`` is a real failure from the database itself. ``park`` announces that
+    the read has begun and then waits to be cancelled, which is what lets a
+    test fire the deadline at a moment it has observed instead of racing it
+    against a budget. ``slow`` is the control: a real, slow local read in the
+    preparation phase, before any of this.
+    """
+
+    def __init__(self, session: Any, *, mode: str, entered: asyncio.Event | None = None, delay: float = 0.0) -> None:
         self._session = session
         self._mode = mode
+        self._entered = entered
+        self._delay = delay
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._session, name)
 
     async def get(self, *args: Any, **kwargs: Any) -> Any:
-        if self._mode == "hang":
-            await asyncio.sleep(5)
+        if self._mode == "park":
+            if self._entered is not None:
+                self._entered.set()
+            # Until the deadline cancels it. No duration to tune, and nothing
+            # that can finish early under load.
+            await asyncio.Event().wait()
+        elif self._mode == "slow":
+            await self._session.execute(text(f"SELECT pg_sleep({self._delay})"))
         else:
             # A real failure, from the database itself.
             await self._session.execute(text("SELECT 1 / 0"))
@@ -4929,13 +4951,15 @@ class _PoisonedProxy:
 
 
 class _PoisonedSession:
-    def __init__(self, context: Any, *, mode: str) -> None:
+    def __init__(self, context: Any, *, mode: str, entered: asyncio.Event | None = None, delay: float = 0.0) -> None:
         self._context = context
         self._mode = mode
+        self._entered = entered
+        self._delay = delay
 
     async def __aenter__(self) -> Any:
         session = await self._context.__aenter__()
-        return _PoisonedProxy(session, mode=self._mode)
+        return _PoisonedProxy(session, mode=self._mode, entered=self._entered, delay=self._delay)
 
     async def __aexit__(self, *exc_info: Any) -> Any:
         return await self._context.__aexit__(*exc_info)
@@ -4947,23 +4971,39 @@ class _GuardSessions:
     Armed by the transport the moment it answers 429, so the poisoned session is
     the one the retry barrier opens between the delay and the repeat request —
     no counting of opens, and no sleeping and hoping.
+
+    ``prepare_delay`` slows the FIRST session instead, which is the preparation
+    phase every one of these tests runs through before the 429 it is about.
     """
 
-    def __init__(self, maker: Any, *, mode: str) -> None:
+    def __init__(
+        self,
+        maker: Any,
+        *,
+        mode: str,
+        entered: asyncio.Event | None = None,
+        prepare_delay: float = 0.0,
+    ) -> None:
         self._maker = maker
         self.mode = mode
+        self.entered = entered
+        self.prepare_delay = prepare_delay
         self.armed = False
         self.poisoned = 0
+        self.slowed = 0
 
     def arm(self, _label: str) -> None:
         self.armed = True
 
     def __call__(self) -> Any:
-        if not self.armed:
-            return self._maker()
-        self.armed = False
-        self.poisoned += 1
-        return _PoisonedSession(self._maker(), mode=self.mode)
+        if self.armed:
+            self.armed = False
+            self.poisoned += 1
+            return _PoisonedSession(self._maker(), mode=self.mode, entered=self.entered)
+        if self.prepare_delay and self.slowed == 0:
+            self.slowed += 1
+            return _PoisonedSession(self._maker(), mode="slow", delay=self.prepare_delay)
+        return self._maker()
 
 
 def _install_live_client(monkeypatch: pytest.MonkeyPatch, transport: RecordingTransport, *, sleep: Any) -> Any:
@@ -5035,11 +5075,44 @@ async def test_a_database_failure_before_a_retry_is_a_database_answer(
     assert transport.requests == expected_requests
 
 
+class _ForwardingAsyncio:
+    """The real :mod:`asyncio`, lending the check's own deadline to the test.
+
+    Round 7: the deadline used to be a budget the test raced — 300 ms covering
+    the pace delay, the booking read, the card read and the database work before
+    the 429 it was about. Slower preparation and the page variant was over
+    before the 429 had been served, so what the test proved depended on the
+    machine it ran on.
+
+    Nothing is faked here: the production code still builds its own
+    ``asyncio.timeout`` and still raises its own ``TimeoutError``. The test
+    simply brings that deadline forward at a moment it has SEEN — the 429
+    answered, the owner check inside its local read — so the sequence is fixed
+    by events rather than by timing.
+    """
+
+    def __init__(self) -> None:
+        self.deadline: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+    def timeout(self, delay: float) -> Any:
+        self.deadline = asyncio.timeout(delay)
+        return self.deadline
+
+    def expire_now(self) -> None:
+        assert self.deadline is not None, "the check never started its deadline"
+        self.deadline.reschedule(asyncio.get_running_loop().time())
+
+
 @pytest.mark.parametrize(
-    ("throttle", "expected_requests"),
+    ("throttle", "expected_requests", "prepare_delay"),
     [
-        pytest.param("card", ["booking", "customer"], id="card-retry"),
-        pytest.param("page", ["booking", "customer", "history:1"], id="page-retry"),
+        pytest.param("card", ["booking", "customer"], 0.0, id="card-retry"),
+        pytest.param("page", ["booking", "customer", "history:1"], 0.0, id="page-retry"),
+        pytest.param("card", ["booking", "customer"], 0.5, id="card-retry-slow-preparation"),
+        pytest.param("page", ["booking", "customer", "history:1"], 0.5, id="page-retry-slow-preparation"),
     ],
 )
 async def test_a_deadline_inside_the_retry_owner_check_is_our_own(
@@ -5048,30 +5121,53 @@ async def test_a_deadline_inside_the_retry_owner_check_is_our_own(
     ui_client,
     throttle: str,
     expected_requests: list[str],
+    prepare_delay: float,
 ) -> None:
-    """Round 6: the deadline expired over our SQL, after EasyWeek had answered.
+    """Rounds 6 and 7: the deadline expired over our SQL, after EasyWeek answered.
 
     EasyWeek answered with a 429 and was waiting to be asked again, so the one
     thing this must not say is that EasyWeek did not answer.
+
+    Three observed events, in this order and no other: the GET this is about was
+    answered 429, the owner check opened its local read, and only then did the
+    deadline expire. The slow-preparation variants spend longer getting there
+    than the whole budget the earlier version allowed itself, which is exactly
+    the load that version could not survive.
     """
     import altegio_bot.campaigns.easyweek_zero_visit_history as history_module
 
     run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
-    sessions = _GuardSessions(session_maker, mode="hang")
+    entered = asyncio.Event()
+    throttled = asyncio.Event()
+    sessions = _GuardSessions(session_maker, mode="park", entered=entered, prepare_delay=prepare_delay)
     monkeypatch.setattr(voucher_mailing_module, "SessionLocal", sessions)
-    monkeypatch.setattr(history_module, "CHECK_TIMEOUT_SEC", 0.3)
+    clock = _ForwardingAsyncio()
+    monkeypatch.setattr(history_module, "asyncio", clock)
+
+    def armed(label: str) -> None:
+        sessions.arm(label)
+        throttled.set()
+
     transport = RecordingTransport(
         person,
         pages=_two_page_history(person),
         throttle_card=throttle == "card",
         throttle_page=1 if throttle == "page" else None,
-        on_throttle=sessions.arm,
+        on_throttle=armed,
     )
     client = _install_live_client(monkeypatch, transport, sleep=_no_sleep)
+    request = asyncio.ensure_future(_ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id))
 
     try:
-        response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+        # Each wait is a safety net, not a schedule: it turns a hang into a
+        # failure and has no part in what the test proves.
+        await asyncio.wait_for(throttled.wait(), 10)
+        await asyncio.wait_for(entered.wait(), 10)
+        assert transport.requests == expected_requests
+        clock.expire_now()
+        response = await asyncio.wait_for(request, 10)
     finally:
+        request.cancel()
         await client.aclose()
 
     assert response.status_code == 409
@@ -5080,6 +5176,7 @@ async def test_a_deadline_inside_the_retry_owner_check_is_our_own(
     assert body["detail_reason"] == DEADLINE_AFTER_READ_DETAIL
     assert body["retryable"] is True
     assert body.get("completed_visit_count") is None
+    assert sessions.poisoned == 1
     assert transport.requests == expected_requests
 
 
@@ -5233,9 +5330,11 @@ async def test_a_database_failure_before_a_page_is_not_classified_as_a_read(
     handling; the barrier did not. Both now leave the database's own failure
     intact for the route to answer, and this asserts it where the Ops layer is
     not involved at all.
-    """
-    from sqlalchemy.exc import SQLAlchemyError
 
+    Round 7: the failure is typed at the boundary of the local read, and carries
+    the database's own error as its cause — a statement that failed in a session
+    already open, which is the half that was never in doubt.
+    """
     run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
     sessions = _GuardSessions(session_maker, mode="sql")
     transport = RecordingTransport(
@@ -5253,7 +5352,7 @@ async def test_a_database_failure_before_a_page_is_not_classified_as_a_read(
         sleep=_no_sleep,
     )
     async with client:
-        with pytest.raises(SQLAlchemyError):
+        with pytest.raises(LocalDatabaseUnavailable) as caught:
             await check_zero_visit_history(
                 sessions,
                 run_id=run_id,
@@ -5265,4 +5364,227 @@ async def test_a_database_failure_before_a_page_is_not_classified_as_a_read(
                 pause_sec=0.0,
             )
 
+    assert isinstance(caught.value.cause, SQLAlchemyError)
+    assert transport.requests == ["booking", "customer", "history:1"]
+
+
+# ===========================================================================
+# 32. A connection that cannot be opened is a database answer — round 7
+# ===========================================================================
+# The owner check before a retry reads our own rows, and the round-6 fix handed
+# its failures to the Ops route as the database being unavailable — as long as
+# they were SQLAlchemy's. Opening a connection fails outside that wrapping:
+# PostgreSQL refusing one client too many answers SQLSTATE 53300, which asyncpg
+# raises as its own error class; an endpoint that is not listening raises
+# OSError; a connect that never completes raises TimeoutError. None of the three
+# is a SQLAlchemyError, so the first was reported as "the card could not be
+# read" or "the history is incomplete", and the third would have been read by
+# the deadline and the route as EasyWeek not answering.
+#
+# The origin is now kept at the boundary of the local read, where both halves
+# are — the connect and the statements after it.
+
+_LIMITED_ROLE = "zero_visit_connection_limit"
+_LIMITED_PASSWORD = "round-seven-synthetic"
+
+
+@asynccontextmanager
+async def _connection_limit_reached(url: Any) -> Any:
+    """Real PostgreSQL, refusing a connect by limit: SQLSTATE 53300.
+
+    A role of its own with ``CONNECTION LIMIT 0``, so the server itself answers
+    "too many connections for role" on the next connect. Nobody else's
+    connections are touched, no cluster setting is changed and no second
+    PostgreSQL is needed; the role is dropped again whatever happens.
+    """
+    admin = create_async_engine(url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    drop = text(f'DROP ROLE IF EXISTS "{_LIMITED_ROLE}"')
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(drop)
+            await conn.execute(
+                text(f"CREATE ROLE \"{_LIMITED_ROLE}\" LOGIN PASSWORD '{_LIMITED_PASSWORD}' CONNECTION LIMIT 0")
+            )
+        limited = create_async_engine(
+            url.set(username=_LIMITED_ROLE, password=_LIMITED_PASSWORD),
+            poolclass=NullPool,
+        )
+        try:
+            yield async_sessionmaker(limited, expire_on_commit=False)
+        finally:
+            await limited.dispose()
+    finally:
+        async with admin.connect() as conn:
+            await conn.execute(drop)
+        await admin.dispose()
+
+
+@asynccontextmanager
+async def _unreachable_endpoint(url: Any) -> Any:
+    """A local port with nothing listening on it: the connect is refused."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    engine = create_async_engine(url.set(host="127.0.0.1", port=port), poolclass=NullPool)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+
+
+@asynccontextmanager
+async def _connect_never_completes(url: Any) -> Any:
+    """A local listener that accepts and then says nothing: the connect times out."""
+    stop = asyncio.Event()
+
+    async def accept_and_say_nothing(_reader: Any, writer: Any) -> None:
+        try:
+            await stop.wait()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(accept_and_say_nothing, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    engine = create_async_engine(
+        url.set(host="127.0.0.1", port=port),
+        poolclass=NullPool,
+        connect_args={"timeout": 0.3},
+    )
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+        stop.set()
+        server.close()
+        await server.wait_closed()
+
+
+_BROKEN_ENDPOINTS = {
+    "connection_limit": _connection_limit_reached,
+    "endpoint_unreachable": _unreachable_endpoint,
+    "connect_timeout": _connect_never_completes,
+}
+
+
+class _BrokenAfterThrottle:
+    """The real session maker until the 429 arms it, then one that cannot connect.
+
+    Armed by the transport the moment it answers 429, so the session that cannot
+    be opened is exactly the one the retry barrier opens between the delay and
+    the repeat request.
+    """
+
+    def __init__(self, maker: Any, broken: Any) -> None:
+        self._maker = maker
+        self._broken = broken
+        self.armed = False
+        self.opened = 0
+
+    def arm(self, _label: str) -> None:
+        self.armed = True
+
+    def __call__(self) -> Any:
+        if not self.armed:
+            return self._maker()
+        self.armed = False
+        self.opened += 1
+        return self._broken()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["connection_limit", "endpoint_unreachable", "connect_timeout"],
+)
+@pytest.mark.parametrize(
+    ("throttle", "expected_requests"),
+    [
+        pytest.param("card", ["booking", "customer"], id="card-retry"),
+        pytest.param("page", ["booking", "customer", "history:1"], id="page-retry"),
+    ],
+)
+async def test_a_connect_that_fails_before_a_retry_is_a_database_answer(
+    session_maker,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    ui_client,
+    failure: str,
+    throttle: str,
+    expected_requests: list[str],
+) -> None:
+    """Round 7: our own database could not be reached, in all three ways.
+
+    EasyWeek answered — with a 429 — and was waiting to be asked again, so none
+    of these is an answer about EasyWeek, about the card or about the history.
+    The route has one answer for all of them, and the repeat request is not sent
+    and no count is shown in any of them.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    async with _BROKEN_ENDPOINTS[failure](engine.url) as broken:
+        sessions = _BrokenAfterThrottle(session_maker, broken)
+        monkeypatch.setattr(voucher_mailing_module, "SessionLocal", sessions)
+        transport = RecordingTransport(
+            person,
+            pages=_two_page_history(person),
+            throttle_card=throttle == "card",
+            throttle_page=1 if throttle == "page" else None,
+            on_throttle=sessions.arm,
+        )
+        client = _install_live_client(monkeypatch, transport, sleep=_no_sleep)
+        try:
+            response = await _ops_zero_visit(ui_client, run_id=run_id, recipient_id=recipient_id)
+        finally:
+            await client.aclose()
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "manual_batch_database_unavailable"
+    assert body.get("completed_visit_count") is None
+    # The unopenable session was reached, and the repeat request was not sent.
+    assert sessions.opened == 1
+    assert transport.requests == expected_requests
+
+
+async def test_the_refused_connect_keeps_postgres_own_error(
+    session_maker, engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7: the same failure at the function boundary, with its origin intact.
+
+    Not a reason invented here: the cause is the driver's own class for the
+    answer PostgreSQL gave, SQLSTATE 53300. That is what makes the three cases
+    one answer at the route and keeps them out of the provider's and the
+    deadline's handlers on the way there.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    async with _connection_limit_reached(engine.url) as broken:
+        sessions = _BrokenAfterThrottle(session_maker, broken)
+        transport = RecordingTransport(
+            person,
+            pages=_two_page_history(person),
+            throttle_page=1,
+            on_throttle=sessions.arm,
+        )
+        client = EasyWeekClient(
+            api_key="synthetic-key",
+            workspace_slug="synthetic-slug",
+            base_url=CANONICAL_API_BASE_URL,
+            transport=httpx.MockTransport(transport.handler),
+            sleep=_no_sleep,
+        )
+        async with client:
+            with pytest.raises(LocalDatabaseUnavailable) as caught:
+                await check_zero_visit_history(
+                    sessions,
+                    run_id=run_id,
+                    recipient_id=recipient_id,
+                    reader=client,
+                    now=NOW,
+                    registry=registry(),
+                    pause=_PauseWriting({}),
+                    pause_sec=0.0,
+                )
+
+    assert isinstance(caught.value.cause, TooManyConnectionsError)
+    assert caught.value.cause.sqlstate == "53300"
     assert transport.requests == ["booking", "customer", "history:1"]

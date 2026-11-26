@@ -85,10 +85,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Final
 
+from asyncpg import PostgresError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -329,6 +331,58 @@ class ZeroVisitHistoryReport:
         }
 
 
+class LocalDatabaseUnavailable(Exception):
+    """Our own database could not answer a read of our own rows.
+
+    Why a class of its own
+    ----------------------
+    SQLAlchemy wraps what fails THROUGH a connection, and a connection that
+    cannot be opened fails before that. Three real answers from the driver, none
+    of them a :class:`~sqlalchemy.exc.SQLAlchemyError`: PostgreSQL refusing one
+    client too many replies with SQLSTATE 53300, which asyncpg raises as
+    ``TooManyConnectionsError``; an endpoint that is not listening raises
+    ``OSError``; and a connect that never completes raises ``TimeoutError``.
+
+    Handed onward unchanged, each of them lands in front of a handler that means
+    something else entirely. Inside the retry barrier the shared history reader
+    turns any exception out of a read into an answer about EasyWeek — "the card
+    could not be read", "the history is incomplete". Outside it, the deadline
+    around the whole check catches ``TimeoutError`` and the Ops route catches it
+    again as the provider being unavailable, so a database that could not be
+    reached was reported as EasyWeek not answering.
+
+    So the origin is kept at the boundary instead, and the route answers with
+    the one reason it already has for exactly this: the database is unavailable,
+    nothing was concluded, try again.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__("local database unavailable")
+        self.cause = cause
+
+
+# Every way a read of our own rows can fail. ``TimeoutError`` is an ``OSError``
+# subclass, so the connect timeout is covered by the same entry. Cancellation is
+# a ``BaseException`` and deliberately absent: the general deadline keeps its own
+# reason, whichever half of the check it expires over.
+_LOCAL_DB_FAILURES: Final = (SQLAlchemyError, PostgresError, OSError)
+
+
+@asynccontextmanager
+async def _local_session(session_maker: Any):
+    """The one boundary every read of OUR OWN rows goes through.
+
+    Both halves are inside it: opening the connection, where the failures that
+    are not SQLAlchemy's live, and the statements afterwards, which is the case
+    that already worked. One origin, one answer, whichever half failed.
+    """
+    try:
+        async with session_maker() as session:
+            yield session
+    except _LOCAL_DB_FAILURES as exc:
+        raise LocalDatabaseUnavailable(exc) from exc
+
+
 class _IdentityMovedOn(Exception):
     """Raised out of the client's retry loop when the row's identity changed.
 
@@ -444,7 +498,7 @@ async def _local_facts(
     a hundred thousand deliveries costs an operator's click exactly what an
     empty one does.
     """
-    async with session_maker() as session:
+    async with _local_session(session_maker) as session:
         run = await session.get(CampaignRun, run_id)
         if run is None:
             return None, RUN_NOT_FOUND, None
@@ -687,7 +741,7 @@ async def _recheck_local_identity(
     * the card no longer carries the contact the proof was built on, which means
       the historical evidence this check used is no longer this card's.
     """
-    async with session_maker() as session:
+    async with _local_session(session_maker) as session:
         client = await session.get(Client, facts.client_id)
         if client is None or client.provider != PROVIDER_EASYWEEK or client.company_id != facts.company_id:
             return RECIPIENT_NOT_FOUND, None
@@ -1044,11 +1098,13 @@ async def _check(
         # local phase. And it runs inside the shared reader's own error
         # handling, which turns every exception into an answer about EasyWeek —
         # so a database failure is handed out as itself instead, for the caller
-        # to report as the database being unavailable.
+        # to report as the database being unavailable. A failed CONNECT is one of
+        # those, and arrives as the driver's own error rather than SQLAlchemy's,
+        # which is why the boundary around the read types it before it gets here.
         with reader.local_phase():
             try:
                 refused = await guard()
-            except SQLAlchemyError as exc:
+            except LocalDatabaseUnavailable as exc:
                 raise GuardFailed(exc) from exc
         if refused is not None:
             raise _IdentityMovedOn(guarded["reason"] or CUSTOMER_IDENTITY_UNPROVEN)
@@ -1232,6 +1288,7 @@ __all__ = [
     "IDENTITY_VIA_STORED_UUID",
     "LOCAL_DEADLINE",
     "LOCAL_DEADLINE_DETAIL",
+    "LocalDatabaseUnavailable",
     "NUMERIC_OWNER_CONFLICT",
     "RECIPIENT_NOT_FOUND",
     "ROW_ALREADY_DECIDED",
