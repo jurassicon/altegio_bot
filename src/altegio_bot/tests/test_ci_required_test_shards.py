@@ -52,7 +52,7 @@ from altegio_bot.tests.test_ci_workflow_nginx_gate import (
     AGGREGATOR_JOB,
     BROWSER_GATE_ENV,
     BROWSER_JOB,
-    BROWSER_SUITE,
+    BROWSER_SUITES,
     DEDICATED_JOB,
     EXECUTION_JOBS,
     HEAVY_JOB,
@@ -377,7 +377,7 @@ def test_the_browser_job_cannot_degrade_into_a_green_skip() -> None:
     assert env.get(BROWSER_GATE_ENV) == "1"
     invocations = _invocations(BROWSER_JOB)
     assert len(invocations) == 1, f"expected one invocation, found {len(invocations)}"
-    assert _pytest_targets(invocations[0]) == [BROWSER_SUITE]
+    assert _pytest_targets(invocations[0]) == list(BROWSER_SUITES)
     # Never marker-filtered: a gate that could be narrowed is not a gate.
     assert _marker_selections(invocations[0]) == []
     # And the browser is actually installed before it runs.

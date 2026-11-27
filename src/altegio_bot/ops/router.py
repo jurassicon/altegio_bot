@@ -28,6 +28,7 @@ from altegio_bot.campaigns.easyweek_voucher_production.ledger import (
     preview_is_locked_by_voucher_production,
     production_batch_id_for_preview,
 )
+from altegio_bot.campaigns.easyweek_zero_visit import ZERO_VISITS_REPORTED, ZERO_VISITS_REPORTED_TEXT
 from altegio_bot.campaigns.followup import (
     FollowupFinalEligibilityResult,
     check_followup_final_eligibility,
@@ -139,12 +140,37 @@ def _error_cell(error: str | None) -> str:
     return cell
 
 
-def _basis_badge(recipient: CampaignRecipient, *, with_audit_column: bool = False) -> str:
+def _excluded_reason_cell(reason: str | None) -> str:
+    """The reason an operator reads, with the stable code still available.
+
+    Only the zero-counter reason gets a sentence so far, because it is the only
+    exclusion whose next step is an operator action rather than a fact: every
+    other code says "this person is not in the audience", and this one says
+    "somebody has to look at this card".
+    """
+    if not reason:
+        return "&mdash;"
+    if reason == ZERO_VISITS_REPORTED:
+        return f'<span class="text-warning-emphasis" title="{_esc(reason)}">{_esc(ZERO_VISITS_REPORTED_TEXT)}</span>'
+    return _esc(reason)
+
+
+def _basis_badge(
+    recipient: CampaignRecipient,
+    *,
+    with_audit_column: bool = False,
+    easyweek_proof_note: bool = False,
+) -> str:
     """`auto`, `manual` or `test` — plus what an override overrode.
 
     A manual row that was originally excluded automatically shows both: the
     operator's decision, and the reason it was taken against. Hiding the second
     half would make an override indistinguishable from a clean addition.
+
+    ``easyweek_proof_note`` adds, for an `auto` EasyWeek row, whether the
+    durable first-visit proof is actually recorded. `earned_first_visit` is the
+    DEFAULT basis and is carried by the segmenter's excluded rows too, so the
+    badge on its own must not be read as "a first visit was proven".
     """
     basis = getattr(recipient, "recipient_basis", None) or RECIPIENT_BASIS_EARNED
     label, style = {
@@ -153,6 +179,10 @@ def _basis_badge(recipient: CampaignRecipient, *, with_audit_column: bool = Fals
         RECIPIENT_BASIS_TEST: ("test", "bg-warning text-dark"),
     }.get(basis, (basis, "bg-light text-dark"))
     badge = f'<span class="badge {style}">{_esc(label)}</span>'
+    if easyweek_proof_note and basis == RECIPIENT_BASIS_EARNED:
+        proven = getattr(recipient, "source_easyweek_event_id", None) is not None
+        note = "первый визит доказан" if proven else "первый визит не доказан"
+        badge += f' <span class="text-muted small">{_esc(note)}</span>'
     overrode = getattr(recipient, "auto_excluded_reason", None)
     if overrode and not with_audit_column:
         # The inline preview has no separate audit column, so the badge carries
@@ -5054,22 +5084,29 @@ function renderRecipientsTable(items, total, provider) {{
     return '<th>' + escHtml(c) + '</th>';
   }}).join("") + '</tr>';
   const BASIS_LABELS = {{
-    "earned_first_visit": ['<span class="badge bg-secondary">auto</span>', "первый визит доказан сегментатором"],
+    // `earned_first_visit` is the DEFAULT basis, not a proof: the segmenter's
+    // excluded rows carry it too. So the sub-label for it is chosen by whether
+    // the durable source proof is actually recorded on the row.
+    "earned_first_visit": ['<span class="badge bg-secondary">auto</span>', ""],
     "operator_manual_selection": ['<span class="badge bg-primary">manual</span>', "решение оператора (§37.1)"],
     "owner_test_account": ['<span class="badge bg-warning text-dark">test</span>', "тестовый аккаунт canary (§36.11)"],
   }};
+  const AUTO_PROOF_LABELS = ["первый визит не доказан", "первый визит доказан сегментатором"];
   const rows = easyweek ? items.map(function(r) {{
     const seg = r.segment || {{}};
     const statusColor = r.status === "candidate" ? "success" : "secondary";
     const basis = BASIS_LABELS[r.recipient_basis] || ['<span class="badge bg-light text-dark">'
       + escHtml(String(r.recipient_basis || "—")) + '</span>', ""];
+    const basisNote = r.recipient_basis === "earned_first_visit"
+      ? AUTO_PROOF_LABELS[r.first_visit_proof_recorded ? 1 : 0]
+      : basis[1];
     // Presence only. The UUID itself is never rendered.
     const bound = r.easyweek_customer_recorded ? "✓" : "—";
     return '<tr>' +
       '<td>' + escHtml(r.display_name || "") + '</td>' +
       '<td>' + escHtml(r.phone_e164 || "") + '</td>' +
       '<td><span class="badge bg-' + statusColor + '">' + escHtml(r.status || "") + '</span></td>' +
-      '<td>' + basis[0] + '<div class="text-muted small">' + escHtml(basis[1]) + '</div></td>' +
+      '<td>' + basis[0] + '<div class="text-muted small">' + escHtml(basisNote) + '</div></td>' +
       '<td><small>' + escHtml(r.excluded_reason || "—") + '</small></td>' +
       '<td><small>' + escHtml(r.auto_excluded_reason || "—") + '</small></td>' +
       '<td>' + bound + '</td>' +
@@ -7026,6 +7063,8 @@ async function recomputeStats(runId) {{
 @router.get("/campaigns/{run_id}/recipients", response_class=HTMLResponse)
 async def ops_campaign_recipients(request: Request, run_id: int) -> str:
     tz = _local_tz()
+    session_token = request.cookies.get(SESSION_COOKIE, "")
+    page_csrf = csrf_token_for(session_token) if session_token else ""
     status_filter = request.query_params.get("status", "")
     excluded_reason_filter = request.query_params.get("excluded_reason", "")
     limit_str = request.query_params.get("limit", "100")
@@ -7141,7 +7180,13 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
             "Booked",
             "Followup",
         ]
+    # The zero-counter rows are the only ones an operator has to go and
+    # check somewhere else, so the check lives on the row rather than in a form
+    # that would need the person identified by hand all over again.
+    show_zero_visit_check = is_easyweek_run and run.mode == "preview" and run.status == "completed"
     extra_cols: list[str] = []
+    if show_zero_visit_check:
+        extra_cols.append("Сверка истории")
     if is_editable_preview:
         extra_cols.append("")
     if is_send_real:
@@ -7157,9 +7202,9 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 _esc(r.display_name or ""),
                 _esc(r.phone_e164 or ""),
                 _status_badge(r.status),
-                _basis_badge(r, with_audit_column=True),
-                _esc(r.excluded_reason or "—"),
-                _esc(r.auto_excluded_reason or "—"),
+                _basis_badge(r, with_audit_column=True, easyweek_proof_note=True),
+                _excluded_reason_cell(r.excluded_reason),
+                _excluded_reason_cell(r.auto_excluded_reason),
                 # Presence only: the customer UUID is never rendered.
                 "✓" if r.easyweek_customer_uuid is not None else "—",
                 "✓" if r.local_client_found else "—",
@@ -7181,6 +7226,16 @@ async def ops_campaign_recipients(request: Request, run_id: int) -> str:
                 _esc(_fmt_dt(r.booked_after_at, tz)),
                 _esc(r.followup_status or ""),
             ]
+        if show_zero_visit_check:
+            if r.excluded_reason == ZERO_VISITS_REPORTED:
+                row.append(
+                    f'<button class="btn btn-sm btn-outline-info" '
+                    f'onclick="checkZeroVisitHistory({run_id},{r.id})">'
+                    f"&#x1F50E; Проверить историю</button>"
+                    f'<div class="small mt-1" id="zero-visit-{r.id}" role="status"></div>'
+                )
+            else:
+                row.append('<span class="text-muted small">—</span>')
         if is_editable_preview:
             # Remove is for ACTIVE candidates. A row the segmenter already
             # excluded has nothing to remove, and offering the button would
@@ -7269,6 +7324,141 @@ async function retryRecipient(runId, recipientId) {
 }
 </script>"""
 
+    zero_visit_js = ""
+    if show_zero_visit_check:
+        zero_visit_js = (
+            """
+<script>
+const ZERO_VISIT_CSRF = """
+            + json.dumps(page_csrf)
+            + """;
+
+// Stable codes turned into sentences. Three families, deliberately distinct:
+// "не удалось подтвердить" says we will not claim whose history this is,
+// "не удалось проверить" says the history itself could not be trusted, and
+// "временно недоступно" says nothing is wrong with the data — only a retry is
+// worth suggesting there. An unread history is never shown as 0 visits.
+const ZERO_VISIT_REASONS = {
+  "zero_visit_check_run_not_found": "Preview не найден.",
+  "zero_visit_check_run_not_completed_easyweek_preview":
+    "Это не завершённый EasyWeek preview.",
+  "zero_visit_check_branch_unknown": "Филиал не настроен на сервере.",
+  "zero_visit_check_recipient_not_found": "Строка не найдена в этом preview.",
+  "zero_visit_check_row_not_zero_diagnostic":
+    "Эта строка не является строкой со счётчиком 0.",
+  "zero_visit_check_row_already_decided":
+    "По этой строке уже принято решение оператора. Обновите страницу.",
+  "zero_visit_check_source_not_established":
+    "Источник не установлен: для этой строки не сохранена привязка к событию.",
+  "zero_visit_check_source_event_unproven":
+    "Не удалось подтвердить: исходное событие больше не относится к этому клиенту.",
+  "zero_visit_check_source_event_ambiguous":
+    "Не удалось подтвердить: для карточки несколько разных событий со счётчиком 0.",
+  "zero_visit_check_customer_identity_unproven":
+    "Не удалось подтвердить: личность клиента в EasyWeek не доказана.",
+  "zero_visit_check_customer_identity_ambiguous":
+    "Не удалось подтвердить: по этому контакту больше одной карточки.",
+  "zero_visit_check_identity_uuid_conflict":
+    "Не удалось подтвердить: конфликт идентификаторов клиента в EasyWeek.",
+  "zero_visit_check_booking_reassigned":
+    "Не удалось подтвердить: бронирование переназначено другому клиенту.",
+  "zero_visit_check_history_unverified":
+    "Не удалось проверить историю: ответ API неполный или некорректный.",
+  "zero_visit_check_temporarily_unavailable":
+    "Временно не удалось проверить историю: EasyWeek не ответил.",
+  // A permanent 4xx. Deliberately NOT in the temporary family: an operator
+  // told to retry a 403 would retry it forever.
+  "zero_visit_check_api_refused":
+    "Не удалось проверить историю: EasyWeek отказал в запросе.",
+  "zero_visit_check_api_response_malformed":
+    "Не удалось проверить историю: EasyWeek вернул ответ неожидаемого формата.",
+  // Ours, not theirs: no key, no workspace, an unusable base URL. Nobody was
+  // asked anything, so a retry changes nothing until the server is configured.
+  "zero_visit_check_api_not_configured":
+    "Проверка недоступна: интеграция с EasyWeek не настроена на сервере.",
+  // The row holds no proof that exactly one contact was captured for this
+  // booking — a row created before that proof existed. Its own sentence,
+  // because an operator must not read it as "this person is unknown".
+  "zero_visit_check_contact_evidence_missing":
+    "Не удалось подтвердить: в строке нет доказательства единственности контакта.",
+  // The identity rested on the number the delivery captured, and the card has
+  // since said that number is not its own. No number and no UUID in the text.
+  "zero_visit_check_contact_proof_stale":
+    "Не удалось подтвердить: контакт клиента в EasyWeek изменился, прежнее совпадение больше не доказывает личность.",
+  // The deadline expired on OUR rows, before EasyWeek was asked at all. Saying
+  // "EasyWeek did not answer" here would send somebody to the wrong system.
+  "zero_visit_check_local_deadline":
+    "Проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался.",
+  // EasyWeek answered, and then our own phase ran out of time. Neutral on
+  // purpose: blaming EasyWeek would be wrong, and so would a confirmation.
+  "zero_visit_check_deadline_after_api_read":
+    "Проверка не успела завершиться на нашей стороне после ответа EasyWeek.",
+  "manual_batch_rate_limit": "Предыдущая проверка ещё выполняется.",
+  "manual_batch_input_invalid": "Некорректный запрос.",
+  "manual_batch_provider_unavailable":
+    "Временно не удалось проверить историю: EasyWeek не ответил.",
+  "manual_batch_database_unavailable": "База недоступна: результат не подтверждён.",
+};
+
+// Present in the history and counted as a completed visit are two facts, so a
+// canceled or unfinished source booking is not reported as "не найдена".
+const ZERO_VISIT_SOURCE_STATES = {
+  "completed_visit": "найдена, завершена и не отменена (учтена в числе визитов)",
+  "canceled": "найдена, но отменена (в числе визитов не учтена)",
+  "not_completed": "найдена, но не завершена (в числе визитов не учтена)",
+  "absent": "в истории не найдена",
+};
+
+function zeroVisitReason(data) {
+  const code = data.reason || (data.reasons || [])[0] || "";
+  let text = ZERO_VISIT_REASONS[code] || code || "Не удалось проверить историю.";
+  if (data.retryable) text += " Можно повторить проверку позже.";
+  return text;
+}
+
+async function checkZeroVisitHistory(runId, recipientId) {
+  const box = document.getElementById("zero-visit-" + recipientId);
+  box.textContent = "Читаем историю EasyWeek. Состав preview не меняется…";
+  let data;
+  try {
+    const resp = await fetch("/ops/voucher-mailings/api/recipients/zero-visit-history", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {"Content-Type": "application/json", "X-Ops-CSRF": ZERO_VISIT_CSRF},
+      // Two ids. The server re-derives the client, the branch, the period and
+      // the source booking itself; this page never names a customer.
+      body: JSON.stringify({preview_run_id: runId, campaign_recipient_id: recipientId})
+    });
+    data = await resp.json();
+  } catch (err) {
+    box.textContent = "Сетевая ошибка: не удалось проверить историю. Состав preview не изменён.";
+    return;
+  }
+  if (!data.ok) {
+    // Never "строка осталась исключённой" here. This tab may have been open
+    // while another one included the person, and the refusal above says so in
+    // its own words; asserting the old state would contradict the server.
+    box.textContent = zeroVisitReason(data) + " Эта проверка ничего не изменила.";
+    return;
+  }
+  const sourceState = ZERO_VISIT_SOURCE_STATES[data.source_booking_state] ||
+    String(data.source_booking_state || "не определено");
+  const parts = [
+    "Счётчик из события: " + data.event_visits_total + ".",
+    "Завершённых неотменённых визитов по истории API: " + data.completed_visit_count + ".",
+    "Исходная запись: " + sourceState + ".",
+    "Активная будущая запись: " + (data.active_future_booking ? "есть" : "нет") + ".",
+    "Проверено: " + data.checked_at + ".",
+    // The row's state as the SERVER read it while checking, not as this page
+    // assumed when it drew the button.
+    "Состояние строки на момент проверки: исключена.",
+    "Просмотр не меняет состав preview и не даёт права на выдачу ваучера."
+  ];
+  box.textContent = parts.join(" ");
+}
+</script>"""
+        )
+
     body = f"""
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h4>👥 Recipients — Run #{run_id}</h4>
@@ -7281,6 +7471,7 @@ async function retryRecipient(runId, recipientId) {
 {table_html}
 {remove_js}
 {retry_js}
+{zero_visit_js}
 """
     return _page(f"Recipients — Run {run_id}", body)
 

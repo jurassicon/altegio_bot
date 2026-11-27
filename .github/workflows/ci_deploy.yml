@@ -304,6 +304,7 @@ jobs:
             --ignore=src/altegio_bot/tests/test_easyweek_migration_cumulative_manifest.py \
             --ignore=src/altegio_bot/tests/test_easyweek_post_booking_handover.py \
             --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py \
+            --ignore=src/altegio_bot/tests/test_easyweek_zero_visit_browser.py \
             --ignore=src/altegio_bot/tests/test_easyweek_voucher_mailing_durability.py
 
   required-tests-dedicated:
@@ -489,7 +490,10 @@ jobs:
           PY
 
       - name: Run required browser acceptance tests
-        run: uv run pytest -q src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py
+        run: |
+          uv run pytest -q \
+            src/altegio_bot/tests/test_easyweek_voucher_mailing_browser.py \
+            src/altegio_bot/tests/test_easyweek_zero_visit_browser.py
 
   # The branch-protection context. Splitting execution across three runners must
   # not cost the repository its required check, so the job key `tests` and the

@@ -2768,6 +2768,12 @@ def _recipient_dict(r: CampaignRecipient) -> dict[str, Any]:
         "recipient_basis": r.recipient_basis,
         "auto_excluded_reason": r.auto_excluded_reason,
         "easyweek_customer_recorded": r.easyweek_customer_uuid is not None,
+        # `earned_first_visit` is the default basis for every non-manual,
+        # non-test row, including the zero-counter diagnostic the segmenter
+        # excluded. The basis alone therefore does not say a first visit was
+        # proven; the durable proof does, and this is its presence. Without it
+        # the screen described an unproven row as "first visit proven".
+        "first_visit_proof_recorded": r.source_easyweek_event_id is not None,
         "segment": {
             "total_records_in_period": r.total_records_in_period,
             "confirmed_records_in_period": r.confirmed_records_in_period,

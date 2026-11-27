@@ -15,7 +15,10 @@ from altegio_bot.campaigns.easyweek_manual_identity import (
     KARLSRUHE_COMPANY_ID as KARLSRUHE_COMPANY_ID,
 )
 from altegio_bot.campaigns.easyweek_manual_identity import (
+    known_numeric_uuid_binding,
     lock_workspace_identity,
+    phone_owner_conflict,
+    uuid_bound_elsewhere,
 )
 from altegio_bot.campaigns.easyweek_manual_recipient import prove_customer
 from altegio_bot.campaigns.easyweek_voucher_delivery.eligibility import _booking_customer_uuid
@@ -61,18 +64,9 @@ async def needs_uuid_resolution(session, booking: NormalizedBooking, *, existing
 
 
 async def _known_binding(session, customer_id: int) -> tuple[uuid.UUID | None, bool]:
-    values = set(
-        (
-            await session.scalars(
-                select(Client.easyweek_customer_uuid).where(
-                    Client.provider == "easyweek",
-                    Client.altegio_client_id == customer_id,
-                    Client.easyweek_customer_uuid.is_not(None),
-                )
-            )
-        ).all()
-    )
-    return (next(iter(values)) if len(values) == 1 else None, len(values) > 1)
+    # One implementation of the workspace-wide correspondence, shared with the
+    # read-only diagnostic so neither can drift from the other.
+    return await known_numeric_uuid_binding(session, customer_id)
 
 
 def _customer_body(payload):
@@ -175,14 +169,23 @@ async def resolve_webhook_identity(
             ).all()
         )
         for row in rows:
-            if row.easyweek_customer_uuid == identity and row.altegio_client_id not in (None, booking.customer_id):
+            # The same two predicates the read-only diagnostic applies to the
+            # workspace, applied here to the rows this transaction has locked.
+            if uuid_bound_elsewhere(
+                row_customer_uuid=row.easyweek_customer_uuid,
+                row_customer_id=row.altegio_client_id,
+                customer_uuid=identity,
+                customer_id=booking.customer_id,
+            ):
                 return False
             if (
                 proven_phone is not None
                 and row.phone_e164 == proven_phone
-                and (
-                    row.easyweek_customer_uuid not in (None, identity)
-                    or row.altegio_client_id not in (None, booking.customer_id)
+                and phone_owner_conflict(
+                    row_customer_uuid=row.easyweek_customer_uuid,
+                    row_customer_id=row.altegio_client_id,
+                    customer_uuid=identity,
+                    customer_id=booking.customer_id,
                 )
             ):
                 return False

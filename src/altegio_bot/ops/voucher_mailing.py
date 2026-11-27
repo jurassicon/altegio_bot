@@ -69,8 +69,12 @@ from altegio_bot.campaigns.easyweek_voucher_production.issuer import (
     APPROVED_ISSUER_DISPLAY_NAME,
     APPROVED_ISSUER_DISPLAY_NAME_GENITIVE,
 )
+from altegio_bot.campaigns.easyweek_zero_visit_history import (
+    API_NOT_CONFIGURED as ZERO_VISIT_API_NOT_CONFIGURED,
+)
+from altegio_bot.campaigns.easyweek_zero_visit_history import LocalDatabaseUnavailable, check_zero_visit_history
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekError
+from altegio_bot.easyweek_client import EasyWeekClient, EasyWeekConfigError, EasyWeekError
 from altegio_bot.easyweek_locations import configured_easyweek_locations
 from altegio_bot.easyweek_log_redaction import redact_easyweek_url_logging
 from altegio_bot.easyweek_voucher_production_contract import (
@@ -141,6 +145,21 @@ class CompositionRequest(BaseModel):
 
 
 class ExcludeRecipientRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preview_run_id: int = Field(gt=0)
+    campaign_recipient_id: int = Field(gt=0)
+
+
+class ZeroVisitHistoryRequest(BaseModel):
+    """Two ids and nothing else.
+
+    ``extra="forbid"`` is load bearing. A request that tried to supply a customer
+    UUID, a phone number or a booking UUID is refused by name rather than having
+    the extra field ignored, because "ignored" is indistinguishable from
+    "accepted" to whoever reads this next.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     preview_run_id: int = Field(gt=0)
@@ -599,6 +618,24 @@ async def _recipient_request(request: Request, schema: type[BaseModel]) -> BaseM
 _MANUAL_BATCH_IN_FLIGHT: set[str] = set()
 
 
+def _claim_manual_slot(account: str) -> bool:
+    """Take this operator's single slot, or report that it is taken.
+
+    The check and the take are one step with no ``await`` between them, which on
+    a single event loop is what makes them atomic. Splitting them around a body
+    read is how two concurrent requests both passed the check and both ran: the
+    first one to finish then released the slot the second was still holding, so
+    a third request could join as well.
+
+    Only the request that took the slot may release it — see the callers, which
+    enter their ``try``/``finally`` only after this returns ``True``.
+    """
+    if account in _MANUAL_BATCH_IN_FLIGHT:
+        return False
+    _MANUAL_BATCH_IN_FLIGHT.add(account)
+    return True
+
+
 async def _manual_batch_action(request: Request, *, confirm: bool) -> JSONResponse:
     principal, refusal = _principal_or_error(request)
     if refusal is not None or principal is None:
@@ -614,9 +651,8 @@ async def _manual_batch_action(request: Request, *, confirm: bool) -> JSONRespon
         payload = None
     if payload is None:
         return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
-    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+    if not _claim_manual_slot(principal.account):
         return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
-    _MANUAL_BATCH_IN_FLIGHT.add(principal.account)
     redact_easyweek_url_logging()
     try:
         async with EasyWeekClient() as reader:
@@ -661,6 +697,66 @@ async def api_check_recipients(request: Request) -> JSONResponse:
 async def api_confirm_recipients(request: Request) -> JSONResponse:
     """Apply the exact server-owned subset after live revalidation, atomically."""
     return await _manual_batch_action(request, confirm=True)
+
+
+@router.post("/api/recipients/zero-visit-history")
+async def api_zero_visit_history(request: Request) -> JSONResponse:
+    """Read what EasyWeek says now about one zero-counter row. Writes nothing.
+
+    Same door as every other action here — session, CSRF, same origin — because
+    it spends somebody else's API budget even though it changes nothing locally.
+    The answer is facts and a timestamp; it is never an authorisation, and the
+    row, its reason, its basis and the audience are untouched by it.
+    """
+    principal, refusal = _principal_or_error(request)
+    if refusal is not None or principal is None:
+        return refusal or _session_error(OpsSessionError("ops_session_invalid"))
+    if principal.account in _MANUAL_BATCH_IN_FLIGHT:
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
+    try:
+        async with asyncio.timeout(10):
+            payload = await _recipient_request(request, ZeroVisitHistoryRequest)
+    except TimeoutError:
+        payload = None
+    if not isinstance(payload, ZeroVisitHistoryRequest):
+        return JSONResponse(status_code=400, content={"ok": False, "reason": "manual_batch_input_invalid"})
+    # Taken AFTER the body read and in the same step as the check, so two
+    # concurrent clicks cannot both get through, and released below only by the
+    # request that took it.
+    if not _claim_manual_slot(principal.account):
+        return JSONResponse(status_code=429, content={"ok": False, "reason": "manual_batch_rate_limit"})
+    redact_easyweek_url_logging()
+    try:
+        async with EasyWeekClient() as reader:
+            report = await check_zero_visit_history(
+                SessionLocal,
+                run_id=payload.preview_run_id,
+                recipient_id=payload.campaign_recipient_id,
+                reader=reader,
+            )
+        result = report.as_safe_dict()
+    except EasyWeekConfigError:
+        # The client could not even be built: no API key, no workspace slug, a
+        # base URL that is not the EasyWeek API. Nothing was asked of anybody,
+        # so "EasyWeek did not answer" would send an operator to look at a
+        # branch — and no retry can configure a workspace.
+        result = {"ok": False, "reason": ZERO_VISIT_API_NOT_CONFIGURED, "retryable": False}
+    except (EasyWeekError, TimeoutError):
+        result = {"ok": False, "reason": "manual_batch_provider_unavailable"}
+    except (LocalDatabaseUnavailable, SQLAlchemyError):
+        # OUR database, not EasyWeek's. The typed one carries the failures that
+        # never become a SQLAlchemyError, because they happen while a connection
+        # is being opened: a refused endpoint, a connect that timed out, a server
+        # answering "too many clients". One answer for all of them — nothing was
+        # concluded, and nobody is sent to look at a branch for it.
+        result = {"ok": False, "reason": "manual_batch_database_unavailable"}
+    finally:
+        _MANUAL_BATCH_IN_FLIGHT.discard(principal.account)
+    return JSONResponse(
+        status_code=200 if result.get("ok") else 409,
+        content=result,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/api/recipients")

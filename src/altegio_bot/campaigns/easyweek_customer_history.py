@@ -157,6 +157,19 @@ def _api_refusal(exc: Exception, *, stage: str, pages_read: int = 0) -> Customer
     return _refusal(SOURCE_BOOKING_MALFORMED, pages_read=pages_read)
 
 
+def classify_read_failure(exc: Exception, *, stage: str) -> tuple[str, LiveProofDisposition]:
+    """One read's failure as a stable code plus whether retrying could help.
+
+    The same classification the PR-15 proof uses, exposed for callers that need
+    the DISPOSITION rather than the whole verdict. A 429, a 5xx, a timeout and
+    an exhausted retry chain are a temporary inability to check; a 404, an auth
+    refusal and a malformed body are not, and telling an operator "try again"
+    for one of those would be advice that can never work.
+    """
+    result = _api_refusal(exc, stage=stage)
+    return result.reason or SOURCE_BOOKING_MALFORMED, result.disposition
+
+
 def _source_booking(
     payload: object,
     *,
@@ -193,6 +206,35 @@ def _source_booking(
     return _Booking(booking_uuid, customer_uuid, canceled, completed, start_time), None, LiveProofDisposition.READY
 
 
+@dataclass(frozen=True)
+class BookingBinding:
+    """Only the identity a booking response carries. Canonical text or nothing.
+
+    Deliberately NOT a verdict. :func:`_source_booking` answers PR-15's question
+    and refuses a booking that is not a completed single-service visit, which is
+    eligibility policy. A caller that has to decide whether an OLD delivery and a
+    CURRENT booking are about the same customer needs the identity and must not
+    inherit that policy, so the projection is shared and the judgement is not.
+    """
+
+    booking_uuid: uuid.UUID | None
+    customer_uuid: uuid.UUID | None
+    location_uuid: str | None
+
+
+def read_booking_binding(payload: object) -> BookingBinding:
+    """Project one booking response's booking/customer/location identity."""
+    if not isinstance(payload, dict):
+        return BookingBinding(None, None, None)
+    customer = payload.get("customer")
+    location_uuid = payload.get("location_uuid")
+    return BookingBinding(
+        booking_uuid=_canonical_uuid(payload.get("uuid")),
+        customer_uuid=_canonical_uuid(customer.get("uuid")) if isinstance(customer, dict) else None,
+        location_uuid=location_uuid if isinstance(location_uuid, str) else None,
+    )
+
+
 def _customer_uuid(payload: object) -> uuid.UUID | None:
     if isinstance(payload, dict) and "data" in payload:
         payload = payload.get("data")
@@ -227,6 +269,7 @@ async def _collect_customer_history(
     *,
     customer_uuid: uuid.UUID,
     paced: Callable[[], Awaitable[None]],
+    guard: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[dict[uuid.UUID, _Booking] | None, str | None, LiveProofDisposition, int]:
     """Every booking of one customer card, or why the set could not be trusted.
 
@@ -241,6 +284,15 @@ async def _collect_customer_history(
 
     ``None`` is NEVER "this customer has no bookings". An empty history is an
     empty dict, behind a complete and structurally valid zero-row response.
+
+    ``guard`` is an optional question asked before EVERY page request, after the
+    pace delay: "is what we are about to read still about the right person?" A
+    caller that holds local evidence a concurrent writer can invalidate — the
+    zero-counter diagnostic does — passes one, and its refusal code is returned
+    instead of a page being requested. The order matters: the delay is where a
+    writer gets its time, so asking before sleeping would prove something about
+    a moment that has passed. Callers that pass none behave exactly as before:
+    no extra call, no database read, and no early stop.
     """
     rows: dict[uuid.UUID, _Booking] = {}
     expected_total: int | None = None
@@ -249,10 +301,27 @@ async def _collect_customer_history(
     page = 1
     while True:
         await paced()
+        if guard is not None:
+            refused = await guard()
+            if refused is not None:
+                # Asked AFTER the pace delay and immediately before the request,
+                # because the delay is exactly where a concurrent writer gets
+                # time to act: asking first and sleeping afterwards left a
+                # window in which the answer became stale before it was asked
+                # for. The page is then not fetched at all — an answer already
+                # known to be about somebody else is not worth somebody's rate
+                # budget, let alone an operator's screen.
+                return None, refused, LiveProofDisposition.PERMANENT_REFUSAL, pages_read
         try:
             payload = await reader.list_customer_bookings(
                 str(customer_uuid), page=page, per_page=CUSTOMER_BOOKINGS_PER_PAGE
             )
+        except GuardFailed:
+            # The caller's guard ran inside this read — the client asks it
+            # between a retry delay and the repeat request — and could not
+            # answer. That is not EasyWeek failing to answer, so it is not
+            # classified here as though it were.
+            raise
         except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
             result = _api_refusal(exc, stage="history", pages_read=pages_read)
             return None, result.reason, result.disposition, pages_read
@@ -309,6 +378,26 @@ async def _collect_customer_history(
     return rows, None, LiveProofDisposition.READY, pages_read
 
 
+class GuardFailed(Exception):
+    """A caller's guard could not answer, and its failure is the caller's to report.
+
+    Not an API failure, and deliberately not classified as one. Every other
+    exception out of a read here is EasyWeek's answer — a timeout, a 4xx, a body
+    that does not keep its contract — and is turned into a stable reason that
+    says so. A guard, however, may read a database, and a database that is
+    unavailable has nothing to do with EasyWeek: reporting it as "incomplete
+    history" or "the card could not be read" sends an operator to look at the
+    wrong system entirely.
+
+    So the read sites re-raise this unchanged and let the caller unwrap
+    :attr:`cause`, which is the failure that actually happened.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__("history read guard failed")
+        self.cause = cause
+
+
 @dataclass(frozen=True)
 class CustomerBookingSet:
     """One customer's complete booking set, for a caller with its own policy.
@@ -337,6 +426,7 @@ async def read_customer_bookings(
     customer_uuid: uuid.UUID,
     pause: Callable[[float], Awaitable[None]] | None = None,
     pause_sec: float = 0.0,
+    guard: Callable[[], Awaitable[str | None]] | None = None,
 ) -> CustomerBookingSet:
     """Prove one customer card's identity, then read every booking it has.
 
@@ -364,6 +454,15 @@ async def read_customer_bookings(
     Strictly read-only — ``get_customer`` and ``list_customer_bookings``, no
     mutation, no database access and no lock. The caller must not hold a row
     lock or an advisory lock across this call.
+
+    ``guard`` is optional and, when given, is asked before every page request —
+    including the first, which is the moment after this function's own card
+    proof. That gap matters to a caller whose local evidence a concurrent
+    writer can invalidate: the card read is a network call like any other, and
+    a conflict written during it must not be followed by a page request. The
+    guard's own refusal code comes back as ``reason``; it may read a database,
+    and it must not hold a lock either. Without it nothing changes for the
+    callers that have no such evidence to lose.
     """
 
     async def paced() -> None:
@@ -372,6 +471,11 @@ async def read_customer_bookings(
 
     try:
         customer_payload = await reader.get_customer(str(customer_uuid))
+    except GuardFailed:
+        # The card read retries too, so the guard runs inside this call as well.
+        # Its own failure is the caller's to report, not a card that could not
+        # be read.
+        raise
     except Exception as exc:  # noqa: BLE001 - only typed classes are inspected
         result = _api_refusal(exc, stage="customer")
         return CustomerBookingSet(
@@ -389,7 +493,7 @@ async def read_customer_bookings(
         return CustomerBookingSet(complete=False, identity_current=False, reason=CUSTOMER_UUID_MISMATCH)
 
     rows, reason, disposition, pages_read = await _collect_customer_history(
-        reader, customer_uuid=customer_uuid, paced=paced
+        reader, customer_uuid=customer_uuid, paced=paced, guard=guard
     )
     if rows is None:
         return CustomerBookingSet(

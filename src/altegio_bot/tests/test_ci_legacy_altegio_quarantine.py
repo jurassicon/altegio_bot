@@ -36,7 +36,7 @@ import pytest
 import yaml
 
 from altegio_bot.tests.test_ci_workflow_nginx_gate import (
-    BROWSER_SUITE,
+    BROWSER_SUITES,
     DEDICATED_JOB,
     EXECUTION_JOBS,
     MIGRATION_GATE_ENV,
@@ -88,9 +88,9 @@ DEDICATED_GATE_SUITES = (
 
 # The --ignore entries that keep the mandatory suites from running a second time
 # inside the general invocation. Every one of them is executed somewhere else: the
-# dedicated job runs these, and `required-tests-browser` runs the browser suite.
+# dedicated job runs these, and `required-tests-browser` runs the browser suites.
 EXPECTED_IGNORED_SUITES = frozenset(
-    {MIGRATION_SUITE, NGINX_SUITE, *HANDOVER_SUITES, VOUCHER_MIGRATION_SUITE, BROWSER_SUITE}
+    {MIGRATION_SUITE, NGINX_SUITE, *HANDOVER_SUITES, VOUCHER_MIGRATION_SUITE, *BROWSER_SUITES}
 )
 
 

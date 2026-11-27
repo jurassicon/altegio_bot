@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from altegio_bot.models.models import PROVIDER_ALTEGIO
 
@@ -43,6 +44,11 @@ class ClientCandidate:
     source_booking_uuid: uuid.UUID | None = field(default=None)
     source_visits_total: int | None = field(default=None)
     source_visits_total_updated_at: datetime | None = field(default=None)
+    # The zero-counter diagnostic's durable binding, already serialised, or
+    # ``None`` for every other row. Deliberately NOT one of the five proof
+    # fields above: it records which delivery a diagnostic row was attributed
+    # to, and carries no claim that a first visit was proven.
+    easyweek_zero_visit_source: dict[str, Any] | None = field(default=None)
 
     @property
     def is_eligible(self) -> bool:

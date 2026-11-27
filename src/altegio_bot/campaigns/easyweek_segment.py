@@ -6,9 +6,9 @@ import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Final
+from typing import Final, Mapping
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altegio_bot.campaigns.contracts import ClientCandidate, ClientSnapshot
@@ -31,15 +31,32 @@ from altegio_bot.campaigns.easyweek_eligibility import (
     REGISTRY_UNAVAILABLE,
     SEGMENT_CONTRACT_UNAVAILABLE,
     SOURCE_VISITS_NOT_ONE,
+    BookingIdentity,
     evaluate_local_evidence,
+    prove_event_record_client_link,
+)
+from altegio_bot.campaigns.easyweek_zero_visit import (
+    CONTACT_EVENT_HINTS,
+    ZERO_VISITS_REPORTED,
+    ZeroVisitReport,
+    ZeroVisitSourceBinding,
+    captured_contact_phone,
+    normalize_zero_visit_event,
+    payload_reports_zero_visits_total,
+    zero_visit_source_meta,
 )
 from altegio_bot.db import SessionLocal
-from altegio_bot.easyweek_locations import EasyWeekLocationRegistry, configured_easyweek_locations
+from altegio_bot.easyweek_locations import (
+    EasyWeekLocation,
+    EasyWeekLocationRegistry,
+    configured_easyweek_locations,
+)
 from altegio_bot.easyweek_normalizer import NormalizationError, SucceededVisit, normalize_succeeded_visit_event
 from altegio_bot.easyweek_service_category import parse_allowed_service_categories
 from altegio_bot.models.models import PROVIDER_EASYWEEK, Client, EasyWeekEvent, Record
 from altegio_bot.settings import settings
 from altegio_bot.utils import utcnow
+from altegio_bot.webhooks.common import normalize_phone_candidate
 
 SEGMENT_SOURCE: Final = "easyweek_booking_succeeded_local_proven_subset"
 
@@ -64,6 +81,13 @@ _COVERAGE_KEYS: Final = (
     "eligible_unique_clients",
     "duplicate_evidence_for_client",
     "conflicting_first_visit_evidence",
+    # Zero-counter diagnostic. Deliveries whose `visits_total` was the integer zero AND whose
+    # Event -> Record -> Client chain and period are provable, and the number of
+    # distinct people those deliveries are about. Two counters, because a repeated
+    # webhook is one more delivery and not one more person, and an operator
+    # deciding how many cards to review needs the second number.
+    "zero_visits_total_reported_events",
+    "zero_visits_total_unique_clients",
 )
 
 
@@ -88,6 +112,11 @@ class EasyWeekSourceProof:
 class EasyWeekCandidate:
     candidate: ClientCandidate
     proof: EasyWeekSourceProof | None = None
+    # The zero-counter diagnostic's binding, serialised, for the one kind of row
+    # that has one. Separate from ``proof`` because it is the opposite claim:
+    # ``proof`` says a first visit was proven, this says which delivery an
+    # operator has to go and look at.
+    zero_source: dict[str, object] | None = None
 
 
 @dataclass
@@ -116,11 +145,65 @@ class _Evidence:
     locally_eligible: bool
 
 
+@dataclass(frozen=True)
+class _Delivery:
+    """One captured delivery, as plain values rather than an ORM row.
+
+    The contact resolution runs in a session of its own, after the archive pass
+    has closed its own. Carrying values instead of a detached ``EasyWeekEvent``
+    keeps that boundary honest: nothing here can trigger a lazy load, and
+    nothing depends on which session an object happened to be loaded in.
+    """
+
+    event_id: int
+    event_hint: str | None
+    payload: object
+    body_truncated: bool
+
+
+@dataclass(frozen=True)
+class _ZeroVisitRow:
+    """One delivery that reported the integer zero, with its proven chain."""
+
+    event_id: int
+    delivery: _Delivery
+    report: ZeroVisitReport
+    record: Record
+    client: Client
+
+
 def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _candidate(client: Client, *, phone: str | None, reason: str | None) -> ClientCandidate:
+def _candidate(
+    client: Client,
+    *,
+    phone: str | None,
+    reason: str | None,
+    evaluated: bool = True,
+    records_in_period: int = 1,
+) -> ClientCandidate:
+    """One row's snapshot counters.
+
+    ``evaluated`` says whether this row went through the proven-subset
+    evaluation — the service category, the counter and the whole local evidence
+    rule. Only then may the row claim a confirmed in-category visit, because
+    only then was one checked.
+
+    The zero-counter diagnostic never reaches that evaluation: it is attributed
+    and then stopped, so every counter that would otherwise assert a confirmed
+    first visit in an allowed service category stays 0. A row the operator is
+    being asked to investigate must not also be a row the screen describes as
+    already proven.
+
+    ``records_in_period`` is the field's own contract — how many of this
+    client's records start inside the campaign's half-open period — and is
+    counted, not assumed. The evaluated path proves exactly one source booking
+    and passes 1; the diagnostic path counts, because a person may have two
+    different bookings in the period (which is 2, never 1) and one booking may
+    have been delivered twice (which is 1, never 2).
+    """
     return ClientCandidate(
         client=ClientSnapshot(
             id=client.id,
@@ -131,10 +214,10 @@ def _candidate(client: Client, *, phone: str | None, reason: str | None) -> Clie
             phone_e164=phone,
             wa_opted_out=client.wa_opted_out,
         ),
-        total_records_in_period=1,
-        confirmed_records_in_period=1,
-        lash_records_in_period=1,
-        confirmed_lash_records_in_period=1,
+        total_records_in_period=records_in_period,
+        confirmed_records_in_period=1 if evaluated else 0,
+        lash_records_in_period=1 if evaluated else 0,
+        confirmed_lash_records_in_period=1 if evaluated else 0,
         service_titles_in_period=[],
         records_before_period=0,
         records_after_period=0,
@@ -166,6 +249,7 @@ def _coverage_key(reason: str) -> str | None:
         FUTURE_BOOKING: "locally_known_future_booking",
         DUPLICATE_EVIDENCE: "duplicate_evidence_for_client",
         CONFLICTING_FIRST_VISIT_EVIDENCE: "conflicting_first_visit_evidence",
+        ZERO_VISITS_REPORTED: "zero_visits_total_unique_clients",
     }.get(reason)
 
 
@@ -200,7 +284,7 @@ async def _future_booking_exists(
 async def _resolve_record(
     session: AsyncSession,
     *,
-    visit: SucceededVisit,
+    visit: BookingIdentity,
 ) -> tuple[Record | None, str | None]:
     exact = await session.scalar(
         select(Record)
@@ -231,6 +315,228 @@ async def _resolve_record(
     return (None, BOOKING_IDENTITY_MISMATCH if numeric_collision is not None else MISSING_RECORD)
 
 
+async def _resolve_zero_visit_row(
+    session: AsyncSession,
+    *,
+    event: EasyWeekEvent,
+    payload: dict,
+    company_id: int,
+    locations: Mapping[int, EasyWeekLocation],
+    period_start: datetime,
+    period_end: datetime,
+) -> _ZeroVisitRow | None:
+    """Can this zero-counter delivery be attributed to a person, or not at all?
+
+    ``None`` means it cannot, and then nothing is shown: a truncated payload, a
+    foreign branch, a booking we do not hold, a booking whose numeric id belongs
+    to a different UUID, a booking reassigned to another client, a mismatched
+    customer id, a start outside the campaign's half-open period and a deleted
+    source record all end here. A diagnostic row attached to the wrong person is
+    worse than no diagnostic row: an operator would review somebody else's card
+    and a later manual decision would be made about the wrong human.
+
+    Every check is the existing one. The record lookup is
+    :func:`_resolve_record`, the chain and the period are
+    :func:`prove_event_record_client_link`, and the payload validation is the
+    full succeeded contract. Nothing about identity is restated here.
+    """
+    try:
+        report = normalize_zero_visit_event(
+            event_hint=event.event_hint,
+            payload=payload,
+            body_truncated=bool(event.body_truncated),
+            location_registry=locations,
+        )
+    except NormalizationError:
+        return None
+
+    record, _unused_reason = await _resolve_record(session, visit=report)
+    if record is None or record.client_id is None:
+        return None
+    client = await session.scalar(
+        select(Client).where(Client.id == record.client_id).order_by(Client.id.asc()).limit(1)
+    )
+    if client is None:
+        return None
+    if (
+        prove_event_record_client_link(
+            booking=report,
+            record=record,
+            client=client,
+            company_id=company_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        is not None
+    ):
+        return None
+    # A deleted source record already has its own exclusion reason and its own
+    # count. This diagnostic is for the row where everything EXCEPT the counter
+    # is proven, so it does not take over a case the segmenter can already name.
+    if record.is_deleted is not False:
+        return None
+    return _ZeroVisitRow(
+        event_id=event.id,
+        delivery=_Delivery(
+            event_id=event.id,
+            event_hint=event.event_hint,
+            payload=payload,
+            body_truncated=bool(event.body_truncated),
+        ),
+        report=report,
+        record=record,
+        client=client,
+    )
+
+
+async def _records_in_period(
+    session: AsyncSession,
+    *,
+    company_id: int,
+    client_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> int:
+    """How many of this client's records start inside the half-open period.
+
+    The literal contract of ``total_records_in_period``, counted in SQL over
+    distinct records rather than inferred from how many deliveries arrived. Two
+    deliveries of one booking are one record; two different bookings are two.
+    Deleted records are left out, exactly as the rest of this path leaves them
+    out: a cancelled booking is not a record in the period for campaign
+    purposes, and the zero-counter row refuses a deleted source outright.
+    """
+    total = await session.scalar(
+        select(func.count(func.distinct(Record.id)))
+        .where(Record.provider == PROVIDER_EASYWEEK)
+        .where(Record.company_id == company_id)
+        .where(Record.client_id == client_id)
+        .where(Record.is_deleted.is_(False))
+        .where(Record.starts_at.is_not(None))
+        .where(Record.starts_at >= _as_utc(period_start))
+        .where(Record.starts_at < _as_utc(period_end))
+    )
+    return int(total or 0)
+
+
+async def _contact_deliveries(
+    session: AsyncSession,
+    *,
+    booking_uuids: set[uuid.UUID],
+) -> dict[uuid.UUID, list[_Delivery]]:
+    """Every delivery that could carry a contact, for ALL of these bookings.
+
+    One query for the whole preview, not one per recipient. The predicate —
+    ``booking_uuid`` plus ``status = 'processed'`` plus a contact-carrying
+    trigger — is not served by any index this schema has: the only index on
+    ``booking_uuid`` is ``ix_easyweek_events_pending_booking``, which is partial
+    on the two NON-terminal statuses and therefore cannot answer a question
+    about processed rows at all. So the read costs one pass over the deliveries
+    whatever is asked of it, and asking once per preview instead of once per
+    recipient is the whole difference; a branch's archive is scanned a single
+    time however many zero-counter rows the preview holds.
+
+    Only the five fields the contact rule needs are selected, so a large archive
+    does not arrive as ORM rows nobody reads, and nothing here is attached to a
+    session: the values outlive it, as :class:`_Delivery` exists to allow.
+    """
+    if not booking_uuids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                EasyWeekEvent.id,
+                EasyWeekEvent.booking_uuid,
+                EasyWeekEvent.event_hint,
+                EasyWeekEvent.payload,
+                EasyWeekEvent.body_truncated,
+            )
+            .where(EasyWeekEvent.booking_uuid.in_(sorted(booking_uuids)))
+            .where(EasyWeekEvent.status == "processed")
+            .where(EasyWeekEvent.event_hint.in_(CONTACT_EVENT_HINTS))
+            .order_by(EasyWeekEvent.id.asc())
+        )
+    ).all()
+    grouped: dict[uuid.UUID, list[_Delivery]] = defaultdict(list)
+    for event_id, booking_uuid, event_hint, payload, truncated in rows:
+        if booking_uuid is None:
+            continue
+        grouped[booking_uuid].append(
+            _Delivery(
+                event_id=int(event_id),
+                event_hint=event_hint,
+                payload=payload,
+                body_truncated=bool(truncated),
+            )
+        )
+    return grouped
+
+
+def _contact_evidence(
+    *,
+    source: _Delivery,
+    deliveries: list[_Delivery],
+    report: ZeroVisitReport,
+    company_id: int,
+    locations: Mapping[int, EasyWeekLocation],
+) -> tuple[int | None, int]:
+    """``(contact_event_id, distinct_contacts)`` for one zero-counter booking.
+
+    §44.2's second identity route needs a contact this workspace captured for
+    this booking. The zero-counter delivery itself often carries none, and
+    §44.2 is equally clear that the booking's CURRENT owner may not stand in for
+    it. So the preview looks — once, while it still has the archive open — at
+    the deliveries of this same booking that could carry one: a repeat of the
+    same ``booking-succeeded``, and its ``booking-created``/``booking-updated``
+    deliveries.
+
+    Every candidate must prove the branch, the booking UUID, the numeric booking
+    id and the numeric customer id against the source delivery; that is
+    :func:`captured_contact_phone` and is not restated here. A delivery about
+    another booking, another branch or another customer is not a candidate.
+
+    The result is deliberately a COUNT plus a pointer, not a number:
+
+    * ``distinct_contacts == 1`` — one contact, however many deliveries carried
+      it. The pointer is the source delivery itself when that is one of them,
+      otherwise the earliest sibling that carried it, so the stored binding does
+      not depend on which replay arrived first.
+    * ``distinct_contacts == 0`` — nothing captured a contact for this booking.
+    * ``distinct_contacts > 1`` — the deliveries contradict each other about who
+      this is. Recorded, never resolved: picking one would pick a person.
+
+    Decided in memory from the deliveries :func:`_contact_deliveries` already
+    read for the whole preview, and bounded by the deliveries of ONE booking.
+    The phone itself is never stored.
+    """
+    # The source delivery is always a candidate, whatever the read returned
+    # about it: it is the delivery this row was written from and it is already
+    # in hand, so its own captured contact never depends on a query succeeding.
+    candidates = [source] + [row for row in deliveries if row.event_id != source.event_id]
+    carriers: dict[str, list[int]] = defaultdict(list)
+    for delivery in candidates:
+        phone = captured_contact_phone(
+            event_hint=delivery.event_hint,
+            payload=delivery.payload,
+            body_truncated=delivery.body_truncated,
+            location_registry=locations,
+            company_id=company_id,
+            booking_uuid=report.booking_uuid,
+            booking_id=report.booking_id,
+            customer_id=report.customer_id,
+        )
+        if phone is not None:
+            carriers[phone].append(delivery.event_id)
+    if len(carriers) != 1:
+        return None, len(carriers)
+    event_ids = sorted(next(iter(carriers.values())))
+    if source.event_id in event_ids:
+        # The source delivery carries it itself; no pointer is needed and the
+        # check reads it from the delivery the binding already names.
+        return None, 1
+    return event_ids[0], 1
+
+
 async def build_easyweek_segment(
     *,
     company_id: int,
@@ -254,6 +560,7 @@ async def build_easyweek_segment(
 
     result = EasyWeekSegmentResult(candidates=[])
     evidence_by_client: dict[tuple[str, int, int], list[_Evidence]] = defaultdict(list)
+    zero_by_client: dict[tuple[str, int, int], list[_ZeroVisitRow]] = defaultdict(list)
     clock = now or utcnow()
 
     async with SessionLocal() as session:
@@ -287,6 +594,24 @@ async def build_easyweek_segment(
                 )
             except NormalizationError as exc:
                 _record_failure(result, exc.code)
+                # `visits_total_out_of_range` also covers negatives and
+                # overflow, so the code alone does not select this branch: the
+                # payload must carry the integer zero itself.
+                if exc.code == NormalizationError.VISITS_TOTAL_OUT_OF_RANGE and payload_reports_zero_visits_total(
+                    payload
+                ):
+                    zero_row = await _resolve_zero_visit_row(
+                        session,
+                        event=event,
+                        payload=payload,
+                        company_id=company_id,
+                        locations=locations.locations,
+                        period_start=period_start,
+                        period_end=period_end,
+                    )
+                    if zero_row is not None:
+                        result.coverage["zero_visits_total_reported_events"] += 1
+                        zero_by_client[(PROVIDER_EASYWEEK, company_id, zero_row.client.id)].append(zero_row)
                 continue
             result.coverage["normalized_succeeded_events"] += 1
 
@@ -372,6 +697,78 @@ async def build_easyweek_segment(
             result.candidates.append(EasyWeekCandidate(candidate=chosen.candidate, proof=proof))
         else:
             result.candidates.append(EasyWeekCandidate(candidate=chosen.candidate))
+
+    # The diagnostic rows, last and only for people the ordinary selection
+    # produced no row for at all. A client the segmenter proved keeps the proof,
+    # and a client it excluded for a reason of its own keeps that reason: the
+    # zero-counter row exists to stop somebody DISAPPEARING, never to override a
+    # verdict or to open a way around an exclusion. Keyed on the client, so the
+    # outcome is the same whichever order the deliveries arrived in.
+    diagnostic_keys = [key for key in sorted(zero_by_client) if key not in evidence_by_client]
+    representatives = {
+        key: sorted(zero_by_client[key], key=lambda row: (row.event_id, str(row.report.booking_uuid)))
+        for key in diagnostic_keys
+    }
+    async with SessionLocal() as session:
+        # One read of the deliveries for every booking this phase is about,
+        # before the loop. Asking per recipient scanned the archive once per
+        # person, because no index serves this predicate.
+        contact_deliveries = await _contact_deliveries(
+            session,
+            booking_uuids={rows[0].report.booking_uuid for rows in representatives.values()},
+        )
+        for key in diagnostic_keys:
+            rows = representatives[key]
+            representative = rows[0]
+            # Deliveries are not people and bookings are not deliveries. A
+            # replayed webhook repeats one booking and must change neither the
+            # row nor the count; two DIFFERENT zero-counter bookings for one
+            # card mean the question "which visit is this about?" has no single
+            # answer, and that fact is recorded now rather than rediscovered —
+            # or guessed at — when the row is opened.
+            distinct = {row.report.booking_uuid for row in rows}
+            contact_event_id, contact_sources = _contact_evidence(
+                source=representative.delivery,
+                deliveries=contact_deliveries.get(representative.report.booking_uuid, []),
+                report=representative.report,
+                company_id=company_id,
+                locations=locations.locations,
+            )
+            binding = ZeroVisitSourceBinding(
+                event_id=representative.event_id,
+                record_id=representative.record.id,
+                booking_uuid=representative.report.booking_uuid,
+                booking_id=representative.report.booking_id,
+                customer_id=representative.report.customer_id,
+                distinct_sources=len(distinct),
+                contact_event_id=contact_event_id,
+                contact_sources=contact_sources,
+            )
+            # Once per person, not once per delivery: a replayed webhook must
+            # not produce a second row or a second reason in the breakdown.
+            _record_failure(result, ZERO_VISITS_REPORTED)
+            result.candidates.append(
+                EasyWeekCandidate(
+                    candidate=_candidate(
+                        representative.client,
+                        phone=normalize_phone_candidate(representative.client.phone_e164),
+                        reason=ZERO_VISITS_REPORTED,
+                        # Not evaluated: attributed and stopped. See `_candidate`.
+                        evaluated=False,
+                        records_in_period=await _records_in_period(
+                            session,
+                            company_id=company_id,
+                            client_id=representative.client.id,
+                            period_start=period_start,
+                            period_end=period_end,
+                        ),
+                    ),
+                    # No source proof, ever. The delivery proved no first visit,
+                    # and a proof here would be a number nobody reported.
+                    proof=None,
+                    zero_source=zero_visit_source_meta(binding),
+                )
+            )
 
     result.candidates.sort(
         key=lambda item: (

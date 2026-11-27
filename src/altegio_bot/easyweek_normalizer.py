@@ -647,6 +647,21 @@ def _customer_phone(payload: dict[str, Any]) -> str | None:
     return f"+{digits}"[:32]
 
 
+def captured_customer_phone(payload: object) -> str | None:
+    """The contact THIS delivery captured, normalised exactly as ingestion did.
+
+    §44.2 allows an identity to be proven from an independently captured
+    contact. "Independently captured" means captured by the webhook at the time
+    of the event — the same string the ingestion path normalised into
+    ``Client.phone_e164`` — not a number read back from a booking's current
+    owner and not one typed in a browser. This exposes that one normalisation so
+    a later diagnostic can use the historical contact without reimplementing it.
+
+    Never logged and never returned to a browser by any caller.
+    """
+    return _customer_phone(payload) if isinstance(payload, dict) else None
+
+
 def _display_name(payload: dict[str, Any]) -> str | None:
     for key in ("customer_full_name", "customer_name"):
         name = _optional_str(payload.get(key), limit=256)

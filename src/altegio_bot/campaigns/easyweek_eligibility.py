@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Final
+from typing import Awaitable, Callable, Final, Protocol
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -125,6 +125,61 @@ def _canonical_uuid(value: object, *, require_canonical_text: bool = False) -> u
     return parsed
 
 
+class BookingIdentity(Protocol):
+    """The four identity fields a proven ``booking-succeeded`` names.
+
+    A protocol rather than :class:`SucceededVisit` so the one caller that must
+    not carry a ``visits_total`` at all — the zero-counter diagnostic — can
+    reuse :func:`prove_event_record_client_link` instead of restating it. The
+    linking rule is the valuable part and must have exactly one definition:
+    restating it for a second caller is how two paths come to disagree about
+    whose visit an event was.
+    """
+
+    company_id: int
+    booking_uuid: uuid.UUID
+    booking_id: int
+    customer_id: int
+
+
+def prove_event_record_client_link(
+    *,
+    booking: BookingIdentity,
+    record: Record,
+    client: Client,
+    company_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> str | None:
+    """Prove Event -> Record -> Client inside one provider/company, in the period.
+
+    ``None`` means the chain holds: both rows are EasyWeek rows of this branch,
+    the Record is the very booking the delivery named (UUID *and* numeric id),
+    the Client is the one the Record points at, both agree with the external
+    customer id the delivery named, and ``Record.starts_at`` falls inside the
+    campaign's half-open period.
+
+    Says nothing about the visit counter, the service, the phone, the opt-out or
+    a future booking. Those are policy; this is identity.
+    """
+    if record.provider != PROVIDER_EASYWEEK or client.provider != PROVIDER_EASYWEEK:
+        return PROVIDER_MISMATCH
+    if record.company_id != company_id or client.company_id != company_id or booking.company_id != company_id:
+        return COMPANY_MISMATCH
+    if record.easyweek_booking_uuid != booking.booking_uuid or record.altegio_record_id != booking.booking_id:
+        return BOOKING_IDENTITY_MISMATCH
+    if record.client_id != client.id:
+        return CUSTOMER_IDENTITY_MISMATCH
+    if record.altegio_client_id != booking.customer_id or client.altegio_client_id != booking.customer_id:
+        return CUSTOMER_IDENTITY_MISMATCH
+    if record.starts_at is None:
+        return RECORD_START_UNPROVEN
+    starts_at = _as_utc(record.starts_at)
+    if not (_as_utc(period_start) <= starts_at < _as_utc(period_end)):
+        return OUTSIDE_PERIOD
+    return None
+
+
 def evaluate_local_evidence(
     *,
     visit: SucceededVisit,
@@ -137,21 +192,16 @@ def evaluate_local_evidence(
     has_future_booking: bool,
 ) -> LocalEligibility:
     """Apply the exact local proven-subset contract in one stable order."""
-    if record.provider != PROVIDER_EASYWEEK or client.provider != PROVIDER_EASYWEEK:
-        return LocalEligibility(False, PROVIDER_MISMATCH, None)
-    if record.company_id != company_id or client.company_id != company_id or visit.company_id != company_id:
-        return LocalEligibility(False, COMPANY_MISMATCH, None)
-    if record.easyweek_booking_uuid != visit.booking_uuid or record.altegio_record_id != visit.booking_id:
-        return LocalEligibility(False, BOOKING_IDENTITY_MISMATCH, None)
-    if record.client_id != client.id:
-        return LocalEligibility(False, CUSTOMER_IDENTITY_MISMATCH, None)
-    if record.altegio_client_id != visit.customer_id or client.altegio_client_id != visit.customer_id:
-        return LocalEligibility(False, CUSTOMER_IDENTITY_MISMATCH, None)
-    if record.starts_at is None:
-        return LocalEligibility(False, RECORD_START_UNPROVEN, None)
-    starts_at = _as_utc(record.starts_at)
-    if not (_as_utc(period_start) <= starts_at < _as_utc(period_end)):
-        return LocalEligibility(False, OUTSIDE_PERIOD, None)
+    link_reason = prove_event_record_client_link(
+        booking=visit,
+        record=record,
+        client=client,
+        company_id=company_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    if link_reason is not None:
+        return LocalEligibility(False, link_reason, None)
     if type(visit.visits_total) is not int or visit.visits_total != 1:
         return LocalEligibility(False, SOURCE_VISITS_NOT_ONE, None)
     current = client.easyweek_visits_total
@@ -380,6 +430,7 @@ __all__ = [
     "BOOKING_SERVICE_COUNT_UNPROVEN",
     "BOOKING_UUID_MISMATCH",
     "BOOKING_LOCATION_MISMATCH",
+    "BookingIdentity",
     "CampaignEligibilityResult",
     "LocalEligibility",
     "SourceBookingProof",
@@ -387,4 +438,5 @@ __all__ = [
     "evaluate_booking_response",
     "evaluate_local_evidence",
     "evaluate_recipient",
+    "prove_event_record_client_link",
 ]

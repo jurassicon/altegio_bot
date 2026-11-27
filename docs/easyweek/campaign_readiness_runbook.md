@@ -77,6 +77,282 @@ belongs to the same EasyWeek customer card. It requires exactly one completed,
 non-canceled visit and no active future booking. This is not an import or
 reconstruction of historical Altegio visits.
 
+## Zero counter reported by a delivery
+
+A processed `booking-succeeded` may carry the JSON integer `0` in
+`visits_total`. The counter is still refused — `Client.easyweek_visits_total`
+stays NULL and the normalizer keeps rejecting the value — but the preview no
+longer loses the person.
+
+**Where the row is.** Open the preview, then **Recipients**
+(`/ops/campaigns/<run_id>/recipients`). The row is `skipped`, its basis is
+`auto`, and its reason reads: «EasyWeek подтвердил завершение визита, но передал
+счётчик 0. Первый визит требует проверки». Filter by the stable code
+`easyweek_campaign_source_visits_total_zero` to list only these. The run meta
+counts them twice: `zero_visits_total_reported_events` is deliveries and
+`zero_visits_total_unique_clients` is people, so a replayed webhook does not
+inflate the number of cards to review.
+
+The row is reviewed and excluded. It is not in the active audience, it does not
+change the voucher nominal, and it carries no source proof. Its basis reads
+`auto` because that is the default for every non-manual row, so the screens show
+«первый визит не доказан» beside it and the recipients JSON answers
+`first_visit_proof_recorded: false`. It claims no confirmed visit in an allowed
+service category either, because none was ever checked for it. A person the
+segmenter already proved, or already excluded for a reason of its own, keeps
+that verdict: this row only exists for somebody who would otherwise have no row.
+
+`total_records_in_period` on that row is the count the field's name promises —
+this client's distinct, non-deleted records starting inside the campaign's
+half-open period, counted in SQL. Two different bookings in the period read as
+2; one booking delivered twice reads as 1. It is never a count of zero-counter
+deliveries.
+
+**Which delivery the row is about.** The preview records it when it creates the
+row: the event id, the record id and the booking's identity, stored in the
+recipient's own snapshot and deliberately **not** in the five source-proof
+columns. Opening the row re-proves that chain and nothing else, so a
+zero-counter delivery that arrives later cannot become the source of a row that
+was written about a different visit. If the preview saw two different
+zero-counter bookings for one card, it records that too and the check refuses as
+ambiguous rather than picking one. A row from before this path existed has no
+binding, and the check says «источник не установлен» instead of guessing. The
+binding is never written onto an existing, manual or frozen row afterwards.
+
+**Which delivery the contact comes from.** Recorded in the same snapshot, as its
+own two fields, because "which delivery carried the counter" and "which delivery
+carried the contact" are different questions. A zero-counter delivery often
+carries no phone at all, so the preview also looks at the other processed
+deliveries of that same booking — a repeat of it, or its `booking-created` /
+`booking-updated` — and takes a contact only from one that proves the same
+branch, the same booking UUID, the same numeric booking id and the same numeric
+customer id. It stores how many different contacts those deliveries carried and,
+when the one contact came from a sibling delivery, which delivery that was. The
+number itself is **not** stored. One contact is usable; none means the identity
+cannot come from this route; more than one means the deliveries contradict each
+other about who this is, and the check refuses rather than choosing. A delivery
+that arrives after the preview supplies nothing, because the binding was already
+decided.
+
+Those sibling deliveries are read **once per preview**, for every zero-counter
+booking in it together, and only the fields the rule needs. The predicate —
+this booking's UUID plus `status = 'processed'` — is served by no index the
+schema has: the only index on `booking_uuid` is
+`ix_easyweek_events_pending_booking`, which is partial on the two non-terminal
+statuses. So the read costs one pass over the deliveries whatever is asked of
+it, and asking once instead of once per person is the whole difference. A plan
+on 20 000 synthetic deliveries reads 606 shared buffers for 40 bookings at once,
+and the same 606 for one booking alone.
+
+A row that does **not** carry the contact count — one created before that field
+existed — is refused with its own reason: «в строке нет доказательства
+единственности контакта». The number on the card cannot distinguish a booking
+whose single delivery captured one contact from one whose deliveries disagreed,
+so it does not authorise a lookup. Such a row is still checked normally when a
+stored numeric-to-UUID correspondence identifies the person: that basis needs no
+contact at all. Old rows are never rewritten, and the count is never re-derived
+from deliveries that arrived afterwards.
+
+**How to check the history.** Press **🔎 Проверить историю** on that row. The
+server takes the run id and the recipient id only, and re-derives the branch,
+the period, the client and the originating booking from its own rows; a customer
+UUID or phone number sent by the browser is refused. One operator gets one check
+at a time. The identity comes from one of the two routes §44.2 allows: the
+stored numeric-to-UUID correspondence, or — when there is none — the contact
+**one of that booking's deliveries captured**, resolved across the whole
+workspace to exactly one customer and then read back directly. The current
+owner of the booking is never used to supply a missing identity.
+
+The correspondence is read **workspace-wide**, through the same rule the webhook
+bridge uses: one customer UUID may legitimately hold cards in several proven
+branches, so a correspondence stored on another branch's card identifies the same
+person here. That case is checked and works, and the same numeric id with the
+same UUID in two branches stays allowed. The correspondence is checked in **both
+directions**: two different UUIDs against one numeric customer id is a conflict,
+and so is one UUID carrying two different numeric customer ids — the second is
+the same contradiction read the other way round, and the webhook bridge has
+always refused it. So is a live answer naming a different customer than the
+stored correspondence does — the case where the Karlsruhe card has no UUID,
+another branch says `N → A`, and the phone and the current booking both point at
+`B`.
+
+For the contact route, local cards are consulted as well as the workspace: a
+card anywhere here that carries the same number for a different numeric customer
+means our own records already disagree about whose number it is, and the check
+stops before the number is sent anywhere. Two cards on the number inside the
+branch remain «по этому контакту больше одной карточки».
+
+Every network call is a window, and the webhook bridge writes while they are
+open, so the local facts are read again after the lookup, **after the source
+booking read**, **before every page of the history** and **after the history
+read**. The page guard matters because the history reader proves the card with a
+`GET` of its own before the first page: a conflict written during that read must
+not be followed by a page request, and one that becomes visible between pages
+ends the walk there.
+
+Each page guard runs **after** the pace delay, immediately before the request,
+because the delay is where a concurrent writer gets its time: asking first and
+waiting afterwards proved something about a moment that had passed. The client's
+retry delay is the same window one level down — a `Retry-After` the server chose
+can be seconds long, and the repeat is a second `GET` of the same page — so the
+check installs a barrier the client asks after that delay and before the repeat
+request. A change already saved by then means the repeat never goes out. The
+barrier is installed for the duration of this one read and removed again, and a
+caller that installs none sees no change at all.
+
+That barrier reads our own rows from inside an HTTP call, so its failures are
+reported as ours and not as EasyWeek's. A database error there gives the
+route's standing answer «База недоступна: результат не подтверждён»
+(`manual_batch_database_unavailable`) instead of a card-format or
+incomplete-history reason, and a deadline that expires over that SQL gives
+«проверка не успела завершиться на нашей стороне после ответа EasyWeek» — the
+branch had answered, with a 429, and was waiting to be asked again. In both
+cases the repeat request is not sent and no visit count is shown. A deadline
+that expires while an answer is genuinely being waited for still reads as
+EasyWeek not answering.
+
+A connection that cannot be **opened** reads the same way, and it is the more
+likely failure in production: the server refusing one client too many, the
+database endpoint not listening after a restart, or a connect that never
+completes. None of those arrives as a database error of the kind an open session
+raises, so each used to be reported as a card that could not be read, an
+incomplete history, or — for the connect that timed out — as EasyWeek not
+answering. All three now give the same «База недоступна» answer, with no repeat
+request and no visit count, because that is what happened: nothing was
+concluded, and nobody needs to look at a branch for it.
+
+A correspondence that appeared mid-call and names somebody else, a UUID since
+bound to another numeric customer, a second card that has taken the proven
+UUID, a local card that now claims the number, or a card whose contact has
+changed all stop the check.
+
+So does a change to the **source record itself**. Each recheck re-proves the
+exact record the preview bound the row to — read by its id, never replaced by
+another record that happens to fit — through the segmenter's own rule: provider,
+branch, booking UUID and numeric id, the customer id on both the record and the
+card, not deleted, and a start inside the campaign's half-open period. A webhook
+that moves the booking to another client leaves both cards and both UUIDs
+untouched, so this is the only check that sees it, and the refusal reads «исходное
+событие больше не относится к этому клиенту» with the stable detail
+`zero_visit_check_source_record_changed`.
+
+A conflict found before the pages stops the check before anybody's booking
+history is read at all; one found during the last page is caught by the check
+after the read, which stops a confirmation already known to be out of date from
+reaching the operator — the count is not shown, and the row stays as it was. All
+of these are short reads of our own rows: no transaction and no lock is held
+across an HTTP call. Other consumers of the shared history module pass no guard
+and read exactly as they did before.
+
+The diagnostic's phone lookup is also stricter than the migration one about
+coverage. Page parameters and metadata must be consistent, `per_page` stable,
+every page before the last one full, the rows must add up to the declared total,
+and every row must be a distinct customer. On top of that the declared size,
+page count and total must describe a listing that can exist: with `per_page` 100
+and `total` 1 there is exactly one page, no page may hold more rows than its
+size allows, no page may be empty while the total says something is left, and no
+page may arrive after the rows have already added up. A `total: 2` listing that
+repeats one UUID is indeterminate here — the row never shown may be a second
+person on that number — and so is an empty first page followed by one card at
+`total: 1`, or an extra empty page after the only card. A correct empty answer
+(`total: 0`) is a complete answer, not a coverage complaint: the customer is
+simply absent. The client never sends a page size, so a `per_page` that is not
+an integer — a string `"100"` — is treated as unknown rather than refused, and
+the structural rules still have to hold. The direct card read is checked too, and
+its two failures are kept apart: a 200 whose body is not a readable card — `{}`
+included — is a format problem, while a readable card for a different customer
+is an identity conflict. That holds for both of the direct card reads: the one
+the lookup makes and the one the history reader repeats before the first page.
+
+That repeat read can also answer with the same customer and a **different
+number**, and where the identity was proven from the contact a delivery
+captured, the number is the proof: the refusal is «контакт клиента в EasyWeek
+изменился, прежнее совпадение больше не доказывает личность», no history is
+read, and no count is shown. Only an explicit contradiction counts — the `phone`
+key present and normalising to something else, a cleared `phone: null`
+included — and the comparison uses the project's own normalizer, so a different
+spelling of the same number is not a contradiction. A body that does not mention
+`phone` says nothing about it. Where a stored numeric↔UUID correspondence proved
+the identity, a changed number is allowed on its own, exactly as §44.2 says. The
+decision is made from the answer already in hand: no extra request, and no
+number, UUID or response body reaches Ops or a log. The migration lookup and the manual Add keep their own contract — one
+UUID listed twice is one customer, and that listing above still resolves for
+them — unchanged.
+
+It then reads the source booking and that customer's complete booking history,
+read-only, within one deadline that covers the local checks and the network
+together.
+
+A successful answer states the counter the delivery carried (0), the number of
+completed non-canceled visits in the full API history, what became of the exact
+source booking, whether anything is booked ahead, the moment it was read, and
+the state of the row as the server saw it while checking. The source booking's
+state is reported in its own words, because "in the history" and "counted as a
+completed visit" are two different facts: it is either completed and not
+canceled (counted), found but canceled, found but not finished, or not in the
+history at all.
+
+Kinds of refusal, and they mean different things:
+
+- «не удалось подтвердить» — we will not say whose history this is. The source
+  event or its record no longer attributes to this person (detail
+  `zero_visit_check_source_record_changed` when the record itself moved,
+  was deleted or left the period), the booking has been reassigned, the
+  identity is unproven, or one contact resolves to more than one card.
+- «конфликт идентификаторов клиента» — the workspace or the API contradicts
+  itself about who this numeric customer is: two UUIDs on one numeric id, one
+  UUID on two numeric ids, a local card claiming the number for somebody else,
+  or a card read answering about a different customer. Repeating the check
+  cannot settle it; the cards have to be looked at.
+- «в строке нет доказательства единственности контакта» — the row predates the
+  contact count and has no stored correspondence either. Only a new preview can
+  give that row a basis; the check never guesses one.
+- «контакт клиента в EasyWeek изменился» — the identity rested on the contact a
+  delivery captured, and the card has since explicitly stopped carrying that
+  number. Not a retry: the number is not coming back, and a stored
+  correspondence is what would make the person identifiable without it.
+- «не удалось проверить историю» — the history itself could not be trusted:
+  incomplete pagination, or a listing whose coverage could not be proven.
+- «EasyWeek отказал в запросе» — a permanent 4xx (401, 403, 404, 422). **Not**
+  offered as a retry: retrying cannot work.
+- «интеграция с EasyWeek не настроена на сервере» — no API key, no workspace
+  slug, or an unusable base URL. Nobody was asked anything, so this is ours and
+  not a branch's; no retry helps until the server is configured.
+- «EasyWeek вернул ответ неожидаемого формата» — a 200 whose body is not the
+  promised shape. Also not a retry.
+- «временно не удалось проверить историю» — a 429, a 5xx or a timeout, the
+  workspace listing included: a request that was made and not answered in time
+  is EasyWeek's side, and this is the one family worth repeating.
+- «проверка не успела завершиться на нашей стороне; EasyWeek не запрашивался» —
+  the one deadline expired while reading our own rows. EasyWeek was never asked,
+  so the message does not say EasyWeek failed to answer.
+- «проверка не успела завершиться на нашей стороне после ответа EasyWeek» — the
+  deadline expired between calls, after EasyWeek had answered: a slow database
+  during an identity recheck, say. Neutral on purpose — EasyWeek did answer, and
+  the check still did not finish, so no count is shown.
+
+An unavailable history is never shown as zero visits, and no count appears for
+an answer that was not read.
+
+The check writes nothing: no status, no reason, no counter, no consent, no UUID,
+no phone, no entitlement. It holds no database lock while the API is read.
+Having looked at the row grants nothing — automatic eligibility still requires a
+source and current `visits_total` of exactly 1 with a paired timestamp, and
+reading the API produces neither. The screen says so on every answer, and a
+refusal says only that this check changed nothing: if another tab has already
+included the person, the refusal reports that decision instead of claiming the
+row is still excluded.
+
+**What a manual decision means.** If an operator decides to include the person,
+use the existing single **Add recipient** with their phone number. The same row
+becomes `operator_manual_selection`, its original verdict is kept in
+`auto_excluded_reason`, and no second row is created. It is recorded as a
+person's decision, not as a proven first visit: the source-proof columns stay
+NULL and a database CHECK keeps them that way. A matching opt-out still blocks
+the addition, and a frozen or already-used preview still refuses it. The §44
+list mode «предыдущий визит в Altegio / ноль записей EasyWeek» does not apply to
+this case.
+
 ## Read-only voucher evidence
 
 The only confirmed Public API voucher-template identity is UUID
