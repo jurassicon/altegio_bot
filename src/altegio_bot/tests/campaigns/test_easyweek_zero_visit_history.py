@@ -32,7 +32,7 @@ from typing import Any
 import httpx
 import pytest
 from asyncpg.exceptions import TooManyConnectionsError
-from sqlalchemy import func, select, text
+from sqlalchemy import URL, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -5384,39 +5384,131 @@ async def test_a_database_failure_before_a_page_is_not_classified_as_a_read(
 # The origin is now kept at the boundary of the local read, where both halves
 # are — the connect and the statements after it.
 
-_LIMITED_ROLE = "zero_visit_connection_limit"
-_LIMITED_PASSWORD = "round-seven-synthetic"
+# The two endpoints this works against are built in this test and belong to it:
+# a listener of our own that refuses a connect the way the server does, and two
+# addresses that cannot answer at all. Nothing in the cluster behind
+# ``DATABASE_URL`` is created, altered or dropped, and no privilege beyond
+# connecting to the test database is needed.
+
+_SSL_REQUEST = (80877103).to_bytes(4, "big")
+_GSSENC_REQUEST = (80877104).to_bytes(4, "big")
+
+
+def _error_response(fields: dict[str, str]) -> bytes:
+    """One PostgreSQL ``ErrorResponse`` frame, in the server's own wire format."""
+    payload = b"".join(code.encode() + value.encode() + b"\x00" for code, value in fields.items()) + b"\x00"
+    return b"E" + (len(payload) + 4).to_bytes(4, "big") + payload
+
+
+# What the postmaster answers when it will not take one more client. It is sent
+# on the connection itself, before any session exists, which is precisely why
+# SQLAlchemy never wraps it: there is nothing yet for it to wrap.
+_TOO_MANY_CLIENTS = _error_response(
+    {
+        "S": "FATAL",
+        "V": "FATAL",
+        "C": "53300",
+        "M": "sorry, too many clients already",
+        "F": "postmaster.c",
+        "R": "canAcceptConnections",
+    }
+)
+
+
+def _test_address(url: Any, port: int) -> Any:
+    """A DSN for one local test port, carrying nothing of the real address.
+
+    Round 8: ``url.set(host=..., port=...)`` was not enough. A working DSN may
+    name its address in the query string — ``?host=/tmp&port=5417`` is how a
+    Unix socket reaches the asyncpg dialect — and those parameters are handed
+    straight to ``connect()``, where they win over the URL's own host and port.
+    The "broken" engine then opened a perfectly good connection to the real
+    database, and every case here answered HTTP 200 while asserting nothing.
+
+    So the address is built from scratch: the same driver and database name,
+    this test's own host and port, and no query at all.
+    """
+    address = URL.create(
+        drivername=url.drivername,
+        username=url.username,
+        password=url.password,
+        host="127.0.0.1",
+        port=port,
+        database=url.database,
+    )
+    assert not address.query, "a test address must not inherit connect arguments"
+    return address
+
+
+class _BrokenEndpoint:
+    """A test address that cannot hand us a session, and what its far end saw.
+
+    ``cause`` is the error asyncpg must raise there, and ``accepted`` is counted
+    by the far end itself. Together they say which address the driver actually
+    reached: the HTTP answer is deliberately the same for all three failures, so
+    it cannot tell a refused connect from one that was taken and left waiting —
+    and it certainly cannot tell either of them from a working database.
+    """
+
+    def __init__(self, cause: type[BaseException], *, accepts: bool) -> None:
+        self.maker: Any = None
+        self.cause = cause
+        self.accepts = accepts
+        self.accepted = 0
+
+    def __call__(self) -> Any:
+        return self.maker()
 
 
 @asynccontextmanager
 async def _connection_limit_reached(url: Any) -> Any:
-    """Real PostgreSQL, refusing a connect by limit: SQLSTATE 53300.
+    """A listener of our own, refusing the connect exactly as PostgreSQL does.
 
-    A role of its own with ``CONNECTION LIMIT 0``, so the server itself answers
-    "too many connections for role" on the next connect. Nobody else's
-    connections are touched, no cluster setting is changed and no second
-    PostgreSQL is needed; the role is dropped again whatever happens.
+    Round 8: this used to create a role with ``CONNECTION LIMIT 0`` in the
+    cluster behind ``DATABASE_URL``. That asked for CREATEROLE, which the owner
+    of a test database need not have, and the role name was global to the
+    cluster: a role of that name that already existed was dropped, and two runs
+    against different databases of one cluster fought over it.
+
+    None of that is needed to reach the code under test. "Too many connections"
+    is an answer given on the connection: the server takes the socket, reads the
+    startup packet and sends one FATAL ``ErrorResponse`` with SQLSTATE 53300.
+    This endpoint sends that frame, declining TLS first the way a server without
+    it does, and asyncpg reads it through its ordinary error path into
+    ``TooManyConnectionsError`` — the class the boundary under test has to
+    classify. No role, no cluster setting, no privilege, no shared name; the
+    listener is created here and dies with the test.
     """
-    admin = create_async_engine(url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
-    drop = text(f'DROP ROLE IF EXISTS "{_LIMITED_ROLE}"')
-    try:
-        async with admin.connect() as conn:
-            await conn.execute(drop)
-            await conn.execute(
-                text(f"CREATE ROLE \"{_LIMITED_ROLE}\" LOGIN PASSWORD '{_LIMITED_PASSWORD}' CONNECTION LIMIT 0")
-            )
-        limited = create_async_engine(
-            url.set(username=_LIMITED_ROLE, password=_LIMITED_PASSWORD),
-            poolclass=NullPool,
-        )
+    endpoint = _BrokenEndpoint(TooManyConnectionsError, accepts=True)
+
+    async def refuse(reader: Any, writer: Any) -> None:
+        endpoint.accepted += 1
         try:
-            yield async_sessionmaker(limited, expire_on_commit=False)
+            while True:
+                length = int.from_bytes(await reader.readexactly(4), "big")
+                body = await reader.readexactly(length - 4)
+                if body[:4] in (_SSL_REQUEST, _GSSENC_REQUEST):
+                    writer.write(b"N")
+                    await writer.drain()
+                    continue
+                writer.write(_TOO_MANY_CLIENTS)
+                await writer.drain()
+                return
+        except (OSError, asyncio.IncompleteReadError):
+            pass
         finally:
-            await limited.dispose()
+            writer.close()
+
+    server = await asyncio.start_server(refuse, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    engine = create_async_engine(_test_address(url, port), poolclass=NullPool)
+    endpoint.maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield endpoint
     finally:
-        async with admin.connect() as conn:
-            await conn.execute(drop)
-        await admin.dispose()
+        await engine.dispose()
+        server.close()
+        await server.wait_closed()
 
 
 @asynccontextmanager
@@ -5426,9 +5518,11 @@ async def _unreachable_endpoint(url: Any) -> Any:
     probe.bind(("127.0.0.1", 0))
     port = probe.getsockname()[1]
     probe.close()
-    engine = create_async_engine(url.set(host="127.0.0.1", port=port), poolclass=NullPool)
+    endpoint = _BrokenEndpoint(ConnectionRefusedError, accepts=False)
+    engine = create_async_engine(_test_address(url, port), poolclass=NullPool)
+    endpoint.maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        yield async_sessionmaker(engine, expire_on_commit=False)
+        yield endpoint
     finally:
         await engine.dispose()
 
@@ -5437,8 +5531,10 @@ async def _unreachable_endpoint(url: Any) -> Any:
 async def _connect_never_completes(url: Any) -> Any:
     """A local listener that accepts and then says nothing: the connect times out."""
     stop = asyncio.Event()
+    endpoint = _BrokenEndpoint(TimeoutError, accepts=True)
 
     async def accept_and_say_nothing(_reader: Any, writer: Any) -> None:
+        endpoint.accepted += 1
         try:
             await stop.wait()
         finally:
@@ -5447,12 +5543,13 @@ async def _connect_never_completes(url: Any) -> Any:
     server = await asyncio.start_server(accept_and_say_nothing, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     engine = create_async_engine(
-        url.set(host="127.0.0.1", port=port),
+        _test_address(url, port),
         poolclass=NullPool,
         connect_args={"timeout": 0.3},
     )
+    endpoint.maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        yield async_sessionmaker(engine, expire_on_commit=False)
+        yield endpoint
     finally:
         await engine.dispose()
         stop.set()
@@ -5543,6 +5640,9 @@ async def test_a_connect_that_fails_before_a_retry_is_a_database_answer(
     assert body.get("completed_visit_count") is None
     # The unopenable session was reached, and the repeat request was not sent.
     assert sessions.opened == 1
+    # And it was reached at the test's own address: refused outright where
+    # nothing listens, taken and left waiting where a listener of ours answers.
+    assert broken.accepted == (1 if broken.accepts else 0)
     assert transport.requests == expected_requests
 
 
@@ -5587,4 +5687,54 @@ async def test_the_refused_connect_keeps_postgres_own_error(
 
     assert isinstance(caught.value.cause, TooManyConnectionsError)
     assert caught.value.cause.sqlstate == "53300"
+    assert transport.requests == ["booking", "customer", "history:1"]
+
+
+@pytest.mark.parametrize("failure", ["endpoint_unreachable", "connect_timeout"])
+async def test_an_address_that_cannot_answer_is_the_one_the_driver_reached(
+    session_maker, engine, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Round 8: one address refuses the connect, the other never answers it.
+
+    The Ops route gives these two the same answer as the refusal above, which is
+    exactly why its answer cannot prove which address was used: a DSN that named
+    the real database in its query string quietly produced a working connection
+    and a green HTTP 200. So the driver's own error is asserted here, at the
+    boundary of the owner check the 429 interrupted — refused where nothing
+    listens, timed out where our listener took the connection and said nothing —
+    and the far end's own count of accepted connections says which happened.
+    """
+    run_id, recipient_id, person = await _preview_with_zero_row(session_maker, monkeypatch)
+    async with _BROKEN_ENDPOINTS[failure](engine.url) as broken:
+        sessions = _BrokenAfterThrottle(session_maker, broken)
+        transport = RecordingTransport(
+            person,
+            pages=_two_page_history(person),
+            throttle_page=1,
+            on_throttle=sessions.arm,
+        )
+        client = EasyWeekClient(
+            api_key="synthetic-key",
+            workspace_slug="synthetic-slug",
+            base_url=CANONICAL_API_BASE_URL,
+            transport=httpx.MockTransport(transport.handler),
+            sleep=_no_sleep,
+        )
+        async with client:
+            with pytest.raises(LocalDatabaseUnavailable) as caught:
+                await check_zero_visit_history(
+                    sessions,
+                    run_id=run_id,
+                    recipient_id=recipient_id,
+                    reader=client,
+                    now=NOW,
+                    registry=registry(),
+                    pause=_PauseWriting({}),
+                    pause_sec=0.0,
+                )
+
+    assert isinstance(caught.value.cause, broken.cause)
+    assert not isinstance(caught.value.cause, SQLAlchemyError)
+    assert broken.accepted == (1 if broken.accepts else 0)
+    assert sessions.opened == 1
     assert transport.requests == ["booking", "customer", "history:1"]
