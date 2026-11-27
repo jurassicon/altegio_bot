@@ -316,34 +316,50 @@ check_targets_running() {
 }
 
 selected_image() {
-  local svc=$1 compat separator
-  dc config --quiet || return 1
-  compat=$(dc config --environment | grep -m1 -- '^COMPOSE_COMPATIBILITY=') || compat=''
-  case "${compat#*=}" in
-    '' | 0 | f | F | false | False | FALSE) separator=- ;;
-    1 | t | T | true | True | TRUE) separator=_ ;;
-    *)
-      printf 'STOP: %s: COMPOSE_COMPATIBILITY=%s is not a boolean Compose accepts\n' \
-        "$svc" "${compat#*=}" >&2
-      return 1
-      ;;
-  esac
-  dc config --format json "$svc" | python3 -c '
+  local svc=$1 described kind line other other_images own remaining
+  local -a others=() excluded=()
+  described=$(dc config --format json "$svc" | python3 -c '
 import json, sys
 
-project, svc, separator = sys.argv[1], sys.argv[2], sys.argv[3]
-service = json.load(sys.stdin).get("services", {}).get(svc)
+svc = sys.argv[1]
+model = json.load(sys.stdin).get("services", {})
+service = model.get(svc)
 if service is None:
     raise SystemExit(f"{svc}: not in the effective configuration")
 image = service.get("image") or ""
-if image and "$" in image:
-    raise SystemExit(f"{svc}: unresolved image reference {image}")
-if not image:
-    if not service.get("build"):
-        raise SystemExit(f"{svc}: the configuration selects no image and no build")
-    image = f"{project}{separator}{svc}"
-print(image)
-' "$compose_project" "$svc" "$separator"
+if image:
+    if "$" in image:
+        raise SystemExit(f"{svc}: unresolved image reference {image}")
+    print("image " + image)
+elif service.get("build"):
+    print("build")
+    for name in sorted(model):
+        if name != svc:
+            print(name)
+else:
+    raise SystemExit(f"{svc}: the configuration selects no image and no build")
+' "$svc") || return 1
+  kind=''
+  while IFS= read -r line; do
+    if [[ -z "$kind" ]]; then kind=$line; else others+=("$line"); fi
+  done <<< "$described"
+  case "$kind" in
+    'image '*) printf '%s\n' "${kind#image }"; return 0 ;;
+    build) ;;
+    *) printf 'STOP: %s: cannot read the configured image\n' "$svc" >&2; return 1 ;;
+  esac
+  own=$(dc config --images "$svc") || return 1
+  for other in "${others[@]}"; do
+    other_images=$(dc config --images "$other") || return 1
+    excluded+=("$other_images")
+  done
+  remaining=$(printf '%s\n' "$own" \
+    | grep -Fxv -f <(printf '%s\n' "${excluded[@]}"))
+  if [[ -z "$remaining" || "$remaining" == *$'\n'* ]]; then
+    printf 'STOP: %s: Compose does not name exactly one image for this service\n' "$svc" >&2
+    return 1
+  fi
+  printf '%s\n' "$remaining"
 }
 
 check_deployed_image_unchanged() {
@@ -385,20 +401,20 @@ decision under its own authorization — it may have been stopped deliberately �
 and this procedure neither starts it nor skips the check.
 
 The image check answers one question per service: would the recreation run a
-different image than the container runs now? It resolves the image that the
-effective configuration — the same files, project and environment as every other
-command here — selects for that service alone, and compares that local image's
-ID with the container's `.Image`. A service with its own `image:` key, from the
-base file or from an override, is checked against that key. A service built from
-`build:` is checked against the name Compose derives, `<project>` and the service
-joined by `-`, or by `_` when compatibility mode is on; the mode is read from the
-environment Compose itself reports for this file set, which covers both the shell
-and the project `.env`, and a value Compose does not read as a boolean stops the
-service with that reason. Looking a name up in `config --images` is not enough:
-that output also lists the images of the service's dependencies, so a dependency
-still carrying the old tag would make a service that now selects a new image look
-unchanged. The decision follows from image IDs, so two tags of one ID pass and
-one tag moved to another ID stops.
+different image than the container runs now? It takes the image from Compose's
+own result for this file set, project and environment, and compares that local
+image's ID with the container's `.Image`. A service with its own `image:` key,
+from the base file or from an override, is checked against that key as the
+rendered configuration reports it. For a service built from `build:` the name is
+whatever Compose prints for it, never a name assembled here, so the separator
+Compose uses between the project and the service — a hyphen, or an underscore in
+compatibility mode, however that mode happens to be set — is Compose's answer
+and not a rule this runbook has to repeat. Because `config --images` for one
+service also prints the images of its dependencies, the dependencies' own image
+lists are subtracted from it, and the check continues only when exactly one name
+is left: nothing left or more than one name is an ambiguity that stops the
+service, as does any failing Compose call. The decision then follows from image
+IDs, so two tags of one ID pass and one tag pointing at another ID stops.
 
 The configuration is filtered on the host by the reader in the function, which
 prints one field and nothing else: never print the configuration, write it to a
@@ -408,7 +424,8 @@ it is missing the check ends and nothing is recreated.
 The group also stops when the service has no ordinary container in this project
 or more than one, when the service is absent from the effective configuration,
 when its image reference is unresolved or it selects neither an image nor a
-build, and when the selected image is not present locally. Report the printed
+build, when Compose leaves more than one or no candidate name for a built
+service, and when the selected image is not present locally. Report the printed
 reason to the operator and resolve it before retrying; do not work around the
 check.
 
