@@ -316,9 +316,13 @@ check_targets_running() {
 }
 
 selected_image() {
-  local svc=$1 described kind line other other_images own remaining
+  local svc=$1 described kind line other other_images own remaining status
   local -a others=() excluded=()
-  described=$(dc config --format json "$svc" | python3 -c '
+  # pipefail is set inside the substitution only: a Compose call that prints a
+  # plausible result and then fails must not pass for a successful read, and the
+  # operator's own shell options are neither relied on nor changed.
+  described=$(set -o pipefail
+    dc config --format json "$svc" | python3 -c '
 import json, sys
 
 svc = sys.argv[1]
@@ -353,8 +357,13 @@ else:
     other_images=$(dc config --images "$other") || return 1
     excluded+=("$other_images")
   done
-  remaining=$(printf '%s\n' "$own" \
-    | grep -Fxv -f <(printf '%s\n' "${excluded[@]}"))
+  status=0
+  remaining=$(set -o pipefail
+    printf '%s\n' "$own" | grep -Fxv -f <(printf '%s\n' "${excluded[@]}")) || status=$?
+  if (( status > 1 )); then
+    printf 'STOP: %s: the image filter failed with exit %d\n' "$svc" "$status" >&2
+    return 1
+  fi
   if [[ -z "$remaining" || "$remaining" == *$'\n'* ]]; then
     printf 'STOP: %s: Compose does not name exactly one image for this service\n' "$svc" >&2
     return 1
@@ -415,6 +424,16 @@ lists are subtracted from it, and the check continues only when exactly one name
 is left: nothing left or more than one name is an ambiguity that stops the
 service, as does any failing Compose call. The decision then follows from image
 IDs, so two tags of one ID pass and one tag pointing at another ID stops.
+
+Every step is judged by exit status, not by how the output reads. Each
+substitution turns on `pipefail` for its own pipeline, so a Compose call that
+prints a whole plausible configuration and then exits non-zero is a failure, and
+so is a host filter that writes one plausible candidate and then exits with an
+error — the filter's own status is read before its text, and anything above the
+"nothing matched" status stops the service. Because the option is set inside the
+substitution, the check behaves the same whether or not the operator's shell has
+`pipefail`, and it does not change that shell. One service failing ends the run
+for the whole group, so §9 and §13 reach no `up` at all.
 
 The configuration is filtered on the host by the reader in the function, which
 prints one field and nothing else: never print the configuration, write it to a
