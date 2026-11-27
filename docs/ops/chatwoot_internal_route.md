@@ -233,12 +233,28 @@ redirects, so a 301 is visible as a failed check.
 For a switch from public to internal, run the §4 setup, choose the shared
 route row, and run §§5–7 first.
 After those checks pass, update only the route settings in
-`/opt/altegio_bot/.env`. These values correspond to the verified `rails` alias:
+`/opt/altegio_bot/.env`. Build the URL from the same `rails_host` value that
+§§6–7 verified, so that no alias is retyped by hand:
+
+```bash
+printf 'CHATWOOT_BASE_URL=http://%s:3000\n' "$rails_host"
+```
+
+Copy the printed line into `/opt/altegio_bot/.env` literally, together with the
+forwarded protocol below. Compose reads `.env` verbatim and expands nothing, so
+never write the shell variable itself into the file. With the standard alias the
+printed line is the first of these two:
 
 ```env
 CHATWOOT_BASE_URL=http://rails:3000
 CHATWOOT_API_FORWARDED_PROTO=https
 ```
+
+With a verified alternative alias the printed URL differs, and then the host
+verified in §§6–7, the value written to `.env` and the address expected in §10
+must be one and the same. Keep `rails_host` unchanged in this shell for the rest
+of the operation: §10 checks the container against `http://$rails_host:3000`,
+so a mismatch there means the applied value was not the verified one.
 
 For a routine env-only change on an already internal deployment, leave the
 route as configured. Within the five services covered here, select only those
@@ -248,8 +264,84 @@ apply and verify it there using their deployment procedure as well. For
 example, the EasyWeek category allowlist is used by both the shared outbox
 worker and `altegio-easyweek-inbox-worker`.
 
+This operation must keep the deployed application version. Even with
+`--no-build --pull never`, `--force-recreate` creates the new container from
+whatever the local image tag points to *now*, so a tag moved by a deploy or a
+build would change the version silently along with the environment. Run §9 and
+§13 on their own, never while a deploy or a build is in progress: the check
+below reads the local images once and cannot see a tag that moves afterwards.
+The approved build in §4 is the opposite case and replaces the images on
+purpose, so it does not use this check.
+
 ```bash
-before_change && dc up -d --no-deps --no-build --pull never --force-recreate "${targets[@]}"
+target_container() {
+  local svc=$1 out
+  out=$(dc ps --all --quiet "$svc") || return 1
+  if [[ -z "$out" || "$out" == *$'\n'* ]]; then
+    printf 'STOP: %s must have exactly one existing container, found: %s\n' \
+      "$svc" "${out:-none}" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+check_targets_running() {
+  local svc cid
+  require_targets || return 1
+  for svc in "${targets[@]}"; do
+    cid=$(target_container "$svc") || return 1
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$cid")" != true ]]; then
+      printf 'STOP: %s is not running; this env-only change does not start it.\n' "$svc" >&2
+      return 1
+    fi
+    printf '%s: running\n' "$svc"
+  done
+}
+
+check_deployed_image_unchanged() {
+  local svc cid ref deployed selected
+  require_targets || return 1
+  for svc in "${targets[@]}"; do
+    cid=$(target_container "$svc") || return 1
+    ref=$(docker inspect --format '{{.Config.Image}}' "$cid") || return 1
+    deployed=$(docker inspect --format '{{.Image}}' "$cid") || return 1
+    if ! dc config --images "$svc" | grep -Fxq -- "$ref"; then
+      printf 'STOP: the effective configuration for %s no longer selects %s\n' \
+        "$svc" "$ref" >&2
+      return 1
+    fi
+    if ! selected=$(docker image inspect --format '{{.Id}}' "$ref"); then
+      printf 'STOP: no local image %s for %s\n' "$ref" "$svc" >&2
+      return 1
+    fi
+    if [[ "$selected" != "$deployed" ]]; then
+      printf 'STOP: %s would move from image %s to %s\n' "$svc" "$deployed" "$selected" >&2
+      return 1
+    fi
+    printf '%s: image %s unchanged (%s)\n' "$svc" "$ref" "$deployed"
+  done
+}
+```
+
+Both checks cover every selected service before anything is recreated, and
+either one failing stops the operation for the whole group, including the
+services that passed. A stopped container ends the check: starting a worker is
+a separate operator decision with its own authorization, because it may have
+been stopped deliberately, and this procedure neither starts it nor skips it.
+The image check compares the existing container's image ID with the ID of the
+local image that the effective configuration — base file, Chatwoot overlay and
+any verified extra override — selects for that same service. `config --images`
+for one service also prints the images of its dependencies, in no fixed order,
+so the check looks for the container's own image reference in that list instead
+of taking a single line. It stops on a reference the effective configuration no
+longer selects, on an image that is not present locally, on more than one
+existing container for a service, and on a tag that has moved away from the
+deployed ID. Report the printed reason to the operator and resolve it before
+retrying; do not work around the check.
+
+```bash
+before_change && check_targets_running && check_deployed_image_unchanged \
+  && dc up -d --no-deps --no-build --pull never --force-recreate "${targets[@]}"
 ```
 
 Continue only after successful recreation. Repeat §§5–6, then §§10 and 12.
@@ -338,7 +430,10 @@ sends or reset completed jobs to repair history.
 Run the shared setup in §4 and select the services whose route you are
 reverting. For a shared route rollback, choose all five. Use the same
 verified Compose files, overrides, networks and
-deployed images. First verify the public endpoint from the selected services:
+deployed images. First verify the public endpoint from the selected services.
+This check runs `exec` inside each selected container, so every one of them
+must already be running; a stopped target ends the rollback here, and starting
+it stays a separate operator decision:
 
 ```bash
 check_public_fallback() {
@@ -360,8 +455,13 @@ CHATWOOT_BASE_URL=https://chatwoot.kitilash.com
 CHATWOOT_API_FORWARDED_PROTO=
 ```
 
+The rollback changes only the URL, so it keeps the deployed version too.
+Define the §9 preflight functions in this shell, run the rollback separately
+from any deploy or build, and stop the whole group on a printed STOP:
+
 ```bash
-before_change && dc up -d --no-deps --no-build --pull never --force-recreate "${targets[@]}"
+before_change && check_targets_running && check_deployed_image_unchanged \
+  && dc up -d --no-deps --no-build --pull never --force-recreate "${targets[@]}"
 ```
 
 After successful recreation, run the §5 network and §6 internal DNS checks.
