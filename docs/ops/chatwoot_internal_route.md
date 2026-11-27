@@ -241,9 +241,10 @@ printf 'CHATWOOT_BASE_URL=http://%s:3000\n' "$rails_host"
 ```
 
 Copy the printed line into `/opt/altegio_bot/.env` literally, together with the
-forwarded protocol below. Compose reads `.env` verbatim and expands nothing, so
-never write the shell variable itself into the file. With the standard alias the
-printed line is the first of these two:
+forwarded protocol below. Compose does interpolate `.env`, so a `$` in a value is
+substituted there as well, and `rails_host` exists only in this shell: written as
+a variable reference it would collapse to `http://:3000`. Write the printed
+literal URL. With the standard alias the printed line is the first of these two:
 
 ```env
 CHATWOOT_BASE_URL=http://rails:3000
@@ -274,6 +275,8 @@ The approved build in §4 is the opposite case and replaces the images on
 purpose, so it does not use this check.
 
 ```bash
+compose_project=altegio_bot
+
 target_container() {
   local svc=$1 out
   out=$(dc ps --all --quiet "$svc") || return 1
@@ -286,58 +289,106 @@ target_container() {
 }
 
 check_targets_running() {
-  local svc cid
+  local svc cid status
   require_targets || return 1
   for svc in "${targets[@]}"; do
     cid=$(target_container "$svc") || return 1
-    if [[ "$(docker inspect --format '{{.State.Running}}' "$cid")" != true ]]; then
-      printf 'STOP: %s is not running; this env-only change does not start it.\n' "$svc" >&2
+    if ! status=$(docker inspect --format '{{.State.Status}}' "$cid"); then
+      printf 'STOP: %s: cannot read the container state\n' "$svc" >&2
+      return 1
+    fi
+    if [[ "$status" != running ]]; then
+      printf 'STOP: %s is %s, not running; this change neither starts it nor skips it.\n' \
+        "$svc" "${status:-unknown}" >&2
       return 1
     fi
     printf '%s: running\n' "$svc"
   done
 }
 
+selected_image() {
+  local svc=$1
+  dc config --format json "$svc" | python3 -c '
+import json, sys
+
+project, svc = sys.argv[1], sys.argv[2]
+service = json.load(sys.stdin).get("services", {}).get(svc)
+if service is None:
+    raise SystemExit(f"{svc}: not in the effective configuration")
+image = service.get("image") or ""
+if image and "$" in image:
+    raise SystemExit(f"{svc}: unresolved image reference {image}")
+if not image:
+    if not service.get("build"):
+        raise SystemExit(f"{svc}: the configuration selects no image and no build")
+    image = f"{project}-{svc}"
+print(image)
+' "$compose_project" "$svc"
+}
+
 check_deployed_image_unchanged() {
-  local svc cid ref deployed selected
+  local svc cid project ref selected deployed
   require_targets || return 1
   for svc in "${targets[@]}"; do
     cid=$(target_container "$svc") || return 1
-    ref=$(docker inspect --format '{{.Config.Image}}' "$cid") || return 1
-    deployed=$(docker inspect --format '{{.Image}}' "$cid") || return 1
-    if ! dc config --images "$svc" | grep -Fxq -- "$ref"; then
-      printf 'STOP: the effective configuration for %s no longer selects %s\n' \
-        "$svc" "$ref" >&2
+    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$cid") || return 1
+    if [[ "$project" != "$compose_project" ]]; then
+      printf 'STOP: %s belongs to Compose project %s, not %s\n' \
+        "$svc" "${project:-none}" "$compose_project" >&2
+      return 1
+    fi
+    if ! ref=$(selected_image "$svc"); then
+      printf 'STOP: %s: cannot tell which image the configuration selects\n' "$svc" >&2
       return 1
     fi
     if ! selected=$(docker image inspect --format '{{.Id}}' "$ref"); then
-      printf 'STOP: no local image %s for %s\n' "$ref" "$svc" >&2
+      printf 'STOP: %s: no local image %s\n' "$svc" "$ref" >&2
       return 1
     fi
+    deployed=$(docker inspect --format '{{.Image}}' "$cid") || return 1
     if [[ "$selected" != "$deployed" ]]; then
-      printf 'STOP: %s would move from image %s to %s\n' "$svc" "$deployed" "$selected" >&2
+      printf 'STOP: %s would move from %s to %s (%s)\n' \
+        "$svc" "$deployed" "$selected" "$ref" >&2
       return 1
     fi
-    printf '%s: image %s unchanged (%s)\n' "$svc" "$ref" "$deployed"
+    printf '%s: %s is still the deployed image %s\n' "$svc" "$ref" "$deployed"
   done
 }
 ```
 
 Both checks cover every selected service before anything is recreated, and
 either one failing stops the operation for the whole group, including the
-services that passed. A stopped container ends the check: starting a worker is
-a separate operator decision with its own authorization, because it may have
-been stopped deliberately, and this procedure neither starts it nor skips it.
-The image check compares the existing container's image ID with the ID of the
-local image that the effective configuration — base file, Chatwoot overlay and
-any verified extra override — selects for that same service. `config --images`
-for one service also prints the images of its dependencies, in no fixed order,
-so the check looks for the container's own image reference in that list instead
-of taking a single line. It stops on a reference the effective configuration no
-longer selects, on an image that is not present locally, on more than one
-existing container for a service, and on a tag that has moved away from the
-deployed ID. Report the printed reason to the operator and resolve it before
-retrying; do not work around the check.
+services that passed. Keep `compose_project` equal to the `-p` value in `dc`.
+
+Only the exact status `running` is accepted. `exited`, `paused`, `restarting`,
+`created`, `dead`, an unexpected value and a failed `inspect` all stop the group
+and print the service name with the status that caused it; the state is read as
+`.State.Status`, because a paused or restarting container still reports
+`.State.Running` as `true`. Starting a stopped worker stays a separate operator
+decision under its own authorization — it may have been stopped deliberately —
+and this procedure neither starts it nor skips the check.
+
+The image check answers one question per service: would the recreation run a
+different image than the container runs now? It resolves the image that the
+effective configuration — base file, Chatwoot overlay and any verified extra
+override — selects for that service alone, taking the service's own `image:` key
+when it has one and Compose's default `<project>-<service>` name when the service
+is built, and compares that local image's ID with the container's `.Image`.
+Looking a name up in `config --images` is not enough: that output also lists the
+images of the service's dependencies, so a dependency still carrying the old tag
+would make a service that now selects a new image look unchanged. The decision
+follows from image IDs, so two tags of one ID pass and one tag moved to another
+ID stops. The configuration is read only by the reader in the function, which
+prints a single field; never print it or write it to a file. The reader needs
+`python3` on the host, or the same program run through
+`dc exec -T "$svc" /app/.venv/bin/python` on a running target.
+
+The group also stops when the service is absent from the effective
+configuration, when its image reference is unresolved or it selects neither an
+image nor a build, when the existing container belongs to another Compose
+project, when a service has more than one existing container, and when the
+selected image is not present locally. Report the printed reason to the operator
+and resolve it before retrying; do not work around the check.
 
 ```bash
 before_change && check_targets_running && check_deployed_image_unchanged \
