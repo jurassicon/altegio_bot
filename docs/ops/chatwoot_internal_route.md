@@ -53,6 +53,7 @@ or differing overrides before grouping services in one command.
 
 ```bash
 extra_files=()
+compose_project=altegio_bot
 dc() {
   local file
   local -a extra_args=()
@@ -69,6 +70,20 @@ app_network=altegio_bot_default
 chatwoot_network=chatwoot_default
 rails_host=rails
 public_url=https://chatwoot.kitilash.com
+
+target_container() {
+  local svc=$1 out
+  out=$(docker ps --all --quiet \
+    --filter "label=com.docker.compose.project=$compose_project" \
+    --filter "label=com.docker.compose.service=$svc" \
+    --filter "label=com.docker.compose.oneoff=False") || return 1
+  if [[ -z "$out" || "$out" == *$'\n'* ]]; then
+    printf 'STOP: %s must have exactly one ordinary container in project %s, found: %s\n' \
+      "$svc" "$compose_project" "${out:-none}" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
 
 require_targets() {
   local svc allowed
@@ -94,8 +109,7 @@ before_change() {
   overlay="$PWD/docker-compose.chatwoot-internal.yml"
   for file in "${extra_files[@]}"; do extras+=",$file"; done
   for svc in "${targets[@]}"; do
-    cid=$(dc ps --all --quiet "$svc") || return 1
-    # This production stack has one existing container per target.
+    cid=$(target_container "$svc") || return 1
     old_files=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$cid") || return 1
     docker inspect --format '{{.Name}} OLD_CONTAINER_CREATED={{.Created}}' "$cid" || return 1
     if [[ "$old_files" != "$base,$overlay$extras" && "$old_files" != "$base$extras" ]]; then
@@ -131,6 +145,14 @@ use the Rails container identified in the Chatwoot deployment.
 docker inspect chatwoot_rails_1 \
   --format '{{range $name, $net := .NetworkSettings.Networks}}{{println $name $net.IPAddress (json $net.Aliases)}}{{end}}'
 ```
+
+`target_container` resolves the one ordinary container of a service from its
+Compose labels: the project in `compose_project`, which must stay equal to the
+`-p` value in `dc`, the service name, and `oneoff=False`. A container left by
+`compose run` carries `oneoff=True` and is therefore never taken for a missing
+worker, and anything other than exactly one match stops the group. Every later
+check resolves the container the same way, so the creation time below, the
+status in §9 and the image in §9 all describe the same ordinary container.
 
 Keep the pre-change output with the incident or deployment record. The label
 check accepts the verified file set or that set missing just the Chatwoot
@@ -275,19 +297,6 @@ The approved build in §4 is the opposite case and replaces the images on
 purpose, so it does not use this check.
 
 ```bash
-compose_project=altegio_bot
-
-target_container() {
-  local svc=$1 out
-  out=$(dc ps --all --quiet "$svc") || return 1
-  if [[ -z "$out" || "$out" == *$'\n'* ]]; then
-    printf 'STOP: %s must have exactly one existing container, found: %s\n' \
-      "$svc" "${out:-none}" >&2
-    return 1
-  fi
-  printf '%s\n' "$out"
-}
-
 check_targets_running() {
   local svc cid status
   require_targets || return 1
@@ -307,11 +316,22 @@ check_targets_running() {
 }
 
 selected_image() {
-  local svc=$1
+  local svc=$1 compat separator
+  dc config --quiet || return 1
+  compat=$(dc config --environment | grep -m1 -- '^COMPOSE_COMPATIBILITY=') || compat=''
+  case "${compat#*=}" in
+    '' | 0 | f | F | false | False | FALSE) separator=- ;;
+    1 | t | T | true | True | TRUE) separator=_ ;;
+    *)
+      printf 'STOP: %s: COMPOSE_COMPATIBILITY=%s is not a boolean Compose accepts\n' \
+        "$svc" "${compat#*=}" >&2
+      return 1
+      ;;
+  esac
   dc config --format json "$svc" | python3 -c '
 import json, sys
 
-project, svc = sys.argv[1], sys.argv[2]
+project, svc, separator = sys.argv[1], sys.argv[2], sys.argv[3]
 service = json.load(sys.stdin).get("services", {}).get(svc)
 if service is None:
     raise SystemExit(f"{svc}: not in the effective configuration")
@@ -321,22 +341,16 @@ if image and "$" in image:
 if not image:
     if not service.get("build"):
         raise SystemExit(f"{svc}: the configuration selects no image and no build")
-    image = f"{project}-{svc}"
+    image = f"{project}{separator}{svc}"
 print(image)
-' "$compose_project" "$svc"
+' "$compose_project" "$svc" "$separator"
 }
 
 check_deployed_image_unchanged() {
-  local svc cid project ref selected deployed
+  local svc cid ref selected deployed
   require_targets || return 1
   for svc in "${targets[@]}"; do
     cid=$(target_container "$svc") || return 1
-    project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$cid") || return 1
-    if [[ "$project" != "$compose_project" ]]; then
-      printf 'STOP: %s belongs to Compose project %s, not %s\n' \
-        "$svc" "${project:-none}" "$compose_project" >&2
-      return 1
-    fi
     if ! ref=$(selected_image "$svc"); then
       printf 'STOP: %s: cannot tell which image the configuration selects\n' "$svc" >&2
       return 1
@@ -358,7 +372,9 @@ check_deployed_image_unchanged() {
 
 Both checks cover every selected service before anything is recreated, and
 either one failing stops the operation for the whole group, including the
-services that passed. Keep `compose_project` equal to the `-p` value in `dc`.
+services that passed. Both read the ordinary container resolved in §4, so a
+container left behind by `compose run` neither passes a check nor stands in for
+a worker that is gone.
 
 Only the exact status `running` is accepted. `exited`, `paused`, `restarting`,
 `created`, `dead`, an unexpected value and a failed `inspect` all stop the group
@@ -370,25 +386,31 @@ and this procedure neither starts it nor skips the check.
 
 The image check answers one question per service: would the recreation run a
 different image than the container runs now? It resolves the image that the
-effective configuration — base file, Chatwoot overlay and any verified extra
-override — selects for that service alone, taking the service's own `image:` key
-when it has one and Compose's default `<project>-<service>` name when the service
-is built, and compares that local image's ID with the container's `.Image`.
-Looking a name up in `config --images` is not enough: that output also lists the
-images of the service's dependencies, so a dependency still carrying the old tag
-would make a service that now selects a new image look unchanged. The decision
-follows from image IDs, so two tags of one ID pass and one tag moved to another
-ID stops. The configuration is read only by the reader in the function, which
-prints a single field; never print it or write it to a file. The reader needs
-`python3` on the host, or the same program run through
-`dc exec -T "$svc" /app/.venv/bin/python` on a running target.
+effective configuration — the same files, project and environment as every other
+command here — selects for that service alone, and compares that local image's
+ID with the container's `.Image`. A service with its own `image:` key, from the
+base file or from an override, is checked against that key. A service built from
+`build:` is checked against the name Compose derives, `<project>` and the service
+joined by `-`, or by `_` when compatibility mode is on; the mode is read from the
+environment Compose itself reports for this file set, which covers both the shell
+and the project `.env`, and a value Compose does not read as a boolean stops the
+service with that reason. Looking a name up in `config --images` is not enough:
+that output also lists the images of the service's dependencies, so a dependency
+still carrying the old tag would make a service that now selects a new image look
+unchanged. The decision follows from image IDs, so two tags of one ID pass and
+one tag moved to another ID stops.
 
-The group also stops when the service is absent from the effective
-configuration, when its image reference is unresolved or it selects neither an
-image nor a build, when the existing container belongs to another Compose
-project, when a service has more than one existing container, and when the
-selected image is not present locally. Report the printed reason to the operator
-and resolve it before retrying; do not work around the check.
+The configuration is filtered on the host by the reader in the function, which
+prints one field and nothing else: never print the configuration, write it to a
+file, or pass it into a container. The reader needs `python3` on the host; where
+it is missing the check ends and nothing is recreated.
+
+The group also stops when the service has no ordinary container in this project
+or more than one, when the service is absent from the effective configuration,
+when its image reference is unresolved or it selects neither an image nor a
+build, and when the selected image is not present locally. Report the printed
+reason to the operator and resolve it before retrying; do not work around the
+check.
 
 ```bash
 before_change && check_targets_running && check_deployed_image_unchanged \
