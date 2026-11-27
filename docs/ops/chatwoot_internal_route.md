@@ -70,7 +70,7 @@ cd /opt/altegio_bot
 
 COMPOSE="docker compose -p altegio_bot -f docker-compose.yml -f docker-compose.chatwoot-internal.yml"
 
-$COMPOSE config >/tmp/altegio_compose_config.txt
+$COMPOSE config --quiet
 $COMPOSE up -d --build \
   altegio-api \
   altegio-inbox-worker \
@@ -82,6 +82,39 @@ $COMPOSE up -d --build \
 Note: from now on, every `up`/`restart` of these services must use the same
 `-f docker-compose.yml -f docker-compose.chatwoot-internal.yml` file set,
 otherwise compose will detach the services from the Chatwoot network again.
+
+### Mandatory recreation checks (incident of 2026-11-25–27)
+
+An env-only outbox recreation on 2026-11-25 used only the base Compose file
+and removed the Chatwoot network. WhatsApp sends continued successfully, but
+Chatwoot mirroring failed while resolving `rails`. The network and API access
+were restored on 2026-11-27 by recreating the outbox with both Compose files.
+
+For every production recreation, including env-only changes and rollbacks:
+
+1. Inspect the effective Compose file set and network requirements. Preserve
+   both files above, in that order, plus any additional verified overrides.
+   This applies equally to commands executed by the owner. Do not copy a
+   base-only `up` command from a development example into production.
+2. Validate with `config --quiet`; do not print or save the rendered config,
+   which can contain secrets. Retain the old container creation timestamp
+   in the diagnostic output so a later incident has a bounded audit window.
+3. Recreate only the intended service(s), with `--no-deps`. For env-only
+   changes use `--no-build --pull never --force-recreate`. A restart does not
+   reload changed environment values. Do not use `down` for this operation.
+4. Check both required networks, internal DNS and an authenticated read-only
+   API request from the affected container, plus the intended non-secret
+   runtime setting. Follow the DNS/API probes below.
+5. Confirm a subsequent ordinary notification has its private note in
+   Chatwoot. DNS and HTTP 200 establish connectivity only; WhatsApp
+   `delivered`/`read` does not establish that a Chatwoot copy exists. Do not
+   send a customer message solely as a mirror test.
+
+Historical recovery requires checking Chatwoot for duplicates and restoring
+only private notes. Never replay customer sends or reset completed jobs to
+repair missing mirrors. Missing mirror-registry rows are not proof of missing
+notes when `CHATWOOT_INSTALLATION_GENERATION` is unset. Recovery and these
+checks do not themselves grant permission for production access or mutation.
 
 ## 5. Verify shared network attachment
 

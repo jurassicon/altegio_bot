@@ -5501,7 +5501,18 @@ async def _connection_limit_reached(url: Any) -> Any:
 
     server = await asyncio.start_server(refuse, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    engine = create_async_engine(_test_address(url, port), poolclass=NullPool)
+    engine = create_async_engine(
+        _test_address(url, port),
+        poolclass=NullPool,
+        # Round 9: this endpoint speaks plain PostgreSQL, and asyncpg takes
+        # ``PGSSLMODE`` from the environment. Where the process asks for TLS,
+        # the driver demanded it here too, stopped at the refused upgrade and
+        # never saw the refusal this endpoint exists to give: what reached the
+        # boundary was "rejected SSL upgrade". So TLS is stated for this one
+        # connection — the real test database and the process itself keep
+        # whatever they are configured with, untouched.
+        connect_args={"ssl": False},
+    )
     endpoint.maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         yield endpoint
@@ -5738,3 +5749,42 @@ async def test_an_address_that_cannot_answer_is_the_one_the_driver_reached(
     assert broken.accepted == (1 if broken.accepts else 0)
     assert sessions.opened == 1
     assert transport.requests == ["booking", "customer", "history:1"]
+
+
+@pytest.mark.parametrize(
+    "sslmode",
+    [
+        pytest.param(None, id="tls-not-asked-for"),
+        pytest.param("require", id="tls-required-of-the-process"),
+        pytest.param("verify-full", id="tls-required-and-verified"),
+    ],
+)
+async def test_the_refusing_endpoint_answers_whatever_tls_the_process_asks_for(
+    engine, monkeypatch: pytest.MonkeyPatch, sslmode: str | None
+) -> None:
+    """Round 9: the simulated refusal is never turned into a TLS failure.
+
+    asyncpg reads ``PGSSLMODE`` from the environment, so a shell, a CI job or a
+    deployment that requires TLS made the driver require it of this endpoint as
+    well. It answers plain PostgreSQL, so the upgrade was refused and the
+    boundary was handed ``ConnectionError: rejected SSL upgrade``. The Ops route
+    answered with the database being unavailable either way, which is exactly
+    why nothing went red: the refusal the cases above are about had not
+    happened, and the driver's own class for it was never produced.
+
+    This asserts what the endpoint gives the driver, under a process that does
+    not ask for TLS and under one that requires it: the server's own answer,
+    SQLSTATE 53300, from a connection its far end really took.
+    """
+    if sslmode is None:
+        monkeypatch.delenv("PGSSLMODE", raising=False)
+    else:
+        monkeypatch.setenv("PGSSLMODE", sslmode)
+
+    async with _connection_limit_reached(engine.url) as broken:
+        with pytest.raises(TooManyConnectionsError) as caught:
+            async with broken() as session:
+                await session.execute(select(1))
+
+    assert caught.value.sqlstate == "53300"
+    assert broken.accepted == 1
